@@ -207,10 +207,11 @@ pub fn put_text_property<'ob>(
     end: usize,
     property: Object<'ob>,
     value: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<()> {
+    let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     let prop = list!(property, value; cx);
     let prop = Slot::new(prop);
@@ -430,9 +431,10 @@ pub fn set_text_properties<'ob>(
     start: usize,
     end: usize,
     properties: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &mut Rt<Env>,
 ) -> Result<()> {
+    let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<()> {
         let tree = data.textprops_with_lifetime();
@@ -456,10 +458,11 @@ pub fn remove_text_properties<'ob>(
     start: usize,
     end: usize,
     properties: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<bool> {
+    let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<bool> {
         let tree = data.textprops_with_lifetime();
@@ -495,10 +498,11 @@ pub fn remove_list_of_text_properties<'ob>(
     start: usize,
     end: usize,
     list_of_properties: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<bool> {
+    let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<bool> {
         let tree = data.textprops_with_lifetime();
@@ -606,15 +610,15 @@ mod tests {
         let key: Object = intern("roadmap-face", &cx).into();
         let missing: Object = intern("roadmap-missing", &cx).into();
         let value = cx.add("bold");
-        put_text_property(1, 7, key, value, buf, env, &cx)?;
-        put_text_property(2, 4, key, value, buf, env, &cx)?;
+        put_text_property(1, 7, key, value, Some(buf), env, &cx)?;
+        put_text_property(2, 4, key, value, Some(buf), env, &cx)?;
         assert_eq!(next_property_change(1, buf, None, env, &cx)?, 7);
-        remove_list_of_text_properties(2, 4, list![missing; &cx], buf, env, &cx)?;
+        remove_list_of_text_properties(2, 4, list![missing; &cx], Some(buf), env, &cx)?;
         assert_eq!(next_property_change(1, buf, None, env, &cx)?, 7);
         // Equal-looking strings are not eq and must retain a boundary.
-        put_text_property(2, 4, key, cx.add("bold"), buf, env, &cx)?;
+        put_text_property(2, 4, key, cx.add("bold"), Some(buf), env, &cx)?;
         assert_eq!(next_property_change(1, buf, None, env, &cx)?, 2);
-        put_text_property(2, 4, key, value, buf, env, &cx)?;
+        put_text_property(2, 4, key, value, Some(buf), env, &cx)?;
         assert_eq!(next_property_change(1, buf, None, env, &cx)?, 7);
         Ok(())
     }
@@ -658,9 +662,9 @@ mod tests {
         let a = cx.add(a);
 
         // Add properties at different ranges
-        put_text_property(0, 5, a, cx.add(1), buf, env, cx)?;
-        put_text_property(5, 10, a, cx.add(2), buf, env, cx)?;
-        put_text_property(15, 20, a, cx.add(3), buf, env, cx)?;
+        put_text_property(0, 5, a, cx.add(1), Some(buf), env, cx)?;
+        put_text_property(5, 10, a, cx.add(2), Some(buf), env, cx)?;
+        put_text_property(15, 20, a, cx.add(3), Some(buf), env, cx)?;
 
         // Test property changes
         let change = next_property_change(0, buf, None, env, cx)?;
@@ -713,10 +717,10 @@ mod tests {
         let b = cx.add(b);
 
         // Add properties at different ranges
-        put_text_property(1, 5, a, cx.add(1), buf, env, cx)?;
-        put_text_property(5, 8, a, cx.add(2), buf, env, cx)?;
-        put_text_property(10, 15, b, cx.add(4), buf, env, cx)?;
-        put_text_property(15, 20, a, cx.add(3), buf, env, cx)?;
+        put_text_property(1, 5, a, cx.add(1), Some(buf), env, cx)?;
+        put_text_property(5, 8, a, cx.add(2), Some(buf), env, cx)?;
+        put_text_property(10, 15, b, cx.add(4), Some(buf), env, cx)?;
+        put_text_property(15, 20, a, cx.add(3), Some(buf), env, cx)?;
 
         // Test property changes for :a
         let change = next_single_property_change(1, a, buf, None, env, cx)?;
@@ -762,15 +766,15 @@ mod tests {
         buf.buffer().unwrap().lock()?.insert(cx.add("abcde"))?;
         let a: Object = intern("roadmap-remove-a", &cx).into();
         let b: Object = intern("roadmap-remove-b", &cx).into();
-        put_text_property(1, 5, a, cx.add(1), buf, env, &cx)?;
-        put_text_property(1, 5, b, cx.add(2), buf, env, &cx)?;
+        put_text_property(1, 5, a, cx.add(1), Some(buf), env, &cx)?;
+        put_text_property(1, 5, b, cx.add(2), Some(buf), env, &cx)?;
         // GNU's CONSP candidate loop ignores a bare symbol, rather than
         // interpreting it as a property name or rejecting it.
-        remove_text_properties(2, 4, a, buf, env, &cx)?;
+        remove_text_properties(2, 4, a, Some(buf), env, &cx)?;
         assert_eq!(plist_get(text_properties_at(2, buf, env)?, a)?, 1);
         assert_eq!(next_property_change(1, buf, None, env, &cx)?, 5);
         // A final proper-list key is still a removal candidate with no value.
-        remove_text_properties(2, 4, list![a; &cx], buf, env, &cx)?;
+        remove_text_properties(2, 4, list![a; &cx], Some(buf), env, &cx)?;
         assert!(plist_get(text_properties_at(2, buf, env)?, a)?.is_nil());
         assert_eq!(plist_get(text_properties_at(1, buf, env)?, a)?, 1);
         assert_eq!(plist_get(text_properties_at(4, buf, env)?, a)?, 1);
@@ -788,15 +792,15 @@ mod tests {
         let key: Object = intern("roadmap-previous-key", &cx).into();
         let other: Object = intern("roadmap-previous-other", &cx).into();
         let value = cx.add("value");
-        put_text_property(2, 5, key, value, buf, env, &cx)?;
-        put_text_property(5, 8, key, cx.add("value"), buf, env, &cx)?;
+        put_text_property(2, 5, key, value, Some(buf), env, &cx)?;
+        put_text_property(5, 8, key, cx.add("value"), Some(buf), env, &cx)?;
         // Equal-looking but non-eq strings have a real boundary at 5.
         assert_eq!(previous_single_property_change(7, key, buf, None, env, &cx)?, 5);
         assert_eq!(previous_single_property_change(5, key, buf, None, env, &cx)?, 2);
         // A gap after a property range changes at the range's end, not start.
         assert_eq!(previous_single_property_change(10, key, buf, None, env, &cx)?, 8);
         // Unrelated boundaries do not interrupt the specific property scan.
-        put_text_property(3, 4, other, cx.add(1), buf, env, &cx)?;
+        put_text_property(3, 4, other, cx.add(1), Some(buf), env, &cx)?;
         assert_eq!(previous_single_property_change(5, key, buf, None, env, &cx)?, 2);
         assert_eq!(previous_single_property_change(7, key, buf, Some(6), env, &cx)?, 6);
         assert!(previous_single_property_change(2, key, buf, None, env, &cx)?.is_nil());
@@ -812,28 +816,28 @@ mod tests {
         buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
         let a: Object = intern("roadmap-reversed-a", &cx).into();
         let b: Object = intern("roadmap-reversed-b", &cx).into();
-        put_text_property(6, 2, a, cx.add(1), buf, env, &cx)?;
+        put_text_property(6, 2, a, cx.add(1), Some(buf), env, &cx)?;
         assert!(get_text_property(1, a, buf, env)?.is_nil());
         assert_eq!(get_text_property(2, a, buf, env)?, 1);
         assert_eq!(get_text_property(5, a, buf, env)?, 1);
         assert!(get_text_property(6, a, buf, env)?.is_nil());
-        set_text_properties(5, 3, list![b, 2; &cx], buf, env)?;
+        set_text_properties(5, 3, list![b, 2; &cx], Some(buf), env)?;
         assert!(get_text_property(3, a, buf, env)?.is_nil());
         assert_eq!(get_text_property(3, b, buf, env)?, 2);
         assert_eq!(get_text_property(2, a, buf, env)?, 1);
         assert_eq!(get_text_property(5, a, buf, env)?, 1);
-        remove_text_properties(4, 3, list![b, NIL; &cx], buf, env, &cx)?;
+        remove_text_properties(4, 3, list![b, NIL; &cx], Some(buf), env, &cx)?;
         assert!(text_properties_at(3, buf, env)?.is_nil());
         assert_eq!(get_text_property(4, b, buf, env)?, 2);
-        remove_list_of_text_properties(6, 4, list![a, b; &cx], buf, env, &cx)?;
+        remove_list_of_text_properties(6, 4, list![a, b; &cx], Some(buf), env, &cx)?;
         assert!(text_properties_at(4, buf, env)?.is_nil());
         assert!(text_properties_at(5, buf, env)?.is_nil());
         assert_eq!(get_text_property(2, a, buf, env)?, 1);
         // Normalization must leave empty ranges as no-ops.
-        put_text_property(2, 2, a, cx.add(9), buf, env, &cx)?;
-        set_text_properties(2, 2, NIL, buf, env)?;
-        remove_text_properties(2, 2, list![a, NIL; &cx], buf, env, &cx)?;
-        remove_list_of_text_properties(2, 2, list![a; &cx], buf, env, &cx)?;
+        put_text_property(2, 2, a, cx.add(9), Some(buf), env, &cx)?;
+        set_text_properties(2, 2, NIL, Some(buf), env)?;
+        remove_text_properties(2, 2, list![a, NIL; &cx], Some(buf), env, &cx)?;
+        remove_list_of_text_properties(2, 2, list![a; &cx], Some(buf), env, &cx)?;
         assert_eq!(get_text_property(2, a, buf, env)?, 1);
         Ok(())
     }
@@ -847,7 +851,7 @@ mod tests {
         buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
         let key: Object = intern("roadmap-search-key", &cx).into();
         let value = cx.add("same");
-        put_text_property(2, 5, key, value, buf, env, &cx)?;
+        put_text_property(2, 5, key, value, Some(buf), env, &cx)?;
         assert_eq!(text_property_any(1, 7, key, value, buf, env, &cx)?, 2);
         assert_eq!(text_property_any(3, 7, key, value, buf, env, &cx)?, 3);
         assert!(text_property_any(1, 7, key, cx.add("same"), buf, env, &cx)?.is_nil());
@@ -872,18 +876,25 @@ mod tests {
         buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
         let key: Object = intern("roadmap-removal-result-key", &cx).into();
         let missing: Object = intern("roadmap-removal-result-missing", &cx).into();
-        put_text_property(1, 6, key, NIL, buf, env, &cx)?;
-        assert!(!remove_text_properties(2, 4, key, buf, env, &cx)?);
-        assert!(!remove_text_properties(2, 4, list![missing, 1; &cx], buf, env, &cx)?);
-        assert!(!remove_list_of_text_properties(2, 2, list![key; &cx], buf, env, &cx)?);
+        put_text_property(1, 6, key, NIL, Some(buf), env, &cx)?;
+        assert!(!remove_text_properties(2, 4, key, Some(buf), env, &cx)?);
+        assert!(!remove_text_properties(2, 4, list![missing, 1; &cx], Some(buf), env, &cx)?);
+        assert!(!remove_list_of_text_properties(2, 2, list![key; &cx], Some(buf), env, &cx)?);
         // Presence, not a non-nil value, determines whether removal changed text.
-        assert!(remove_text_properties(2, 4, list![key, 999; &cx], buf, env, &cx)?);
-        assert!(!remove_text_properties(2, 4, list![key, NIL; &cx], buf, env, &cx)?);
+        assert!(remove_text_properties(2, 4, list![key, 999; &cx], Some(buf), env, &cx)?);
+        assert!(!remove_text_properties(2, 4, list![key, NIL; &cx], Some(buf), env, &cx)?);
         assert!(!text_properties_at(1, buf, env)?.is_nil());
         assert!(text_properties_at(2, buf, env)?.is_nil());
         assert!(!text_properties_at(4, buf, env)?.is_nil());
-        assert!(remove_list_of_text_properties(1, 6, list![missing, key; &cx], buf, env, &cx)?);
-        assert!(!remove_list_of_text_properties(1, 6, list![key; &cx], buf, env, &cx)?);
+        assert!(remove_list_of_text_properties(
+            1,
+            6,
+            list![missing, key; &cx],
+            Some(buf),
+            env,
+            &cx
+        )?);
+        assert!(!remove_list_of_text_properties(1, 6, list![key; &cx], Some(buf), env, &cx)?);
         Ok(())
     }
 
@@ -908,6 +919,50 @@ mod tests {
     }
 
     #[test]
+    fn roadmap_m0_optional_property_object_keeps_explicit_buffer_isolated() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        env.current_buffer.get_mut().insert(cx.add("abc"))?;
+        let other = get_buffer_create(cx.add("roadmap-optional-other"), None, &cx)?;
+        other.buffer().unwrap().lock()?.insert(cx.add("abc"))?;
+        let key: Object = intern("roadmap-optional-key", &cx).into();
+        put_text_property(1, 3, key, cx.add(1), None, env, &cx)?;
+        set_text_properties(1, 3, list![key, 2; &cx], Some(other), env)?;
+        assert_eq!(get_text_property(1, key, NIL, env)?, 1);
+        assert_eq!(get_text_property(1, key, other, env)?, 2);
+        assert!(remove_text_properties(1, 3, list![key, NIL; &cx], None, env, &cx)?);
+        assert_eq!(get_text_property(1, key, other, env)?, 2);
+        assert!(remove_list_of_text_properties(1, 3, list![key; &cx], Some(other), env, &cx)?);
+        assert!(get_text_property(1, key, other, env)?.is_nil());
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_property_mutators_accept_omitted_object() {
+        for (source, expected) in [
+            (
+                "(progn (insert \"abc\") (put-text-property 1 2 'a 7) (put-text-property 2 3 'a 7 nil) (list (get-text-property 1 'a nil) (get-text-property 2 'a nil)))",
+                "(7 7)",
+            ),
+            (
+                "(progn (insert \"abc\") (set-text-properties 1 2 '(a 8)) (set-text-properties 2 3 '(a 8) nil) (list (get-text-property 1 'a nil) (get-text-property 2 'a nil)))",
+                "(8 8)",
+            ),
+            (
+                "(progn (insert \"abc\") (put-text-property 1 3 'a nil) (list (remove-text-properties 1 2 '(a ignored)) (remove-text-properties 2 3 '(a ignored) nil)))",
+                "(t t)",
+            ),
+            (
+                "(progn (insert \"abc\") (put-text-property 1 3 'a nil) (list (remove-list-of-text-properties 1 2 '(a)) (remove-list-of-text-properties 2 3 '(a) nil)))",
+                "(t t)",
+            ),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
     fn test_remove_text_properties() -> Result<()> {
         let roots = &RootSet::default();
         let mut context = Context::new(roots);
@@ -925,11 +980,11 @@ mod tests {
         let b = cx.add(b);
 
         // Add properties
-        put_text_property(1, 5, a, cx.add(1), buf, env, cx)?;
-        put_text_property(5, 10, b, cx.add(2), buf, env, cx)?;
+        put_text_property(1, 5, a, cx.add(1), Some(buf), env, cx)?;
+        put_text_property(5, 10, b, cx.add(2), Some(buf), env, cx)?;
 
         // Remove property :a; the supplied value is ignored.
-        remove_text_properties(1, 10, list![a, 999; cx], buf, env, cx)?;
+        remove_text_properties(1, 10, list![a, 999; cx], Some(buf), env, cx)?;
 
         // Verify :a was removed
         let props = text_properties_at(3, buf, env)?;
@@ -941,7 +996,7 @@ mod tests {
         assert_eq!(val, cx.add(2));
 
         // Try removing non-existent property
-        remove_text_properties(0, 10, list![a, NIL; cx], buf, env, cx)?;
+        remove_text_properties(0, 10, list![a, NIL; cx], Some(buf), env, cx)?;
 
         BUFFERS.lock().unwrap().clear();
         Ok(())
@@ -956,7 +1011,7 @@ mod tests {
         env.current_buffer.get_mut().insert(cx.add("abc"))?;
         let key: Object = intern("roadmap-current-property", &cx).into();
         let value = cx.add("identity");
-        put_text_property(1, 3, key, value, NIL, env, &cx)?;
+        put_text_property(1, 3, key, value, None, env, &cx)?;
         // Env already owns this buffer's guard. Explicit current-buffer reads
         // must use it rather than trying to lock the same mutex again.
         let implicit = text_properties_at(1, NIL, env)?;
@@ -986,14 +1041,14 @@ mod tests {
         assert!(text_properties_at(0, buf, env).is_err());
         assert!(text_properties_at(2, buf, env).is_err());
         buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"))?;
-        put_text_property(1, 3, key, cx.add(7), buf, env, &cx)?;
+        put_text_property(1, 3, key, cx.add(7), Some(buf), env, &cx)?;
         assert_eq!(get_text_property(2, key, buf, env)?, 7);
         assert!(text_properties_at(3, buf, env)?.is_nil());
         assert!(get_text_property(3, key, buf, env)?.is_nil());
         // Character counts, not UTF-8 bytes, determine the legal endpoint.
         assert!(get_text_property(4, key, buf, env).is_err());
         assert!(get_text_property(0, key, buf, env).is_err());
-        env.current_buffer.set(buf.buffer().unwrap());
+        env.set_buffer(buf.buffer().unwrap());
         assert_eq!(get_text_property(2, key, NIL, env)?, 7);
         assert!(text_properties_at(0, NIL, env).is_err());
         assert!(text_properties_at(3, NIL, env)?.is_nil());
@@ -1014,7 +1069,7 @@ mod tests {
         let a = intern(":a", cx);
         let a = cx.add(a);
         buf.buffer().unwrap().lock()?.insert(cx.add("x"))?;
-        put_text_property(1, 2, a, cx.add(3), buf, env, cx)?;
+        put_text_property(1, 2, a, cx.add(3), Some(buf), env, cx)?;
         let n = text_properties_at(1, buf, env)?;
         let val = plist_get(n, a)?;
         assert!(eq(val, cx.add(3)));

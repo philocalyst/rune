@@ -23,6 +23,16 @@ pub(crate) struct OpenBuffer<'a> {
     back_ref: &'a LispBuffer,
 }
 
+impl Trace for OpenBuffer<'_> {
+    fn trace(&self, state: &mut GcState) {
+        // A cached guard can outlive killing its buffer. Do not use get(),
+        // which assumes the buffer is still live, while tracing roots.
+        if let Some(data) = self.data.as_ref() {
+            data.textprops.trace(state);
+        }
+    }
+}
+
 impl OpenBuffer<'_> {
     pub(crate) fn get(&self) -> &BufferData {
         // buffer can never be none because we check it as part of `lock`.

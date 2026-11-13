@@ -1,4 +1,4 @@
-use super::gc::{Context, ObjectMap, Rto, Slot};
+use super::gc::{Context, GcState, ObjectMap, RootedDeref, Rt, Rto, Slot, Trace};
 use super::object::{LispBuffer, Object, OpenBuffer, Symbol, WithLifetime};
 use anyhow::{Result, anyhow};
 use rune_macros::Trace;
@@ -20,7 +20,6 @@ pub(crate) struct Env<'a> {
     exception_id: u32,
     binding_stack: Vec<(Slot<Symbol<'a>>, Option<Slot<Object<'a>>>)>,
     pub(crate) match_data: Slot<Object<'a>>,
-    #[no_trace]
     pub(crate) current_buffer: CurrentBuffer<'a>,
     pub(crate) stack: LispStack<'a>,
 }
@@ -29,6 +28,43 @@ pub(crate) struct Env<'a> {
 pub(crate) struct CurrentBuffer<'a> {
     buffer: OnceCell<OpenBuffer<'a>>,
     pub(crate) buf_ref: &'a LispBuffer,
+}
+
+// CurrentBuffer contains a globally stable buffer handle and an optional
+// guard, not directly borrowed GC pointers. Its property slots are traced via
+// OpenBuffer, so rooting does not require a transformed field representation.
+impl RootedDeref for CurrentBuffer<'_> {
+    type Target = Self;
+
+    fn rooted_deref(rooted: &Rt<Self>) -> &Self {
+        // Rt is repr(transparent); keep the lifetime parameter unchanged.
+        unsafe { &*(rooted as *const Rt<Self>).cast::<Self>() }
+    }
+
+    fn rooted_derefmut(rooted: &mut Rt<Self>) -> &mut Self {
+        unsafe { &mut *(rooted as *mut Rt<Self>).cast::<Self>() }
+    }
+}
+
+impl PartialEq<LispBuffer> for Rt<CurrentBuffer<'_>> {
+    fn eq(&self, other: &LispBuffer) -> bool {
+        CurrentBuffer::eq(self, other)
+    }
+}
+
+impl Trace for CurrentBuffer<'_> {
+    fn trace(&self, state: &mut GcState) {
+        // LispBuffer itself lives in global storage and skips GC tracing.
+        // Trace the current buffer's local property values explicitly, without
+        // trying to lock a mutex whose guard this environment already holds.
+        if let Some(buffer) = self.buffer.get() {
+            buffer.trace(state);
+        } else if let Ok(buffer) = self.buf_ref.lock() {
+            buffer.trace(state);
+        }
+        // This is only a root for this environment's current buffer. It does
+        // not establish ownership of non-current or cross-context buffers.
+    }
 }
 
 impl Default for CurrentBuffer<'_> {
@@ -153,7 +189,7 @@ impl<'a> RootedEnv<'a> {
         if buffer == self.current_buffer.buf_ref {
             return;
         }
-        self.current_buffer.set(buffer);
+        CurrentBuffer::set(&mut self.current_buffer, buffer);
     }
 
     pub(crate) fn with_buffer<T>(
@@ -180,5 +216,61 @@ impl<'a> RootedEnv<'a> {
             let mut buffer = buffer.lock()?;
             Ok(func(&mut buffer))
         }
+    }
+}
+
+#[cfg(test)]
+mod current_buffer_gc_tests {
+    use super::*;
+    use crate::core::{cons::Cons, gc::RootSet, object::NIL};
+    use rune_core::macros::root;
+
+    #[test]
+    fn m0_current_buffer_properties_survive_gc_with_cached_and_released_guard() {
+        for release in [false, true] {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            root!(env, new(Env), cx);
+            env.current_buffer.get_mut().insert(cx.add("x")).unwrap();
+            let key = cx.add(intern("m0-buffer-gc-property", cx));
+            // The stored list/string have no root except the current buffer.
+            let plist =
+                Cons::new(key, Cons::new(cx.add("survives-current-buffer-gc"), NIL, cx), cx);
+            env.current_buffer.get_mut().textprops_with_lifetime().set_properties(
+                1,
+                2,
+                plist.into(),
+            );
+            if release {
+                env.current_buffer.release();
+            }
+            for _ in 0..3 {
+                cx.garbage_collect(true);
+                let properties = *env.current_buffer.get().textprops.find(1).unwrap().val;
+                let value = crate::intervals::textget(
+                    properties,
+                    cx.add(intern("m0-buffer-gc-property", cx)),
+                )
+                .unwrap();
+                assert_eq!(value, cx.add("survives-current-buffer-gc"));
+                if release {
+                    env.current_buffer.release();
+                }
+            }
+            // Remove context-local values before this global buffer outlives
+            // its context; non-current-buffer ownership remains separate work.
+            env.current_buffer.get_mut().textprops_with_lifetime().set_properties(1, 2, NIL);
+        }
+    }
+
+    #[test]
+    fn m0_current_buffer_gc_tolerates_killed_guard() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, new(Env), cx);
+        env.current_buffer.get_mut().kill();
+        cx.garbage_collect(true);
+        env.current_buffer.release();
+        cx.garbage_collect(true);
     }
 }
