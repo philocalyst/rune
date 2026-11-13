@@ -308,6 +308,19 @@ mod test {
     }
 
     #[test]
+    fn executable_lisp_headers_load_without_evaluating_the_header() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        load_internal("#!/usr/bin/env rune\n(setq shebang-loaded-value 41)\n#! ignored\n(setq shebang-loaded-value (+ shebang-loaded-value 1))", cx, env).unwrap();
+        let form = reader::read("shebang-loaded-value", cx).unwrap().0;
+        root!(form, cx);
+        let value = interpreter::eval(form, None, env, cx).unwrap();
+        assert_eq!(value, 42_i64);
+    }
+
+    #[test]
     fn test_load() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);

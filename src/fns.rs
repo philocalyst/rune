@@ -269,23 +269,60 @@ pub(crate) fn mapconcat(
 }
 
 #[defun]
-pub(crate) fn nreverse(seq: List) -> Result<Object> {
-    let mut prev = NIL;
-    for tail in seq.conses() {
-        let tail = tail?;
-        tail.set_cdr(prev)?;
-        prev = tail.into();
+pub(crate) fn nreverse(seq: Object) -> Result<Object> {
+    match seq.untag() {
+        ObjectType::NIL => Ok(NIL),
+        ObjectType::Cons(cons) => {
+            let mut prev = NIL;
+            for tail in cons.conses() {
+                let tail = tail?;
+                tail.set_cdr(prev)?;
+                prev = tail.into();
+            }
+            Ok(prev)
+        }
+        ObjectType::Vec(vector) => {
+            if vector.len() < 2 {
+                return Ok(seq);
+            }
+            let cells = vector.try_mut()?;
+            for index in 0..cells.len() / 2 {
+                let opposite = cells.len() - index - 1;
+                let first = cells[index].get();
+                let last = cells[opposite].get();
+                cells[index].set(last);
+                cells[opposite].set(first);
+            }
+            Ok(seq)
+        }
+        _ => bail!(TypeError::new(Type::Sequence, seq)),
     }
-    Ok(prev)
 }
 
 #[defun]
-pub(crate) fn reverse<'ob>(seq: List, cx: &'ob Context) -> Result<Object<'ob>> {
-    let mut tail = NIL;
-    for elem in seq {
-        tail = Cons::new(elem?, tail, cx).into();
+pub(crate) fn reverse<'ob>(seq: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
+    match seq.untag() {
+        ObjectType::NIL => Ok(NIL),
+        ObjectType::Cons(cons) => {
+            let mut tail = NIL;
+            for elem in cons {
+                tail = Cons::new(elem?, tail, cx).into();
+            }
+            Ok(tail)
+        }
+        ObjectType::Vec(vector) => {
+            let values: Vec<Object> = vector.iter().rev().map(|cell| cell.get()).collect();
+            Ok(values.into_obj(cx).into())
+        }
+        ObjectType::String(string) if string.is_ascii() => {
+            Ok(cx.add(string.as_bytes().iter().rev().copied().collect::<Vec<u8>>()))
+        }
+        ObjectType::String(string) => Ok(cx.add(string.chars().rev().collect::<String>())),
+        ObjectType::ByteString(string) => {
+            Ok(cx.add(string.iter().rev().copied().collect::<Vec<u8>>()))
+        }
+        _ => bail!(TypeError::new(Type::Sequence, seq)),
     }
-    Ok(tail)
 }
 
 #[defun]
@@ -1373,6 +1410,36 @@ mod test {
         assert_lisp("(nthcdr 3 '(1 2 3))", "nil");
         assert_lisp("(nthcdr 1 '(1 . 2))", "2");
         assert_lisp("(nthcdr 2 '(1 2 . 3))", "3");
+    }
+
+    #[test]
+    fn reverse_array_sequences_and_vector_identity() {
+        assert_lisp("(reverse [1 2 3])", "[3 2 1]");
+        assert_lisp("(reverse [])", "[]");
+        assert_lisp("(reverse \"aé🦀\")", "\"🦀éa\"");
+        assert_lisp("(let ((v [1 2 3])) (list (reverse v) v))", "([3 2 1] [1 2 3])");
+        assert_lisp("(let ((x (list 1))) (eq (aref (reverse (vector x)) 0) x))", "t");
+        assert_lisp("(let ((v [1 2 3 4])) (list (eq (nreverse v) v) v))", "(t [4 3 2 1])");
+        assert_lisp("(nreverse [])", "[]");
+        assert_lisp("(nreverse [1])", "[1]");
+    }
+
+    #[test]
+    fn reverse_unibyte_strings_and_invalid_sequences() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        let ascii = super::reverse(cx.add("ab"), cx).unwrap();
+        assert!(matches!(ascii.untag(), crate::core::object::ObjectType::ByteString(_)));
+        assert_eq!(ascii, cx.add(vec![b'b', b'a']));
+        let bytes = cx.add(vec![0u8, 128, 255]);
+        let reversed = super::reverse(bytes, cx).unwrap();
+        assert!(matches!(reversed.untag(), crate::core::object::ObjectType::ByteString(_)));
+        assert_eq!(reversed, cx.add(vec![255u8, 128, 0]));
+        assert_eq!(bytes, cx.add(vec![0u8, 128, 255]));
+        assert!(super::reverse(1i64.into(), cx).is_err());
+        assert!(super::nreverse(1i64.into()).is_err());
+        let dotted = crate::core::cons::Cons::new(1i64, 2i64, cx);
+        assert!(super::reverse(dotted.into(), cx).is_err());
     }
 
     #[test]

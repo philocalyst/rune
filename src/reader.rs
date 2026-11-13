@@ -173,23 +173,25 @@ impl<'a> Tokenizer<'a> {
 
     /// Skip whitespace and comments until the next valid read character.
     fn skip_till_char(&mut self) {
-        let mut in_comment = false;
-        let valid_char = |chr: char| {
-            if in_comment {
-                if chr == '\n' {
-                    in_comment = false;
+        // GNU read_obj treats every character <= space and NBSP as reader
+        // whitespace. Do not use Unicode is_whitespace: other Unicode space
+        // characters remain legal constituents of Lisp symbol names.
+        loop {
+            match self.iter.peek().copied() {
+                Some((_, chr)) if reader_whitespace(chr) => {
+                    self.iter.next();
                 }
-                false
-            } else if chr.is_ascii_whitespace() {
-                false
-            } else if chr == ';' {
-                in_comment = true;
-                false
-            } else {
-                true
+                Some((_, ';')) => {
+                    self.skip_till(|chr| chr == '\n');
+                }
+                Some((_, '#')) if matches!(self.iter.clone().nth(1), Some((_, '!'))) => {
+                    // Executable Lisp shebangs use the same line-comment rule
+                    // as GNU lread.c's #! dispatch, even between forms.
+                    self.skip_till(|chr| chr == '\n');
+                }
+                _ => break,
             }
-        };
-        self.skip_till(valid_char);
+        }
     }
 
     fn get_string(&mut self, open_delim_pos: usize) -> Result<Token<'a>> {
@@ -459,9 +461,14 @@ fn unescape_string<'a>(string: &str, offset: usize, cx: &'a Context) -> Result<O
     Ok(cx.add(new))
 }
 
+const fn reader_whitespace(chr: char) -> bool {
+    matches!(chr, '\x00'..=' ' | '\u{a0}')
+}
+
 /// Return true if `chr` is a valid symbol character.
 const fn symbol_char(chr: char) -> bool {
-    !matches!(chr, '\x00'..=' ' | '(' | ')' | '[' | ']' | '#' | ',' | '`' | ';' | '"' | '\'')
+    !reader_whitespace(chr)
+        && !matches!(chr, '(' | ')' | '[' | ']' | '#' | ',' | '`' | ';' | '"' | '\'')
 }
 
 fn escaped(escaped: &mut bool, chr: char) -> bool {
@@ -857,7 +864,6 @@ baz""#,
         assert_error("  (1 (2 3 4", Error::MissingCloseParen(5), cx);
         assert_error(" \"foo", Error::MissingStringDel(1), cx);
         assert_error("(1 2 . 3 4)", Error::ExtraItemInCdr(9), cx);
-        assert_error("(1 3 \0)", Error::UnexpectedChar('\0', 5), cx);
         assert_error(" '", Error::MissingQuotedItem(1), cx);
         assert_error(" )", Error::ExtraCloseParen(1), cx);
         assert_error("(1 . #o9 3)", Error::ParseInt(8, 5), cx);
@@ -878,6 +884,45 @@ baz""#,
 mod m0_reader_regressions {
     use super::*;
     use crate::core::{cons::Cons, gc::RootSet, object::ObjectType};
+
+    #[test]
+    fn gnu_reader_whitespace_and_nbsp_delimit_symbols() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for chr in ('\x00'..=' ').chain(std::iter::once('\u{a0}')) {
+            let source = format!("{chr}42{chr}");
+            assert_eq!(read(&source, &cx).unwrap(), (cx.add(42_i64), chr.len_utf8() + 2));
+            let source = format!("(one{chr}two)");
+            assert_eq!(
+                read(&source, &cx).unwrap().0,
+                cx.add(list!(intern("one", &cx), intern("two", &cx); &cx))
+            );
+        }
+        assert_eq!(read("(1 3 \0)", &cx).unwrap().0, cx.add(list!(1, 3; &cx)));
+        // NBSP is special; Unicode EM SPACE is not Lisp reader whitespace.
+        assert_eq!(read("a\u{2003}b", &cx).unwrap().0, cx.add(intern("a\u{2003}b", &cx)));
+        assert_eq!(read("a\\\u{a0}b", &cx).unwrap().0, cx.add(intern("a\u{a0}b", &cx)));
+        assert_eq!(read("?\u{a0}", &cx).unwrap().0, cx.add(160_i64));
+        assert_eq!(read("\"a\u{a0}b\"", &cx).unwrap().0, cx.add("a\u{a0}b"));
+    }
+
+    #[test]
+    fn shebang_comments_are_skipped_iteratively_without_consuming_forms() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let source = "#!/usr/bin/env rune\n42 next";
+        assert_eq!(read(source, &cx).unwrap(), (cx.add(42_i64), source.find(" next").unwrap()));
+        assert_eq!(read("(1 #! ignored\n2)", &cx).unwrap().0, cx.add(list!(1, 2; &cx)));
+        assert_eq!(read("'#! ignored\n42", &cx).unwrap().0, cx.add(list!(sym::QUOTE, 42; &cx)));
+        for source in ["#!", "#! comment without newline", "; comment\n#! comment\n"] {
+            assert_eq!(read(source, &cx).unwrap_err(), Error::EmptyStream);
+        }
+        assert_eq!(read(r"\#!", &cx).unwrap().0, cx.add(intern("#!", &cx)));
+        assert_eq!(read(r##""#!not a comment""##, &cx).unwrap().0, cx.add("#!not a comment"));
+        let source = "#! ignored\n".repeat(10_000) + "7";
+        assert_eq!(read(&source, &cx).unwrap().0, cx.add(7_i64));
+        assert_eq!(read("#a", &cx).unwrap_err(), Error::UnknownMacroCharacter('a', 0));
+    }
 
     #[test]
     fn dotted_lists_require_one_cdr_after_a_nonempty_prefix() {

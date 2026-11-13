@@ -339,15 +339,52 @@ fn logand(int_or_markers: &[Gc<i64>]) -> i64 {
     int_or_markers.iter().fold(-1, |accum, x| accum & x.untag())
 }
 
+fn remainder_driver(x: Number, y: Number, modulo: bool) -> Result<NumberValue> {
+    if x.is_float() || y.is_float() {
+        if !modulo {
+            return Err(anyhow!("remainder requires integer arguments"));
+        }
+        let to_float = |number: Number| -> Result<f64> {
+            match number.untag() {
+                NumberType::Int(value) => Ok(value as f64),
+                NumberType::Float(value) => Ok(**value),
+                NumberType::Big(value) => value.to_f64().ok_or_else(|| anyhow!("float overflow")),
+            }
+        };
+        let (numerator, denominator) = (to_float(x)?, to_float(y)?);
+        let mut result = numerator % denominator;
+        // Match GNU fmod_float: nonzero modulo has the divisor's sign. Float
+        // zero denominators remain IEEE NaN, unlike integer zero errors.
+        if if denominator < 0.0 { result > 0.0 } else { result < 0.0 } {
+            result += denominator;
+        }
+        return Ok(NumberValue::Float(result));
+    }
+    let integer = |number: Number| match number.untag() {
+        NumberType::Int(value) => BigInt::from(value),
+        NumberType::Big(value) => (**value).clone(),
+        NumberType::Float(_) => unreachable!("float operands were handled first"),
+    };
+    let (numerator, denominator) = (integer(x), integer(y));
+    if denominator.is_zero() {
+        return Err(anyhow!("(arith-error)"));
+    }
+    let mut result = numerator % &denominator;
+    if modulo && !result.is_zero() && result.sign() != denominator.sign() {
+        result += denominator;
+    }
+    Ok(NumberValue::Big(result).coerce_integer())
+}
+
 #[defun(name = "mod")]
-pub(crate) fn modulo(x: Number, y: Number) -> NumberValue {
-    x.val() % y.val()
+pub(crate) fn modulo(x: Number, y: Number) -> Result<NumberValue> {
+    remainder_driver(x, y, true)
 }
 
 #[defun(name = "%")]
-pub(crate) fn remainder(x: i64, y: i64) -> i64 {
+pub(crate) fn remainder(x: Number, y: Number) -> Result<NumberValue> {
     // TODO: Handle markers
-    x % y
+    remainder_driver(x, y, false)
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
@@ -450,6 +487,48 @@ mod test {
         crate::interpreter::assert_lisp("(condition-case nil (/ 0) (error 'caught))", "caught");
         crate::interpreter::assert_lisp("(/ 18446744073709551616 2)", "9223372036854775808");
         crate::interpreter::assert_lisp("(/ 2.0)", "0.5");
+    }
+
+    #[test]
+    fn m0_remainder_and_modulo_distinguish_sign_and_zero_rules() {
+        for (source, expected) in [
+            ("(% -5 3)", "-2"),
+            ("(mod -5 3)", "1"),
+            ("(% 5 -3)", "2"),
+            ("(mod 5 -3)", "-1"),
+            ("(mod -5 -3)", "-2"),
+            ("(mod -6 3)", "0"),
+            ("(mod -5.5 3)", "0.5"),
+            ("(mod 5 -3.0)", "-1.0"),
+            ("(% 18446744073709551617 3)", "2"),
+            ("(mod -18446744073709551617 3)", "1"),
+            ("(% -36028797018963968 -1)", "0"),
+            ("(condition-case nil (% 5 0) (error 'caught))", "caught"),
+            ("(condition-case nil (mod 5 0) (error 'caught))", "caught"),
+            ("(condition-case nil (% 5.0 2) (error 'caught))", "caught"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn m0_remainder_zero_bignums_error_and_float_mod_zero_is_nan() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let zero = cx.add_as(BigInt::from(0));
+        for operation in [remainder, modulo] {
+            for numerator in [Number::from(5_i64), cx.add_as(BigInt::from(i64::MAX) + 1_u8)] {
+                assert!(operation(numerator, zero).is_err());
+            }
+        }
+        for (numerator, denominator) in
+            [(cx.add_as(5.0), Number::from(0_i64)), (5_i64.into(), cx.add_as(-0.0))]
+        {
+            let NumberValue::Float(value) = modulo(numerator, denominator).unwrap() else {
+                panic!("floating modulo must return a float");
+            };
+            assert!(value.is_nan());
+        }
     }
 
     #[test]
