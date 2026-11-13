@@ -51,13 +51,15 @@ fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
     init_sender.close();
 
     // Spawn thread to evaluate expression
-    crate::debug::enable_debug();
     thread::spawn(move || {
         // Create block inside the thread
         let block = Block::new_local_unchecked();
         let roots = &RootSet::default();
         let cx = &mut Context::from_block(block, roots);
         root!(env, new(Env), cx);
+        // Each worker has its own variable bindings, including the same built-in
+        // defaults as the main interpreter. Root them before evaluation can GC.
+        crate::core::env::init_variables(cx, env);
 
         // Reconstruct the object from raw
         let obj = init_receiver.recv(cx).expect("go_internal parent thread waited on the send operation in this channel before spawning the thread");
@@ -91,6 +93,73 @@ fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
 mod tests {
     use super::*;
     use crate::core::object::{ChannelReceiver, Gc, ObjectType};
+
+    #[test]
+    fn roadmap_m0_go_initializes_scalar_builtin_defaults() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+
+        for (variable, expected) in [
+            (sym::FILL_COLUMN, cx.add(70)),
+            (sym::TAB_WIDTH, cx.add(8)),
+            (sym::LEXICAL_BINDING, cx.add(true)),
+            (sym::PRINT_LENGTH, cx.add(false)),
+        ] {
+            let receiver_obj = go_internal(variable.into(), cx);
+            let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
+            assert_eq!(receiver.recv(cx).unwrap(), expected, "default for {variable}");
+        }
+    }
+
+    #[test]
+    fn roadmap_m0_go_initializes_allocated_builtin_defaults() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        let receiver_obj = go_internal(sym::LOAD_PATH.into(), cx);
+        let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
+        let result = receiver.recv(cx).unwrap();
+        let ObjectType::Cons(path) = result.untag() else {
+            panic!("Expected initialized load-path, got {result:?}");
+        };
+        assert_eq!(path.car(), cx.add(format!("{}/lisp", env!("CARGO_MANIFEST_DIR"))));
+        assert_eq!(path.cdr(), crate::core::object::NIL);
+    }
+
+    #[test]
+    fn roadmap_m0_go_defaults_are_local_to_child_env() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        root!(env, new(Env), cx);
+        crate::core::env::init_variables(cx, env);
+        env.set_var(sym::FILL_COLUMN, cx.add(91)).unwrap();
+
+        // A worker's assignment must not change either the parent or the next
+        // worker's defaults. SETQ/PROGN are special forms, not global subr setup.
+        let form = crate::reader::read("(progn (setq fill-column 23) fill-column)", cx).unwrap().0;
+        let receiver_obj = go_internal(form, cx);
+        let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
+        assert_eq!(receiver.recv(cx).unwrap(), cx.add(23));
+        assert_eq!(env.vars.get(sym::FILL_COLUMN).unwrap().bind(cx), cx.add(91));
+
+        let receiver_obj = go_internal(sym::FILL_COLUMN.into(), cx);
+        let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
+        assert_eq!(receiver.recv(cx).unwrap(), cx.add(70));
+    }
+
+    #[test]
+    fn roadmap_m0_go_preserves_error_channel_result() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        let missing = crate::core::env::intern("roadmap-m0-unbound-worker-variable", cx);
+        let receiver_obj = go_internal(missing.into(), cx);
+        let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
+        let result = receiver.recv(cx).unwrap();
+        let ObjectType::Cons(error) = result.untag() else {
+            panic!("Expected thread error result, got {result:?}");
+        };
+        assert_eq!(error.car(), sym::THREAD_ERRORED);
+        assert!(matches!(error.cdr().untag(), ObjectType::String(_)));
+    }
 
     #[test]
     fn test_go() {

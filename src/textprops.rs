@@ -4,7 +4,7 @@ use crate::{
         env::Env,
         error::{Type, TypeError},
         gc::{Context, Rt, Slot},
-        object::{Gc, ListType, NIL, Object, ObjectType, WithLifetime},
+        object::{NIL, Object, ObjectType, WithLifetime},
     },
     fns::eq,
     intervals::textget,
@@ -41,33 +41,34 @@ pub fn add_properties<'ob>(
     _destructive: bool,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    // TODO return type
-    let Ok(plist) = Gc::<ListType>::try_from(plist) else { return Ok(obj_i) };
-    let Ok(plist_i) = Gc::<ListType>::try_from(obj_i) else { return Ok(obj_i) };
-    let mut iter = plist.elements();
-    // iterate through plist, finding key1 and val1
-    while let Some(key1) = iter.next() {
-        let key1 = key1?;
-        let Some(val1) = iter.next() else { return Ok(obj_i) };
-        let mut found = false;
-
-        let mut iter_i = plist_i.conses();
-        // iterate through i's plist, finding (key2, val2) and set val2 if key2 == key1;
-        while let Some(key2_cons) = iter_i.next() {
-            let Some(val2_cons) = iter_i.next() else { return Ok(obj_i) };
-            if eq(key1, key2_cons?.car()) {
-                // TODO this should depend on set_type
-                val2_cons?.set_car(val1?)?;
-                found = true;
-                break;
-            }
+    // Property lists are shared by split intervals and may also belong to Lisp.
+    // Build a fresh list instead of changing any existing cons cells.
+    let mut pairs = Vec::new();
+    let mut existing = obj_i.as_list()?;
+    while let Some(key) = existing.next() {
+        let key = key?;
+        let value = existing.next().ok_or_else(|| anyhow!("Odd length property list"))??;
+        pairs.push((key, value));
+    }
+    let original_pairs = pairs.clone();
+    let mut incoming = plist.as_list()?;
+    while let Some(key) = incoming.next() {
+        let key = key?;
+        let value = incoming.next().ok_or_else(|| anyhow!("Odd length property list"))??;
+        if let Some(pair) = pairs.iter_mut().find(|pair| eq(pair.0, key)) {
+            pair.1 = value;
+        } else {
+            pairs.push((key, value));
         }
-        // if no key1 found, append them
-        if !found {
-            let pl = plist_i.untag();
-            let new_cons = Cons::new(key1, Cons::new(val1?, pl, cx), cx);
-            obj_i = new_cons.into();
-        }
+    }
+    if pairs.len() == original_pairs.len()
+        && pairs.iter().zip(&original_pairs).all(|(a, b)| eq(a.0, b.0) && eq(a.1, b.1))
+    {
+        return Ok(obj_i);
+    }
+    obj_i = NIL;
+    for (key, value) in pairs.into_iter().rev() {
+        obj_i = Cons::new(key, Cons::new(value, obj_i, cx), cx).into();
     }
     Ok(obj_i)
 }
@@ -212,8 +213,7 @@ pub fn put_text_property<'ob>(
     let prop = Slot::new(prop);
     modify_buffer_data(object, env, |data| {
         let tree = &mut data.textprops_with_lifetime();
-        tree.insert(start, end, prop, cx);
-        Ok(())
+        tree.insert(start, end, prop, cx)
     })
 }
 /// Return the position of next property change.
@@ -240,8 +240,6 @@ pub fn next_property_change<'ob>(
         let point_max = data.text.len_chars() + 1;
         let end = limit.unwrap_or(point_max);
         let tree = data.textprops_with_lifetime();
-        // NOTE this can be optimized
-        tree.clean();
         let prop = tree.tree.find_intersect_min(position..end);
 
         match prop {
@@ -294,8 +292,6 @@ pub fn next_single_property_change<'ob>(
         let point_max = data.text.len_chars() + 1;
         let end = limit.unwrap_or(point_max);
         let tree = data.textprops_with_lifetime();
-        // NOTE this can be optimized
-        tree.clean();
         let iter = tree.iter(position, end);
 
         let mut val = None;
@@ -341,8 +337,6 @@ pub fn previous_property_change<'ob>(
         let start = limit.unwrap_or(point_min);
         let end = position;
         let tree = data.textprops_with_lifetime();
-        // NOTE this can be optimized
-        tree.clean();
         let prop = tree.tree.find_intersect_max(start..end);
 
         match prop {
@@ -399,8 +393,6 @@ pub fn previous_single_property_change<'ob>(
         let point_min = 1;
         let start = limit.unwrap_or(point_min);
         let tree = data.textprops_with_lifetime();
-        // NOTE this can be optimized
-        tree.clean();
         let iter = tree.iter_reverse(start, position);
 
         let mut val = None;
@@ -464,7 +456,17 @@ pub fn remove_text_properties<'ob>(
 ) -> Result<()> {
     modify_buffer_data(object, env, |data| -> Result<()> {
         let tree = data.textprops_with_lifetime();
-        tree.delete(start, end, list![properties; cx])
+        let mut keys = Vec::new();
+        let mut properties = properties.as_list()?;
+        while let Some(key) = properties.next() {
+            keys.push(key?);
+            properties.next().ok_or_else(|| anyhow!("Odd length property list"))??;
+        }
+        let mut list = NIL;
+        for key in keys.into_iter().rev() {
+            list = Cons::new(key, list, cx).into();
+        }
+        tree.delete(start, end, list, cx)
     })
 }
 
@@ -481,10 +483,11 @@ pub fn remove_list_of_text_properties<'ob>(
     list_of_properties: Object<'ob>,
     object: Object<'ob>,
     env: &mut Rt<Env>,
+    cx: &'ob Context,
 ) -> Result<()> {
     modify_buffer_data(object, env, |data| -> Result<()> {
         let tree = data.textprops_with_lifetime();
-        tree.delete(start, end, list_of_properties)
+        tree.delete(start, end, list_of_properties, cx)
     })
 }
 
@@ -559,6 +562,45 @@ mod tests {
     use rune_core::macros::{list, root};
 
     use super::*;
+
+    #[test]
+    fn roadmap_m0_add_properties_does_not_change_shared_list() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let a = intern(":roadmap-a", &cx);
+        let b = intern(":roadmap-b", &cx);
+        let original = list![a, 1; &cx];
+        let additions = list![a, 2, b, 3; &cx];
+        let result =
+            add_properties(additions, original, PropertySetType::Append, false, &cx).unwrap();
+        assert_eq!(plist_get(original, a.into()).unwrap(), 1);
+        assert_eq!(plist_get(result, a.into()).unwrap(), 2);
+        assert_eq!(plist_get(result, b.into()).unwrap(), 3);
+        assert_eq!(plist_get(additions, a.into()).unwrap(), 2);
+    }
+
+    #[test]
+    fn roadmap_m0_property_noops_and_restore_coalesce() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-property-noops"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdefg"))?;
+        let key: Object = intern("roadmap-face", &cx).into();
+        let missing: Object = intern("roadmap-missing", &cx).into();
+        let value = cx.add("bold");
+        put_text_property(1, 7, key, value, buf, env, &cx)?;
+        put_text_property(2, 4, key, value, buf, env, &cx)?;
+        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 7);
+        remove_list_of_text_properties(2, 4, list![missing; &cx], buf, env, &cx)?;
+        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 7);
+        // Equal-looking strings are not eq and must retain a boundary.
+        put_text_property(2, 4, key, cx.add("bold"), buf, env, &cx)?;
+        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 2);
+        put_text_property(2, 4, key, value, buf, env, &cx)?;
+        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 7);
+        Ok(())
+    }
 
     #[test]
     fn test_add_properties() {

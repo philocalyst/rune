@@ -46,6 +46,8 @@ impl OpenBuffer<'_> {
     }
 
     pub(crate) fn insert(&mut self, arg: Object) -> Result<()> {
+        let position = self.get().text.cursor().chars() + 1;
+        let old_len = self.get().text.len_chars();
         match arg.untag() {
             ObjectType::Int(i) => {
                 let Ok(u_32) = i.try_into() else { bail!("{i} is an invalid char") };
@@ -55,6 +57,8 @@ impl OpenBuffer<'_> {
             ObjectType::String(s) => self.get_mut().text.insert(s),
             x => bail!(TypeError::new(Type::String, x)),
         }
+        let chars = self.get().text.len_chars() - old_len;
+        self.get_mut().textprops.insert_text(position, chars);
         Ok(())
     }
 
@@ -67,7 +71,9 @@ impl OpenBuffer<'_> {
     pub(crate) fn delete(&mut self, beg: usize, end: usize) -> Result<()> {
         let beg = self.in_range(beg)?;
         let end = self.in_range(end)?;
+        let (beg, end) = (beg.min(end), beg.max(end));
         self.get_mut().text.delete_range(beg, end);
+        self.get_mut().textprops.delete_text(beg + 1, end + 1);
         Ok(())
     }
 
@@ -210,5 +216,32 @@ impl<'new> LispBuffer {
         _: &'new Block<C>,
     ) -> Gc<&'new LispBuffer> {
         unsafe { self.with_lifetime().tag() }
+    }
+}
+
+#[cfg(test)]
+mod roadmap_m0_buffer_property_regressions {
+    use super::*;
+    use crate::RootSet;
+
+    #[test]
+    fn roadmap_m0_buffer_edits_use_character_property_positions() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let object = crate::buffer::get_buffer_create(cx.add("roadmap-m0-properties"), None, &cx)?;
+        let buffer = object.buffer().unwrap();
+        let mut buffer = buffer.lock()?;
+        buffer.insert(cx.add("aé🙂z"))?;
+        // Lisp character positions are one-based, regardless of UTF-8 width.
+        buffer.textprops_with_lifetime().set_properties(2, 4, cx.add(7));
+        buffer.text.set_cursor(0);
+        buffer.insert(cx.add("λ"))?;
+        assert!(buffer.textprops.find(2).is_none());
+        assert_eq!(buffer.textprops.find(3).map(|node| *node.val), Some(cx.add(7)));
+        // Reversed endpoints are accepted and normalized before editing.
+        buffer.delete(4, 2)?;
+        assert_eq!(buffer.textprops.find(2).map(|node| *node.val), Some(cx.add(7)));
+        assert!(buffer.textprops.find(3).is_none());
+        Ok(())
     }
 }

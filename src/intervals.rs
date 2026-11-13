@@ -49,18 +49,76 @@ impl<'ob> IntervalTree<'ob> {
     ///
     /// If the interval overlaps with existing intervals, their properties will be merged
     /// using `add_properties`. The resulting object will be stored in the tree.
-    pub fn insert(&mut self, start: usize, end: usize, val: Slot<Object<'ob>>, cx: &'ob Context) {
+    pub fn insert(
+        &mut self,
+        start: usize,
+        end: usize,
+        val: Slot<Object<'ob>>,
+        cx: &'ob Context,
+    ) -> Result<()> {
+        // Validate every overlapping plist before changing the tree. This also
+        // keeps malformed input out of the infallible tree merge callback.
+        for (_, existing) in self.iter(start, end) {
+            if !existing.is_nil() {
+                add_properties(
+                    *val,
+                    existing,
+                    crate::textprops::PropertySetType::Append,
+                    false,
+                    cx,
+                )?;
+            }
+        }
         self.tree.insert((start, end), val, |a, b| {
             add_properties(*a, *b, crate::textprops::PropertySetType::Append, false, cx)
                 .map(Slot::new)
-                .unwrap()
+                .unwrap_or(b)
         });
         // Ensure canonical form after insertion so adjacent equal intervals are merged
         self.clean();
+        Ok(())
     }
 
     pub fn set_properties(&mut self, start: usize, end: usize, properties: Object<'ob>) {
-        self.tree.insert((start, end), Slot::new(properties), |a, _b| a).unwrap();
+        self.tree.insert((start, end), Slot::new(properties), |a, _b| a);
+        self.clean();
+    }
+
+    /// Shift existing property ranges after inserting unpropertized text.
+    pub(crate) fn insert_text(&mut self, position: usize, chars: usize) {
+        if chars != 0 {
+            self.tree.advance(position, chars);
+        }
+    }
+
+    /// Remove text and translate surviving ranges to the new coordinates.
+    /// This stopgap rebuild is linear; the persistent text core replaces it.
+    pub(crate) fn delete_text(&mut self, start: usize, end: usize) {
+        if start == end {
+            return;
+        }
+        let mut ranges = Vec::new();
+        self.tree.apply_mut(&mut |node| {
+            let translate = |position: usize| {
+                if position <= start {
+                    position
+                } else if position < end {
+                    start
+                } else {
+                    position - (end - start)
+                }
+            };
+            let begin = translate(node.key.start);
+            let finish = translate(node.key.end);
+            if begin < finish {
+                ranges.push((begin, finish, *node.val));
+            }
+        });
+        self.tree = Tree::new();
+        for (begin, finish, value) in ranges {
+            self.tree.insert((begin, finish), Slot::new(value), |new, _old| new);
+        }
+        self.clean();
     }
 
     pub fn find(&self, position: usize) -> Option<&Node<Slot<Object<'ob>>>> {
@@ -78,25 +136,41 @@ impl<'ob> IntervalTree<'ob> {
     /// * `end` - End position of the range (exclusive)
     /// * `list_of_props` - The properties to delete (as an Object containing a list of properties)
     /// * `cx` - The context used for equality testing
-    pub fn delete(&mut self, start: usize, end: usize, list_of_props: Object<'ob>) -> Result<()> {
-        let props = list_of_props.as_list()?;
+    pub fn delete(
+        &mut self,
+        start: usize,
+        end: usize,
+        list_of_props: Object<'ob>,
+        cx: &'ob Context,
+    ) -> Result<()> {
+        let props: Vec<_> = list_of_props.as_list()?.collect::<Result<_, _>>()?;
+        // Validate all affected lists before apply_with_split can mutate anything.
+        for (_, value) in self.iter(start, end) {
+            if value.is_nil() {
+                continue;
+            }
+            let mut result = value;
+            for &sym in &props {
+                result = remove_sym_from_props(sym, result, cx)?;
+            }
+        }
         self.tree.apply_with_split(
             |val| {
-                let props = props.clone();
                 let mut result = *val;
-                for sym in props {
-                    let sym = sym.ok()?;
-                    result = remove_sym_from_props(sym, result).ok()?;
+                for &sym in &props {
+                    // The preflight above has already validated these lists.
+                    result = remove_sym_from_props(sym, result, cx).unwrap_or(result);
                 }
                 Some(unsafe { result.into_root() })
             },
             start..end,
         );
+        self.clean();
         Ok(())
     }
 
     pub fn clean(&mut self) {
-        self.tree.clean(|a, b| eq(**a, **b), |n| n.is_nil());
+        self.tree.clean(|a, b| properties_eq(**a, **b), |n| n.is_nil());
     }
 
     pub(crate) fn iter<'a>(&'a self, start: usize, end: usize) -> IntervalIntersections<'ob, 'a> {
@@ -112,70 +186,59 @@ impl<'ob> IntervalTree<'ob> {
     }
 }
 
-/// Removes all occurrences of `sym` from the property list `props`.
-///
-/// This function scans through a property list (a cons cell chain) and removes any
-/// pairs where the car matches `sym`. The property list is modified in-place.
-///
-/// # Arguments
-/// * `sym` - The symbol to remove from the property list
-/// * `props` - The property list to modify (must be a cons cell chain)
-///
-/// # Returns
-/// Returns the modified property list with all occurrences of `sym` removed.
-/// If the input is not a cons cell, returns a TypeError.
-fn remove_sym_from_props<'ob>(sym: Object<'ob>, props: Object<'ob>) -> Result<Object<'ob>> {
-    let ObjectType::Cons(props) = props.untag() else {
-        bail!(TypeError::new(Type::List, props))
-    };
-
-    // remove properties at the beginning of list
-
-    let mut plist = Some(props);
-    while let Some(cons) = plist {
-        let prop = cons.car();
-        if eq(prop, sym) {
-            plist = cons.cddr().and_then(|n| n.try_into().ok());
-            // .and_then(|cons: &Cons| cons.cdr().try_into().ok());
-        } else {
-            break;
-        }
+/// Compare effective properties without confusing plist cons identity with
+/// property-value identity. Lisp property values must still compare with `eq`.
+fn properties_eq(a: Object<'_>, b: Object<'_>) -> bool {
+    if eq(a, b) {
+        return true;
     }
-
-    let result = plist.map(|c| ObjectType::Cons(c).tag()).unwrap_or(NIL);
-
-    // now, first pair in this alist is ensured not to be sym. Let's call it `p1`
-    while let Some(cons) = plist {
-        println!("{cons:?}");
-        let cdr = cons.cdr();
-        if let Some(cdr) = cdr.cons() {
-            let cddr = cdr.cdr();
-            if let Some(this) = cddr.cons() {
-                // if the second pair(p2)'s key is `sym`, remove it and put its cons(p3)
-                // right after p1.
-                // if not, then advance p1 to p2, then continue the loop
-                if eq(this.car(), sym) {
-                    set_cdr(cdr, this.cdr());
-                }
-                plist = Some(this);
-            } else {
-                // cddr is not a cons; then it should be nil
-                break;
+    fn pairs(value: Object<'_>) -> Result<Vec<(Object<'_>, Object<'_>)>> {
+        let mut iter = value.as_list()?;
+        let mut result = Vec::new();
+        while let Some(key) = iter.next() {
+            let key = key?;
+            let value =
+                iter.next().ok_or_else(|| anyhow::anyhow!("Odd length property list"))??;
+            if !result.iter().any(|(existing, _)| eq(*existing, key)) {
+                result.push((key, value));
             }
         }
+        Ok(result)
     }
-
-    Ok(result)
+    let (Ok(a), Ok(b)) = (pairs(a), pairs(b)) else { return false };
+    a.len() == b.len()
+        && a.iter().all(|(key, value)| {
+            b.iter()
+                .any(|(other_key, other_value)| eq(*key, *other_key) && eq(*value, *other_value))
+        })
 }
 
-fn set_cdr<'ob>(this: &'ob Cons, other: Object<'ob>) -> Option<&'ob Cons> {
-    if let Some(cons) = other.cons() {
-        if let Some(_c) = cons.cdr().cons() {
-            this.set_cdr(cons.cdr()).ok()?;
+/// Return a fresh property list without `sym`, preserving the original list.
+fn remove_sym_from_props<'ob>(
+    sym: Object<'ob>,
+    props: Object<'ob>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    let mut pairs = Vec::new();
+    let mut removed = false;
+    let mut iter = props.as_list()?;
+    while let Some(key) = iter.next() {
+        let key = key?;
+        let value = iter.next().ok_or_else(|| anyhow::anyhow!("Odd length property list"))??;
+        if !eq(key, sym) {
+            pairs.push((key, value));
+        } else {
+            removed = true;
         }
-        return Some(cons);
     }
-    None
+    if !removed {
+        return Ok(props);
+    }
+    let mut result = NIL;
+    for (key, value) in pairs.into_iter().rev() {
+        result = Cons::new(key, Cons::new(value, result, cx), cx).into();
+    }
+    Ok(result)
 }
 
 /// Get the value of property `prop` from `plist`,
@@ -356,7 +419,7 @@ mod tests {
 
         // Create a property list: (test 1 test 2 test 3)
         // Remove all 'test' symbols
-        let result = remove_sym_from_props(sym.into(), props).unwrap();
+        let result = remove_sym_from_props(sym.into(), props, &cx).unwrap();
         let rs = result.to_string();
         assert_eq!(rs, "(bar 2 baz 4)".to_string());
     }
@@ -497,5 +560,61 @@ mod interval_iterator_tests {
         assert_eq!(iter.next(), Some((30..40, val2.into())));
         assert_eq!(iter.next(), Some((40..50, NIL)));
         assert_eq!(iter.next(), None);
+    }
+}
+
+#[cfg(test)]
+mod roadmap_m0_property_regressions {
+    use super::*;
+    use crate::{RootSet, intern};
+    use rune_core::macros::list;
+
+    #[test]
+    fn roadmap_m0_remove_keeps_shared_plist() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let key = intern("roadmap-remove", &cx);
+        let other = intern("roadmap-keep", &cx);
+        let original = list![other, 1, key, 2, other, 3; &cx];
+        let before = original.to_string();
+        let result = remove_sym_from_props(key.into(), original, &cx).unwrap();
+        assert_eq!(original.to_string(), before);
+        assert_eq!(result.to_string(), "(roadmap-keep 1 roadmap-keep 3)");
+        assert!(remove_sym_from_props(key.into(), NIL, &cx).unwrap().is_nil());
+    }
+
+    #[test]
+    fn roadmap_m0_malformed_plists_fail_before_tree_changes() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let key = intern("roadmap-malformed", &cx);
+        let odd = list![key; &cx];
+        let mut tree = IntervalTree::new();
+        tree.set_properties(1, 5, odd);
+        let valid = list![key, 1; &cx];
+        assert!(tree.insert(2, 4, Slot::new(valid), &cx).is_err());
+        assert_eq!(tree.find(2).map(|node| *node.val), Some(odd));
+        let keys = list![key; &cx];
+        assert!(tree.delete(2, 4, keys, &cx).is_err());
+        assert_eq!(tree.find(2).map(|node| *node.val), Some(odd));
+    }
+
+    #[test]
+    fn roadmap_m0_property_ranges_follow_text_edits() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let value: Object = intern("roadmap-property", &cx).into();
+        let mut tree = IntervalTree::new();
+        tree.set_properties(2, 6, value);
+        tree.insert_text(4, 2);
+        assert_eq!(tree.find(3).map(|n| *n.val), Some(value));
+        assert!(tree.find(4).is_none());
+        assert_eq!(tree.find(6).map(|n| *n.val), Some(value));
+        tree.delete_text(3, 7);
+        assert_eq!(tree.find(2).map(|n| *n.val), Some(value));
+        assert_eq!(tree.find(3).map(|n| *n.val), Some(value));
+        assert!(tree.find(4).is_none());
+        tree.delete_text(1, 5);
+        assert!(tree.find(1).is_none());
     }
 }

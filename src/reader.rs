@@ -27,6 +27,7 @@ pub(crate) enum Error {
     UnknownMacroCharacter(char, usize),
     ParseInt(u8, usize),
     MalformedUnicdoe(usize),
+    InvalidEscape(usize),
     EmptyStream,
 }
 
@@ -40,6 +41,7 @@ impl Display for Error {
             Error::ExtraCloseBracket(i) => write!(f, "Extra Closing brace: at {i}"),
             Error::UnexpectedChar(chr, i) => write!(f, "Unexpected character {chr}: at {i}"),
             Error::MalformedUnicdoe(i) => write!(f, "Malformed unicode: at {i}"),
+            Error::InvalidEscape(i) => write!(f, "Invalid or unsupported character escape: at {i}"),
             Error::EmptyStream => write!(f, "Empty Stream"),
             Error::ExtraItemInCdr(i) => write!(f, "Extra item in cdr: at {i}"),
             Error::MissingQuotedItem(i) => write!(f, "Missing element after quote: at {i}"),
@@ -63,6 +65,7 @@ impl Error {
             | Error::MissingStringDel(i)
             | Error::UnexpectedChar(_, i)
             | Error::MalformedUnicdoe(i)
+            | Error::InvalidEscape(i)
             | Error::ExtraItemInCdr(i)
             | Error::ExtraCloseParen(i)
             | Error::ExtraCloseBracket(i)
@@ -213,37 +216,17 @@ impl<'a> Tokenizer<'a> {
         match self.iter.next() {
             Some((start, item)) => {
                 if item == '\\' {
-                    let Token::Ident(tok) = self.get_symbol(start, item) else { unreachable!() };
-                    let Some(chr) = tok.chars().nth(1) else {
+                    // Character escapes have their own boundaries: a control
+                    // target can itself be whitespace or a list delimiter.
+                    let Some((_, chr)) = self.iter.next() else {
                         return Err(Error::MissingQuotedItem(start));
                     };
-                    if chr == 'u' || chr == 'x' {
-                        match u32::from_str_radix(&tok[2..], 16) {
-                            Ok(digits) => match char::from_u32(digits) {
-                                Some(c) => Ok(Token::QuestionMark(start, c)),
-                                None => Err(Error::MalformedUnicdoe(start)),
-                            },
-                            Err(_) => Err(Error::MalformedUnicdoe(start)),
-                        }
-                    } else if tok.chars().count() == 2 {
-                        let new = match chr {
-                            'a' => '\u{07}',
-                            'b' => '\u{08}',
-                            'd' => '\u{7F}',
-                            'e' => '\u{1B}',
-                            'f' => '\u{0C}',
-                            'n' => '\n',
-                            'r' => '\r',
-                            's' => ' ',
-                            't' => '\t',
-                            'v' => '\u{0B}',
-                            c => c,
-                        };
-                        Ok(Token::QuestionMark(start, new))
-                    } else {
-                        // TODO implement keycode parsing
-                        Ok(Token::QuestionMark(start, '\0'))
+                    let value = read_character_escape(chr, &mut self.iter, start)?;
+                    if matches!(self.iter.peek(), Some((_, chr)) if symbol_char(*chr) && *chr != '?')
+                    {
+                        return Err(Error::InvalidEscape(start));
                     }
+                    Ok(Token::QuestionMark(start, value))
                 } else {
                     match self.iter.peek() {
                         Some((i, chr)) if symbol_char(*chr) && *chr != '?' => {
@@ -310,45 +293,150 @@ fn intern_symbol<'ob>(symbol: &str, cx: &'ob Context) -> Symbol<'ob> {
 /// Parse a symbol from a string. This will either by a true symbol or a number
 /// literal.
 fn parse_symbol<'a>(slice: &str, cx: &'a Context) -> Object<'a> {
-    if let Ok(num) = slice.parse::<i64>() {
-        return cx.add(num);
+    // A trailing decimal point denotes an integer in Lisp, not a Rust float.
+    let integer = slice.strip_suffix('.').unwrap_or(slice);
+    let digits = integer.strip_prefix(['+', '-']).unwrap_or(integer);
+    if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        if let Ok(num) = integer.parse::<i64>() {
+            return cx.add(num);
+        }
+        if let Ok(num) = BigInt::from_str(integer) {
+            return cx.add(num);
+        }
     }
-    if let Ok(num) = BigInt::from_str(slice) {
-        return cx.add(num);
+    match lisp_float(slice) {
+        Some(num) => cx.add(num),
+        None => cx.add(intern_symbol(slice, cx)),
     }
-    match slice.parse::<f64>() {
-        Ok(num) => cx.add(num),
-        Err(_) => cx.add(intern_symbol(slice, cx)),
+}
+
+/// Recognise Lisp's decimal spelling before asking Rust to convert its value.
+/// In particular, Rust's bare `inf`, `nan` and `infinity` are Lisp symbols.
+fn lisp_float(slice: &str) -> Option<f64> {
+    let unsigned = slice.strip_prefix(['+', '-']).unwrap_or(slice);
+    let mut chars = unsigned.chars().peekable();
+    let mut digits = 0;
+    while chars.next_if(char::is_ascii_digit).is_some() {
+        digits += 1;
     }
+    let dot = chars.next_if_eq(&'.').is_some();
+    let mut fraction = 0;
+    if dot {
+        while chars.next_if(char::is_ascii_digit).is_some() {
+            fraction += 1;
+        }
+    }
+    if digits + fraction == 0 {
+        return None;
+    }
+    if chars.next_if(|chr| matches!(chr, 'e' | 'E')).is_some() {
+        let exponent: String = chars.collect();
+        match exponent.as_str() {
+            "+INF" => {
+                return Some(if slice.starts_with('-') {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                });
+            }
+            // The current float object preserves NaN classification/sign, not GNU's payload.
+            "+NaN" => return Some(if slice.starts_with('-') { -f64::NAN } else { f64::NAN }),
+            _ => {}
+        }
+        let exponent_digits = exponent.strip_prefix(['+', '-']).unwrap_or(&exponent);
+        if exponent_digits.is_empty() || !exponent_digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+    } else if chars.next().is_some() || !dot || fraction == 0 {
+        return None;
+    }
+    slice.parse::<f64>().ok()
+}
+
+/// Decode the scalar-valued subset that the current Rust UTF-8 string model can
+/// represent. Modified keycodes (Meta/Super/etc.) and raw-byte string metadata
+/// need the later character/string representation; never silently return NUL.
+fn read_character_escape(
+    first: char,
+    chars: &mut Peekable<impl Iterator<Item = (usize, char)>>,
+    pos: usize,
+) -> Result<char> {
+    let value = match first {
+        'a' => '\u{07}',
+        'b' => '\u{08}',
+        'd' => '\u{7f}',
+        'e' => '\u{1b}',
+        'f' => '\u{0c}',
+        'n' => '\n',
+        'r' => '\r',
+        's' if !matches!(chars.peek(), Some((_, '-'))) => ' ',
+        't' => '\t',
+        'v' => '\u{0b}',
+        'C' | '^' => {
+            if first == 'C' && chars.next().map(|(_, chr)| chr) != Some('-') {
+                return Err(Error::InvalidEscape(pos));
+            }
+            let (_, character) = chars.next().ok_or(Error::InvalidEscape(pos))?;
+            match character {
+                '?' => '\u{7f}',
+                ' ' | '@'..='_' | 'a'..='z' => {
+                    char::from_u32((character as u32) & 0x1f).ok_or(Error::InvalidEscape(pos))?
+                }
+                _ => return Err(Error::InvalidEscape(pos)),
+            }
+        }
+        'x' | 'u' | 'U' | '0'..='7' => {
+            let radix = if first.is_ascii_digit() { 8 } else { 16 };
+            let (minimum, maximum) = match first {
+                'u' => (4, 4),
+                'U' => (8, 8),
+                'x' => (1, usize::MAX),
+                _ => (1, 3),
+            };
+            let mut count = usize::from(first.is_ascii_digit());
+            let mut code = first.to_digit(8).unwrap_or(0);
+            while count < maximum {
+                let Some(digit) = chars.peek().and_then(|(_, chr)| chr.to_digit(radix)) else {
+                    break;
+                };
+                chars.next();
+                code = code
+                    .checked_mul(radix)
+                    .and_then(|n| n.checked_add(digit))
+                    .ok_or(Error::MalformedUnicdoe(pos))?;
+                count += 1;
+            }
+            if count < minimum {
+                return Err(Error::MalformedUnicdoe(pos));
+            }
+            char::from_u32(code).ok_or(Error::MalformedUnicdoe(pos))?
+        }
+        'M' | 'S' | 'H' | 'A' | 's' if matches!(chars.peek(), Some((_, '-'))) => {
+            return Err(Error::InvalidEscape(pos));
+        }
+        other => other,
+    };
+    Ok(value)
 }
 
 /// process escape characters in the string slice and return the resulting
 /// string.
-fn unescape_string<'a>(string: &str, cx: &'a Context) -> Object<'a> {
-    let mut escaped = false;
-    let unescape = |c: char| {
-        if escaped {
-            escaped = false;
-            // TODO: Handle unicode, hex, and octal escapes
-            match c {
-                'n' => Some('\n'),
-                't' => Some('\t'),
-                'r' => Some('\r'),
-                '\n' | ' ' => None,
-                _ => Some(c),
-            }
-        } else if c == '\\' {
-            escaped = true;
-            None
-        } else {
-            Some(c)
-        }
-    };
+fn unescape_string<'a>(string: &str, offset: usize, cx: &'a Context) -> Result<Object<'a>> {
     let mut new = cx.string_with_capacity(string.len());
-    for c in string.chars().filter_map(unescape) {
-        new.push(c);
+    let mut chars = string.char_indices().peekable();
+    while let Some((index, chr)) = chars.next() {
+        let pos = offset + index;
+        if chr != '\\' {
+            new.push(chr);
+            continue;
+        }
+        let (_, escaped) = chars.next().ok_or(Error::InvalidEscape(pos))?;
+        if escaped != '\n' && escaped != ' ' {
+            new.push(read_character_escape(escaped, &mut chars, pos)?);
+        }
     }
-    cx.add(new)
+    Ok(cx.add(new))
 }
 
 /// Return true if `chr` is a valid symbol character.
@@ -511,7 +599,7 @@ impl<'a, 'ob> Reader<'a, 'ob> {
             Token::Sharp(i) => self.read_sharp(i),
             Token::QuestionMark(_, c) => Ok((c as i64).into()),
             Token::Ident(x) => Ok(parse_symbol(x, self.cx)),
-            Token::String(x) => Ok(unescape_string(x, self.cx)),
+            Token::String(x) => unescape_string(x, self.tokens.relative_pos(token), self.cx),
         }
     }
 }
@@ -666,7 +754,7 @@ baz""#,
         check_reader!(u32::from('a'), "?a", cx);
         check_reader!(u32::from(' '), "?\\s", cx);
         check_reader!(u32::from('\t'), "?\\t", cx);
-        check_reader!(u32::from('\u{AFD}'), "?\\uafd", cx);
+        check_reader!(u32::from('\u{AFD}'), "?\\u0afd", cx);
         check_reader!(0xabc_u32, "?\\xabc", cx);
     }
 
@@ -726,5 +814,158 @@ baz""#,
         let cx = &Context::new(roots);
         assert_error(" ; comment ", Error::EmptyStream, cx);
         check_reader!(1, "; comment \n  1", cx);
+    }
+}
+
+/// Narrow M0 regressions; these do not claim the full RD-01 reader or GNU's
+/// raw-byte/multibyte string representation and modified character set.
+#[cfg(test)]
+mod m0_reader_regressions {
+    use super::*;
+    use crate::core::{gc::RootSet, object::ObjectType};
+
+    #[test]
+    fn m0_reader_rust_float_words_remain_symbols() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for name in ["inf", "nan", "infinity", "NaN", "INF", "+inf", "-infinity", "1e", "+", "-"] {
+            assert_eq!(read(name, &cx).unwrap().0, cx.add(intern(name, &cx)), "{name}");
+        }
+    }
+
+    #[test]
+    fn m0_reader_trailing_decimal_point_is_integer() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, value) in [("1.", 1_i64), ("-25.", -25), ("+001.", 1), ("0.", 0)] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(value), "{source}");
+        }
+        let digits = "123456789012345678901234567890";
+        assert_eq!(
+            read(&format!("{digits}."), &cx).unwrap().0,
+            cx.add(BigInt::from_str(digits).unwrap())
+        );
+        assert_eq!(read(r"\1.", &cx).unwrap().0, cx.add(intern("1.", &cx)));
+    }
+
+    #[test]
+    fn m0_reader_decimal_float_grammar() {
+        for (source, value) in [
+            ("1.5", 1.5),
+            (".5", 0.5),
+            ("-.5", -0.5),
+            ("1e3", 1000.0),
+            ("1E-3", 0.001),
+            ("1.e2", 100.0),
+        ] {
+            assert_eq!(lisp_float(source), Some(value), "{source}");
+        }
+        for source in ["inf", "nan", "1.", ".", "1e", "1e+", ".e2", "1.2.3", "1_0.5", "1e2x"] {
+            assert_eq!(lisp_float(source), None, "{source}");
+        }
+        assert!(lisp_float("-0.0").unwrap().is_sign_negative());
+    }
+
+    #[test]
+    fn m0_reader_special_float_syntax() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, negative) in [("1.0e+INF", false), ("-1.0e+INF", true)] {
+            let ObjectType::Float(value) = read(source, &cx).unwrap().0.untag() else {
+                panic!("special infinity must be a float");
+            };
+            assert!(value.is_infinite());
+            assert_eq!(value.is_sign_negative(), negative);
+        }
+        for source in ["0.0e+NaN", "1.5e+NaN", "-0.0e+NaN"] {
+            let ObjectType::Float(value) = read(source, &cx).unwrap().0.untag() else {
+                panic!("special NaN must be a float");
+            };
+            assert!(value.is_nan());
+            assert_eq!(value.is_sign_negative(), source.starts_with('-'));
+        }
+    }
+
+    #[test]
+    fn m0_reader_ascii_control_character_literals() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, value) in [
+            (r"?\C-a", 1_i64),
+            (r"?\C-z", 26),
+            (r"?\^A", 1),
+            (r"?\C-?", 127),
+            (r"?\C-@", 0),
+            (r"?\C-_", 31),
+            ("?\\C- ", 0),
+            (r"?\C-]", 29),
+        ] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(value), "{source}");
+        }
+        let (_, next) = read(r"?\C-a next", &cx).unwrap();
+        assert_eq!(next, 5);
+        // Escaped literals, like plain character literals, leave the next
+        // character literal and enclosing delimiter for the next read.
+        assert_eq!(read(r"?\n?a", &cx).unwrap(), (cx.add(10_i64), 3));
+        assert_eq!(read(r"[?\C-]]", &cx).unwrap().1, 7);
+    }
+
+    #[test]
+    fn m0_reader_numeric_character_escapes() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, value) in [
+            (r"?\101", 65_i64),
+            (r"?\x41", 65),
+            (r"?\u0041", 65),
+            (r"?\U0001F600", 0x1f600),
+            (r"?\000", 0),
+        ] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(value), "{source}");
+        }
+    }
+
+    #[test]
+    fn m0_reader_common_string_escapes() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let source = r#""\a\b\d\e\f\n\r\s\t\v\C-a\^B\101\x42\u0043\U0001F600""#;
+        let expected = "\u{07}\u{08}\u{7f}\u{1b}\u{0c}\n\r \t\u{0b}\u{01}\u{02}ABC\u{1f600}";
+        assert_eq!(read(source, &cx).unwrap().0, cx.add(expected));
+        assert_eq!(read("\"a\\ \u{e9}\\\nb\"", &cx).unwrap().0, cx.add("a\u{e9}b"));
+    }
+
+    #[test]
+    fn m0_reader_string_numeric_escape_boundaries() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, expected) in [
+            (r#""\u0041F""#, "AF"),
+            (r#""\1012""#, "A2"),
+            (r#""\x41F""#, "\u{41f}"),
+            (r#""\\n\"""#, "\\n\""),
+        ] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(expected), "{source}");
+        }
+    }
+
+    #[test]
+    fn m0_reader_malformed_numeric_escapes_are_errors() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for source in [r"?\x", r"?\u123", r"?\U00110000", r"?\xFFFFFFFFFFFFFFFF"] {
+            assert_eq!(read(source, &cx).unwrap_err(), Error::MalformedUnicdoe(1), "{source}");
+        }
+        assert_eq!(read(r#""\u123""#, &cx).unwrap_err(), Error::MalformedUnicdoe(1));
+        assert_eq!(read("\"\u{e9}\\u123\"", &cx).unwrap_err(), Error::MalformedUnicdoe(3));
+    }
+
+    #[test]
+    fn m0_reader_unsupported_modifiers_do_not_silently_return_nul() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for source in [r"?\M-a", r"?\H-a", r"?\C-%", r"?\C-"] {
+            assert_eq!(read(source, &cx).unwrap_err(), Error::InvalidEscape(1), "{source}");
+        }
     }
 }

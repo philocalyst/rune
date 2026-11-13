@@ -119,12 +119,17 @@ fn parens_closed(buffer: &str) -> bool {
 }
 
 fn repl(env: &mut Rt<Env>, cx: &mut Context) {
+    repl_with_input(io::stdin().lock(), env, cx);
+}
+
+fn repl_with_input(mut input: impl io::BufRead, env: &mut Rt<Env>, cx: &mut Context) {
     let mut buffer = String::new();
-    let stdin = io::stdin();
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
-        stdin.read_line(&mut buffer).unwrap();
+        if input.read_line(&mut buffer).unwrap() == 0 {
+            return;
+        }
         if buffer.trim() == "exit" {
             return;
         }
@@ -176,16 +181,29 @@ fn load(file: &str, cx: &mut Context, env: &mut Rt<Env>) -> Result<(), ()> {
 }
 
 fn eval_stdin(cx: &mut Context, env: &mut Rt<Env>) -> Result<(), ()> {
+    eval_stdin_with_input(io::stdin().lock(), cx, env)
+}
+
+fn eval_stdin_with_input(
+    mut input: impl io::BufRead,
+    cx: &mut Context,
+    env: &mut Rt<Env>,
+) -> Result<(), ()> {
     let mut buffer = String::new();
     let mut point = 0;
     let mut count = 0;
+    let mut eof = false;
     loop {
-        io::stdin().read_line(&mut buffer).unwrap();
+        if !eof {
+            eof = input.read_line(&mut buffer).unwrap() == 0;
+        }
         let obj = match reader::read(&buffer[point..], cx) {
             Ok((obj, offset)) => {
                 point += offset;
                 obj
             }
+            // Drain forms already buffered on the final line before finishing.
+            Err(reader::Error::EmptyStream) if eof => return Ok(()),
             Err(reader::Error::EmptyStream) => continue,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -217,4 +235,93 @@ fn bootstrap(env: &mut Rt<Env>, cx: &mut Context) -> Result<(), ()> {
 fn verify_cli() {
     use clap::CommandFactory;
     Args::command().debug_assert()
+}
+
+#[cfg(test)]
+mod stdin_tests {
+    use super::*;
+    use std::io::{BufRead, Cursor, Read};
+
+    // Repeated EOF reads fail immediately instead of hanging the test runner.
+    struct EofOnce<R> {
+        input: R,
+        eof_seen: bool,
+    }
+
+    impl<R: Read> Read for EofOnce<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.input.read(buffer)
+        }
+    }
+
+    impl<R: BufRead> BufRead for EofOnce<R> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.input.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.input.consume(amount);
+        }
+
+        fn read_line(&mut self, buffer: &mut String) -> io::Result<usize> {
+            assert!(!self.eof_seen, "stdin loop read EOF more than once");
+            let bytes = self.input.read_line(buffer)?;
+            self.eof_seen = bytes == 0;
+            Ok(bytes)
+        }
+    }
+
+    fn input(text: &str) -> EofOnce<Cursor<&[u8]>> {
+        EofOnce { input: Cursor::new(text.as_bytes()), eof_seen: false }
+    }
+
+    #[test]
+    fn repl_stops_at_eof_even_with_an_unfinished_form() {
+        for text in ["", "\n", "("] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            root!(env, new(Env), cx);
+            repl_with_input(input(text), env, cx);
+        }
+    }
+
+    #[test]
+    fn eval_stdin_finishes_cleanly_on_empty_or_comment_only_input() {
+        for text in ["", " \n", "; comment without a final newline"] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            root!(env, new(Env), cx);
+            assert_eq!(eval_stdin_with_input(input(text), cx, env), Ok(()));
+        }
+    }
+
+    #[test]
+    fn eval_stdin_drains_all_forms_buffered_before_eof() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        assert_eq!(
+            eval_stdin_with_input(
+                input("(setq eof-test-value 1) (setq eof-test-value 2)"),
+                cx,
+                env
+            ),
+            Ok(())
+        );
+        let form = reader::read("eof-test-value", cx).unwrap().0;
+        root!(form, cx);
+        assert_eq!(interpreter::eval(form, None, env, cx).unwrap().to_string(), "2");
+    }
+
+    #[test]
+    fn eval_stdin_keeps_malformed_input_as_an_error() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        assert_eq!(eval_stdin_with_input(input("("), cx, env), Err(()));
+    }
 }
