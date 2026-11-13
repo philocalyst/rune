@@ -151,9 +151,10 @@ fn validate_property_mutation_range(data: &BufferData, start: usize, end: usize)
 #[defun]
 pub fn text_properties_at<'ob>(
     position: usize,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &'ob mut Rt<Env>,
 ) -> Result<Object<'ob>> {
+    let object = object.unwrap_or(NIL);
     if matches!(object.untag(), ObjectType::String(_)) {
         bail!("String text properties are not supported yet");
     }
@@ -186,7 +187,7 @@ pub fn text_properties_at<'ob>(
 pub fn get_text_property<'ob>(
     position: usize,
     prop: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &'ob mut Rt<Env>,
 ) -> Result<Object<'ob>> {
     let props = text_properties_at(position, object, env)?;
@@ -307,11 +308,12 @@ pub fn put_text_property<'ob>(
 #[defun]
 pub fn next_property_change<'ob>(
     position: usize,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     limit: Option<usize>,
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let object = object.unwrap_or(NIL);
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let point_max = data.text.len_chars() + 1;
         let end = limit.unwrap_or(point_max);
@@ -359,11 +361,12 @@ pub fn next_property_change<'ob>(
 pub fn next_single_property_change<'ob>(
     position: usize,
     prop: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     limit: Option<usize>,
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let object = object.unwrap_or(NIL);
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let point_max = data.text.len_chars() + 1;
         let end = limit.unwrap_or(point_max);
@@ -403,11 +406,12 @@ pub fn next_single_property_change<'ob>(
 #[defun]
 pub fn previous_property_change<'ob>(
     position: usize,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     limit: Option<usize>,
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let object = object.unwrap_or(NIL);
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let point_min = 1;
         let start = limit.unwrap_or(point_min);
@@ -460,11 +464,12 @@ pub fn previous_property_change<'ob>(
 pub fn previous_single_property_change<'ob>(
     position: usize,
     prop: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     limit: Option<usize>,
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let object = object.unwrap_or(NIL);
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let point_min = 1;
         let start = limit.unwrap_or(point_min);
@@ -630,10 +635,11 @@ pub fn text_property_any<'ob>(
     end: usize,
     property: Object<'ob>,
     value: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let tree = data.textprops_with_lifetime();
@@ -660,10 +666,11 @@ pub fn text_property_not_all<'ob>(
     end: usize,
     property: Object<'ob>,
     value: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let tree = data.textprops_with_lifetime();
@@ -720,14 +727,14 @@ mod tests {
         let value = cx.add("bold");
         put_text_property(1, 7, key, value, Some(buf), env, &cx)?;
         put_text_property(2, 4, key, value, Some(buf), env, &cx)?;
-        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 7);
+        assert_eq!(next_property_change(1, Some(buf), None, env, &cx)?, 7);
         remove_list_of_text_properties(2, 4, list![missing; &cx], Some(buf), env, &cx)?;
-        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 7);
+        assert_eq!(next_property_change(1, Some(buf), None, env, &cx)?, 7);
         // Equal-looking strings are not eq and must retain a boundary.
         put_text_property(2, 4, key, cx.add("bold"), Some(buf), env, &cx)?;
-        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 2);
+        assert_eq!(next_property_change(1, Some(buf), None, env, &cx)?, 2);
         put_text_property(2, 4, key, value, Some(buf), env, &cx)?;
-        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 7);
+        assert_eq!(next_property_change(1, Some(buf), None, env, &cx)?, 7);
         Ok(())
     }
 
@@ -775,27 +782,27 @@ mod tests {
         put_text_property(15, 20, a, cx.add(3), Some(buf), env, cx)?;
 
         // Test property changes
-        let change = next_property_change(1, buf, None, env, cx)?;
+        let change = next_property_change(1, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(5)); // Change at end of first range
 
-        let change = next_property_change(5, buf, None, env, cx)?;
+        let change = next_property_change(5, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(10)); // Change at end of second range
 
-        let change = next_property_change(10, buf, None, env, cx)?;
+        let change = next_property_change(10, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(15)); // Change at start of third range
 
-        let change = next_property_change(15, buf, None, env, cx)?;
+        let change = next_property_change(15, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(20)); // Change at end of third range
 
         // Test with limit
-        let change = next_property_change(1, buf, Some(8), env, cx)?;
+        let change = next_property_change(1, Some(buf), Some(8), env, cx)?;
         assert_eq!(change, cx.add(5)); // Change within limit
 
-        let change = next_property_change(5, buf, Some(8), env, cx)?;
+        let change = next_property_change(5, Some(buf), Some(8), env, cx)?;
         assert_eq!(change, cx.add(8)); // Limit reached
 
         // Test no change case
-        let change = next_property_change(20, buf, None, env, cx)?;
+        let change = next_property_change(20, Some(buf), None, env, cx)?;
         assert!(change.is_nil()); // No changes after last property
 
         BUFFERS.lock().unwrap().clear();
@@ -831,34 +838,34 @@ mod tests {
         put_text_property(15, 20, a, cx.add(3), Some(buf), env, cx)?;
 
         // Test property changes for :a
-        let change = next_single_property_change(1, a, buf, None, env, cx)?;
+        let change = next_single_property_change(1, a, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(5)); // Change at end of first range
 
-        let change = next_single_property_change(5, a, buf, None, env, cx)?;
+        let change = next_single_property_change(5, a, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(8)); // Change at end of second range
 
-        let change = next_single_property_change(10, a, buf, None, env, cx)?;
+        let change = next_single_property_change(10, a, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(15)); // Change at start of third range
 
-        let change = next_single_property_change(15, a, buf, None, env, cx)?;
+        let change = next_single_property_change(15, a, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(20)); // Change at end of third range
 
         // Test with limit
-        let change = next_single_property_change(1, a, buf, Some(8), env, cx)?;
+        let change = next_single_property_change(1, a, Some(buf), Some(8), env, cx)?;
         assert_eq!(change, cx.add(5)); // Change within limit
 
-        let change = next_single_property_change(5, a, buf, Some(8), env, cx)?;
+        let change = next_single_property_change(5, a, Some(buf), Some(8), env, cx)?;
         assert_eq!(change, cx.add(8)); // Limit reached
 
         // Test no change case
-        let change = next_single_property_change(20, a, buf, None, env, cx)?;
+        let change = next_single_property_change(20, a, Some(buf), None, env, cx)?;
         assert!(change.is_nil()); // No changes after last property
 
         // Test property changes for :b
-        let change = next_single_property_change(1, b, buf, None, env, cx)?;
+        let change = next_single_property_change(1, b, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(10)); // Change at start of b range
 
-        let change = next_single_property_change(10, b, buf, None, env, cx)?;
+        let change = next_single_property_change(10, b, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(15)); // Change at end of b range
 
         BUFFERS.lock().unwrap().clear();
@@ -879,14 +886,14 @@ mod tests {
         // GNU's CONSP candidate loop ignores a bare symbol, rather than
         // interpreting it as a property name or rejecting it.
         remove_text_properties(2, 4, a, Some(buf), env, &cx)?;
-        assert_eq!(plist_get(text_properties_at(2, buf, env)?, a)?, 1);
-        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 5);
+        assert_eq!(plist_get(text_properties_at(2, Some(buf), env)?, a)?, 1);
+        assert_eq!(next_property_change(1, Some(buf), None, env, &cx)?, 5);
         // A final proper-list key is still a removal candidate with no value.
         remove_text_properties(2, 4, list![a; &cx], Some(buf), env, &cx)?;
-        assert!(plist_get(text_properties_at(2, buf, env)?, a)?.is_nil());
-        assert_eq!(plist_get(text_properties_at(1, buf, env)?, a)?, 1);
-        assert_eq!(plist_get(text_properties_at(4, buf, env)?, a)?, 1);
-        assert_eq!(plist_get(text_properties_at(2, buf, env)?, b)?, 2);
+        assert!(plist_get(text_properties_at(2, Some(buf), env)?, a)?.is_nil());
+        assert_eq!(plist_get(text_properties_at(1, Some(buf), env)?, a)?, 1);
+        assert_eq!(plist_get(text_properties_at(4, Some(buf), env)?, a)?, 1);
+        assert_eq!(plist_get(text_properties_at(2, Some(buf), env)?, b)?, 2);
         Ok(())
     }
 
@@ -903,15 +910,15 @@ mod tests {
         put_text_property(2, 5, key, value, Some(buf), env, &cx)?;
         put_text_property(5, 8, key, cx.add("value"), Some(buf), env, &cx)?;
         // Equal-looking but non-eq strings have a real boundary at 5.
-        assert_eq!(previous_single_property_change(7, key, buf, None, env, &cx)?, 5);
-        assert_eq!(previous_single_property_change(5, key, buf, None, env, &cx)?, 2);
+        assert_eq!(previous_single_property_change(7, key, Some(buf), None, env, &cx)?, 5);
+        assert_eq!(previous_single_property_change(5, key, Some(buf), None, env, &cx)?, 2);
         // A gap after a property range changes at the range's end, not start.
-        assert_eq!(previous_single_property_change(10, key, buf, None, env, &cx)?, 8);
+        assert_eq!(previous_single_property_change(10, key, Some(buf), None, env, &cx)?, 8);
         // Unrelated boundaries do not interrupt the specific property scan.
         put_text_property(3, 4, other, cx.add(1), Some(buf), env, &cx)?;
-        assert_eq!(previous_single_property_change(5, key, buf, None, env, &cx)?, 2);
-        assert_eq!(previous_single_property_change(7, key, buf, Some(6), env, &cx)?, 6);
-        assert!(previous_single_property_change(2, key, buf, None, env, &cx)?.is_nil());
+        assert_eq!(previous_single_property_change(5, key, Some(buf), None, env, &cx)?, 2);
+        assert_eq!(previous_single_property_change(7, key, Some(buf), Some(6), env, &cx)?, 6);
+        assert!(previous_single_property_change(2, key, Some(buf), None, env, &cx)?.is_nil());
         Ok(())
     }
 
@@ -925,28 +932,28 @@ mod tests {
         let a: Object = intern("roadmap-reversed-a", &cx).into();
         let b: Object = intern("roadmap-reversed-b", &cx).into();
         put_text_property(6, 2, a, cx.add(1), Some(buf), env, &cx)?;
-        assert!(get_text_property(1, a, buf, env)?.is_nil());
-        assert_eq!(get_text_property(2, a, buf, env)?, 1);
-        assert_eq!(get_text_property(5, a, buf, env)?, 1);
-        assert!(get_text_property(6, a, buf, env)?.is_nil());
+        assert!(get_text_property(1, a, Some(buf), env)?.is_nil());
+        assert_eq!(get_text_property(2, a, Some(buf), env)?, 1);
+        assert_eq!(get_text_property(5, a, Some(buf), env)?, 1);
+        assert!(get_text_property(6, a, Some(buf), env)?.is_nil());
         set_text_properties(5, 3, list![b, 2; &cx], Some(buf), env, &cx)?;
-        assert!(get_text_property(3, a, buf, env)?.is_nil());
-        assert_eq!(get_text_property(3, b, buf, env)?, 2);
-        assert_eq!(get_text_property(2, a, buf, env)?, 1);
-        assert_eq!(get_text_property(5, a, buf, env)?, 1);
+        assert!(get_text_property(3, a, Some(buf), env)?.is_nil());
+        assert_eq!(get_text_property(3, b, Some(buf), env)?, 2);
+        assert_eq!(get_text_property(2, a, Some(buf), env)?, 1);
+        assert_eq!(get_text_property(5, a, Some(buf), env)?, 1);
         remove_text_properties(4, 3, list![b, NIL; &cx], Some(buf), env, &cx)?;
-        assert!(text_properties_at(3, buf, env)?.is_nil());
-        assert_eq!(get_text_property(4, b, buf, env)?, 2);
+        assert!(text_properties_at(3, Some(buf), env)?.is_nil());
+        assert_eq!(get_text_property(4, b, Some(buf), env)?, 2);
         remove_list_of_text_properties(6, 4, list![a, b; &cx], Some(buf), env, &cx)?;
-        assert!(text_properties_at(4, buf, env)?.is_nil());
-        assert!(text_properties_at(5, buf, env)?.is_nil());
-        assert_eq!(get_text_property(2, a, buf, env)?, 1);
+        assert!(text_properties_at(4, Some(buf), env)?.is_nil());
+        assert!(text_properties_at(5, Some(buf), env)?.is_nil());
+        assert_eq!(get_text_property(2, a, Some(buf), env)?, 1);
         // Normalization must leave empty ranges as no-ops.
         put_text_property(2, 2, a, cx.add(9), Some(buf), env, &cx)?;
         set_text_properties(2, 2, NIL, Some(buf), env, &cx)?;
         remove_text_properties(2, 2, list![a, NIL; &cx], Some(buf), env, &cx)?;
         remove_list_of_text_properties(2, 2, list![a; &cx], Some(buf), env, &cx)?;
-        assert_eq!(get_text_property(2, a, buf, env)?, 1);
+        assert_eq!(get_text_property(2, a, Some(buf), env)?, 1);
         Ok(())
     }
 
@@ -960,18 +967,18 @@ mod tests {
         let key: Object = intern("roadmap-search-key", &cx).into();
         let value = cx.add("same");
         put_text_property(2, 5, key, value, Some(buf), env, &cx)?;
-        assert_eq!(text_property_any(1, 7, key, value, buf, env, &cx)?, 2);
-        assert_eq!(text_property_any(3, 7, key, value, buf, env, &cx)?, 3);
-        assert!(text_property_any(1, 7, key, cx.add("same"), buf, env, &cx)?.is_nil());
-        assert_eq!(text_property_not_all(1, 7, key, value, buf, env, &cx)?, 1);
-        assert_eq!(text_property_not_all(2, 7, key, value, buf, env, &cx)?, 5);
-        assert!(text_property_not_all(2, 5, key, value, buf, env, &cx)?.is_nil());
-        assert_eq!(text_property_any(2, 7, key, NIL, buf, env, &cx)?, 5);
-        assert_eq!(text_property_not_all(1, 7, key, NIL, buf, env, &cx)?, 2);
-        assert_eq!(text_property_any(7, 1, key, value, buf, env, &cx)?, 2);
-        assert_eq!(text_property_not_all(7, 2, key, value, buf, env, &cx)?, 5);
-        assert!(text_property_any(3, 3, key, value, buf, env, &cx)?.is_nil());
-        assert!(text_property_not_all(3, 3, key, NIL, buf, env, &cx)?.is_nil());
+        assert_eq!(text_property_any(1, 7, key, value, Some(buf), env, &cx)?, 2);
+        assert_eq!(text_property_any(3, 7, key, value, Some(buf), env, &cx)?, 3);
+        assert!(text_property_any(1, 7, key, cx.add("same"), Some(buf), env, &cx)?.is_nil());
+        assert_eq!(text_property_not_all(1, 7, key, value, Some(buf), env, &cx)?, 1);
+        assert_eq!(text_property_not_all(2, 7, key, value, Some(buf), env, &cx)?, 5);
+        assert!(text_property_not_all(2, 5, key, value, Some(buf), env, &cx)?.is_nil());
+        assert_eq!(text_property_any(2, 7, key, NIL, Some(buf), env, &cx)?, 5);
+        assert_eq!(text_property_not_all(1, 7, key, NIL, Some(buf), env, &cx)?, 2);
+        assert_eq!(text_property_any(7, 1, key, value, Some(buf), env, &cx)?, 2);
+        assert_eq!(text_property_not_all(7, 2, key, value, Some(buf), env, &cx)?, 5);
+        assert!(text_property_any(3, 3, key, value, Some(buf), env, &cx)?.is_nil());
+        assert!(text_property_not_all(3, 3, key, NIL, Some(buf), env, &cx)?.is_nil());
         Ok(())
     }
 
@@ -991,9 +998,9 @@ mod tests {
         // Presence, not a non-nil value, determines whether removal changed text.
         assert!(remove_text_properties(2, 4, list![key, 999; &cx], Some(buf), env, &cx)?);
         assert!(!remove_text_properties(2, 4, list![key, NIL; &cx], Some(buf), env, &cx)?);
-        assert!(!text_properties_at(1, buf, env)?.is_nil());
-        assert!(text_properties_at(2, buf, env)?.is_nil());
-        assert!(!text_properties_at(4, buf, env)?.is_nil());
+        assert!(!text_properties_at(1, Some(buf), env)?.is_nil());
+        assert!(text_properties_at(2, Some(buf), env)?.is_nil());
+        assert!(!text_properties_at(4, Some(buf), env)?.is_nil());
         assert!(remove_list_of_text_properties(
             1,
             6,
@@ -1037,12 +1044,12 @@ mod tests {
         let key: Object = intern("roadmap-optional-key", &cx).into();
         put_text_property(1, 3, key, cx.add(1), None, env, &cx)?;
         set_text_properties(1, 3, list![key, 2; &cx], Some(other), env, &cx)?;
-        assert_eq!(get_text_property(1, key, NIL, env)?, 1);
-        assert_eq!(get_text_property(1, key, other, env)?, 2);
+        assert_eq!(get_text_property(1, key, None, env)?, 1);
+        assert_eq!(get_text_property(1, key, Some(other), env)?, 2);
         assert!(remove_text_properties(1, 3, list![key, NIL; &cx], None, env, &cx)?);
-        assert_eq!(get_text_property(1, key, other, env)?, 2);
+        assert_eq!(get_text_property(1, key, Some(other), env)?, 2);
         assert!(remove_list_of_text_properties(1, 3, list![key; &cx], Some(other), env, &cx)?);
-        assert!(get_text_property(1, key, other, env)?.is_nil());
+        assert!(get_text_property(1, key, Some(other), env)?.is_nil());
         Ok(())
     }
 
@@ -1090,9 +1097,9 @@ mod tests {
                 remove_list_of_text_properties(start, end, list![key; &cx], Some(buf), env, &cx)
                     .is_err()
             );
-            assert_eq!(get_text_property(1, key, buf, env)?, 7);
-            assert_eq!(get_text_property(2, key, buf, env)?, 7);
-            assert!(text_properties_at(3, buf, env)?.is_nil());
+            assert_eq!(get_text_property(1, key, Some(buf), env)?, 7);
+            assert_eq!(get_text_property(2, key, Some(buf), env)?, 7);
+            assert!(text_properties_at(3, Some(buf), env)?.is_nil());
         }
         // GNU returns without validating the bounds of an empty range.
         put_text_property(usize::MAX, usize::MAX, key, NIL, Some(buf), env, &cx)?;
@@ -1106,10 +1113,10 @@ mod tests {
             env,
             &cx
         )?);
-        assert_eq!(get_text_property(1, key, buf, env)?, 7);
+        assert_eq!(get_text_property(1, key, Some(buf), env)?, 7);
         // Endpoint3 is legal for two Unicode characters, regardless of bytes.
         assert!(remove_list_of_text_properties(3, 1, list![key; &cx], Some(buf), env, &cx)?);
-        assert!(text_properties_at(1, buf, env)?.is_nil());
+        assert!(text_properties_at(1, Some(buf), env)?.is_nil());
         Ok(())
     }
 
@@ -1124,19 +1131,19 @@ mod tests {
         let value = cx.add("shared-value");
         let original = list![key, value; &cx];
         set_text_properties(1, 3, original, Some(buf), env, &cx)?;
-        assert!(!eq(text_properties_at(1, buf, env)?, original));
-        assert!(eq(get_text_property(1, key, buf, env)?, value));
+        assert!(!eq(text_properties_at(1, Some(buf), env)?, original));
+        assert!(eq(get_text_property(1, key, Some(buf), env)?, value));
         original.cons().unwrap().cdr().cons().unwrap().set_car(cx.add(99))?;
         original.cons().unwrap().set_cdr(NIL)?;
-        assert!(eq(get_text_property(1, key, buf, env)?, value));
+        assert!(eq(get_text_property(1, key, Some(buf), env)?, value));
         // Odd input must fail before any existing interval changes, even for
         // an empty range: GNU validates the plist before range processing.
         let odd = list![key; &cx];
         assert!(set_text_properties(1, 3, odd, Some(buf), env, &cx).is_err());
         assert!(set_text_properties(2, 2, odd, Some(buf), env, &cx).is_err());
-        assert!(eq(get_text_property(1, key, buf, env)?, value));
+        assert!(eq(get_text_property(1, key, Some(buf), env)?, value));
         set_text_properties(1, 3, key, Some(buf), env, &cx)?;
-        let installed = text_properties_at(1, buf, env)?;
+        let installed = text_properties_at(1, Some(buf), env)?;
         assert_eq!(installed.to_string(), "(roadmap-set-plist-key nil)");
         Ok(())
     }
@@ -1163,14 +1170,14 @@ mod tests {
         let incoming = list![a, value; &cx];
         assert!(add_text_properties(2, 5, incoming, Some(buf), env, &cx)?);
         assert!(!add_text_properties(3, 4, incoming, Some(buf), env, &cx)?);
-        assert_eq!(next_property_change(2, buf, None, env, &cx)?, 5);
-        assert!(eq(get_text_property(3, a, buf, env)?, value));
-        assert_eq!(get_text_property(3, b, buf, env)?, 9);
+        assert_eq!(next_property_change(2, Some(buf), None, env, &cx)?, 5);
+        assert!(eq(get_text_property(3, a, Some(buf), env)?, value));
+        assert_eq!(get_text_property(3, b, Some(buf), env)?, 9);
         incoming.cons().unwrap().cdr().cons().unwrap().set_car(cx.add(8))?;
-        assert!(eq(get_text_property(3, a, buf, env)?, value));
+        assert!(eq(get_text_property(3, a, Some(buf), env)?, value));
         assert!(add_text_properties(3, 4, list![a, cx.add("same"); &cx], Some(buf), env, &cx)?);
         assert!(add_text_properties(5, 2, list![a, value; &cx], Some(buf), env, &cx)?);
-        assert_eq!(next_property_change(2, buf, None, env, &cx)?, 5);
+        assert_eq!(next_property_change(2, Some(buf), None, env, &cx)?, 5);
         assert!(!add_text_properties(2, 5, list![a, value; &cx], Some(buf), env, &cx)?);
         assert!(add_text_properties(1, 2, list![a, NIL; &cx], Some(buf), env, &cx)?);
         assert!(!add_text_properties(1, 2, list![a, NIL; &cx], Some(buf), env, &cx)?);
@@ -1178,8 +1185,8 @@ mod tests {
         assert!(!add_text_properties(usize::MAX, 0, NIL, Some(cx.add(42)), env, &cx)?);
         assert!(add_text_properties(0, 2, list![a, 1; &cx], Some(buf), env, &cx).is_err());
         assert!(add_text_properties(2, 5, list![a; &cx], Some(buf), env, &cx).is_err());
-        assert!(eq(get_text_property(3, a, buf, env)?, value));
-        assert_eq!(get_text_property(3, b, buf, env)?, 9);
+        assert!(eq(get_text_property(3, a, Some(buf), env)?, value));
+        assert_eq!(get_text_property(3, b, Some(buf), env)?, 9);
         Ok(())
     }
 
@@ -1193,19 +1200,19 @@ mod tests {
         let key: Object = intern("roadmap-add-duplicate", &cx).into();
         // Initially uncovered text must end up with the last assignment.
         assert!(add_text_properties(2, 5, list![key, 1, key, 2; &cx], Some(buf), env, &cx)?);
-        assert_eq!(get_text_property(3, key, buf, env)?, 2);
+        assert_eq!(get_text_property(3, key, Some(buf), env)?, 2);
         // Changing and then restoring the original value still reports t,
         // while final equal intervals must not acquire artificial boundaries.
         assert!(add_text_properties(3, 4, list![key, 1, key, 2; &cx], Some(buf), env, &cx)?);
-        assert_eq!(get_text_property(3, key, buf, env)?, 2);
-        assert_eq!(next_property_change(2, buf, None, env, &cx)?, 5);
+        assert_eq!(get_text_property(3, key, Some(buf), env)?, 2);
+        assert_eq!(next_property_change(2, Some(buf), None, env, &cx)?, 5);
         assert!(!add_text_properties(3, 4, list![key, 2, key, 2; &cx], Some(buf), env, &cx)?);
         // A range spanning both covered text and gaps applies the same final
         // value everywhere and preserves nil-valued property presence.
         assert!(add_text_properties(1, 6, list![key, 9, key, NIL; &cx], Some(buf), env, &cx)?);
         for position in 1..6 {
             assert_eq!(
-                text_properties_at(position, buf, env)?.to_string(),
+                text_properties_at(position, Some(buf), env)?.to_string(),
                 "(roadmap-add-duplicate nil)"
             );
         }
@@ -1226,6 +1233,67 @@ mod tests {
             "(progn (insert \"abc\") (list (add-text-properties 1 3 '(a 1 a 2)) (get-text-property 1 'a nil) (add-text-properties 1 3 '(a 1 a 2)) (get-text-property 1 'a nil)))",
             "(t 2 t 2)",
         );
+    }
+
+    #[test]
+    fn roadmap_m0_property_queries_accept_omitted_object() {
+        for (query, expected) in [
+            ("(equal (text-properties-at 1) (text-properties-at 1 nil))", "t"),
+            ("(list (get-text-property 1 'a) (get-text-property 1 'a nil))", "(7 7)"),
+            ("(list (next-property-change 1) (next-property-change 1 nil))", "(3 3)"),
+            (
+                "(list (next-single-property-change 1 'a) (next-single-property-change 1 'a nil))",
+                "(3 3)",
+            ),
+            ("(list (previous-property-change 6) (previous-property-change 6 nil))", "(3 3)"),
+            (
+                "(list (previous-single-property-change 6 'a) (previous-single-property-change 6 'a nil))",
+                "(3 3)",
+            ),
+            ("(list (text-property-any 1 7 'a 7) (text-property-any 1 7 'a 7 nil))", "(1 1)"),
+            (
+                "(list (text-property-not-all 1 7 'a 7) (text-property-not-all 1 7 'a 7 nil))",
+                "(3 3)",
+            ),
+            (
+                "(list (next-property-change 1 nil 2) (next-single-property-change 1 'a nil 2) (previous-property-change 6 nil 4) (previous-single-property-change 6 'a nil 4))",
+                "(2 2 4 4)",
+            ),
+        ] {
+            let source =
+                format!("(progn (insert \"abcdef\") (put-text-property 1 3 'a 7) {query})");
+            crate::interpreter::assert_lisp(&source, expected);
+        }
+    }
+
+    #[test]
+    fn roadmap_m0_optional_property_queries_preserve_explicit_object() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        env.current_buffer.get_mut().insert(cx.add("abcdef"))?;
+        let other = get_buffer_create(cx.add("roadmap-query-other-buffer"), None, &cx)?;
+        other.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        let key: Object = intern("roadmap-query-object-key", &cx).into();
+        put_text_property(1, 3, key, cx.add(7), None, env, &cx)?;
+        put_text_property(2, 5, key, cx.add(9), Some(other), env, &cx)?;
+        assert!(!text_properties_at(1, None, env)?.is_nil());
+        assert!(text_properties_at(1, Some(other), env)?.is_nil());
+        assert_eq!(get_text_property(2, key, None, env)?, 7);
+        assert_eq!(get_text_property(2, key, Some(other), env)?, 9);
+        assert_eq!(next_property_change(1, None, None, env, &cx)?, 3);
+        assert_eq!(next_property_change(2, Some(other), None, env, &cx)?, 5);
+        assert_eq!(next_single_property_change(1, key, None, None, env, &cx)?, 3);
+        assert_eq!(next_single_property_change(2, key, Some(other), None, env, &cx)?, 5);
+        assert_eq!(previous_property_change(6, None, None, env, &cx)?, 3);
+        assert_eq!(previous_property_change(6, Some(other), None, env, &cx)?, 5);
+        assert_eq!(previous_single_property_change(6, key, None, None, env, &cx)?, 3);
+        assert_eq!(previous_single_property_change(6, key, Some(other), None, env, &cx)?, 5);
+        assert_eq!(text_property_any(1, 7, key, cx.add(7), None, env, &cx)?, 1);
+        assert_eq!(text_property_any(1, 7, key, cx.add(9), Some(other), env, &cx)?, 2);
+        assert_eq!(text_property_not_all(1, 7, key, cx.add(7), None, env, &cx)?, 3);
+        assert_eq!(text_property_not_all(1, 7, key, cx.add(9), Some(other), env, &cx)?, 1);
+        Ok(())
     }
 
     #[test]
@@ -1253,11 +1321,11 @@ mod tests {
         remove_text_properties(1, 10, list![a, 999; cx], Some(buf), env, cx)?;
 
         // Verify :a was removed
-        let props = text_properties_at(3, buf, env)?;
+        let props = text_properties_at(3, Some(buf), env)?;
         assert!(props.is_nil());
 
         // Verify :b remains
-        let props = text_properties_at(5, buf, env)?;
+        let props = text_properties_at(5, Some(buf), env)?;
         let val = plist_get(props, b)?;
         assert_eq!(val, cx.add(2));
 
@@ -1280,18 +1348,18 @@ mod tests {
         put_text_property(1, 3, key, value, None, env, &cx)?;
         // Env already owns this buffer's guard. Explicit current-buffer reads
         // must use it rather than trying to lock the same mutex again.
-        let implicit = text_properties_at(1, NIL, env)?;
+        let implicit = text_properties_at(1, None, env)?;
         root!(implicit, cx);
-        let explicit = text_properties_at(1, current, env)?;
+        let explicit = text_properties_at(1, Some(current), env)?;
         assert!(eq(implicit.bind(&cx), explicit));
-        assert!(eq(get_text_property(2, key, current, env)?, value));
-        assert!(text_properties_at(4, current, env)?.is_nil());
+        assert!(eq(get_text_property(2, key, Some(current), env)?, value));
+        assert!(text_properties_at(4, Some(current), env)?.is_nil());
 
         let deleted = get_buffer_create(cx.add("roadmap-deleted-property"), None, &cx)?;
         deleted.buffer().unwrap().lock()?.kill();
-        assert!(text_properties_at(1, deleted, env).is_err());
-        assert!(text_properties_at(1, cx.add(123), env).is_err());
-        assert!(text_properties_at(0, cx.add("string"), env).is_err());
+        assert!(text_properties_at(1, Some(deleted), env).is_err());
+        assert!(text_properties_at(1, Some(cx.add(123)), env).is_err());
+        assert!(text_properties_at(0, Some(cx.add("string")), env).is_err());
         Ok(())
     }
 
@@ -1303,21 +1371,21 @@ mod tests {
         let buf = get_buffer_create(cx.add("roadmap-property-read-bounds"), None, &cx)?;
         let key: Object = intern("roadmap-read-bounds-key", &cx).into();
         // An empty buffer has one legal position, but no character there.
-        assert!(text_properties_at(1, buf, env)?.is_nil());
-        assert!(text_properties_at(0, buf, env).is_err());
-        assert!(text_properties_at(2, buf, env).is_err());
+        assert!(text_properties_at(1, Some(buf), env)?.is_nil());
+        assert!(text_properties_at(0, Some(buf), env).is_err());
+        assert!(text_properties_at(2, Some(buf), env).is_err());
         buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"))?;
         put_text_property(1, 3, key, cx.add(7), Some(buf), env, &cx)?;
-        assert_eq!(get_text_property(2, key, buf, env)?, 7);
-        assert!(text_properties_at(3, buf, env)?.is_nil());
-        assert!(get_text_property(3, key, buf, env)?.is_nil());
+        assert_eq!(get_text_property(2, key, Some(buf), env)?, 7);
+        assert!(text_properties_at(3, Some(buf), env)?.is_nil());
+        assert!(get_text_property(3, key, Some(buf), env)?.is_nil());
         // Character counts, not UTF-8 bytes, determine the legal endpoint.
-        assert!(get_text_property(4, key, buf, env).is_err());
-        assert!(get_text_property(0, key, buf, env).is_err());
+        assert!(get_text_property(4, key, Some(buf), env).is_err());
+        assert!(get_text_property(0, key, Some(buf), env).is_err());
         env.set_buffer(buf.buffer().unwrap());
-        assert_eq!(get_text_property(2, key, NIL, env)?, 7);
-        assert!(text_properties_at(0, NIL, env).is_err());
-        assert!(text_properties_at(3, NIL, env)?.is_nil());
+        assert_eq!(get_text_property(2, key, None, env)?, 7);
+        assert!(text_properties_at(0, None, env).is_err());
+        assert!(text_properties_at(3, None, env)?.is_nil());
         Ok(())
     }
 
@@ -1329,14 +1397,14 @@ mod tests {
         root!(env, new(Env), cx);
 
         let buf = get_buffer_create(cx.add("test_text_properties_at"), None, cx)?;
-        let n = text_properties_at(1, buf, env)?;
+        let n = text_properties_at(1, Some(buf), env)?;
         assert!(n.is_nil());
 
         let a = intern(":a", cx);
         let a = cx.add(a);
         buf.buffer().unwrap().lock()?.insert(cx.add("x"))?;
         put_text_property(1, 2, a, cx.add(3), Some(buf), env, cx)?;
-        let n = text_properties_at(1, buf, env)?;
+        let n = text_properties_at(1, Some(buf), env)?;
         let val = plist_get(n, a)?;
         assert!(eq(val, cx.add(3)));
 
