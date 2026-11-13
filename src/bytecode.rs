@@ -8,7 +8,7 @@ use crate::core::object::{
 };
 use crate::data::LispError;
 use crate::eval::{ErrorType, EvalError, EvalResult};
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use rune_core::macros::{bail_err, rebind, root};
 use rune_macros::{Trace, defun};
 
@@ -37,45 +37,51 @@ impl ProgramCounter {
         self.pc.addr() - self.range.start.addr()
     }
 
-    fn goto(&mut self, offset: u16) {
-        unsafe {
-            self.pc = self.range.start.add(offset as usize);
-            debug_assert!(self.range.contains(&self.pc));
-        }
+    fn ensure_remaining(&self, bytes: usize) -> Result<()> {
+        let start = self.range.start.addr();
+        let end = self.range.end.addr();
+        let position = self.pc.addr();
+        ensure!(
+            position >= start && position <= end && bytes <= end.saturating_sub(position),
+            "Truncated bytecode instruction"
+        );
+        Ok(())
     }
 
-    /// Take the next byte in the stream
-    fn next(&mut self) -> u8 {
-        unsafe {
-            debug_assert!(self.range.contains(&self.pc));
-            let value = *self.pc;
-            self.pc = self.pc.add(1);
-            value
-        }
+    fn goto(&mut self, offset: u16) -> Result<()> {
+        let offset = usize::from(offset);
+        let len = self.range.end.addr() - self.range.start.addr();
+        ensure!(offset < len, "Bytecode jump target {offset} is out of range");
+        // Validate before pointer arithmetic: even creating an out-of-allocation
+        // pointer with add() would violate its safety precondition.
+        self.pc = unsafe { self.range.start.add(offset) };
+        Ok(())
     }
 
-    fn arg1(&mut self) -> u16 {
-        unsafe {
-            debug_assert!(self.range.contains(&self.pc));
-            let value = *self.pc;
-            self.pc = self.pc.add(1);
-            if cfg!(feature = "debug_bytecode") && crate::debug::debug_enabled() {
-                println!("  arg: {value}");
-            }
-            value.into()
-        }
+    /// Take the next byte in the stream, validating before dereferencing.
+    fn next(&mut self) -> Result<u8> {
+        self.ensure_remaining(1)?;
+        let value = unsafe { *self.pc };
+        self.pc = unsafe { self.pc.add(1) };
+        Ok(value)
     }
 
-    fn arg2(&mut self) -> u16 {
-        unsafe {
-            debug_assert!(self.range.contains(&self.pc.add(1)));
-            let value = u16::from_le(self.pc.cast::<u16>().read_unaligned());
-            self.pc = self.pc.add(2);
-            if cfg!(feature = "debug_bytecode") && crate::debug::debug_enabled() {
-                println!("  arg: {value}");
-            }
-            value
+    fn arg1(&mut self) -> Result<u16> {
+        let value = self.next()?;
+        if cfg!(feature = "debug_bytecode") && crate::debug::debug_enabled() {
+            println!("  arg: {value}");
         }
+        Ok(value.into())
+    }
+
+    fn arg2(&mut self) -> Result<u16> {
+        self.ensure_remaining(2)?;
+        let value = unsafe { u16::from_le(self.pc.cast::<u16>().read_unaligned()) };
+        self.pc = unsafe { self.pc.add(2) };
+        if cfg!(feature = "debug_bytecode") && crate::debug::debug_enabled() {
+            println!("  arg: {value}");
+        }
+        Ok(value)
     }
 }
 
@@ -297,7 +303,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 self.unwind(handler.stack_frame, cx);
                 self.env.stack.truncate(handler.stack_size);
                 self.env.stack.push(Object::from(error));
-                self.pc.goto(handler.jump_code);
+                self.pc.goto(handler.jump_code)?;
                 continue 'main;
             }
             return Err(err);
@@ -310,7 +316,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
         use crate::{alloc, arith, data, fns};
         use opcode::OpCode as op;
         loop {
-            let op = match self.pc.next().try_into() {
+            let op = match self.pc.next()?.try_into() {
                 Ok(x) => x,
                 Err(e) => bail_err!("Invalid Bytecode: {e}"),
             };
@@ -332,19 +338,19 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::StackRef4 => self.env.stack.push_ref(4, cx),
                 op::StackRef5 => self.env.stack.push_ref(5, cx),
                 op::StackRefN => {
-                    let idx = self.pc.arg1();
+                    let idx = self.pc.arg1()?;
                     self.env.stack.push_ref(idx, cx);
                 }
                 op::StackRefN2 => {
-                    let idx = self.pc.arg2();
+                    let idx = self.pc.arg2()?;
                     self.env.stack.push_ref(idx, cx);
                 }
                 op::StackSetN => {
-                    let idx = self.pc.arg1();
+                    let idx = self.pc.arg1()?;
                     self.env.stack.set_ref(idx);
                 }
                 op::StackSetN2 => {
-                    let idx = self.pc.arg2();
+                    let idx = self.pc.arg2()?;
                     self.env.stack.set_ref(idx);
                 }
                 op::VarRef0 => self.varref(0, cx)?,
@@ -354,11 +360,11 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::VarRef4 => self.varref(4, cx)?,
                 op::VarRef5 => self.varref(5, cx)?,
                 op::VarRefN => {
-                    let idx = self.pc.arg1();
+                    let idx = self.pc.arg1()?;
                     self.varref(idx, cx)?;
                 }
                 op::VarRefN2 => {
-                    let idx = self.pc.arg2();
+                    let idx = self.pc.arg2()?;
                     self.varref(idx, cx)?;
                 }
                 op::VarSet0 => self.varset(0, cx)?,
@@ -368,11 +374,11 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::VarSet4 => self.varset(4, cx)?,
                 op::VarSet5 => self.varset(5, cx)?,
                 op::VarSetN => {
-                    let idx = self.pc.arg1();
+                    let idx = self.pc.arg1()?;
                     self.varset(idx.into(), cx)?;
                 }
                 op::VarSetN2 => {
-                    let idx = self.pc.arg2();
+                    let idx = self.pc.arg2()?;
                     self.varset(idx.into(), cx)?;
                 }
                 op::VarBind0 => self.varbind(0, cx)?,
@@ -382,11 +388,11 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::VarBind4 => self.varbind(4, cx)?,
                 op::VarBind5 => self.varbind(5, cx)?,
                 op::VarBindN => {
-                    let idx = self.pc.arg1();
+                    let idx = self.pc.arg1()?;
                     self.varbind(idx, cx)?;
                 }
                 op::VarBindN2 => {
-                    let idx = self.pc.arg2();
+                    let idx = self.pc.arg2()?;
                     self.varbind(idx, cx)?;
                 }
                 op::Call0 => self.call(0, cx)?,
@@ -396,11 +402,11 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Call4 => self.call(4, cx)?,
                 op::Call5 => self.call(5, cx)?,
                 op::CallN => {
-                    let idx = self.pc.arg1();
+                    let idx = self.pc.arg1()?;
                     self.call(idx, cx)?;
                 }
                 op::CallN2 => {
-                    let idx = self.pc.arg2();
+                    let idx = self.pc.arg2()?;
                     self.call(idx, cx)?;
                 }
                 op::Unbind0 => self.unbind(0, cx),
@@ -410,21 +416,22 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Unbind4 => self.unbind(4, cx),
                 op::Unbind5 => self.unbind(5, cx),
                 op::UnbindN => {
-                    let idx = self.pc.arg1();
+                    let idx = self.pc.arg1()?;
                     self.unbind(idx, cx);
                 }
                 op::UnbindN2 => {
-                    let idx = self.pc.arg2();
+                    let idx = self.pc.arg2()?;
                     self.unbind(idx, cx);
                 }
                 op::PopHandler => {
                     self.handlers.pop();
                 }
                 op::PushCondtionCase => {
-                    // pop before getting stack size
+                    let jump_code = self.pc.arg2()?;
+                    // pop before getting stack size, after validating operands
                     let condition = self.env.stack.pop(cx);
                     let handler = Handler {
-                        jump_code: self.pc.arg2(),
+                        jump_code,
                         stack_size: self.env.stack.len(),
                         stack_frame: self.env.stack.current_frame(),
                         condition: Slot::new(condition),
@@ -638,42 +645,42 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Widen => return Err(self.unsupported_opcode(op, cx)),
                 op::EndOfLine => return Err(self.unsupported_opcode(op, cx)),
                 op::ConstantN2 => {
-                    let idx = self.pc.arg2();
+                    let idx = self.pc.arg2()?;
                     let cnst = self.get_const(idx.into(), cx)?;
                     self.env.stack.push(cnst);
                 }
                 op::Goto => {
-                    let offset = self.pc.arg2();
-                    self.pc.goto(offset);
+                    let offset = self.pc.arg2()?;
+                    self.pc.goto(offset)?;
                 }
                 op::GotoIfNil => {
+                    let offset = self.pc.arg2()?;
                     let cond = self.env.stack.pop(cx);
-                    let offset = self.pc.arg2();
                     if cond.is_nil() {
-                        self.pc.goto(offset);
+                        self.pc.goto(offset)?;
                     }
                 }
                 op::GotoIfNonNil => {
+                    let offset = self.pc.arg2()?;
                     let cond = self.env.stack.pop(cx);
-                    let offset = self.pc.arg2();
                     if !cond.is_nil() {
-                        self.pc.goto(offset);
+                        self.pc.goto(offset)?;
                     }
                 }
                 op::GotoIfNilElsePop => {
-                    let offset = self.pc.arg2();
+                    let offset = self.pc.arg2()?;
                     if self.env.stack[0].bind(cx).is_nil() {
-                        self.pc.goto(offset);
+                        self.pc.goto(offset)?;
                     } else {
                         self.env.stack.pop(cx);
                     }
                 }
                 op::GotoIfNonNilElsePop => {
-                    let offset = self.pc.arg2();
+                    let offset = self.pc.arg2()?;
                     if self.env.stack[0].bind(cx).is_nil() {
                         self.env.stack.pop(cx);
                     } else {
-                        self.pc.goto(offset);
+                        self.pc.goto(offset)?;
                     }
                 }
                 op::Return => {
@@ -691,7 +698,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     self.env.stack.pop(cx);
                 }
                 op::DiscardN => {
-                    let arg = self.pc.arg1();
+                    let arg = self.pc.arg1()?;
                     let cur_len = self.env.stack.len();
                     let keep_tos = (arg & 0x80) != 0;
                     let count = (arg & 0x7F) as usize;
@@ -780,7 +787,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     top.set(data::integerp(top.bind(cx)));
                 }
                 op::ListN => {
-                    let size = self.pc.arg1() as usize;
+                    let size = self.pc.arg1()? as usize;
                     let slice = Rt::bind_slice(&self.env.stack[..size], cx);
                     let list = alloc::list(slice, cx);
                     let len = self.env.stack.len();
@@ -798,7 +805,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                         let ObjectType::Int(offset) = offset.untag() else {
                             unreachable!("switch value was not a int")
                         };
-                        self.pc.goto(offset as u16);
+                        self.pc.goto(offset as u16)?;
                     }
                 }
                 op::Constant0
@@ -1019,6 +1026,58 @@ mod test {
         let val = rebind!(call(bytecode, frame.arg_count(), "test", frame, cx).unwrap());
         let expect = expect.bind(cx);
         assert_eq!(val, expect);
+    }
+
+    #[test]
+    fn m0_program_counter_checks_reads_and_jumps_before_access() {
+        let mut empty = ProgramCounter::new(&[]);
+        assert!(empty.next().is_err());
+        assert!(empty.arg1().is_err());
+        assert!(empty.arg2().is_err());
+        assert!(empty.goto(0).is_err());
+        let bytes = [0x34, 0x12];
+        let mut pc = ProgramCounter::new(&bytes);
+        assert_eq!(pc.arg2().unwrap(), 0x1234);
+        assert!(pc.next().is_err());
+        pc.goto(1).unwrap();
+        assert!(pc.arg2().is_err());
+        // Failed accesses/jumps leave the cursor unchanged.
+        assert_eq!(pc.as_offset(), 1);
+        assert!(pc.goto(2).is_err());
+        assert!(pc.goto(u16::MAX).is_err());
+        assert_eq!(pc.arg1().unwrap(), 0x12);
+        assert!(pc.arg1().is_err());
+    }
+
+    #[test]
+    fn m0_truncated_bytecode_and_invalid_jumps_return_errors() {
+        use OpCode as O;
+        for bytes in [
+            vec![],
+            vec![O::VarRefN as u8],
+            vec![O::ConstantN2 as u8, 0],
+            vec![O::Goto as u8, 0],
+            vec![O::GotoIfNil as u8],
+            vec![O::GotoIfNonNil as u8],
+            vec![O::PushCondtionCase as u8],
+            vec![O::Goto as u8, 3, 0],
+            vec![O::Goto as u8, 0xff, 0xff],
+        ] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            let constants: &LispVec = Vec::<Object>::new().into_obj(cx).untag();
+            // Use the ordinary byte-code constructor with a complete buffer;
+            // only instruction/target validity is intentionally malformed.
+            let codes: &ByteString = bytes.into_obj(cx).untag();
+            let function =
+                crate::alloc::make_byte_code(0, codes, constants, 10, None, None, &[], cx).unwrap();
+            root!(function, cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            assert!(call(function, 0, "truncated-bytecode", frame, cx).is_err());
+        }
     }
 
     #[test]
