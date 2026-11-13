@@ -128,22 +128,15 @@ pub fn text_properties_at<'ob>(
     object: Object<'ob>,
     env: &'ob mut Rt<Env>,
 ) -> Result<Object<'ob>> {
-    let tree = if eq(object, NIL) {
-        &env.current_buffer.get().textprops
-    } else {
-        let obj = object.untag();
-        match obj {
-            ObjectType::Buffer(buf) => &buf.lock().unwrap().textprops,
-            ObjectType::String(_str) => {
-                todo!()
-            }
-            _ => {
-                bail!(TypeError::new(Type::BufferOrString, obj))
-            }
-        }
-    };
-    let a = tree.find(position).map(|a| *a.val).unwrap_or(NIL);
-    Ok(unsafe { a.with_lifetime() })
+    if matches!(object.untag(), ObjectType::String(_)) {
+        bail!("String text properties are not supported yet");
+    }
+    modify_buffer_data(object, env, |data| {
+        let properties = data.textprops.find(position).map(|node| *node.val).unwrap_or(NIL);
+        // The returned Lisp object belongs to the GC context, not to the
+        // temporary buffer mutex guard used to look it up.
+        Ok(unsafe { properties.with_lifetime() })
+    })
 }
 
 /// Return the value of POSITION's property PROP, in OBJECT.
@@ -832,6 +825,33 @@ mod tests {
         remove_text_properties(0, 10, list![a, NIL; cx], buf, env, cx)?;
 
         BUFFERS.lock().unwrap().clear();
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_property_reads_reuse_current_buffer_guard() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let current = cx.add(env.current_buffer.buf_ref);
+        env.current_buffer.get_mut().insert(cx.add("abc"))?;
+        let key: Object = intern("roadmap-current-property", &cx).into();
+        let value = cx.add("identity");
+        put_text_property(1, 3, key, value, NIL, env, &cx)?;
+        // Env already owns this buffer's guard. Explicit current-buffer reads
+        // must use it rather than trying to lock the same mutex again.
+        let implicit = text_properties_at(1, NIL, env)?;
+        root!(implicit, cx);
+        let explicit = text_properties_at(1, current, env)?;
+        assert!(eq(implicit.bind(&cx), explicit));
+        assert!(eq(get_text_property(2, key, current, env)?, value));
+        assert!(text_properties_at(4, current, env)?.is_nil());
+
+        let deleted = get_buffer_create(cx.add("roadmap-deleted-property"), None, &cx)?;
+        deleted.buffer().unwrap().lock()?.kill();
+        assert!(text_properties_at(1, deleted, env).is_err());
+        assert!(text_properties_at(1, cx.add(123), env).is_err());
+        assert!(text_properties_at(0, cx.add("string"), env).is_err());
         Ok(())
     }
 

@@ -282,30 +282,24 @@ fn take<'ob>(n: i64, list: List<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
 }
 
 #[defun]
-pub(crate) fn append<'ob>(
-    append: Object<'ob>,
-    sequences: &[Object<'ob>],
-    cx: &'ob Context,
-) -> Result<Object<'ob>> {
-    let mut list = Vec::new();
-    match append.untag() {
-        ObjectType::String(string) => {
-            for ch in string.chars() {
-                list.push((ch as i64).into());
+pub(crate) fn append<'ob>(sequences: &[Object<'ob>], cx: &'ob Context) -> Result<Object<'ob>> {
+    let Some((tail, sequences)) = sequences.split_last() else { return Ok(NIL) };
+    let mut elements: Vec<Object<'ob>> = Vec::new();
+    for sequence in sequences {
+        match sequence.untag() {
+            ObjectType::String(string) => {
+                elements.extend(string.chars().map(|ch| Object::from(ch as i64)));
             }
-        }
-        ObjectType::ByteString(string) => {
-            for ch in string.iter() {
-                list.push((*ch as i64).into());
+            ObjectType::ByteString(string) => {
+                elements.extend(string.iter().map(|byte| Object::from(*byte as i64)));
             }
+            ObjectType::Vec(vector) => elements.extend(vector.iter().map(|cell| cell.get())),
+            ObjectType::NIL | ObjectType::Cons(_) => join(&mut elements, (*sequence).try_into()?)?,
+            _ => bail!(TypeError::new(Type::Sequence, *sequence)),
         }
-        _ => join(&mut list, append.try_into()?)?,
     }
-    for seq in sequences {
-        join(&mut list, (*seq).try_into()?)?;
-    }
-    // TODO: Remove this temp vector
-    Ok(slice_into_list(&list, None, cx))
+    // The last argument is shared, not copied, and may be any object.
+    Ok(slice_into_list(&elements, Some(*tail), cx))
 }
 
 #[defun]
@@ -1181,8 +1175,28 @@ mod test {
     }
 
     #[test]
+    fn append_preserves_final_tail() {
+        assert_lisp("(append)", "nil");
+        assert_lisp("(append 42)", "42");
+        assert_lisp("(append '(1 2) 3)", "(1 2 . 3)");
+        assert_lisp("(let ((tail (list 2 3))) (eq (cdr (append '(1) tail)) tail))", "t");
+        assert_lisp("(let ((tail (list 2 3))) (eq (append tail) tail))", "t");
+        assert_lisp("(append [1 2] '(3))", "(1 2 3)");
+        assert_lisp("(append \"é🦀\" nil)", "(233 129408)");
+    }
+
+    #[test]
+    fn append_rejects_invalid_nonfinal_sequences() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        assert!(super::append(&[42i64.into(), NIL], cx).is_err());
+        let dotted = crate::core::cons::Cons::new(1i64, 2i64, cx);
+        assert!(super::append(&[dotted.into(), NIL], cx).is_err());
+    }
+
+    #[test]
     fn test_append() {
-        assert_lisp("(append \"hello\")", "(104 101 108 108 111)");
+        assert_lisp("(append \"hello\" nil)", "(104 101 108 108 111)");
     }
 
     #[test]

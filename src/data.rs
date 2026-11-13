@@ -308,8 +308,22 @@ fn subr_arity<'ob>(subr: &SubrFn, cx: &'ob Context) -> Object<'ob> {
 
 #[defun]
 fn ash(value: i64, count: i64) -> i64 {
-    let shift = if count >= 0 { std::ops::Shl::shl } else { std::ops::Shr::shr };
-    let result = shift(value.abs(), count.abs());
+    if value == 0 || count == 0 {
+        return value;
+    }
+    if count < 0 {
+        // Signed right shift rounds negative values down. Saturate before
+        // negating COUNT so even i64::MIN never overflows or shifts by >= 64.
+        return if count <= -i64::from(i64::BITS) {
+            if value < 0 { -1 } else { 0 }
+        } else {
+            value >> -count
+        };
+    }
+    // Known limitation: positive shifts still use the old fixed-width path.
+    // Large positive counts/overflow and BigInt arguments need a separate
+    // promotion/allocation design; this change only repairs right shifts.
+    let result = std::ops::Shl::shl(value.abs(), count.abs());
     if value >= 0 { result } else { -result }
 }
 
@@ -537,11 +551,29 @@ mod test {
 
     #[test]
     fn test_ash() {
-        assert_eq!(ash(4, 1), 8);
-        assert_eq!(ash(4, -1), 2);
-        assert_eq!(ash(-8, -1), -4);
-        assert_eq!(ash(256, -8), 1);
-        assert_eq!(ash(-8, 1), -16);
+        for (value, count, expected) in [
+            (4, 1, 8),
+            (4, -1, 2),
+            (-8, -1, -4),
+            (-3, -1, -2),
+            (256, -8, 1),
+            (-8, 1, -16),
+            (i64::MIN, -1, i64::MIN / 2),
+            (i64::MIN, 0, i64::MIN),
+            (1, -63, 0),
+            (-3, -63, -1),
+            (1, -64, 0),
+            (-3, -64, -1),
+            (1, i64::MIN, 0),
+            (-3, i64::MIN, -1),
+            (0, i64::MIN, 0),
+            (0, i64::MAX, 0),
+        ] {
+            assert_eq!(ash(value, count), expected, "ash({value}, {count})");
+        }
+        assert_lisp("(ash -3 -1)", "-2");
+        assert_lisp("(ash -3 -1000)", "-1");
+        assert_lisp("(ash 1 -1000)", "0");
     }
 
     #[test]
