@@ -10,6 +10,7 @@ edition = { workspace = true }
 members = [
   "crates/rune-tree",
   "crates/rune-text",
+  "crates/rune-display",
   "crates/text-buffer",
   "crates/rune-macros",
   "crates/rune-core",
