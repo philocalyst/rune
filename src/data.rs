@@ -406,8 +406,8 @@ pub(crate) fn aref<'ob>(array: Object<'ob>, idx: usize, cx: &'ob Context) -> Res
 #[defun]
 fn type_of(object: Object) -> Object {
     match object.untag() {
-        ObjectType::Int(_) => sym::INTEGER.into(),
-        ObjectType::Float(_) => sym::FLOATP.into(),
+        ObjectType::Int(_) | ObjectType::BigInt(_) => sym::INTEGER.into(),
+        ObjectType::Float(_) => sym::FLOAT.into(),
         ObjectType::Symbol(_) => sym::SYMBOL.into(),
         ObjectType::Cons(_) => sym::CONS.into(),
         ObjectType::Vec(_) => sym::VECTOR.into(),
@@ -418,7 +418,6 @@ fn type_of(object: Object) -> Object {
         ObjectType::SubrFn(_) => sym::SUBR.into(),
         ObjectType::Buffer(_) => sym::BUFFER.into(),
         ObjectType::CharTable(_) => sym::CHAR_TABLE.into(),
-        ObjectType::BigInt(_) => sym::BIG_INT.into(),
         ObjectType::ChannelSender(_) => sym::CHANNEL_SENDER.into(),
         ObjectType::ChannelReceiver(_) => sym::CHANNEL_RECEIVER.into(),
     }
@@ -661,6 +660,26 @@ mod test {
         // Exercise the Lisp primitive dispatch paths as well as direct calls.
         assert_lisp("(numberp 9223372036854775808)", "t");
         assert_lisp("(integerp -9223372036854775809)", "t");
+    }
+
+    #[test]
+    fn m0_type_of_numeric_values_uses_basic_type_symbols() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        for integer in [
+            cx.add(1_i64),
+            cx.add(num_bigint::BigInt::from(i64::MAX) + 1_u8),
+            cx.add(num_bigint::BigInt::from(i64::MIN) - 1_u8),
+        ] {
+            assert_eq!(type_of(integer), cx.add(sym::INTEGER));
+        }
+        for float in [0.0, -1.5, f64::INFINITY, f64::NAN] {
+            assert_eq!(type_of(cx.add(float)), cx.add(sym::FLOAT));
+        }
+        drop(cx);
+        assert_lisp("(type-of 9223372036854775808)", "integer");
+        assert_lisp("(type-of -9223372036854775809)", "integer");
+        assert_lisp("(type-of 1.5)", "float");
     }
 
     #[test]

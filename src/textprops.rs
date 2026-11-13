@@ -504,7 +504,7 @@ pub fn remove_list_of_text_properties<'ob>(
 /// the current buffer), START and END are buffer positions (integers or
 /// markers).  If OBJECT is a string, START and END are 0-based indices into it.
 #[defun]
-pub fn text_properties_any<'ob>(
+pub fn text_property_any<'ob>(
     start: usize,
     end: usize,
     property: Object<'ob>,
@@ -513,12 +513,13 @@ pub fn text_properties_any<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let tree = data.textprops_with_lifetime();
         let iter = tree.iter(start, end);
         for (interval, props) in iter {
             let val = textget(props, property)?;
-            if !eq(val, value) {
+            if eq(val, value) {
                 return Ok(cx.add(interval.start));
             }
         }
@@ -533,7 +534,7 @@ pub fn text_properties_any<'ob>(
 /// the current buffer), START and END are buffer positions (integers or
 /// markers).  If OBJECT is a string, START and END are 0-based indices into it.
 #[defun]
-pub fn text_properties_not_all<'ob>(
+pub fn text_property_not_all<'ob>(
     start: usize,
     end: usize,
     property: Object<'ob>,
@@ -542,12 +543,13 @@ pub fn text_properties_not_all<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let tree = data.textprops_with_lifetime();
         let iter = tree.iter(start, end);
         for (interval, props) in iter {
             let val = textget(props, property)?;
-            if eq(val, value) {
+            if !eq(val, value) {
                 return Ok(cx.add(interval.start));
             }
         }
@@ -824,6 +826,31 @@ mod tests {
         remove_text_properties(2, 2, list![a, NIL; &cx], buf, env, &cx)?;
         remove_list_of_text_properties(2, 2, list![a; &cx], buf, env, &cx)?;
         assert_eq!(get_text_property(2, a, buf, env)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_property_search_predicates_and_identity() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-property-search"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        let key: Object = intern("roadmap-search-key", &cx).into();
+        let value = cx.add("same");
+        put_text_property(2, 5, key, value, buf, env, &cx)?;
+        assert_eq!(text_property_any(1, 7, key, value, buf, env, &cx)?, 2);
+        assert_eq!(text_property_any(3, 7, key, value, buf, env, &cx)?, 3);
+        assert!(text_property_any(1, 7, key, cx.add("same"), buf, env, &cx)?.is_nil());
+        assert_eq!(text_property_not_all(1, 7, key, value, buf, env, &cx)?, 1);
+        assert_eq!(text_property_not_all(2, 7, key, value, buf, env, &cx)?, 5);
+        assert!(text_property_not_all(2, 5, key, value, buf, env, &cx)?.is_nil());
+        assert_eq!(text_property_any(2, 7, key, NIL, buf, env, &cx)?, 5);
+        assert_eq!(text_property_not_all(1, 7, key, NIL, buf, env, &cx)?, 2);
+        assert_eq!(text_property_any(7, 1, key, value, buf, env, &cx)?, 2);
+        assert_eq!(text_property_not_all(7, 2, key, value, buf, env, &cx)?, 5);
+        assert!(text_property_any(3, 3, key, value, buf, env, &cx)?.is_nil());
+        assert!(text_property_not_all(3, 3, key, NIL, buf, env, &cx)?.is_nil());
         Ok(())
     }
 

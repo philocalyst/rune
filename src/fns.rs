@@ -249,21 +249,38 @@ pub(crate) fn reverse<'ob>(seq: List, cx: &'ob Context) -> Result<Object<'ob>> {
 }
 
 #[defun]
-pub(crate) fn nconc<'ob>(lists: &[List<'ob>]) -> Result<Object<'ob>> {
+pub(crate) fn nconc<'ob>(lists: &[Object<'ob>]) -> Result<Object<'ob>> {
+    let mut head = NIL;
     let mut tail: Option<&Cons> = None;
-    for list in lists {
-        if let Some(cons) = tail {
-            cons.set_cdr((*list).into())?;
+    for (index, &list) in lists.iter().enumerate() {
+        if list == NIL {
+            continue;
         }
-        if let Some(last) = list.conses().last() {
-            tail = Some(last?);
+        if head == NIL {
+            head = list;
+        }
+        if let Some(previous) = tail {
+            previous.set_cdr(list)?;
+        }
+        // The final argument is shared and may be any object.
+        if index + 1 == lists.len() {
+            return Ok(head);
+        }
+        let cons = list.cons().ok_or_else(|| TypeError::new(Type::List, list))?;
+        for next in cons.conses() {
+            match next {
+                Ok(cons) => tail = Some(cons),
+                // GNU nconc replaces the last cdr even in a dotted prefix.
+                Err(crate::core::cons::ConsError::NonNilCdr) => break,
+                Err(error) => return Err(error.into()),
+            }
         }
     }
-
-    Ok(match lists.iter().find(|&&x| x != ListType::empty()) {
-        Some(x) => (*x).into(),
-        None => NIL,
-    })
+    // Trailing nil arguments must terminate the concatenated list.
+    if let Some(tail) = tail {
+        tail.set_cdr(NIL)?;
+    }
+    Ok(head)
 }
 
 fn join<'ob>(list: &mut Vec<Object<'ob>>, seq: List<'ob>) -> Result<()> {
@@ -1176,6 +1193,22 @@ mod test {
         assert_lisp("(nreverse '(1 2))", "(2 1)");
         assert_lisp("(nreverse '(1 2 3))", "(3 2 1)");
         assert_lisp("(nreverse '(1 2 3 4))", "(4 3 2 1)");
+    }
+
+    #[test]
+    fn nconc_arbitrary_tail_and_dotted_prefix() {
+        assert_lisp("(nconc)", "nil");
+        assert_lisp("(nconc 42)", "42");
+        assert_lisp("(nconc nil 42)", "42");
+        assert_lisp("(nconc (list 1 2) 3)", "(1 2 . 3)");
+        assert_lisp("(nconc (cons 1 2) (list 3))", "(1 3)");
+        assert_lisp("(nconc (list 1) nil (list 2) nil)", "(1 2)");
+        assert_lisp("(let ((tail (list 2))) (eq (cdr (nconc (list 1) tail)) tail))", "t");
+    }
+
+    #[test]
+    fn nconc_rejects_nonfinal_atom() {
+        assert!(super::nconc(&[42i64.into(), NIL]).is_err());
     }
 
     #[test]
