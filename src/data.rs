@@ -261,10 +261,11 @@ pub(crate) fn multibyte_string_p(object: Object) -> bool {
 fn string_to_number<'ob>(string: &str, base: Option<i64>, cx: &'ob Context) -> Result<Number<'ob>> {
     // TODO: Handle trailing characters, which should be ignored
     let base = base.unwrap_or(10);
-    // Rust's parser panics outside this range. Validate before narrowing so
-    // large Lisp integers cannot wrap into an apparently valid radix either.
-    if !(2..=36).contains(&base) {
-        return Err(anyhow!("base {base} is out of range; expected 2 through 36"));
+    // GNU's string-to-number allows 2..=16, unlike the reader's #Nr syntax.
+    // Validate before narrowing: Rust's parser panics on some invalid bases,
+    // and large Lisp integers must not wrap into an apparently valid radix.
+    if !(2..=16).contains(&base) {
+        return Err(anyhow!("base {base} is out of range; expected 2 through 16"));
     }
     let string = string.trim();
     Ok(match i64::from_str_radix(string, base as u32) {
@@ -619,7 +620,7 @@ mod test {
     fn m0_string_to_number_rejects_invalid_radices_without_panicking() {
         let roots = crate::core::gc::RootSet::default();
         let cx = Context::new(&roots);
-        for base in [i64::MIN, -1, 0, 1, 37, i64::MAX, (1_i64 << 32) + 10] {
+        for base in [i64::MIN, -1, 0, 1, 17, 36, 37, i64::MAX, (1_i64 << 32) + 10] {
             for input in ["", "10", "1.5"] {
                 assert!(string_to_number(input, Some(base), &cx).is_err(), "base {base}");
             }
@@ -629,7 +630,7 @@ mod test {
     #[test]
     fn m0_string_to_number_preserves_valid_radices() {
         assert_lisp("(string-to-number \"101\" 2)", "5");
-        assert_lisp("(string-to-number \"z\" 36)", "35");
+        assert_lisp("(string-to-number \"f\" 16)", "15");
         assert_lisp("(string-to-number \"-ff\" 16)", "-255");
         assert_lisp("(string-to-number \"42\")", "42");
         assert_lisp("(string-to-number \"1.5\" 10)", "1.5");

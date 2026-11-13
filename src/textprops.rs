@@ -202,6 +202,7 @@ pub fn put_text_property<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<()> {
+    let (start, end) = (start.min(end), start.max(end));
     let prop = list!(property, value; cx);
     let prop = Slot::new(prop);
     modify_buffer_data(object, env, |data| {
@@ -423,6 +424,7 @@ pub fn set_text_properties<'ob>(
     object: Object<'ob>,
     env: &mut Rt<Env>,
 ) -> Result<()> {
+    let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<()> {
         let tree = data.textprops_with_lifetime();
         tree.set_properties(start, end, properties);
@@ -449,6 +451,7 @@ pub fn remove_text_properties<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<()> {
+    let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<()> {
         let tree = data.textprops_with_lifetime();
         // GNU textprop.c traverses candidate keys without validate_plist:
@@ -487,6 +490,7 @@ pub fn remove_list_of_text_properties<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<()> {
+    let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<()> {
         let tree = data.textprops_with_lifetime();
         tree.delete(start, end, list_of_properties, cx)
@@ -785,6 +789,41 @@ mod tests {
         assert_eq!(previous_single_property_change(5, key, buf, None, env, &cx)?, 2);
         assert_eq!(previous_single_property_change(7, key, buf, Some(6), env, &cx)?, 6);
         assert!(previous_single_property_change(2, key, buf, None, env, &cx)?.is_nil());
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_reversed_property_mutations_normalize_ranges() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-reversed-properties"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        let a: Object = intern("roadmap-reversed-a", &cx).into();
+        let b: Object = intern("roadmap-reversed-b", &cx).into();
+        put_text_property(6, 2, a, cx.add(1), buf, env, &cx)?;
+        assert!(get_text_property(1, a, buf, env)?.is_nil());
+        assert_eq!(get_text_property(2, a, buf, env)?, 1);
+        assert_eq!(get_text_property(5, a, buf, env)?, 1);
+        assert!(get_text_property(6, a, buf, env)?.is_nil());
+        set_text_properties(5, 3, list![b, 2; &cx], buf, env)?;
+        assert!(get_text_property(3, a, buf, env)?.is_nil());
+        assert_eq!(get_text_property(3, b, buf, env)?, 2);
+        assert_eq!(get_text_property(2, a, buf, env)?, 1);
+        assert_eq!(get_text_property(5, a, buf, env)?, 1);
+        remove_text_properties(4, 3, list![b, NIL; &cx], buf, env, &cx)?;
+        assert!(text_properties_at(3, buf, env)?.is_nil());
+        assert_eq!(get_text_property(4, b, buf, env)?, 2);
+        remove_list_of_text_properties(6, 4, list![a, b; &cx], buf, env, &cx)?;
+        assert!(text_properties_at(4, buf, env)?.is_nil());
+        assert!(text_properties_at(5, buf, env)?.is_nil());
+        assert_eq!(get_text_property(2, a, buf, env)?, 1);
+        // Normalization must leave empty ranges as no-ops.
+        put_text_property(2, 2, a, cx.add(9), buf, env, &cx)?;
+        set_text_properties(2, 2, NIL, buf, env)?;
+        remove_text_properties(2, 2, list![a, NIL; &cx], buf, env, &cx)?;
+        remove_list_of_text_properties(2, 2, list![a; &cx], buf, env, &cx)?;
+        assert_eq!(get_text_property(2, a, buf, env)?, 1);
         Ok(())
     }
 

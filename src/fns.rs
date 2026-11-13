@@ -595,20 +595,18 @@ pub(crate) fn proper_list_p(object: Object) -> Option<usize> {
 }
 
 #[defun]
-pub(crate) fn nth(n: usize, list: List) -> Result<Object> {
-    Ok(list.elements().fallible().nth(n)?.unwrap_or_default())
+pub(crate) fn nth(n: i64, list: List) -> Result<Object> {
+    Ok(crate::data::car(nthcdr(n, list)?.try_into()?))
 }
 
 #[defun]
-pub(crate) fn nthcdr(n: usize, list: List) -> Result<Object> {
-    let ListType::Cons(mut cons) = list.untag() else { return Ok(NIL) };
+pub(crate) fn nthcdr(n: i64, list: List) -> Result<Object> {
     let mut tail = list.as_obj_copy();
     for _ in 0..n {
-        tail = cons.cdr();
-        if let Some(next) = tail.cons() {
-            cons = next;
-        } else {
-            break;
+        match tail.untag() {
+            ObjectType::Cons(cons) => tail = cons.cdr(),
+            ObjectType::NIL => return Ok(NIL),
+            _ => bail!(TypeError::new(Type::List, tail)),
         }
     }
     Ok(tail)
@@ -617,7 +615,7 @@ pub(crate) fn nthcdr(n: usize, list: List) -> Result<Object> {
 #[defun]
 pub(crate) fn elt<'ob>(sequence: Object<'ob>, n: usize, cx: &'ob Context) -> Result<Object<'ob>> {
     match sequence.untag() {
-        ObjectType::Cons(x) => nth(n, x.into()),
+        ObjectType::Cons(x) => nth(n.try_into()?, x.into()),
         ObjectType::NIL => Ok(NIL),
         ObjectType::Vec(x) => aref(x.into(), n, cx),
         ObjectType::Record(x) => aref(x.into(), n, cx),
@@ -1141,6 +1139,22 @@ mod test {
     fn test_delq() {
         assert_lisp("(delq 1 '(1 2 3 1 4 1))", "(2 3 4)");
         assert_lisp("(delq t '(t t t))", "nil");
+    }
+
+    #[test]
+    fn nth_and_nthcdr_negative_and_dotted_bounds() {
+        assert_lisp("(nth -1 '(1 2))", "1");
+        assert_lisp("(nthcdr -1 '(1 2))", "(1 2)");
+        assert_lisp("(nthcdr 100 nil)", "nil");
+    }
+
+    #[test]
+    fn nth_and_nthcdr_reject_past_dotted_tail() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        let dotted = crate::core::cons::Cons::new(1i64, 2i64, cx);
+        assert!(super::nthcdr(2, dotted.into()).is_err());
+        assert!(super::nth(1, dotted.into()).is_err());
     }
 
     #[test]
