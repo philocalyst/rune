@@ -1,0 +1,5 @@
+[
+  {"id": "arithmetic", "form": "(list (+ 1 2) (- 0 1) (* 7 6))"},
+  {"id": "unicode-string", "form": "(list (length \"aλ\") (aref \"aλ\" 1))"},
+  {"id": "condition", "form": "(car 1)"}
+]
