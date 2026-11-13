@@ -312,7 +312,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
         loop {
             let op = match self.pc.next().try_into() {
                 Ok(x) => x,
-                Err(e) => panic!("Invalid Bytecode: {e}"),
+                Err(e) => bail_err!("Invalid Bytecode: {e}"),
             };
 
             if Self::debug_enabled() {
@@ -1019,6 +1019,59 @@ mod test {
         let val = rebind!(call(bytecode, frame.arg_count(), "test", frame, cx).unwrap());
         let expect = expect.bind(cx);
         assert_eq!(val, expect);
+    }
+
+    #[test]
+    fn m0_unknown_opcode_bytes_return_errors() {
+        let mut invalid_count = 0;
+        for byte in 0_u8..=u8::MAX {
+            if OpCode::try_from(byte).is_ok() {
+                continue;
+            }
+            invalid_count += 1;
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            // A complete one-byte stream exercises decoding only. Truncated
+            // operands and stack validation are separate, still-open issues.
+            make_bytecode!(bytecode, 0, [byte], [], cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let error = call(bytecode, 0, "invalid-opcode", frame, cx).unwrap_err();
+            assert!(error.to_string().contains("Invalid Bytecode:"), "byte {byte}");
+            assert!(matches!(error.error, ErrorType::Err(_)));
+        }
+        assert!(invalid_count > 0);
+    }
+
+    #[test]
+    fn m0_unknown_opcode_uses_existing_error_handler() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let condition = Cons::new1(sym::ERROR, cx);
+        assert!(O::try_from(51_u8).is_err());
+        make_bytecode!(
+            bytecode,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                0x08,
+                0x00,
+                51_u8,
+                O::PopHandler,
+                O::Constant1,
+                O::Return,
+                O::Constant2,
+                O::Return
+            ],
+            [condition, NIL, 7],
+            cx
+        );
+        check_bytecode!(bytecode, [], 7, cx);
     }
 
     #[test]

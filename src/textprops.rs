@@ -36,11 +36,21 @@ pub enum PropertySetType {
 /// are actually added to I's plist)
 pub fn add_properties<'ob>(
     plist: Object<'ob>,
-    mut obj_i: Object<'ob>,
+    obj_i: Object<'ob>,
     _set_type: PropertySetType,
     _destructive: bool,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    merge_properties(plist, obj_i, cx).map(|(properties, _)| properties)
+}
+
+/// Return the final plist and whether any sequential incoming assignment
+/// changed a value/presence, even if a later duplicate restores the old value.
+fn merge_properties<'ob>(
+    plist: Object<'ob>,
+    mut obj_i: Object<'ob>,
+    cx: &'ob Context,
+) -> Result<(Object<'ob>, bool)> {
     // Property lists are shared by split intervals and may also belong to Lisp.
     // Build a fresh list instead of changing any existing cons cells.
     let mut pairs = Vec::new();
@@ -51,26 +61,29 @@ pub fn add_properties<'ob>(
         pairs.push((key, value));
     }
     let original_pairs = pairs.clone();
+    let mut changed = false;
     let mut incoming = plist.as_list()?;
     while let Some(key) = incoming.next() {
         let key = key?;
         let value = incoming.next().ok_or_else(|| anyhow!("Odd length property list"))??;
         if let Some(pair) = pairs.iter_mut().find(|pair| eq(pair.0, key)) {
+            changed |= !eq(pair.1, value);
             pair.1 = value;
         } else {
+            changed = true;
             pairs.push((key, value));
         }
     }
     if pairs.len() == original_pairs.len()
         && pairs.iter().zip(&original_pairs).all(|(a, b)| eq(a.0, b.0) && eq(a.1, b.1))
     {
-        return Ok(obj_i);
+        return Ok((obj_i, changed));
     }
     obj_i = NIL;
     for (key, value) in pairs.into_iter().rev() {
         obj_i = Cons::new(key, Cons::new(value, obj_i, cx), cx).into();
     }
-    Ok(obj_i)
+    Ok((obj_i, changed))
 }
 
 /// Helper function to safely modify buffer data.
@@ -207,6 +220,49 @@ pub fn get_char_property<'ob>(
 }
 
 // TODO also missing `next-char-property-change` and 3 other similar functions.
+
+/// Add or replace properties on text from START to END, preserving unrelated
+/// properties. Return t if any property actually changes, nil otherwise.
+/// OBJECT defaults to the current buffer.
+#[defun]
+pub fn add_text_properties<'ob>(
+    start: usize,
+    end: usize,
+    properties: Object<'ob>,
+    object: Option<Object<'ob>>,
+    env: &mut Rt<Env>,
+    cx: &'ob Context,
+) -> Result<bool> {
+    // GNU validates first and treats an empty plist as a no-op without even
+    // examining OBJECT or bounds (textprop.c add_text_properties_1).
+    let properties = copy_text_property_plist(properties, cx)?;
+    if properties.is_nil() {
+        return Ok(false);
+    }
+    let object = object.unwrap_or(NIL);
+    let (start, end) = (start.min(end), start.max(end));
+    modify_buffer_data(object, env, |data| {
+        if !validate_property_mutation_range(data, start, end)? {
+            return Ok(false);
+        }
+        let tree = data.textprops_with_lifetime();
+        let mut changed = false;
+        // Normalize duplicate keys for uncovered gaps, where insertion stores
+        // the incoming plist directly. GNU applies later assignments last.
+        let normalized = merge_properties(properties, NIL, cx)?.0;
+        // Include gaps: adding a nil-valued property is still a change in
+        // property presence, unlike merely looking up its effective value.
+        // Validate every affected plist before making any tree changes.
+        for (_, existing) in tree.iter(start, end) {
+            let (_, modified) = merge_properties(properties, existing, cx)?;
+            changed |= modified;
+        }
+        if changed {
+            tree.insert(start, end, Slot::new(normalized), cx)?;
+        }
+        Ok(changed)
+    })
+}
 
 /// Set one property of the text from START to END.
 /// The third and fourth arguments PROPERTY and VALUE
@@ -1090,6 +1146,85 @@ mod tests {
         crate::interpreter::assert_lisp(
             "(progn (insert \"abc\") (let ((p (list 'a 7))) (set-text-properties 1 3 p) (setcar (cdr p) 9) (get-text-property 1 'a nil)))",
             "7",
+        );
+    }
+
+    #[test]
+    fn roadmap_m0_add_text_properties_merges_and_reports_eq_changes() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-add-properties"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        let a: Object = intern("roadmap-add-a", &cx).into();
+        let b: Object = intern("roadmap-add-b", &cx).into();
+        let value = cx.add("same");
+        put_text_property(1, 7, b, cx.add(9), Some(buf), env, &cx)?;
+        let incoming = list![a, value; &cx];
+        assert!(add_text_properties(2, 5, incoming, Some(buf), env, &cx)?);
+        assert!(!add_text_properties(3, 4, incoming, Some(buf), env, &cx)?);
+        assert_eq!(next_property_change(2, buf, None, env, &cx)?, 5);
+        assert!(eq(get_text_property(3, a, buf, env)?, value));
+        assert_eq!(get_text_property(3, b, buf, env)?, 9);
+        incoming.cons().unwrap().cdr().cons().unwrap().set_car(cx.add(8))?;
+        assert!(eq(get_text_property(3, a, buf, env)?, value));
+        assert!(add_text_properties(3, 4, list![a, cx.add("same"); &cx], Some(buf), env, &cx)?);
+        assert!(add_text_properties(5, 2, list![a, value; &cx], Some(buf), env, &cx)?);
+        assert_eq!(next_property_change(2, buf, None, env, &cx)?, 5);
+        assert!(!add_text_properties(2, 5, list![a, value; &cx], Some(buf), env, &cx)?);
+        assert!(add_text_properties(1, 2, list![a, NIL; &cx], Some(buf), env, &cx)?);
+        assert!(!add_text_properties(1, 2, list![a, NIL; &cx], Some(buf), env, &cx)?);
+        assert!(!add_text_properties(3, 3, list![a, value; &cx], Some(buf), env, &cx)?);
+        assert!(!add_text_properties(usize::MAX, 0, NIL, Some(cx.add(42)), env, &cx)?);
+        assert!(add_text_properties(0, 2, list![a, 1; &cx], Some(buf), env, &cx).is_err());
+        assert!(add_text_properties(2, 5, list![a; &cx], Some(buf), env, &cx).is_err());
+        assert!(eq(get_text_property(3, a, buf, env)?, value));
+        assert_eq!(get_text_property(3, b, buf, env)?, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_add_text_properties_applies_duplicate_keys_sequentially() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-add-duplicate-keys"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        let key: Object = intern("roadmap-add-duplicate", &cx).into();
+        // Initially uncovered text must end up with the last assignment.
+        assert!(add_text_properties(2, 5, list![key, 1, key, 2; &cx], Some(buf), env, &cx)?);
+        assert_eq!(get_text_property(3, key, buf, env)?, 2);
+        // Changing and then restoring the original value still reports t,
+        // while final equal intervals must not acquire artificial boundaries.
+        assert!(add_text_properties(3, 4, list![key, 1, key, 2; &cx], Some(buf), env, &cx)?);
+        assert_eq!(get_text_property(3, key, buf, env)?, 2);
+        assert_eq!(next_property_change(2, buf, None, env, &cx)?, 5);
+        assert!(!add_text_properties(3, 4, list![key, 2, key, 2; &cx], Some(buf), env, &cx)?);
+        // A range spanning both covered text and gaps applies the same final
+        // value everywhere and preserves nil-valued property presence.
+        assert!(add_text_properties(1, 6, list![key, 9, key, NIL; &cx], Some(buf), env, &cx)?);
+        for position in 1..6 {
+            assert_eq!(
+                text_properties_at(position, buf, env)?.to_string(),
+                "(roadmap-add-duplicate nil)"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_add_text_properties_lisp_results_and_optional_object() {
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (list (add-text-properties 1 3 '(a 1 b nil)) (add-text-properties 1 3 '(a 1 b nil) nil) (get-text-property 1 'a nil)))",
+            "(t nil 1)",
+        );
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (list (add-text-properties 1 2 'a) (text-properties-at 1 nil)))",
+            "(t (a nil))",
+        );
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (list (add-text-properties 1 3 '(a 1 a 2)) (get-text-property 1 'a nil) (add-text-properties 1 3 '(a 1 a 2)) (get-text-property 1 'a nil)))",
+            "(t 2 t 2)",
         );
     }
 
