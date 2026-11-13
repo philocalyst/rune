@@ -120,9 +120,15 @@ fn string_to_multibyte(string: &LispString) -> &LispString {
 }
 
 #[defun]
-fn string_search(needle: &str, haystack: &str, start_pos: Option<usize>) -> Option<usize> {
+fn string_search(needle: &str, haystack: &str, start_pos: Option<usize>) -> Result<Option<usize>> {
     let start = start_pos.unwrap_or(0);
-    haystack[start..].find(needle).map(|x| x + start)
+    let char_len = haystack.chars().count();
+    ensure!(start <= char_len, "string-search start out of range");
+    let start_byte =
+        haystack.char_indices().nth(start).map_or(haystack.len(), |(offset, _)| offset);
+    Ok(haystack[start_byte..]
+        .find(needle)
+        .map(|offset| start + haystack[start_byte..start_byte + offset].chars().count()))
 }
 
 #[defun]
@@ -1044,12 +1050,30 @@ fn base64_encode(string: &str, _line_break: bool, pad: bool, base64url: bool) ->
 
 #[cfg(test)]
 mod test {
-    use super::substring;
+    use super::{string_search, substring};
     use crate::{
         assert_elprop, fns::levenshtein_distance, interpreter::assert_lisp,
         library::elprop::arb_custom_string,
     };
     use proptest::prelude::*;
+
+    #[test]
+    fn string_search_uses_character_positions() {
+        assert_eq!(string_search("🦀", "aé🦀z", None).unwrap(), Some(2));
+        assert_eq!(string_search("z", "aé🦀z", Some(2)).unwrap(), Some(3));
+        assert_eq!(string_search("é", "aé🦀z", Some(2)).unwrap(), None);
+        assert_eq!(string_search("", "aé🦀z", Some(4)).unwrap(), Some(4));
+        assert_eq!(string_search("z", "aé🦀z", Some(4)).unwrap(), None);
+        assert_eq!(string_search("", "", None).unwrap(), Some(0));
+        assert_eq!(string_search("x", "", None).unwrap(), None);
+    }
+
+    #[test]
+    fn string_search_rejects_invalid_start() {
+        assert!(string_search("", "é", Some(2)).is_err());
+        assert!(string_search("", "é", Some(usize::MAX)).is_err());
+        assert!(string_search("", "", Some(1)).is_err());
+    }
 
     #[test]
     fn substring_uses_character_positions() {

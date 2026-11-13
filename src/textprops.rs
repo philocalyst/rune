@@ -456,11 +456,18 @@ pub fn remove_text_properties<'ob>(
 ) -> Result<()> {
     modify_buffer_data(object, env, |data| -> Result<()> {
         let tree = data.textprops_with_lifetime();
+        // GNU textprop.c traverses candidate keys without validate_plist:
+        // non-lists are no-ops, and a final key need not have a value.
+        if !properties.is_nil() && properties.cons().is_none() {
+            return Ok(());
+        }
         let mut keys = Vec::new();
         let mut properties = properties.as_list()?;
         while let Some(key) = properties.next() {
             keys.push(key?);
-            properties.next().ok_or_else(|| anyhow!("Odd length property list"))??;
+            if let Some(value) = properties.next() {
+                value?;
+            }
         }
         let mut list = NIL;
         for key in keys.into_iter().rev() {
@@ -733,6 +740,31 @@ mod tests {
         assert_eq!(change, cx.add(15)); // Change at end of b range
 
         BUFFERS.lock().unwrap().clear();
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_remove_candidates_match_gnu_traversal() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-remove-candidates"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcde"))?;
+        let a: Object = intern("roadmap-remove-a", &cx).into();
+        let b: Object = intern("roadmap-remove-b", &cx).into();
+        put_text_property(1, 5, a, cx.add(1), buf, env, &cx)?;
+        put_text_property(1, 5, b, cx.add(2), buf, env, &cx)?;
+        // GNU's CONSP candidate loop ignores a bare symbol, rather than
+        // interpreting it as a property name or rejecting it.
+        remove_text_properties(2, 4, a, buf, env, &cx)?;
+        assert_eq!(plist_get(text_properties_at(2, buf, env)?, a)?, 1);
+        assert_eq!(next_property_change(1, buf, None, env, &cx)?, 5);
+        // A final proper-list key is still a removal candidate with no value.
+        remove_text_properties(2, 4, list![a; &cx], buf, env, &cx)?;
+        assert!(plist_get(text_properties_at(2, buf, env)?, a)?.is_nil());
+        assert_eq!(plist_get(text_properties_at(1, buf, env)?, a)?, 1);
+        assert_eq!(plist_get(text_properties_at(4, buf, env)?, a)?, 1);
+        assert_eq!(plist_get(text_properties_at(2, buf, env)?, b)?, 2);
         Ok(())
     }
 
