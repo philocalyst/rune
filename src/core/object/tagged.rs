@@ -1305,7 +1305,7 @@ impl<'ob> TryFrom<Object<'ob>> for Number<'ob> {
 
     fn try_from(value: Object<'ob>) -> Result<Self, Self::Error> {
         match value.get_tag() {
-            Tag::Int | Tag::Float => unsafe { Ok(cast_gc(value)) },
+            Tag::Int | Tag::Float | Tag::BigInt => unsafe { Ok(cast_gc(value)) },
             _ => Err(TypeError::new(Type::Number, value)),
         }
     }
@@ -1808,6 +1808,27 @@ mod test {
     use super::{MAX_FIXNUM, MIN_FIXNUM, TagType};
     use crate::core::gc::{Context, RootSet};
     use rune_core::macros::list;
+
+    #[test]
+    fn m0_number_conversion_accepts_bignums() {
+        use super::{NIL, Number, NumberType, Object};
+        use num_bigint::BigInt;
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for value in [BigInt::from(i64::MAX) + 1_u8, BigInt::from(i64::MIN) - 1_u8] {
+            let object = cx.add(value.clone());
+            let number = Number::try_from(object).unwrap();
+            let NumberType::Big(actual) = number.untag() else {
+                panic!("bignum conversion must preserve its tag");
+            };
+            assert_eq!(**actual, value);
+            let optional = Option::<Number>::try_from(object).unwrap().unwrap();
+            assert_eq!(Object::from(optional), object);
+        }
+        assert!(Number::try_from(cx.add("123")).is_err());
+        assert!(Number::try_from(NIL).is_err());
+        assert!(Option::<Number>::try_from(NIL).unwrap().is_none());
+    }
 
     #[test]
     fn test_clamp_fixnum() {

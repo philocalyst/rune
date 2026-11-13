@@ -109,6 +109,19 @@ fn modify_buffer_data<'ob, T>(
     }
 }
 
+/// GNU validate_interval_range treats empty mutation ranges as no-ops before
+/// checking bounds; nonempty buffer ranges use one-based character positions.
+fn validate_property_mutation_range(data: &BufferData, start: usize, end: usize) -> Result<bool> {
+    if start == end {
+        return Ok(false);
+    }
+    let point_max = data.text.len_chars() + 1;
+    if start == 0 || end > point_max {
+        bail!("Buffer range {start}..{end} is out of range 1..={point_max}");
+    }
+    Ok(true)
+}
+
 /// Return the list of properties of the character at POSITION in OBJECT.
 /// If the optional second argument OBJECT is a buffer (or nil, which means
 /// the current buffer), POSITION is a buffer position (integer or marker).
@@ -216,6 +229,9 @@ pub fn put_text_property<'ob>(
     let prop = list!(property, value; cx);
     let prop = Slot::new(prop);
     modify_buffer_data(object, env, |data| {
+        if !validate_property_mutation_range(data, start, end)? {
+            return Ok(());
+        }
         let tree = &mut data.textprops_with_lifetime();
         tree.insert(start, end, prop, cx)
     })
@@ -437,6 +453,9 @@ pub fn set_text_properties<'ob>(
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<()> {
+        if !validate_property_mutation_range(data, start, end)? {
+            return Ok(());
+        }
         let tree = data.textprops_with_lifetime();
         tree.set_properties(start, end, properties);
         Ok(())
@@ -465,6 +484,9 @@ pub fn remove_text_properties<'ob>(
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<bool> {
+        if !validate_property_mutation_range(data, start, end)? {
+            return Ok(false);
+        }
         let tree = data.textprops_with_lifetime();
         // GNU textprop.c traverses candidate keys without validate_plist:
         // non-lists are no-ops, and a final key need not have a value.
@@ -505,6 +527,9 @@ pub fn remove_list_of_text_properties<'ob>(
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<bool> {
+        if !validate_property_mutation_range(data, start, end)? {
+            return Ok(false);
+        }
         let tree = data.textprops_with_lifetime();
         tree.delete(start, end, list_of_properties, cx)
     })
@@ -662,12 +687,12 @@ mod tests {
         let a = cx.add(a);
 
         // Add properties at different ranges
-        put_text_property(0, 5, a, cx.add(1), Some(buf), env, cx)?;
+        put_text_property(1, 5, a, cx.add(1), Some(buf), env, cx)?;
         put_text_property(5, 10, a, cx.add(2), Some(buf), env, cx)?;
         put_text_property(15, 20, a, cx.add(3), Some(buf), env, cx)?;
 
         // Test property changes
-        let change = next_property_change(0, buf, None, env, cx)?;
+        let change = next_property_change(1, buf, None, env, cx)?;
         assert_eq!(change, cx.add(5)); // Change at end of first range
 
         let change = next_property_change(5, buf, None, env, cx)?;
@@ -680,7 +705,7 @@ mod tests {
         assert_eq!(change, cx.add(20)); // Change at end of third range
 
         // Test with limit
-        let change = next_property_change(0, buf, Some(8), env, cx)?;
+        let change = next_property_change(1, buf, Some(8), env, cx)?;
         assert_eq!(change, cx.add(5)); // Change within limit
 
         let change = next_property_change(5, buf, Some(8), env, cx)?;
@@ -963,6 +988,49 @@ mod tests {
     }
 
     #[test]
+    fn roadmap_m0_property_mutations_validate_character_ranges_atomically() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-mutation-bounds"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"))?;
+        let key: Object = intern("roadmap-mutation-bounds-key", &cx).into();
+        put_text_property(1, 3, key, cx.add(7), Some(buf), env, &cx)?;
+        for (start, end) in [(0, 2), (1, 4), (4, 1), (1, usize::MAX)] {
+            assert!(put_text_property(start, end, key, cx.add(8), Some(buf), env, &cx).is_err());
+            assert!(set_text_properties(start, end, NIL, Some(buf), env).is_err());
+            assert!(
+                remove_text_properties(start, end, list![key, NIL; &cx], Some(buf), env, &cx)
+                    .is_err()
+            );
+            assert!(
+                remove_list_of_text_properties(start, end, list![key; &cx], Some(buf), env, &cx)
+                    .is_err()
+            );
+            assert_eq!(get_text_property(1, key, buf, env)?, 7);
+            assert_eq!(get_text_property(2, key, buf, env)?, 7);
+            assert!(text_properties_at(3, buf, env)?.is_nil());
+        }
+        // GNU returns without validating the bounds of an empty range.
+        put_text_property(usize::MAX, usize::MAX, key, NIL, Some(buf), env, &cx)?;
+        set_text_properties(0, 0, NIL, Some(buf), env)?;
+        assert!(!remove_text_properties(0, 0, list![key; &cx], Some(buf), env, &cx)?);
+        assert!(!remove_list_of_text_properties(
+            usize::MAX,
+            usize::MAX,
+            list![key; &cx],
+            Some(buf),
+            env,
+            &cx
+        )?);
+        assert_eq!(get_text_property(1, key, buf, env)?, 7);
+        // Endpoint3 is legal for two Unicode characters, regardless of bytes.
+        assert!(remove_list_of_text_properties(3, 1, list![key; &cx], Some(buf), env, &cx)?);
+        assert!(text_properties_at(1, buf, env)?.is_nil());
+        Ok(())
+    }
+
+    #[test]
     fn test_remove_text_properties() -> Result<()> {
         let roots = &RootSet::default();
         let mut context = Context::new(roots);
@@ -996,7 +1064,7 @@ mod tests {
         assert_eq!(val, cx.add(2));
 
         // Try removing non-existent property
-        remove_text_properties(0, 10, list![a, NIL; cx], Some(buf), env, cx)?;
+        remove_text_properties(1, 10, list![a, NIL; cx], Some(buf), env, cx)?;
 
         BUFFERS.lock().unwrap().clear();
         Ok(())

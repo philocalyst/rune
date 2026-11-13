@@ -136,8 +136,10 @@ where
     let abs_r: T = r.abs();
     let abs_r1: T = den.abs() - abs_r.clone();
 
-    let increment = if (q.clone() & T::one()) == T::one() { T::zero() } else { T::one() };
-    if abs_r1 < abs_r + increment {
+    let odd = (q.clone() & T::one()) == T::one();
+    // At the midpoint only an odd truncated quotient needs adjusting. Keep
+    // the comparison explicit rather than adding one to a bounded magnitude.
+    if abs_r1 < abs_r || (abs_r1 == abs_r && odd) {
         if neg_d == neg_r {
             q += T::one();
         } else {
@@ -357,4 +359,51 @@ fn frexp<'ob>(x: Number, cx: &'ob Context) -> Object<'ob> {
 fn frexp_f(f: f64) -> (f64, i64) {
     let (x, exp) = libm::frexp(f);
     (x, exp as i64)
+}
+
+#[cfg(test)]
+mod m0_rounding_regressions {
+    use super::*;
+    use crate::interpreter::assert_lisp;
+
+    #[test]
+    fn integer_divisor_rounding_uses_even_midpoints() {
+        for (numerator, denominator, expected) in [
+            (5_i64, 2_i64, 2_i64),
+            (7, 2, 4),
+            (-5, 2, -2),
+            (-7, 2, -4),
+            (5, -2, -2),
+            (7, -2, -4),
+            (-5, -2, 2),
+            (-7, -2, 4),
+            (4, 3, 1),
+            (5, 3, 2),
+            (-4, 3, -1),
+            (-5, 3, -2),
+            (6, 3, 2),
+        ] {
+            assert_eq!(round2(numerator, denominator), expected);
+            assert_eq!(
+                round2(BigInt::from(numerator), BigInt::from(denominator)),
+                BigInt::from(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn round_primitive_preserves_even_midpoints_across_numeric_types() {
+        for (source, expected) in [
+            ("(round 5 2)", "2"),
+            ("(round 7 2)", "4"),
+            ("(round -5 2)", "-2"),
+            ("(round -7 -2)", "4"),
+            ("(round 5.0 2)", "2"),
+            ("(round 7 2.0)", "4"),
+            ("(round 18446744073709551617 2)", "9223372036854775808"),
+            ("(round 18446744073709551619 2)", "9223372036854775810"),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
 }
