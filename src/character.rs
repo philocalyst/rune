@@ -1,7 +1,7 @@
 //! Character and string utilities.
 use crate::core::{
     gc::Context,
-    object::{Gc, Object, OptionalFlag, int_to_char},
+    object::{Gc, Object, ObjectType, OptionalFlag, int_to_char},
 };
 use anyhow::{Result, anyhow, ensure};
 use rune_macros::defun;
@@ -18,8 +18,10 @@ fn max_char(unicode: OptionalFlag) -> usize {
 }
 
 #[defun]
-fn characterp(obj: Object) -> bool {
-    char::try_from(obj).is_ok()
+fn characterp(obj: Object, _ignore: Option<Object>) -> bool {
+    // GNU character codes include surrogates and values beyond Unicode, even
+    // though the current UTF-8 string constructors only support Rust scalars.
+    matches!(obj.untag(), ObjectType::Int(code) if (0..=0x3f_ffff).contains(&code))
 }
 
 #[defun]
@@ -102,5 +104,38 @@ mod m0_make_string_regressions {
             assert!(make_string(length, init, forced, &cx).is_err());
         }
         assert!(make_string(0, 0x110000, None, &cx).is_err());
+    }
+}
+
+#[cfg(test)]
+mod m0_character_predicate_regressions {
+    use super::*;
+    use crate::{
+        core::{gc::RootSet, object::NIL},
+        interpreter::assert_lisp,
+    };
+
+    #[test]
+    fn characterp_uses_gnu_character_code_range_not_unicode_scalars() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for code in [0_i64, 127, 0xd800, 0xdfff, 0x10ffff, 0x110000, 0x3fffff] {
+            assert!(characterp(cx.add(code), None), "code {code}");
+        }
+        for code in [-1_i64, 0x400000, 1_i64 << 26] {
+            assert!(!characterp(cx.add(code), None), "code {code}");
+        }
+        for noncharacter in
+            [NIL, cx.add(65.0_f64), cx.add("a"), cx.add(num_bigint::BigInt::from(i64::MAX))]
+        {
+            assert!(!characterp(noncharacter, None));
+        }
+        drop(cx);
+        assert_lisp("(characterp (max-char))", "t");
+        assert_lisp("(characterp 55296)", "t");
+        assert_lisp("(characterp 1114112)", "t");
+        assert_lisp("(characterp 4194304)", "nil");
+        // The historical optional second argument is accepted but ignored.
+        assert_lisp("(characterp 1114112 t)", "t");
     }
 }
