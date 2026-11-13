@@ -8,6 +8,8 @@ edition = { workspace = true }
 
 [workspace]
 members = [
+  "crates/rune-tree",
+  "crates/rune-text",
   "crates/text-buffer",
   "crates/rune-macros",
   "crates/rune-core",
