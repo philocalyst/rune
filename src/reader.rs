@@ -198,10 +198,15 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    fn get_symbol(&mut self, beg: usize, chr: char) -> Token<'a> {
+    fn get_symbol(&mut self, beg: usize, chr: char) -> Result<Token<'a>> {
         let mut skip = chr == '\\';
         let end = self.skip_till(|c| !escaped(&mut skip, c) && !symbol_char(c));
-        Token::Ident(&self.slice[beg..end])
+        // An unmatched quoting backslash requests another source character.
+        // GNU lread.c:read_symbol signals end-of-file rather than dropping it.
+        if skip {
+            return Err(Error::MissingQuotedItem(end));
+        }
+        Ok(Token::Ident(&self.slice[beg..end]))
     }
 
     /// After having found a `,`, see if the next token is a `@` or not.
@@ -262,7 +267,7 @@ impl<'a> Iterator for Tokenizer<'a> {
             '#' => Ok(Token::Sharp(idx)),
             '?' => self.read_quoted_char(idx),
             '"' => self.get_string(idx),
-            other if symbol_char(other) => Ok(self.get_symbol(idx, other)),
+            other if symbol_char(other) => self.get_symbol(idx, other),
             unknown => Err(Error::UnexpectedChar(unknown, idx)),
         };
         Some(token)
@@ -295,7 +300,11 @@ fn parse_symbol<'a>(slice: &str, cx: &'a Context) -> Object<'a> {
     let digits = integer.strip_prefix(['+', '-']).unwrap_or(integer);
     if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
         if let Ok(num) = integer.parse::<i64>() {
-            return cx.add(num);
+            // The tagged integer payload is narrower than i64. Normalize at
+            // the reader boundary instead of losing high bits while boxing.
+            if (crate::arith::MIN_FIXNUM..=crate::arith::MAX_FIXNUM).contains(&num) {
+                return cx.add(num);
+            }
         }
         if let Ok(num) = BigInt::from_str(integer) {
             return cx.add(num);
@@ -556,13 +565,9 @@ impl<'a, 'ob> Reader<'a, 'ob> {
         let name = match self.tokens.iter.peek().copied() {
             Some((start, chr)) if symbol_char(chr) => {
                 self.tokens.iter.next();
-                let Token::Ident(raw) = self.tokens.get_symbol(start, chr) else {
+                let Token::Ident(raw) = self.tokens.get_symbol(start, chr)? else {
                     unreachable!();
                 };
-                // A final backslash must not silently disappear from a name.
-                if raw.chars().rev().take_while(|chr| *chr == '\\').count() % 2 != 0 {
-                    return Err(Error::MissingQuotedItem(self.tokens.cur_pos()));
-                }
                 symbol_name(raw)
             }
             _ => String::new(),
@@ -859,6 +864,46 @@ baz""#,
 mod m0_reader_regressions {
     use super::*;
     use crate::core::{gc::RootSet, object::ObjectType};
+
+    #[test]
+    fn decimal_literals_normalize_at_fixnum_boundaries() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for value in [crate::arith::MIN_FIXNUM, crate::arith::MAX_FIXNUM] {
+            for source in [value.to_string(), format!("{value}.")] {
+                let object = read(&source, &cx).unwrap().0;
+                assert!(matches!(object.untag(), ObjectType::Int(_)), "{source}");
+                assert_eq!(object, cx.add(value), "{source}");
+            }
+        }
+        for value in
+            [crate::arith::MIN_FIXNUM - 1, crate::arith::MAX_FIXNUM + 1, i64::MIN, i64::MAX]
+        {
+            for source in [value.to_string(), format!("{value}.")] {
+                let object = read(&source, &cx).unwrap().0;
+                assert!(matches!(object.untag(), ObjectType::BigInt(_)), "{source}");
+                assert_eq!(object, cx.add(BigInt::from(value)), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn dangling_symbol_quotes_are_read_errors() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for source in ["\\", "name\\", "(name\\", "#:name\\", "#_name\\"] {
+            assert_eq!(
+                read(source, &cx).unwrap_err(),
+                Error::MissingQuotedItem(source.len()),
+                "{source}"
+            );
+        }
+        // Complete pairs quote an actual backslash and must remain readable.
+        for source in [r"name\\", r"#_name\\"] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(intern("name\\", &cx)));
+        }
+        assert_eq!(read(r"a\ b", &cx).unwrap().0, cx.add(intern("a b", &cx)));
+    }
 
     #[test]
     fn m0_reader_signed_and_large_radix_integers() {

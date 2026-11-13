@@ -109,12 +109,16 @@ impl Interpreter<'_, '_> {
                     && let Some((throw_tag, data)) = self.env.get_exception(id)
                 {
                     let catch_tag = self.env.catch_stack.last().unwrap();
-                    // TODO: Remove binds
                     if catch_tag == throw_tag {
-                        return Ok(data.bind(cx));
+                        // Continue through the common cleanup below: a caught
+                        // throw must not leave its tag active in the environment.
+                        Ok(data.bind(cx))
+                    } else {
+                        Err(e)
                     }
+                } else {
+                    Err(e)
                 }
-                Err(e)
             }
         };
         // pop this tag from the catch stack
@@ -1132,6 +1136,36 @@ mod test {
         // An invalid dotted handler body takes an early return but must never
         // install a handler-variable binding visible to the following form.
         check_interpreter("(let ((e 42)) (progn (condition-case e (if) (error . 7)) e))", 42, cx);
+    }
+
+    #[test]
+    fn m0_catch_unwinds_tags_on_all_exit_paths() {
+        for (source, expected) in [
+            ("(catch 1 7)", Some(7_i64)),
+            ("(catch 1 (throw 1 2))", Some(2)),
+            ("(catch 1 (catch 2 (throw 1 3)))", Some(3)),
+            ("(catch 1 (if))", None),
+        ] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            root!(env, new(Env), cx);
+            let form = crate::reader::read(source, cx).unwrap().0;
+            root!(form, cx);
+            let result = eval(form, None, env, cx);
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), Object::from(expected)),
+                None => assert!(result.is_err()),
+            }
+            assert!(env.catch_stack.is_empty(), "leaked catch tag after {source}");
+            // Reusing the same environment must not find the expired catch.
+            let form = crate::reader::read("(throw 1 9)", cx).unwrap().0;
+            root!(form, cx);
+            let error = eval(form, None, env, cx).unwrap_err();
+            let error = error.downcast::<EvalError>().unwrap();
+            assert!(!matches!(error.error, ErrorType::Throw(_)));
+            assert!(env.catch_stack.is_empty());
+        }
     }
 
     #[test]

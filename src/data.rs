@@ -164,13 +164,29 @@ pub(crate) fn symbolp(object: Object) -> bool {
 }
 
 #[defun]
-pub(crate) fn functionp(object: Object) -> bool {
-    match object.untag() {
+pub(crate) fn functionp(object: Object, cx: &Context) -> Result<bool> {
+    let symbolic = object.is_symbol();
+    let object = resolve_function_chain(object, cx)?;
+    // An autoload is callable through its symbol, not as a raw cons. Its fifth
+    // field marks macro/keymap autoloads, which are not functions (GNU FUNCTIONP).
+    if symbolic
+        && let ObjectType::Cons(cons) = object.untag()
+        && cons.car() == sym::AUTOLOAD
+    {
+        let mut tail = object;
+        for _ in 0..4 {
+            match tail.untag() {
+                ObjectType::Cons(cons) => tail = cons.cdr(),
+                _ => break,
+            }
+        }
+        return Ok(!matches!(tail.untag(), ObjectType::Cons(cons) if !cons.car().is_nil()));
+    }
+    Ok(match object.untag() {
         ObjectType::ByteFn(_) | ObjectType::SubrFn(_) => true,
         ObjectType::Cons(cons) => cons.car() == sym::CLOSURE || cons.car() == sym::LAMBDA,
-        ObjectType::Symbol(sym) => sym.has_func(),
         _ => false,
-    }
+    })
 }
 
 #[defun]
@@ -490,15 +506,37 @@ fn type_of(object: Object) -> Object {
     }
 }
 
-#[defun]
-pub(crate) fn indirect_function<'ob>(object: Object<'ob>, cx: &'ob Context) -> Object<'ob> {
-    match object.untag() {
-        ObjectType::Symbol(sym) => match sym.follow_indirect(cx) {
-            Some(func) => func.into(),
-            None => NIL,
-        },
-        _ => object,
+/// Resolve aliases without recursive calls or an allocation per alias.
+/// GNU's indirect-function detects cycles; a malformed function chain must
+/// cross the Lisp error boundary rather than overflow the Rust stack.
+fn resolve_function_chain<'ob>(object: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
+    fn next<'ob>(object: Object<'ob>, cx: &'ob Context) -> Option<Object<'ob>> {
+        match object.untag() {
+            ObjectType::Symbol(symbol) if !object.is_nil() => {
+                Some(symbol.func(cx).map_or(NIL, Into::into))
+            }
+            _ => None,
+        }
     }
+
+    let mut slow = object;
+    let mut fast = object;
+    loop {
+        let Some(next_fast) = next(fast, cx) else { return Ok(fast) };
+        fast = next_fast;
+        let Some(next_fast) = next(fast, cx) else { return Ok(fast) };
+        fast = next_fast;
+        // If the fast cursor advanced twice, the slow cursor can advance once.
+        slow = next(slow, cx).ok_or_else(|| anyhow!("function chain changed during lookup"))?;
+        if fast.ptr_eq(slow) && fast.is_symbol() && !fast.is_nil() {
+            return Err(anyhow!("cyclic function indirection: {object}"));
+        }
+    }
+}
+
+#[defun]
+pub(crate) fn indirect_function<'ob>(object: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
+    resolve_function_chain(object, cx)
 }
 
 #[defun]
@@ -816,6 +854,75 @@ mod test {
         assert_lisp("(stringp (unibyte-string 255))", "t");
         assert_lisp("(stringp (unibyte-string))", "t");
         assert_lisp("(multibyte-string-p (unibyte-string 255))", "nil");
+    }
+
+    #[test]
+    fn m0_function_predicate_resolves_alias_targets() {
+        for (source, expected) in [
+            ("(progn (fset 'm0-data-alias 'identity) (functionp 'm0-data-alias))", "t"),
+            (
+                "(progn (fset 'm0-data-alias 'm0-data-unbound) (functionp 'm0-data-alias))",
+                "nil",
+            ),
+            (
+                "(progn (fset 'm0-data-macro '(macro lambda nil)) (functionp 'm0-data-macro))",
+                "nil",
+            ),
+            (
+                "(progn (fset 'm0-data-invalid '(not-a-function)) (functionp 'm0-data-invalid))",
+                "nil",
+            ),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn m0_function_predicate_distinguishes_autoload_types_and_raw_lists() {
+        for (source, expected) in [
+            (
+                "(progn (fset 'm0-data-autoload '(autoload \"unused\" nil nil nil)) (functionp 'm0-data-autoload))",
+                "t",
+            ),
+            (
+                "(progn (fset 'm0-data-autoload '(autoload \"unused\" nil nil macro)) (functionp 'm0-data-autoload))",
+                "nil",
+            ),
+            (
+                "(progn (fset 'm0-data-autoload '(autoload \"unused\" nil nil keymap)) (functionp 'm0-data-autoload))",
+                "nil",
+            ),
+            (
+                "(progn (fset 'm0-data-autoload '(autoload \"unused\")) (functionp 'm0-data-autoload))",
+                "t",
+            ),
+            (
+                "(progn (fset 'm0-data-autoload '(autoload \"unused\" nil nil nil)) (fset 'm0-data-autoload-alias 'm0-data-autoload) (functionp 'm0-data-autoload-alias))",
+                "t",
+            ),
+            ("(functionp '(autoload \"unused\" nil nil nil))", "nil"),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn m0_indirect_function_rejects_cycles_without_recursion() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        let a = crate::core::env::intern("m0-data-cycle-a", &cx);
+        let b = crate::core::env::intern("m0-data-cycle-b", &cx);
+        fset(a, cx.add(b)).unwrap();
+        fset(b, cx.add(a)).unwrap();
+        assert!(indirect_function(cx.add(a), &cx).unwrap_err().to_string().contains("cyclic"));
+        assert!(functionp(cx.add(a), &cx).is_err());
+        fmakunbound(a);
+        fmakunbound(b);
+        fset(a, cx.add(a)).unwrap();
+        assert!(indirect_function(cx.add(a), &cx).is_err());
+        fmakunbound(a);
+        assert_eq!(indirect_function(cx.add(a), &cx).unwrap(), NIL);
+        assert_eq!(indirect_function(cx.add(42_i64), &cx).unwrap(), cx.add(42_i64));
     }
 
     #[test]

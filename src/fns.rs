@@ -218,25 +218,21 @@ pub(crate) fn mapcan<'ob>(
 pub(crate) fn mapconcat(
     function: &Rto<Function>,
     sequence: &Rto<Object>,
-    seperator: Option<&Rto<Gc<&LispString>>>,
+    separator: Option<&Rto<Object>>,
     env: &mut Rt<Env>,
     cx: &mut Context,
 ) -> Result<String> {
     let mapped = rebind!(mapcar(function, sequence, env, cx)?);
-    let sep = match seperator {
-        Some(sep) => sep.bind(cx).untag(),
-        _ => "",
-    };
     let mut string = String::new();
     let mut first = true;
     for element in mapped.as_list()? {
-        if first {
-            first = false;
-        } else {
-            string.push_str(sep);
+        if !first {
+            if let Some(separator) = separator {
+                append_character_sequence(&mut string, separator.bind(cx))?;
+            }
         }
-        let element: &str = element?.try_into()?;
-        string.push_str(element);
+        first = false;
+        append_character_sequence(&mut string, element?)?;
     }
     Ok(string)
 }
@@ -554,15 +550,45 @@ pub(crate) fn require<'ob>(
 
 #[defun]
 pub(crate) fn concat(sequences: &[Object]) -> Result<String> {
-    let mut concat = String::new();
-    for elt in sequences {
-        match elt.untag() {
-            ObjectType::String(string) => concat += string,
-            ObjectType::NIL => continue,
-            _ => bail!("Currently only concatenating strings are supported"),
-        }
+    let mut result = String::new();
+    for &sequence in sequences {
+        append_character_sequence(&mut result, sequence)?;
     }
-    Ok(concat)
+    Ok(result)
+}
+
+/// Append characters without interpreting sequence elements as bytes or slicing UTF-8.
+/// Rune's current string representation supports Unicode scalar values only.
+fn append_character_sequence(output: &mut String, sequence: Object) -> Result<()> {
+    let mut append_character = |value: Object| -> Result<()> {
+        let ObjectType::Int(value) = value.untag() else {
+            bail!("concat sequence element must be a character integer");
+        };
+        let character = u32::try_from(value)
+            .ok()
+            .and_then(char::from_u32)
+            .ok_or_else(|| anyhow!("concat character {value} is outside Rune's Unicode range"))?;
+        output.push(character);
+        Ok(())
+    };
+    match sequence.untag() {
+        ObjectType::String(string) => output.push_str(string),
+        ObjectType::NIL => {}
+        ObjectType::Cons(cons) => {
+            for element in cons {
+                append_character(element?)?;
+            }
+        }
+        ObjectType::Vec(vector) => {
+            for element in vector.iter() {
+                append_character(element.get())?;
+            }
+        }
+        // Raw-byte multibyteness needs the string-representation rewrite.
+        ObjectType::ByteString(_) => bail!("concat unibyte strings are not supported yet"),
+        _ => bail!(TypeError::new(Type::Sequence, sequence)),
+    }
+    Ok(())
 }
 
 #[defun]
@@ -1158,6 +1184,44 @@ mod test {
         proptest! {|(string in arb_custom_string("[\x00-\x7F]*"))| {
             assert_elprop![r#"(base64-encode-string {} t)"#, string];
         }};
+    }
+
+    #[test]
+    fn concat_character_sequences() {
+        assert_lisp("(concat)", "\"\"");
+        assert_lisp("(concat nil [] '(65 233) [129408] \"z\")", "\"Aé🦀z\"");
+    }
+
+    #[test]
+    fn mapconcat_character_results_and_separators() {
+        assert_lisp("(mapconcat 'identity '((65) [233] \"🦀\") [45])", "\"A-é-🦀\"");
+        assert_lisp("(mapconcat 'identity '(nil (65) nil) '(45))", "\"-A-\"");
+        assert_lisp("(mapconcat 'identity '((65) (66)))", "\"AB\"");
+        assert_lisp("(mapconcat 'identity nil 42)", "\"\"");
+        assert_lisp("(mapconcat 'identity '((65)) 42)", "\"A\"");
+    }
+
+    #[test]
+    fn concat_preserves_control_characters() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        let sequence = super::slice_into_list(&[0i64.into(), 10i64.into(), 9i64.into()], None, cx);
+        assert_eq!(super::concat(&[sequence]).unwrap(), "\0\n\t");
+    }
+
+    #[test]
+    fn concat_rejects_invalid_character_sequences() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        for character in [-1i64, 0xd800, 0x110000, i64::MAX] {
+            let sequence = crate::core::cons::Cons::new(character, NIL, cx);
+            assert!(super::concat(&[sequence.into()]).is_err());
+        }
+        let dotted = crate::core::cons::Cons::new(65i64, 66i64, cx);
+        assert!(super::concat(&[dotted.into()]).is_err());
+        assert!(super::concat(&[42i64.into()]).is_err());
+        let noncharacter = crate::core::cons::Cons::new(true, NIL, cx);
+        assert!(super::concat(&[noncharacter.into()]).is_err());
     }
 
     #[test]
