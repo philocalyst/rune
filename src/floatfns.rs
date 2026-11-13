@@ -34,6 +34,18 @@ Return DBL_MANT_DIG - DBL_MIN_EXP (the maximum possible valid
 scale) if D is zero or tiny.  Return one greater than that if
 D is infinite, and two greater than that if D is a NaN.  */
 fn double_integer_scale(d: f64) -> i64 {
+    // frexp's exponent is not meaningful for nonfinite inputs. Preserve GNU's
+    // sentinel scales so rescaling rejects them before integer conversion.
+    let maximum = f64::MANTISSA_DIGITS as i64 - f64::MIN_EXP as i64;
+    if d.is_nan() {
+        return maximum + 2;
+    }
+    if d.is_infinite() {
+        return maximum + 1;
+    }
+    if d == 0.0 {
+        return maximum;
+    }
     let exponent = frexp_f(d).1 - 1;
 
     if f64::MIN_EXP as i64 - 1 <= exponent && exponent < i64::MAX {
@@ -52,7 +64,8 @@ fn rescale_for_division(n: NumberValue, nscale: i64, dscale: i64) -> Result<BigI
             if (f64::MANTISSA_DIGITS as i64 - f64::MIN_EXP as i64) < nscale {
                 return Err(anyhow!("Overflow error"));
             }
-            BigInt::from_f64(libm::scalbn(f, nscale as i32)).expect("Conversion error")
+            BigInt::from_f64(libm::scalbn(f, nscale as i32))
+                .ok_or_else(|| anyhow!("Overflow error"))?
         }
         NumberValue::Big(b) => b,
     };
@@ -75,7 +88,13 @@ fn rounding_driver(
     let d = match d {
         None => {
             return Ok(match n {
-                NumberValue::Float(f) => NumberValue::Float(double_round(f)).coerce_integer(),
+                NumberValue::Float(f) => {
+                    let rounded = double_round(f);
+                    if !rounded.is_finite() {
+                        return Err(anyhow!("Overflow error"));
+                    }
+                    NumberValue::Float(rounded).coerce_integer()
+                }
                 other => other,
             });
         }
@@ -405,5 +424,42 @@ mod m0_rounding_regressions {
         ] {
             assert_lisp(source, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod m0_nonfinite_rounding_regressions {
+    use super::*;
+    use crate::{
+        core::gc::{Context, RootSet},
+        interpreter::assert_lisp,
+    };
+
+    #[test]
+    fn integer_rounding_rejects_nonfinite_values_without_panicking() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for operation in [floor, ceiling, round, truncate] {
+            for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                let value = cx.add_as(value);
+                assert!(operation(value, None).is_err());
+                assert!(operation(value, Some(1_i64.into())).is_err());
+                if matches!(value.untag(), NumberType::Float(f) if f.is_nan()) {
+                    assert!(operation(1_i64.into(), Some(value)).is_err());
+                }
+            }
+            for infinity in [f64::INFINITY, f64::NEG_INFINITY] {
+                assert_eq!(
+                    operation(5_i64.into(), Some(cx.add_as(infinity))).unwrap(),
+                    NumberValue::Int(0)
+                );
+                assert!(operation(cx.add_as(infinity), Some(cx.add_as(infinity))).is_err());
+            }
+        }
+        drop(cx);
+        assert_lisp("(condition-case nil (floor 1.0e+INF) (error 'caught))", "caught");
+        assert_lisp("(condition-case nil (truncate 1.0e+INF 1) (error 'caught))", "caught");
+        assert_lisp("(floor 5 1.0e+INF)", "0");
+        assert_lisp("(condition-case nil (ceiling 5 0.0e+NaN) (error 'caught))", "caught");
     }
 }

@@ -140,40 +140,40 @@ impl<'ob> RootedVM<'_, '_, '_> {
     }
 
     fn varref(&mut self, idx: u16, cx: &'ob Context) -> Result<()> {
-        let symbol = self.get_const(idx as usize, cx);
-        if let ObjectType::Symbol(sym) = symbol.untag() {
-            let Some(var) = self.env.vars.get(sym) else { bail!("Void Variable: {sym}") };
-            let var = var.bind(cx);
-            self.env.stack.push(var);
-            Ok(())
-        } else {
-            unreachable!("Varref was not a symbol: {:?}", symbol);
-        }
+        let symbol: Symbol = self.get_const(idx as usize, cx)?.try_into()?;
+        let Some(var) = self.env.vars.get(symbol) else { bail!("Void Variable: {symbol}") };
+        let var = var.bind(cx);
+        self.env.stack.push(var);
+        Ok(())
     }
 
     fn varset(&mut self, idx: usize, cx: &Context) -> Result<()> {
-        let obj = self.get_const(idx, cx);
+        let obj = self.get_const(idx, cx)?;
         let symbol: Symbol = obj.try_into()?;
         let value = self.env.stack.pop(cx);
         crate::data::set(symbol, value, self.env)?;
         Ok(())
     }
 
-    fn varbind(&mut self, idx: u16, cx: &'ob Context) {
+    fn varbind(&mut self, idx: u16, cx: &'ob Context) -> Result<()> {
+        // Validate the constant before consuming a stack value.
+        let symbol: Symbol = self.get_const(idx as usize, cx)?.try_into()?;
         let value = self.env.stack.pop(cx);
-        let symbol = self.get_const(idx as usize, cx);
-        let ObjectType::Symbol(sym) = symbol.untag() else {
-            unreachable!("Varbind was not a symbol: {:?}", symbol)
-        };
-        self.env.varbind(sym, value, cx);
+        self.env.varbind(symbol, value, cx);
+        Ok(())
     }
 
     fn unbind(&mut self, idx: u16, cx: &'ob Context) {
         self.env.unbind(idx, cx);
     }
 
-    fn get_const(&self, i: usize, cx: &'ob Context) -> Object<'ob> {
-        *self.func.bind(cx).consts().get(i).expect("constant had invalid index")
+    fn get_const(&self, i: usize, cx: &'ob Context) -> Result<Object<'ob>> {
+        self.func
+            .bind(cx)
+            .consts()
+            .get(i)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Invalid bytecode constant index: {i}"))
     }
 
     fn set_current_frame(&mut self, f: &ByteFn, offset: usize) {
@@ -375,19 +375,19 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let idx = self.pc.arg2();
                     self.varset(idx.into(), cx)?;
                 }
-                op::VarBind0 => self.varbind(0, cx),
-                op::VarBind1 => self.varbind(1, cx),
-                op::VarBind2 => self.varbind(2, cx),
-                op::VarBind3 => self.varbind(3, cx),
-                op::VarBind4 => self.varbind(4, cx),
-                op::VarBind5 => self.varbind(5, cx),
+                op::VarBind0 => self.varbind(0, cx)?,
+                op::VarBind1 => self.varbind(1, cx)?,
+                op::VarBind2 => self.varbind(2, cx)?,
+                op::VarBind3 => self.varbind(3, cx)?,
+                op::VarBind4 => self.varbind(4, cx)?,
+                op::VarBind5 => self.varbind(5, cx)?,
                 op::VarBindN => {
                     let idx = self.pc.arg1();
-                    self.varbind(idx, cx);
+                    self.varbind(idx, cx)?;
                 }
                 op::VarBindN2 => {
                     let idx = self.pc.arg2();
-                    self.varbind(idx, cx);
+                    self.varbind(idx, cx)?;
                 }
                 op::Call0 => self.call(0, cx)?,
                 op::Call1 => self.call(1, cx)?,
@@ -639,7 +639,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::EndOfLine => return Err(self.unsupported_opcode(op, cx)),
                 op::ConstantN2 => {
                     let idx = self.pc.arg2();
-                    let cnst = self.get_const(idx.into(), cx);
+                    let cnst = self.get_const(idx.into(), cx)?;
                     self.env.stack.push(cnst);
                 }
                 op::Goto => {
@@ -866,7 +866,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 | op::Constant62
                 | op::Constant63 => {
                     let idx = (op as u8) - (op::Constant0 as u8);
-                    let cnst = self.get_const(idx as usize, cx);
+                    let cnst = self.get_const(idx as usize, cx)?;
                     self.env.stack.push(cnst);
                 }
             }
@@ -1019,6 +1019,40 @@ mod test {
         let val = rebind!(call(bytecode, frame.arg_count(), "test", frame, cx).unwrap());
         let expect = expect.bind(cx);
         assert_eq!(val, expect);
+    }
+
+    #[test]
+    fn m0_invalid_constant_indices_return_errors_before_stack_access() {
+        use OpCode as O;
+        for opcode in [O::Constant0, O::VarRef0, O::VarSet0, O::VarBind0, O::ConstantN2] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            // Operand bytes are present, but no constants or stack values are.
+            make_bytecode!(bytecode, 0, [opcode, 0xff, 0xff], [], cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let error = call(bytecode, 0, "invalid-constant", frame, cx).unwrap_err();
+            assert!(error.to_string().contains("Invalid bytecode constant index:"));
+        }
+    }
+
+    #[test]
+    fn m0_variable_opcodes_reject_nonsymbol_constants() {
+        use OpCode as O;
+        for opcode in [O::VarRef0, O::VarSet0, O::VarBind0] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            // An invalid symbol must signal before VarSet/VarBind pop an empty stack.
+            make_bytecode!(bytecode, 0, [opcode, O::Return], [7], cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let error = call(bytecode, 0, "nonsymbol-constant", frame, cx).unwrap_err();
+            assert!(matches!(error.error, ErrorType::Err(_)));
+        }
     }
 
     #[test]
