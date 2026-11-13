@@ -198,26 +198,30 @@ pub fn get_text_property<'ob>(
     textget(props, prop)
 }
 
+/// Return (VALUE . OVERLAY). Rune currently has no overlays/windows, so the
+/// supported buffer case follows GNU's text-property fallback with a nil cdr.
 #[defun]
-#[allow(unused)]
 pub fn get_char_property_and_overlay<'ob>(
     position: usize,
     prop: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &'ob mut Rt<Env>,
+    cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    todo!()
+    let value = get_text_property(position, prop, object, env)?;
+    Ok(Cons::new(value, NIL, cx).into())
 }
 
+/// Read a character property from supported buffer text. Overlay/window
+/// precedence and string properties require their respective data models.
 #[defun]
-#[allow(unused)]
 pub fn get_char_property<'ob>(
     position: usize,
     prop: Object<'ob>,
-    object: Object<'ob>,
+    object: Option<Object<'ob>>,
     env: &'ob mut Rt<Env>,
 ) -> Result<Object<'ob>> {
-    todo!()
+    get_text_property(position, prop, object, env)
 }
 
 // TODO also missing `next-char-property-change` and 3 other similar functions.
@@ -1347,6 +1351,43 @@ mod tests {
         crate::interpreter::assert_lisp(
             "(progn (insert \"abcdef\") (put-text-property 2 5 'a 1) (list (next-property-change 1 nil t) (next-property-change 2 nil t) (next-property-change 5 nil t)))",
             "(2 5 7)",
+        );
+    }
+
+    #[test]
+    fn roadmap_m0_character_property_text_fallback_preserves_identity() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        env.current_buffer.get_mut().insert(cx.add("é🙂"))?;
+        let key: Object = intern("roadmap-char-property-key", &cx).into();
+        let value = cx.add("identity");
+        put_text_property(1, 3, key, value, None, env, &cx)?;
+        assert!(eq(get_char_property(2, key, None, env)?, value));
+        let pair = get_char_property_and_overlay(1, key, None, env, &cx)?;
+        assert!(eq(pair.cons().unwrap().car(), value));
+        assert!(pair.cons().unwrap().cdr().is_nil());
+        assert!(get_char_property(3, key, None, env)?.is_nil());
+        assert_eq!(get_char_property_and_overlay(3, key, None, env, &cx)?.to_string(), "(nil)");
+        assert!(get_char_property(0, key, None, env).is_err());
+        assert!(get_char_property_and_overlay(4, key, None, env, &cx).is_err());
+        let other = get_buffer_create(cx.add("roadmap-char-property-other"), None, &cx)?;
+        other.buffer().unwrap().lock()?.insert(cx.add("x"))?;
+        assert!(get_char_property(1, key, Some(other), env)?.is_nil());
+        assert_eq!(
+            get_char_property_and_overlay(1, key, Some(other), env, &cx)?.to_string(),
+            "(nil)"
+        );
+        assert!(get_char_property(1, key, Some(cx.add(42)), env).is_err());
+        assert!(get_char_property(0, key, Some(cx.add("string")), env).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_character_property_text_fallback_lisp_results() {
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (put-text-property 1 3 'a 7) (list (get-char-property 1 'a) (get-char-property 1 'a nil) (get-char-property-and-overlay 1 'a) (get-char-property-and-overlay 3 'a nil) (get-char-property 4 'a)))",
+            "(7 7 (7) (nil) nil)",
         );
     }
 

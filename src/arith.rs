@@ -46,10 +46,12 @@ impl NumberValue {
     pub fn coerce_integer(self) -> NumberValue {
         match self {
             NumberValue::Float(x) => {
-                if x.is_finite() && x <= MAX_FIXNUM as f64 && x >= MIN_FIXNUM as f64 {
-                    NumberValue::Int(x as i64)
-                } else {
-                    NumberValue::Big(BigInt::from_f64(x).unwrap_or_else(BigInt::zero))
+                // MAX_FIXNUM rounds upward when cast to f64. Check the
+                // converted integer instead, or the first bignum is clamped
+                // back to the largest fixnum when it is tagged.
+                match x.to_i64().filter(|value| (MIN_FIXNUM..=MAX_FIXNUM).contains(value)) {
+                    Some(value) => NumberValue::Int(value),
+                    None => NumberValue::Big(BigInt::from_f64(x).unwrap_or_else(BigInt::zero)),
                 }
             }
             NumberValue::Big(x) => x
@@ -470,6 +472,37 @@ mod test {
             ("(1+ 36028797018963967)", "36028797018963968"),
             ("(1- -36028797018963968)", "-36028797018963969"),
             ("(eq (- 36028797018963968 1) 36028797018963967)", "t"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn m0_float_to_integer_checks_exact_tagged_bounds() {
+        let first_positive_bignum = -(MIN_FIXNUM as f64);
+        assert_eq!(
+            NumberValue::Float(first_positive_bignum).coerce_integer(),
+            NumberValue::Big(-BigInt::from(MIN_FIXNUM))
+        );
+        assert_eq!(
+            NumberValue::Float(MIN_FIXNUM as f64).coerce_integer(),
+            NumberValue::Int(MIN_FIXNUM)
+        );
+        assert_eq!(
+            NumberValue::Float(first_positive_bignum - 4.0).coerce_integer(),
+            NumberValue::Int(-MIN_FIXNUM - 4)
+        );
+        assert_eq!(
+            NumberValue::Float(MIN_FIXNUM as f64 - 8.0).coerce_integer(),
+            NumberValue::Big(BigInt::from(MIN_FIXNUM) - 8_u8)
+        );
+        assert_eq!(NumberValue::Float(-1.9).coerce_integer(), NumberValue::Int(-1));
+        for (source, expected) in [
+            ("(truncate 36028797018963968.0)", "36028797018963968"),
+            ("(floor 36028797018963968.0)", "36028797018963968"),
+            ("(ceiling 36028797018963968.0)", "36028797018963968"),
+            ("(round 36028797018963968.0)", "36028797018963968"),
+            ("(truncate -36028797018963976.0)", "-36028797018963976"),
         ] {
             crate::interpreter::assert_lisp(source, expected);
         }
