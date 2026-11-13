@@ -142,8 +142,9 @@ impl<'ob> IntervalTree<'ob> {
         end: usize,
         list_of_props: Object<'ob>,
         cx: &'ob Context,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let props: Vec<_> = list_of_props.as_list()?.collect::<Result<_, _>>()?;
+        let mut changed = false;
         // Validate all affected lists before apply_with_split can mutate anything.
         for (_, value) in self.iter(start, end) {
             if value.is_nil() {
@@ -153,6 +154,10 @@ impl<'ob> IntervalTree<'ob> {
             for &sym in &props {
                 result = remove_sym_from_props(sym, result, cx)?;
             }
+            changed |= !eq(value, result);
+        }
+        if !changed {
+            return Ok(false);
         }
         self.tree.apply_with_split(
             |val| {
@@ -166,7 +171,7 @@ impl<'ob> IntervalTree<'ob> {
             start..end,
         );
         self.clean();
-        Ok(())
+        Ok(true)
     }
 
     pub fn clean(&mut self) {

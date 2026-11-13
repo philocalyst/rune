@@ -676,16 +676,19 @@ impl Interpreter<'_, '_> {
                         _ => unreachable!("Error type throw was not handled"),
                     };
 
-                    let binding = Cons::new(var, error, cx);
-                    self.vars.push(binding);
                     let list: List = match cons.cdr().try_into() {
                         Ok(x) => x,
                         Err(_) => return Ok(NIL),
                     };
+                    let previous_bindings = self.vars.len();
+                    let binding = Cons::new(var, error, cx);
+                    self.vars.push(binding);
                     rooted_iter!(handlers, list, cx);
-                    let result = self.implicit_progn(handlers, cx)?;
-                    self.vars.pop();
-                    return Ok(result);
+                    // Errors and throws from the handler must unwind its error
+                    // variable too. Do not propagate with `?` before cleanup.
+                    let result = self.implicit_progn(handlers, cx);
+                    self.vars.truncate(previous_bindings);
+                    return result;
                 }
                 ObjectType::NIL => {}
                 invalid => bail_err!("Invalid condition handler: {invalid}"),
@@ -1105,6 +1108,30 @@ mod test {
         check_error("(condition-case nil (if))", cx);
         check_error("(condition-case nil (if) nil)", cx);
         check_error("(condition-case nil (if) 5 (error 7))", cx);
+    }
+
+    #[test]
+    fn m0_condition_case_unwinds_handler_variable_on_error_and_throw() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        check_interpreter(
+            "(let ((e 42)) (condition-case nil (condition-case e (if) (error (if))) (error e)))",
+            42,
+            cx,
+        );
+        check_interpreter(
+            "(let ((e 42)) (progn (catch 'tag (condition-case e (if) (error (throw 'tag 9)))) e))",
+            42,
+            cx,
+        );
+        check_interpreter(
+            "(let ((e 42)) (condition-case nil (condition-case e (if) (error (garbage-collect) (if))) (error e)))",
+            42,
+            cx,
+        );
+        // An invalid dotted handler body takes an early return but must never
+        // install a handler-variable binding visible to the following form.
+        check_interpreter("(let ((e 42)) (progn (condition-case e (if) (error . 7)) e))", 42, cx);
     }
 
     #[test]

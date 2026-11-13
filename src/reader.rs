@@ -269,22 +269,19 @@ impl<'a> Iterator for Tokenizer<'a> {
     }
 }
 
+/// Remove reader quoting without applying number parsing or symbol shorthands.
+fn symbol_name(symbol: &str) -> String {
+    let mut chars = symbol.chars();
+    let mut name = String::with_capacity(symbol.len());
+    while let Some(chr) = chars.next() {
+        name.push(if chr == '\\' { chars.next().unwrap_or(chr) } else { chr });
+    }
+    name
+}
+
 fn intern_symbol<'ob>(symbol: &str, cx: &'ob Context) -> Symbol<'ob> {
-    let mut escaped = false;
-    let is_not_escape = |c: &char| {
-        if escaped {
-            escaped = false;
-            true
-        } else if *c == '\\' {
-            escaped = true;
-            false
-        } else {
-            true
-        }
-    };
     if symbol.contains('\\') {
-        let escaped_slice: String = symbol.chars().filter(is_not_escape).collect();
-        intern(escaped_slice.as_str(), cx)
+        intern(&symbol_name(symbol), cx)
     } else {
         intern(symbol, cx)
     }
@@ -533,13 +530,49 @@ impl<'a, 'ob> Reader<'a, 'ob> {
             return Err(Error::ParseInt(radix, pos));
         }
 
-        match self.tokens.next() {
-            Some(Ok(Token::Ident(ident))) => match usize::from_str_radix(ident, radix.into()) {
-                Ok(x) => Ok(self.cx.add(x as i64)),
-                Err(_) => Err(Error::ParseInt(radix, pos)),
-            },
-            _ => Err(Error::ParseInt(radix, pos)),
+        // Radix syntax does not skip whitespace between the prefix and digits
+        // (GNU lread.c:read_integer). Preserve arbitrary precision and signs.
+        let start = self.tokens.cur_pos();
+        let end = self.tokens.skip_till(|chr| !symbol_char(chr));
+        let ident = &self.tokens.slice[start..end];
+        let digits = ident.strip_prefix(['+', '-']).unwrap_or(ident);
+        if digits.is_empty() || !digits.chars().all(|chr| chr.is_digit(radix.into())) {
+            return Err(Error::ParseInt(radix, pos));
         }
+        if let Ok(value) = i64::from_str_radix(ident, radix.into()) {
+            if (crate::arith::MIN_FIXNUM..=crate::arith::MAX_FIXNUM).contains(&value) {
+                return Ok(self.cx.add(value));
+            }
+        }
+        match BigInt::parse_bytes(ident.as_bytes(), radix.into()) {
+            Some(value) => Ok(self.cx.add(value)),
+            None => Err(Error::ParseInt(radix, pos)),
+        }
+    }
+
+    /// Read a symbol after #: or #_. These dispatch forms never read numbers;
+    /// an absent name denotes the empty symbol without consuming its delimiter.
+    fn read_sharp_symbol(&mut self, uninterned: bool) -> Result<Object<'ob>> {
+        let name = match self.tokens.iter.peek().copied() {
+            Some((start, chr)) if symbol_char(chr) => {
+                self.tokens.iter.next();
+                let Token::Ident(raw) = self.tokens.get_symbol(start, chr) else {
+                    unreachable!();
+                };
+                // A final backslash must not silently disappear from a name.
+                if raw.chars().rev().take_while(|chr| *chr == '\\').count() % 2 != 0 {
+                    return Err(Error::MissingQuotedItem(self.tokens.cur_pos()));
+                }
+                symbol_name(raw)
+            }
+            _ => String::new(),
+        };
+        let symbol = if uninterned {
+            Symbol::new_uninterned(&name, self.cx)
+        } else {
+            intern(&name, self.cx)
+        };
+        Ok(self.cx.add(symbol))
     }
 
     /// read a sharp quoted character. This could be used for reader macro's in
@@ -557,14 +590,17 @@ impl<'a, 'ob> Reader<'a, 'ob> {
                 }
                 None => Err(Error::MissingQuotedItem(pos)),
             },
-            Some('b') => self.read_radix(pos, 2),
-            Some('o') => self.read_radix(pos, 8),
-            Some('x') => self.read_radix(pos, 16),
+            Some('b' | 'B') => self.read_radix(pos, 2),
+            Some('o' | 'O') => self.read_radix(pos, 8),
+            Some('x' | 'X') => self.read_radix(pos, 16),
+            Some(':') => self.read_sharp_symbol(true),
+            Some('_') => self.read_sharp_symbol(false),
+            Some('#') => Ok(self.cx.add(intern("", self.cx))),
             Some(chr) if chr.is_ascii_digit() => {
                 let mut radix = (chr as u8) - b'0';
                 loop {
                     match self.tokens.read_char() {
-                        Some('r') => break,
+                        Some('r' | 'R') => break,
                         Some(chr) if chr.is_ascii_digit() => {
                             match radix
                                 .checked_mul(10)
@@ -823,6 +859,65 @@ baz""#,
 mod m0_reader_regressions {
     use super::*;
     use crate::core::{gc::RootSet, object::ObjectType};
+
+    #[test]
+    fn m0_reader_signed_and_large_radix_integers() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, value) in [
+            ("#x-ff", -255_i64),
+            ("#X+FF", 255),
+            ("#B-10", -2),
+            ("#O+77", 63),
+            ("#16R-fF", -255),
+            ("#36rZ", 35),
+        ] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(value), "{source}");
+        }
+        for (source, digits, radix) in [
+            ("#x7fffffffffffffff", "7fffffffffffffff", 16),
+            ("#x-8000000000000000", "-8000000000000000", 16),
+            ("#x10000000000000000", "10000000000000000", 16),
+            ("#x-10000000000000000", "-10000000000000000", 16),
+            (
+                "#2r11111111111111111111111111111111111111111111111111111111111111111",
+                "11111111111111111111111111111111111111111111111111111111111111111",
+                2,
+            ),
+        ] {
+            let ObjectType::BigInt(actual) = read(source, &cx).unwrap().0.untag() else {
+                panic!("large radix integer must not wrap: {source}");
+            };
+            let expected = cx.add(BigInt::parse_bytes(digits.as_bytes(), radix).unwrap());
+            assert_eq!(cx.add(actual), expected, "{source}");
+        }
+        for source in ["#x ff", "#x\n10", "#b;comment\n10", "#x+", "#x-", "#b2", "#xfg"] {
+            assert!(matches!(read(source, &cx), Err(Error::ParseInt(_, 0))), "{source}");
+        }
+        assert_eq!(read("#Xff next", &cx).unwrap(), (cx.add(255_i64), 4));
+    }
+
+    #[test]
+    fn m0_reader_sharp_symbol_dispatch() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, name) in
+            [("#:alpha", "alpha"), ("#:123", "123"), (r"#:a\ b", "a b"), ("#:", "")]
+        {
+            let ObjectType::Symbol(first) = read(source, &cx).unwrap().0.untag() else {
+                panic!("uninterned dispatch must read a symbol");
+            };
+            assert_eq!(first.name(), name);
+            assert_ne!(cx.add(first), cx.add(intern(name, &cx)));
+            assert_ne!(cx.add(first), read(source, &cx).unwrap().0);
+        }
+        for (source, name) in [("##", ""), ("#_123", "123"), ("#_", ""), (r"#_a\ b", "a b")] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(intern(name, &cx)), "{source}");
+        }
+        // An empty name leaves the closing delimiter to the surrounding reader.
+        assert_eq!(read("[#: ## #_123]", &cx).unwrap().1, 13);
+        assert_eq!(read("#: next", &cx).unwrap().1, 2);
+    }
 
     #[test]
     fn m0_reader_rust_float_words_remain_symbols() {

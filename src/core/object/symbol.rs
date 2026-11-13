@@ -218,8 +218,8 @@ impl SymbolCell {
     }
 
     fn new_normal(name: &'static str, block: &Block<true>) -> Self {
-        // We have to do this workaround because starts_with is not const
-        if name.as_bytes()[0] == b':' {
+        // The empty name is a valid interned symbol (reader syntax ##).
+        if matches!(name.as_bytes().first(), Some(b':')) {
             Self::new_const(name, block)
         } else {
             Self(GcHeap::new(
@@ -234,8 +234,8 @@ impl SymbolCell {
     }
 
     pub(in crate::core) const fn new_static(name: &'static str) -> Self {
-        // We have to do this workaround because starts_with is not const
-        if name.as_bytes()[0] == b':' {
+        // The empty name is a valid interned symbol (reader syntax ##).
+        if matches!(name.as_bytes().first(), Some(b':')) {
             Self::new_static_const(name)
         } else {
             Self(GcHeap::new_pure(SymbolCellData {
@@ -389,5 +389,22 @@ impl UninternedSymbolMap {
 
     pub(in crate::core) fn clear(&self) {
         self.map.borrow_mut().clear();
+    }
+}
+
+#[cfg(test)]
+mod empty_name_regressions {
+    use crate::core::{
+        env::intern,
+        gc::{Context, RootSet},
+    };
+
+    #[test]
+    fn empty_named_symbol_can_be_interned_repeatedly() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let symbol = intern("", &cx);
+        assert_eq!(symbol.name(), "");
+        assert_eq!(symbol, intern("", &cx));
     }
 }

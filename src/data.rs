@@ -180,7 +180,7 @@ pub(crate) fn subrp(object: Object) -> bool {
 
 #[defun]
 pub(crate) fn stringp(object: Object) -> bool {
-    object.is_string()
+    matches!(object.untag(), ObjectType::String(_) | ObjectType::ByteString(_))
 }
 
 #[defun]
@@ -259,7 +259,6 @@ pub(crate) fn multibyte_string_p(object: Object) -> bool {
 
 #[defun]
 fn string_to_number<'ob>(string: &str, base: Option<i64>, cx: &'ob Context) -> Result<Number<'ob>> {
-    // TODO: Handle trailing characters, which should be ignored
     let base = base.unwrap_or(10);
     // GNU's string-to-number allows 2..=16, unlike the reader's #Nr syntax.
     // Validate before narrowing: Rust's parser panics on some invalid bases,
@@ -267,14 +266,82 @@ fn string_to_number<'ob>(string: &str, base: Option<i64>, cx: &'ob Context) -> R
     if !(2..=16).contains(&base) {
         return Err(anyhow!("base {base} is out of range; expected 2 through 16"));
     }
-    let string = string.trim();
-    Ok(match i64::from_str_radix(string, base as u32) {
-        Ok(x) => x.into(),
-        Err(_) => match string.parse::<f64>() {
-            Ok(x) => cx.add_as(x),
-            Err(_) => 0.into(),
-        },
-    })
+    let base = base as u32;
+    // Only space and tab are skipped, not Rust's wider Unicode whitespace set.
+    let string = string.trim_start_matches([' ', '\t']);
+    let bytes = string.as_bytes();
+    let sign = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut end = sign;
+    while bytes.get(end).is_some_and(|byte| char::from(*byte).is_digit(base)) {
+        end += 1;
+    }
+    let integer_end = end;
+    let leading_digits = end > sign;
+    if base == 10 {
+        let mut fraction = false;
+        if bytes.get(end) == Some(&b'.') {
+            end += 1;
+            let fraction_start = end;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            fraction = end > fraction_start;
+        }
+        let mut exponent = false;
+        let mut special = None;
+        if matches!(bytes.get(end), Some(b'e' | b'E')) {
+            let exponent_start = end;
+            end += 1;
+            if matches!(bytes.get(end), Some(b'+' | b'-')) {
+                end += 1;
+            }
+            let exponent_digits = end;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            exponent = end > exponent_digits;
+            if !exponent && bytes.get(exponent_digits - 1) == Some(&b'+') {
+                let tail = &string[exponent_digits..];
+                special = if tail.starts_with("INF") {
+                    Some(f64::INFINITY)
+                } else if tail.starts_with("NaN") {
+                    Some(f64::NAN)
+                } else {
+                    None
+                };
+                exponent = special.is_some();
+            }
+            if !exponent {
+                end = exponent_start;
+            }
+        }
+        if fraction || (leading_digits && exponent) {
+            let value = match special {
+                Some(value) => {
+                    if string.starts_with('-') {
+                        -value
+                    } else {
+                        value
+                    }
+                }
+                None => string[..end].parse::<f64>()?,
+            };
+            return Ok(cx.add_as(value));
+        }
+    }
+    if !leading_digits {
+        return Ok(0.into());
+    }
+    let integer = &string[..integer_end];
+    if let Ok(value) = i64::from_str_radix(integer, base) {
+        // i64 is wider than the tagged fixnum; normalize before boxing.
+        if (crate::arith::MIN_FIXNUM..=crate::arith::MAX_FIXNUM).contains(&value) {
+            return Ok(value.into());
+        }
+    }
+    let value = num_bigint::BigInt::parse_bytes(integer.as_bytes(), base)
+        .ok_or_else(|| anyhow!("invalid integer prefix"))?;
+    Ok(cx.add_as(value))
 }
 
 #[defun]
@@ -636,6 +703,54 @@ mod test {
     }
 
     #[test]
+    fn m0_string_to_number_reads_numeric_prefixes() {
+        for (source, expected) in [
+            (r#"(string-to-number "123suffix")"#, "123"),
+            (r#"(string-to-number "  \t-12tail")"#, "-12"),
+            (r#"(string-to-number "1.5tail")"#, "1.5"),
+            (r#"(string-to-number ".5e2tail")"#, "50.0"),
+            (r#"(string-to-number "1e+2tail")"#, "100.0"),
+            (r#"(string-to-number "1e+tail")"#, "1"),
+            (r#"(string-to-number "1.5e+tail")"#, "1.5"),
+            (r#"(string-to-number "1.tail")"#, "1"),
+            (r#"(string-to-number "ff.tail" 16)"#, "255"),
+            (r#"(string-to-number "1.5" 16)"#, "1"),
+            (r#"(string-to-number "1e2" 16)"#, "482"),
+            (r#"(string-to-number "102" 2)"#, "2"),
+            (r#"(string-to-number "9223372036854775808tail")"#, "9223372036854775808"),
+            (r#"(string-to-number "-9223372036854775809tail")"#, "-9223372036854775809"),
+            (r#"(string-to-number "fffffffffffffffftail" 16)"#, "18446744073709551615"),
+            (r#"(string-to-number "inf")"#, "0"),
+            (r#"(string-to-number "NaN")"#, "0"),
+            (r#"(string-to-number "\n12")"#, "0"),
+            (r#"(string-to-number "\u00a012")"#, "0"),
+            (r#"(string-to-number "+")"#, "0"),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn m0_string_to_number_preserves_special_float_class_and_sign() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, nan, negative) in [
+            ("1.0e+INFtail", false, false),
+            ("-1.0e+INFtail", false, true),
+            ("0.0e+NaNtail", true, false),
+            ("-0.0e+NaNtail", true, true),
+            ("-0.0tail", false, true),
+        ] {
+            let number = string_to_number(source, None, &cx).unwrap();
+            let crate::core::object::NumberType::Float(value) = number.untag() else {
+                panic!("expected float for {source}");
+            };
+            assert_eq!(value.is_nan(), nan, "{source}");
+            assert_eq!(value.is_sign_negative(), negative, "{source}");
+        }
+    }
+
+    #[test]
     fn m0_numeric_predicates_include_bignums() {
         let roots = crate::core::gc::RootSet::default();
         let cx = Context::new(&roots);
@@ -680,6 +795,27 @@ mod test {
         assert_lisp("(type-of 9223372036854775808)", "integer");
         assert_lisp("(type-of -9223372036854775809)", "integer");
         assert_lisp("(type-of 1.5)", "float");
+    }
+
+    #[test]
+    fn m0_stringp_accepts_multibyte_and_unibyte_strings() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        for string in [cx.add(""), cx.add("a\u{e9}\u{1f600}")] {
+            assert!(stringp(string));
+            assert!(multibyte_string_p(string));
+        }
+        for bytes in [cx.add(Vec::<u8>::new()), cx.add(vec![0_u8, 0x80, 0xff])] {
+            assert!(stringp(bytes));
+            assert!(!multibyte_string_p(bytes));
+        }
+        for nonstring in [NIL, cx.add(1_i64), cx.add(vec![cx.add(1_i64)])] {
+            assert!(!stringp(nonstring));
+        }
+        drop(cx);
+        assert_lisp("(stringp (unibyte-string 255))", "t");
+        assert_lisp("(stringp (unibyte-string))", "t");
+        assert_lisp("(multibyte-string-p (unibyte-string 255))", "nil");
     }
 
     #[test]

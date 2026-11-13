@@ -151,16 +151,18 @@ pub(crate) fn mapcar<'ob>(
             // TODO: remove this intermediate vector
             Ok(slice_into_list(Rt::bind_slice(outputs, cx), None, cx))
         }
-        ObjectType::ByteFn(fun) => {
-            let len = fun.len();
-            root!(fun, cx);
+        ObjectType::Vec(_)
+        | ObjectType::String(_)
+        | ObjectType::ByteString(_)
+        | ObjectType::ByteFn(_) => {
+            let len = length(sequence)?;
+            root!(array, sequence, cx);
             root!(outputs, new(Vec), cx);
             for i in 0..len {
-                let val = fun.bind(cx).index(i, cx).unwrap();
+                let val = aref(array.bind(cx), i, cx)?;
                 let output = call!(function, val; env, cx)?;
                 outputs.push(output);
             }
-            // TODO: remove this intermediate vector
             Ok(slice_into_list(Rt::bind_slice(outputs, cx), None, cx))
         }
         _ => Err(TypeError::new(Type::Sequence, sequence).into()),
@@ -170,20 +172,31 @@ pub(crate) fn mapcar<'ob>(
 #[defun]
 pub(crate) fn mapc<'ob>(
     function: &Rto<Function>,
-    sequence: &Rto<List>,
+    sequence: &Rto<Object>,
     env: &mut Rt<Env>,
     cx: &'ob mut Context,
 ) -> Result<Object<'ob>> {
-    match sequence.untag(cx) {
-        ListType::Nil => Ok(NIL),
-        ListType::Cons(cons) => {
+    match sequence.bind(cx).untag() {
+        ObjectType::NIL => {}
+        ObjectType::Cons(cons) => {
             rooted_iter!(elements, cons, cx);
             while let Some(elem) = elements.next()? {
                 call!(function, elem; env, cx)?;
             }
-            Ok(sequence.bind(cx).into())
         }
+        ObjectType::Vec(_)
+        | ObjectType::String(_)
+        | ObjectType::ByteString(_)
+        | ObjectType::ByteFn(_) => {
+            let len = length(sequence.bind(cx))?;
+            for i in 0..len {
+                let val = aref(sequence.bind(cx), i, cx)?;
+                call!(function, val; env, cx)?;
+            }
+        }
+        _ => return Err(TypeError::new(Type::Sequence, sequence.bind(cx)).into()),
     }
+    Ok(sequence.bind(cx))
 }
 
 #[defun]
@@ -1145,6 +1158,21 @@ mod test {
         proptest! {|(string in arb_custom_string("[\x00-\x7F]*"))| {
             assert_elprop![r#"(base64-encode-string {} t)"#, string];
         }};
+    }
+
+    #[test]
+    fn mapping_array_sequences() {
+        assert_lisp("(mapcar 'identity [1 2 3])", "(1 2 3)");
+        assert_lisp("(mapcar 'identity \"é🦀\")", "(233 129408)");
+        assert_lisp("(mapcar 'identity [])", "nil");
+        assert_lisp("(mapcar 'identity \"\")", "nil");
+        assert_lisp("(let ((v [1 2])) (eq (mapc 'identity v) v))", "t");
+        assert_lisp("(let ((s \"é🦀\")) (eq (mapc 'identity s) s))", "t");
+        assert_lisp(
+            "(let ((result nil)) (mapc #'(lambda (x) (setq result (cons x result))) [1 2 3]) result)",
+            "(3 2 1)",
+        );
+        assert_lisp("(mapcan #'(lambda (x) (list x x)) [1 2])", "(1 1 2 2)");
     }
 
     #[test]

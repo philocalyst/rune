@@ -129,7 +129,16 @@ impl<'brw, 'env> IntoRoot<VM<'brw, 'env, 'static>> for VM<'brw, 'env, '_> {
     }
 }
 
+defsym!(RUNE_UNIMPLEMENTED);
+
 impl<'ob> RootedVM<'_, '_, '_> {
+    /// Unsupported operations must cross the normal Lisp error boundary, not
+    /// unwind the Rust process. Opcode semantics remain deliberately unimplemented.
+    fn unsupported_opcode(&mut self, opcode: opcode::OpCode, cx: &Context) -> EvalError {
+        let data = Cons::new1(cx.add(format!("Unsupported bytecode opcode: {opcode:?}")), cx);
+        EvalError::signal(sym::RUNE_UNIMPLEMENTED.into(), data.into(), self.env)
+    }
+
     fn varref(&mut self, idx: u16, cx: &'ob Context) -> Result<()> {
         let symbol = self.get_const(idx as usize, cx);
         if let ObjectType::Symbol(sym) = symbol.untag() {
@@ -422,7 +431,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     };
                     self.handlers.push(handler);
                 }
-                op::PushCatch => todo!("PushCatch bytecode"),
+                op::PushCatch => return Err(self.unsupported_opcode(op, cx)),
                 op::Nth => {
                     let list = self.env.stack.pop(cx);
                     let top = self.env.stack.top();
@@ -534,10 +543,10 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let value = data::get(top, prop, self.env, cx);
                     self.env.stack.top().set(value);
                 }
-                op::Substring => todo!("Substring bytecode"),
-                op::Concat2 => todo!("Concat2 bytecode"),
-                op::Concat3 => todo!("Concat3 bytecode"),
-                op::Concat4 => todo!("Concat4 bytecode"),
+                op::Substring => return Err(self.unsupported_opcode(op, cx)),
+                op::Concat2 => return Err(self.unsupported_opcode(op, cx)),
+                op::Concat3 => return Err(self.unsupported_opcode(op, cx)),
+                op::Concat4 => return Err(self.unsupported_opcode(op, cx)),
                 op::Sub1 => {
                     let top = self.env.stack.top();
                     top.set(cx.add(arith::sub_one(top.bind_as(cx)?)));
@@ -571,7 +580,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let top = self.env.stack.top();
                     top.set(arith::greater_than_or_eq(top.bind_as(cx)?, v1));
                 }
-                op::Diff => todo!("Diff bytecode"),
+                op::Diff => return Err(self.unsupported_opcode(op, cx)),
                 op::Negate => {
                     let top = self.env.stack.top();
                     top.set(cx.add(arith::sub(top.bind_as(cx)?, &[])));
@@ -600,34 +609,34 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let args = &[top.bind_as(cx)?, arg1.try_into()?];
                     top.set(cx.add(arith::mul(args)));
                 }
-                op::Point => todo!("Point bytecode"),
-                op::GotoChar => todo!("GotoChar bytecode"),
-                op::Insert => todo!("Insert bytecode"),
-                op::PointMax => todo!("PointMax bytecode"),
-                op::PointMin => todo!("PointMin bytecode"),
-                op::CharAfter => todo!("CharAfter bytecode"),
-                op::FollowingChar => todo!("FollowingChar bytecode"),
-                op::PrecedingChar => todo!("PrecedingChar bytecode"),
-                op::CurrentColumn => todo!("CurrentColumn bytecode"),
-                op::IndentTo => todo!("IndentTo bytecode"),
-                op::EndOfLineP => todo!("EndOfLineP bytecode"),
-                op::EndOfBufferP => todo!("EndOfBufferP bytecode"),
-                op::BeginningOfLineP => todo!("BeginningOfLineP bytecode"),
-                op::BeginningOfBufferP => todo!("BeginningOfBufferP bytecode"),
-                op::CurrentBuffer => todo!("CurrentBuffer bytecode"),
-                op::SetBuffer => todo!("SetBuffer bytecode"),
-                op::SaveCurrentBuffer1 => todo!("SaveCurrentBuffer1 bytecode"),
-                op::ForwardChar => todo!("ForwardChar bytecode"),
-                op::ForwardWord => todo!("ForwardWord bytecode"),
-                op::SkipCharsForward => todo!("SkipCharsForward bytecode"),
-                op::SkipCharsBackward => todo!("SkipCharsBackward bytecode"),
-                op::ForwardLine => todo!("ForwardLine bytecode"),
-                op::CharSyntax => todo!("CharSyntax bytecode"),
-                op::BufferSubstring => todo!("BufferSubstring bytecode"),
-                op::DeleteRegion => todo!("DeleteRegion bytecode"),
-                op::NarrowToRegion => todo!("NarrowToRegion bytecode"),
-                op::Widen => todo!("Widen bytecode"),
-                op::EndOfLine => todo!("EndOfLine bytecode"),
+                op::Point => return Err(self.unsupported_opcode(op, cx)),
+                op::GotoChar => return Err(self.unsupported_opcode(op, cx)),
+                op::Insert => return Err(self.unsupported_opcode(op, cx)),
+                op::PointMax => return Err(self.unsupported_opcode(op, cx)),
+                op::PointMin => return Err(self.unsupported_opcode(op, cx)),
+                op::CharAfter => return Err(self.unsupported_opcode(op, cx)),
+                op::FollowingChar => return Err(self.unsupported_opcode(op, cx)),
+                op::PrecedingChar => return Err(self.unsupported_opcode(op, cx)),
+                op::CurrentColumn => return Err(self.unsupported_opcode(op, cx)),
+                op::IndentTo => return Err(self.unsupported_opcode(op, cx)),
+                op::EndOfLineP => return Err(self.unsupported_opcode(op, cx)),
+                op::EndOfBufferP => return Err(self.unsupported_opcode(op, cx)),
+                op::BeginningOfLineP => return Err(self.unsupported_opcode(op, cx)),
+                op::BeginningOfBufferP => return Err(self.unsupported_opcode(op, cx)),
+                op::CurrentBuffer => return Err(self.unsupported_opcode(op, cx)),
+                op::SetBuffer => return Err(self.unsupported_opcode(op, cx)),
+                op::SaveCurrentBuffer1 => return Err(self.unsupported_opcode(op, cx)),
+                op::ForwardChar => return Err(self.unsupported_opcode(op, cx)),
+                op::ForwardWord => return Err(self.unsupported_opcode(op, cx)),
+                op::SkipCharsForward => return Err(self.unsupported_opcode(op, cx)),
+                op::SkipCharsBackward => return Err(self.unsupported_opcode(op, cx)),
+                op::ForwardLine => return Err(self.unsupported_opcode(op, cx)),
+                op::CharSyntax => return Err(self.unsupported_opcode(op, cx)),
+                op::BufferSubstring => return Err(self.unsupported_opcode(op, cx)),
+                op::DeleteRegion => return Err(self.unsupported_opcode(op, cx)),
+                op::NarrowToRegion => return Err(self.unsupported_opcode(op, cx)),
+                op::Widen => return Err(self.unsupported_opcode(op, cx)),
+                op::EndOfLine => return Err(self.unsupported_opcode(op, cx)),
                 op::ConstantN2 => {
                     let idx = self.pc.arg2();
                     let cnst = self.get_const(idx.into(), cx);
@@ -698,16 +707,16 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let top = self.env.stack[0].bind(cx);
                     self.env.stack.push(top);
                 }
-                op::SaveExcursion => todo!("SaveExcursion bytecode"),
-                op::SaveRestriction => todo!("SaveRestriction bytecode"),
-                op::UnwindProtect => todo!("UnwindProtect bytecode"),
-                op::SetMarker => todo!("SetMarker bytecode"),
-                op::MatchBeginning => todo!("MatchBeginning bytecode"),
-                op::MatchEnd => todo!("MatchEnd bytecode"),
-                op::Upcase => todo!("Upcase bytecode"),
-                op::Downcase => todo!("Downcase bytecode"),
-                op::StringEqlSign => todo!("StringEqlSign bytecode"),
-                op::StringLessThan => todo!("StringLessThan bytecode"),
+                op::SaveExcursion => return Err(self.unsupported_opcode(op, cx)),
+                op::SaveRestriction => return Err(self.unsupported_opcode(op, cx)),
+                op::UnwindProtect => return Err(self.unsupported_opcode(op, cx)),
+                op::SetMarker => return Err(self.unsupported_opcode(op, cx)),
+                op::MatchBeginning => return Err(self.unsupported_opcode(op, cx)),
+                op::MatchEnd => return Err(self.unsupported_opcode(op, cx)),
+                op::Upcase => return Err(self.unsupported_opcode(op, cx)),
+                op::Downcase => return Err(self.unsupported_opcode(op, cx)),
+                op::StringEqlSign => return Err(self.unsupported_opcode(op, cx)),
+                op::StringLessThan => return Err(self.unsupported_opcode(op, cx)),
                 op::Equal => {
                     let rhs = self.env.stack.pop(cx);
                     let top = self.env.stack.top();
@@ -760,8 +769,8 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let top = self.env.stack.top();
                     top.set(fns::nconc(&[top.bind_as(cx)?, list2.try_into()?])?);
                 }
-                op::Quo => todo!("Quo bytecode"),
-                op::Rem => todo!("Rem bytecode"),
+                op::Quo => return Err(self.unsupported_opcode(op, cx)),
+                op::Rem => return Err(self.unsupported_opcode(op, cx)),
                 op::Numberp => {
                     let top = self.env.stack.top();
                     top.set(data::numberp(top.bind(cx)));
@@ -778,8 +787,8 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     self.env.stack.truncate(len - (size - 1));
                     self.env.stack.top().set(list);
                 }
-                op::ConcatN => todo!("ConcatN bytecode"),
-                op::InsertN => todo!("InsertN bytecode"),
+                op::ConcatN => return Err(self.unsupported_opcode(op, cx)),
+                op::InsertN => return Err(self.unsupported_opcode(op, cx)),
                 op::Switch => {
                     let ObjectType::HashTable(table) = self.env.stack.pop(cx).untag() else {
                         unreachable!("switch table was not a hash table")
@@ -1010,6 +1019,105 @@ mod test {
         let val = rebind!(call(bytecode, frame.arg_count(), "test", frame, cx).unwrap());
         let expect = expect.bind(cx);
         assert_eq!(val, expect);
+    }
+
+    #[test]
+    fn m0_unimplemented_opcodes_signal_instead_of_panicking() {
+        use OpCode as O;
+        for opcode in [
+            O::PushCatch,
+            O::Substring,
+            O::Concat2,
+            O::Concat3,
+            O::Concat4,
+            O::Diff,
+            O::Point,
+            O::GotoChar,
+            O::Insert,
+            O::PointMax,
+            O::PointMin,
+            O::CharAfter,
+            O::FollowingChar,
+            O::PrecedingChar,
+            O::CurrentColumn,
+            O::IndentTo,
+            O::EndOfLineP,
+            O::EndOfBufferP,
+            O::BeginningOfLineP,
+            O::BeginningOfBufferP,
+            O::CurrentBuffer,
+            O::SetBuffer,
+            O::SaveCurrentBuffer1,
+            O::ForwardChar,
+            O::ForwardWord,
+            O::SkipCharsForward,
+            O::SkipCharsBackward,
+            O::ForwardLine,
+            O::CharSyntax,
+            O::BufferSubstring,
+            O::DeleteRegion,
+            O::NarrowToRegion,
+            O::Widen,
+            O::EndOfLine,
+            O::SaveExcursion,
+            O::SaveRestriction,
+            O::UnwindProtect,
+            O::SetMarker,
+            O::MatchBeginning,
+            O::MatchEnd,
+            O::Upcase,
+            O::Downcase,
+            O::StringEqlSign,
+            O::StringLessThan,
+            O::Quo,
+            O::Rem,
+            O::ConcatN,
+            O::InsertN,
+        ] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            make_bytecode!(bytecode, 0, [opcode, O::Return], [], cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let error = call(bytecode, 0, "unsupported-opcode", frame, cx).unwrap_err();
+            let ErrorType::Signal(id) = error.error else {
+                panic!("Expected named signal for {opcode:?}");
+            };
+            let (symbol, data) = frame.get_exception(id).unwrap();
+            assert_eq!(symbol.bind(cx), sym::RUNE_UNIMPLEMENTED);
+            let data = data.bind(cx).cons().unwrap();
+            assert_eq!(data.car(), cx.add(format!("Unsupported bytecode opcode: {opcode:?}")));
+        }
+    }
+
+    #[test]
+    fn m0_unimplemented_opcode_uses_existing_error_handler() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let condition = Cons::new1(sym::ERROR, cx);
+        make_bytecode!(
+            bytecode,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                0x08,
+                0x00,
+                O::Substring,
+                O::PopHandler,
+                O::Constant1,
+                O::Return,
+                O::Car,
+                O::Return
+            ],
+            [condition, NIL],
+            cx
+        );
+        check_bytecode!(bytecode, [], sym::RUNE_UNIMPLEMENTED, cx);
     }
 
     #[test]

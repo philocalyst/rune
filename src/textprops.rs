@@ -132,6 +132,15 @@ pub fn text_properties_at<'ob>(
         bail!("String text properties are not supported yet");
     }
     modify_buffer_data(object, env, |data| {
+        let point_max = data.text.len_chars() + 1;
+        if position == 0 || position > point_max {
+            bail!("Buffer position {position} is out of range 1..={point_max}");
+        }
+        // The endpoint has no character, even if an internal caller has
+        // installed a property interval extending beyond the buffer text.
+        if position == point_max {
+            return Ok(NIL);
+        }
         let properties = data.textprops.find(position).map(|node| *node.val).unwrap_or(NIL);
         // The returned Lisp object belongs to the GC context, not to the
         // temporary buffer mutex guard used to look it up.
@@ -450,14 +459,14 @@ pub fn remove_text_properties<'ob>(
     object: Object<'ob>,
     env: &mut Rt<Env>,
     cx: &'ob Context,
-) -> Result<()> {
+) -> Result<bool> {
     let (start, end) = (start.min(end), start.max(end));
-    modify_buffer_data(object, env, |data| -> Result<()> {
+    modify_buffer_data(object, env, |data| -> Result<bool> {
         let tree = data.textprops_with_lifetime();
         // GNU textprop.c traverses candidate keys without validate_plist:
         // non-lists are no-ops, and a final key need not have a value.
         if !properties.is_nil() && properties.cons().is_none() {
-            return Ok(());
+            return Ok(false);
         }
         let mut keys = Vec::new();
         let mut properties = properties.as_list()?;
@@ -489,9 +498,9 @@ pub fn remove_list_of_text_properties<'ob>(
     object: Object<'ob>,
     env: &mut Rt<Env>,
     cx: &'ob Context,
-) -> Result<()> {
+) -> Result<bool> {
     let (start, end) = (start.min(end), start.max(end));
-    modify_buffer_data(object, env, |data| -> Result<()> {
+    modify_buffer_data(object, env, |data| -> Result<bool> {
         let tree = data.textprops_with_lifetime();
         tree.delete(start, end, list_of_properties, cx)
     })
@@ -855,6 +864,50 @@ mod tests {
     }
 
     #[test]
+    fn roadmap_m0_property_removal_reports_actual_changes() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-removal-results"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        let key: Object = intern("roadmap-removal-result-key", &cx).into();
+        let missing: Object = intern("roadmap-removal-result-missing", &cx).into();
+        put_text_property(1, 6, key, NIL, buf, env, &cx)?;
+        assert!(!remove_text_properties(2, 4, key, buf, env, &cx)?);
+        assert!(!remove_text_properties(2, 4, list![missing, 1; &cx], buf, env, &cx)?);
+        assert!(!remove_list_of_text_properties(2, 2, list![key; &cx], buf, env, &cx)?);
+        // Presence, not a non-nil value, determines whether removal changed text.
+        assert!(remove_text_properties(2, 4, list![key, 999; &cx], buf, env, &cx)?);
+        assert!(!remove_text_properties(2, 4, list![key, NIL; &cx], buf, env, &cx)?);
+        assert!(!text_properties_at(1, buf, env)?.is_nil());
+        assert!(text_properties_at(2, buf, env)?.is_nil());
+        assert!(!text_properties_at(4, buf, env)?.is_nil());
+        assert!(remove_list_of_text_properties(1, 6, list![missing, key; &cx], buf, env, &cx)?);
+        assert!(!remove_list_of_text_properties(1, 6, list![key; &cx], buf, env, &cx)?);
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_property_removal_returns_lisp_booleans() {
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (put-text-property 1 3 'a nil nil) (remove-text-properties 1 3 '(a ignored) nil))",
+            "t",
+        );
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (remove-text-properties 1 3 '(a ignored) nil))",
+            "nil",
+        );
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (put-text-property 1 3 'a nil nil) (remove-list-of-text-properties 1 3 '(a) nil))",
+            "t",
+        );
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (remove-list-of-text-properties 1 3 '(a) nil))",
+            "nil",
+        );
+    }
+
+    #[test]
     fn test_remove_text_properties() -> Result<()> {
         let roots = &RootSet::default();
         let mut context = Context::new(roots);
@@ -922,6 +975,32 @@ mod tests {
     }
 
     #[test]
+    fn roadmap_m0_property_reads_validate_character_positions() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-property-read-bounds"), None, &cx)?;
+        let key: Object = intern("roadmap-read-bounds-key", &cx).into();
+        // An empty buffer has one legal position, but no character there.
+        assert!(text_properties_at(1, buf, env)?.is_nil());
+        assert!(text_properties_at(0, buf, env).is_err());
+        assert!(text_properties_at(2, buf, env).is_err());
+        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"))?;
+        put_text_property(1, 3, key, cx.add(7), buf, env, &cx)?;
+        assert_eq!(get_text_property(2, key, buf, env)?, 7);
+        assert!(text_properties_at(3, buf, env)?.is_nil());
+        assert!(get_text_property(3, key, buf, env)?.is_nil());
+        // Character counts, not UTF-8 bytes, determine the legal endpoint.
+        assert!(get_text_property(4, key, buf, env).is_err());
+        assert!(get_text_property(0, key, buf, env).is_err());
+        env.current_buffer.set(buf.buffer().unwrap());
+        assert_eq!(get_text_property(2, key, NIL, env)?, 7);
+        assert!(text_properties_at(0, NIL, env).is_err());
+        assert!(text_properties_at(3, NIL, env)?.is_nil());
+        Ok(())
+    }
+
+    #[test]
     fn test_text_properties_at() -> Result<()> {
         let roots = &RootSet::default();
         let mut context = Context::new(roots);
@@ -929,13 +1008,14 @@ mod tests {
         root!(env, new(Env), cx);
 
         let buf = get_buffer_create(cx.add("test_text_properties_at"), None, cx)?;
-        let n = text_properties_at(0, buf, env)?;
+        let n = text_properties_at(1, buf, env)?;
         assert!(n.is_nil());
 
         let a = intern(":a", cx);
         let a = cx.add(a);
-        put_text_property(0, 1, a, cx.add(3), buf, env, cx)?;
-        let n = text_properties_at(0, buf, env)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("x"))?;
+        put_text_property(1, 2, a, cx.add(3), buf, env, cx)?;
+        let n = text_properties_at(1, buf, env)?;
         let val = plist_get(n, a)?;
         assert!(eq(val, cx.add(3)));
 
