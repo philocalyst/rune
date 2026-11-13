@@ -48,3 +48,31 @@ belongs to an omitted file is a regression. Keep the same suite/path identities
 between reports. Exit status is nonzero for regressions, incomplete files, or
 any observed failed/unimplemented/errored result. Reports are still written on
 those outcomes, allowing CI to retain honest baseline evidence.
+
+## Render a per-file table
+
+Convert a saved schema-v1 ERT report to Markdown without running either
+interpreter. An optional previous report adds formerly-passing regressions:
+
+```sh
+python3 scripts/ert_table.py /tmp/ert-current.json \
+  --baseline /tmp/ert-previous.json --output /tmp/ert-table.md
+```
+
+The table recomputes counts and rates from observed test outcomes, ignoring
+stored `counts`, `pass_rate` and `regressions` fields. Rates include all observed
+outcomes in the denominator, including skipped tests; no records means a dash,
+not 0% or 100%. Incomplete statuses remain explicit, and files omitted from the
+current report but present in the baseline appear as `missing-current`.
+`completed` means the runner finished, not that every test passed. Baseline
+regressions mean formerly-passing tests now absent or nonpassing, exactly as in
+the runner; retaining a passed result in a subsequently incomplete file is not
+itself a test regression, though the file remains visibly incomplete.
+
+File/test/revision text is escaped for Markdown tables; raw interpreter output
+is not embedded. Input schemas, statuses and outcomes are checked, and duplicate
+JSON keys/file identities are rejected. Invalid reports fail before replacing
+existing output. This validates report structure, not provenance or whether an
+interpreter genuinely ran. An empty file list is displayed honestly as zero
+files, never evidence of a successful suite. Rendering is local only: no
+publication, CI artifact upload or roadmap milestone coverage claim is implied.
