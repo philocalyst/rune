@@ -3,11 +3,25 @@ use super::object::{LispBuffer, Object, OpenBuffer, Symbol, WithLifetime};
 use anyhow::{Result, anyhow};
 use rune_macros::Trace;
 use std::cell::OnceCell;
+use std::sync::{LazyLock, Mutex};
 
 mod stack;
 mod symbol_map;
 pub(crate) use stack::*;
 pub(crate) use symbol_map::*;
+
+/// Interned feature symbols have global identity and stable storage, so provide
+/// in a worker remains visible to other Envs. Heap-local uninterned features
+/// instead live in each Env's traced feature slots below.
+#[derive(Default)]
+struct InternedFeatures(Vec<Symbol<'static>>);
+
+// SAFETY: Only provide_feature inserts entries, after checking interned().
+// All entries point into nonmoving global symbol storage; the mutex serializes
+// access. No arbitrary Symbol or moving uninterned name can enter this table.
+unsafe impl Send for InternedFeatures {}
+
+static INTERNED_FEATURES: LazyLock<Mutex<InternedFeatures>> = LazyLock::new(Mutex::default);
 
 type PropertyMap<'a> = ObjectMap<Slot<Symbol<'a>>, Vec<(Slot<Symbol<'a>>, Slot<Object<'a>>)>>;
 #[derive(Debug, Default, Trace)]
@@ -20,6 +34,7 @@ pub(crate) struct Env<'a> {
     exception_id: u32,
     binding_stack: Vec<(Slot<Symbol<'a>>, Option<Slot<Object<'a>>>)>,
     pub(crate) match_data: Slot<Object<'a>>,
+    features: Vec<Slot<Symbol<'a>>>,
     pub(crate) current_buffer: CurrentBuffer<'a>,
     pub(crate) stack: LispStack<'a>,
 }
@@ -31,8 +46,8 @@ pub(crate) struct CurrentBuffer<'a> {
 }
 
 // CurrentBuffer contains a globally stable buffer handle and an optional
-// guard, not directly borrowed GC pointers. Its property slots are traced via
-// OpenBuffer, so rooting does not require a transformed field representation.
+// guard, not directly borrowed GC pointers. Its property slots are owned by
+// the Context registry, so rooting needs no transformed field representation.
 impl RootedDeref for CurrentBuffer<'_> {
     type Target = Self;
 
@@ -53,17 +68,9 @@ impl PartialEq<LispBuffer> for Rt<CurrentBuffer<'_>> {
 }
 
 impl Trace for CurrentBuffer<'_> {
-    fn trace(&self, state: &mut GcState) {
-        // LispBuffer itself lives in global storage and skips GC tracing.
-        // Trace the current buffer's local property values explicitly, without
-        // trying to lock a mutex whose guard this environment already holds.
-        if let Some(buffer) = self.buffer.get() {
-            buffer.trace(state);
-        } else if let Ok(buffer) = self.buf_ref.lock() {
-            buffer.trace(state);
-        }
-        // This is only a root for this environment's current buffer. It does
-        // not establish ownership of non-current or cross-context buffers.
+    fn trace(&self, _: &mut GcState) {
+        // Globally stable text handle; Lisp metadata is traced by Context's
+        // owner-domain registry even when this buffer is not current.
     }
 }
 
@@ -83,6 +90,23 @@ impl Default for CurrentBuffer<'_> {
 impl<'a> CurrentBuffer<'a> {
     fn lock(&self) -> OpenBuffer<'a> {
         unsafe { self.buf_ref.lock().unwrap().with_lifetime() }
+    }
+
+    /// Fallible cached access for unwind/marker restoration. In particular,
+    /// selecting a killed saved buffer must not panic or re-lock a held guard.
+    pub(crate) fn try_get(&self) -> Result<&OpenBuffer<'a>> {
+        if self.buffer.get().is_none() {
+            let locked = unsafe { self.buf_ref.lock()?.with_lifetime() };
+            let _ = self.buffer.set(locked);
+        }
+        let buffer = self.buffer.get().unwrap();
+        anyhow::ensure!(buffer.is_live(), "selecting deleted buffer");
+        Ok(buffer)
+    }
+
+    pub(crate) fn try_get_mut(&mut self) -> Result<&mut OpenBuffer<'a>> {
+        self.try_get()?;
+        Ok(self.buffer.get_mut().unwrap())
     }
 
     pub(crate) fn get(&self) -> &OpenBuffer<'a> {
@@ -117,6 +141,25 @@ impl PartialEq<LispBuffer> for CurrentBuffer<'_> {
 
 // RootedEnv created by #[derive(Trace)]
 impl<'a> RootedEnv<'a> {
+    pub(crate) fn has_feature(&self, feature: Symbol, cx: &Context) -> bool {
+        if feature.get().interned() {
+            return INTERNED_FEATURES.lock().unwrap().0.contains(&feature);
+        }
+        self.features.iter().any(|provided| provided.bind(cx) == feature)
+    }
+
+    pub(crate) fn provide_feature(&mut self, feature: Symbol, cx: &Context) {
+        if feature.get().interned() {
+            let mut features = INTERNED_FEATURES.lock().unwrap();
+            if !features.0.contains(&feature) {
+                // The interned() check proves globally allocated stable storage.
+                features.0.push(unsafe { feature.with_lifetime() });
+            }
+        } else if !self.has_feature(feature, cx) {
+            self.features.push(feature);
+        }
+    }
+
     pub(crate) fn set_var(&mut self, sym: Symbol, value: Object) -> Result<()> {
         if sym.is_const() {
             Err(anyhow!("Attempt to set a constant symbol: {sym}"))
@@ -231,12 +274,12 @@ mod current_buffer_gc_tests {
             let roots = RootSet::default();
             let cx = &mut Context::new(&roots);
             root!(env, new(Env), cx);
-            env.current_buffer.get_mut().insert(cx.add("x")).unwrap();
+            env.current_buffer.get_mut().insert(cx.add("x"), &cx).unwrap();
             let key = cx.add(intern("m0-buffer-gc-property", cx));
             // The stored list/string have no root except the current buffer.
             let plist =
                 Cons::new(key, Cons::new(cx.add("survives-current-buffer-gc"), NIL, cx), cx);
-            env.current_buffer.get_mut().textprops_with_lifetime().set_properties(
+            env.current_buffer.get_mut().textprops.lock(&cx).unwrap().set_properties(
                 1,
                 2,
                 plist.into(),
@@ -246,7 +289,8 @@ mod current_buffer_gc_tests {
             }
             for _ in 0..3 {
                 cx.garbage_collect(true);
-                let properties = *env.current_buffer.get().textprops.find(1).unwrap().val;
+                let properties =
+                    *env.current_buffer.get().textprops.lock(&cx).unwrap().find(1).unwrap().val;
                 let value = crate::intervals::textget(
                     properties,
                     cx.add(intern("m0-buffer-gc-property", cx)),
@@ -257,9 +301,7 @@ mod current_buffer_gc_tests {
                     env.current_buffer.release();
                 }
             }
-            // Remove context-local values before this global buffer outlives
-            // its context; non-current-buffer ownership remains separate work.
-            env.current_buffer.get_mut().textprops_with_lifetime().set_properties(1, 2, NIL);
+            // Context teardown retires metadata even while its global handle survives.
         }
     }
 
@@ -272,5 +314,58 @@ mod current_buffer_gc_tests {
         cx.garbage_collect(true);
         env.current_buffer.release();
         cx.garbage_collect(true);
+    }
+}
+
+#[cfg(test)]
+mod feature_ownership_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+
+    #[test]
+    fn interned_features_provided_by_worker_remain_globally_visible() {
+        let name = "ownership-global-worker-feature";
+        std::thread::spawn(move || {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            root!(env, new(Env), cx);
+            let feature = intern(name, cx);
+            env.provide_feature(feature, cx);
+            assert!(env.features.is_empty());
+        })
+        .join()
+        .unwrap();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, new(Env), cx);
+        assert!(env.has_feature(intern(name, cx), cx));
+    }
+
+    #[test]
+    fn uninterned_features_are_rooted_and_keep_identity() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, new(Env), cx);
+        {
+            let first = Symbol::new_uninterned("local-feature", &cx.block);
+            let second = Symbol::new_uninterned("local-feature", &cx.block);
+            env.provide_feature(first, cx);
+            env.provide_feature(first, cx);
+            env.provide_feature(second, cx);
+        }
+        assert_eq!(env.features.len(), 2);
+        for _ in 0..10 {
+            cx.garbage_collect(true);
+            let first = env.features[0].bind(cx);
+            let second = env.features[1].bind(cx);
+            assert_ne!(first, second);
+            assert_eq!(first.get().name(), "local-feature");
+            assert_eq!(second.get().name(), "local-feature");
+            assert!(env.has_feature(first, cx));
+            assert!(env.has_feature(second, cx));
+            let fresh = Symbol::new_uninterned("local-feature", &cx.block);
+            assert!(!env.has_feature(fresh, cx));
+        }
     }
 }

@@ -7,7 +7,7 @@ use crate::{
         gc::{Context, Rt, Rto},
         object::{
             Function, Gc, HashTable, IntoObject, LispHashTable, LispString, LispVec, List,
-            ListType, NIL, Object, ObjectType, OptionalFlag, Symbol, WithLifetime,
+            ListType, NIL, Object, ObjectType, OptionalFlag, Symbol,
         },
     },
     data::aref,
@@ -609,12 +609,7 @@ pub(crate) fn featurep(
     env: &Rt<Env>,
     cx: &Context,
 ) -> Result<bool> {
-    // Share the registry used by provide/require, without extending any symbol lifetime.
-    let present = crate::data::FEATURES
-        .lock()
-        .map_err(|_| anyhow!("Feature registry lock is poisoned"))?
-        .iter()
-        .any(|provided| *provided == feature);
+    let present = env.has_feature(feature, cx);
     if !present {
         return Ok(false);
     }
@@ -633,9 +628,7 @@ pub(crate) fn require<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob mut Context,
 ) -> Result<Symbol<'ob>> {
-    // TODO: Fix this unsafe into_root
-    let feat = unsafe { feature.untag(cx).with_lifetime() };
-    if crate::data::FEATURES.lock().unwrap().contains(&feat) {
+    if env.has_feature(feature.untag(cx), cx) {
         return Ok(feature.untag(cx));
     }
     let file = match filename {

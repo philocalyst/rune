@@ -14,6 +14,11 @@ struct SymbolMapCore {
     map: HashMap<&'static str, Symbol<'static>>,
 }
 
+// SAFETY: This private table contains only globally allocated interned symbols
+// with leaked names. It never accepts heap-local uninterned symbols. Its parent
+// SymbolMap is accessed under INTERNED_SYMBOLS' mutex.
+unsafe impl Send for SymbolMapCore {}
+
 impl SymbolMapCore {
     fn with_capacity(cap: usize) -> Self {
         Self {
@@ -57,8 +62,8 @@ impl SymbolMap {
     }
 
     pub(crate) fn set_func(&self, symbol: Symbol, func: Function) -> Result<()> {
+        let _clone_session = self.block.clone_session();
         let new_func = func.clone_in(&self.block);
-        self.block.uninterned_symbol_map.clear();
         // SAFETY: The object is marked read-only, we have cloned in the map's
         // context, and it is const, so calling this function is safe.
         unsafe { symbol.set_func(new_func) }

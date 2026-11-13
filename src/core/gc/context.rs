@@ -2,12 +2,13 @@ use super::GcState;
 use super::Trace;
 use crate::core::object::GcString;
 use crate::core::object::LispHashTable;
+use crate::core::object::WeakBufferPropertyRoot;
 use crate::core::object::{Gc, IntoObject, Object, UninternedSymbolMap, WithLifetime};
 use bumpalo::collections::Vec as GcVec;
 use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
 use std::ops::Deref;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A global store of all gc roots. This struct should be passed to the [Context]
 /// when it is created.
@@ -43,7 +44,6 @@ pub(in crate::core) enum DropStackElem {
 
 /// A block of allocations. This type should be owned by [Context] and not used
 /// directly.
-#[derive(Default)]
 pub(crate) struct Block<const CONST: bool> {
     pub(in crate::core) objects: bumpalo::Bump,
     // Allocations that will be dropped when the objects are moved. At that time
@@ -68,10 +68,17 @@ pub(crate) struct Context<'rt> {
     pub(crate) block: Block<false>,
     root_set: &'rt RootSet,
     next_limit: usize,
+    domain_id: u64,
+    buffer_properties: RefCell<Vec<WeakBufferPropertyRoot>>,
 }
 
 impl Drop for Context<'_> {
     fn drop(&mut self) {
+        // Global buffer handles outlive the local heap: retire their Lisp
+        // metadata before releasing any allocation in this domain.
+        for root in self.buffer_properties.get_mut().drain(..).filter_map(|root| root.upgrade()) {
+            root.close_owned(self.domain_id);
+        }
         self.garbage_collect(true);
         if self.block.objects.allocated_bytes() == 0 {
             return;
@@ -96,18 +103,23 @@ impl Block<true> {
     pub(crate) fn new_global() -> Self {
         use std::sync::atomic::Ordering::SeqCst as Ord;
         assert!(GLOBAL_CHECK.compare_exchange(false, true, Ord, Ord).is_ok());
-        Self::default()
+        Self::empty()
     }
 }
 
 impl Block<false> {
     pub(crate) fn new_local() -> Self {
         Self::assert_unique();
-        Self::default()
+        Self::empty()
     }
 
-    pub(crate) fn new_local_unchecked() -> Self {
-        Self::default()
+    /// Construct an arena outside the thread's sole ordinary Context.
+    ///
+    /// SAFETY: The caller must supply an independent owner which prevents raw
+    /// borrowed objects escaping into any other heap domain. Transfers must
+    /// deep-copy, and collection must synchronize all retained root slots.
+    pub(crate) unsafe fn new_local_unchecked() -> Self {
+        Self::empty()
     }
 
     pub(crate) fn assert_unique() {
@@ -119,6 +131,22 @@ impl Block<false> {
 }
 
 impl<const CONST: bool> Block<CONST> {
+    // No Default impl: a safe second local arena would bypass Context's domain
+    // singleton and let borrowed objects be rooted in the wrong heap.
+    fn empty() -> Self {
+        Self {
+            objects: bumpalo::Bump::new(),
+            drop_stack: RefCell::default(),
+            lisp_hashtables: RefCell::default(),
+            uninterned_symbol_map: UninternedSymbolMap::default(),
+        }
+    }
+
+    /// Scope the uninterned-symbol alias cache to one complete graph copy.
+    pub(crate) fn clone_session(&self) -> impl Drop + '_ {
+        self.uninterned_symbol_map.clone_session()
+    }
+
     pub(crate) fn add<'ob, T, Tx>(&'ob self, obj: T) -> Object<'ob>
     where
         T: IntoObject<Out<'ob> = Tx>,
@@ -154,16 +182,34 @@ impl<const CONST: bool> Block<CONST> {
     }
 }
 
+static NEXT_DOMAIN: AtomicU64 = AtomicU64::new(1);
+
 impl<'ob, 'rt> Context<'rt> {
     pub(crate) const MIN_GC_BYTES: usize = 2000;
     pub(crate) const GC_GROWTH_FACTOR: usize = 12; // divide by 10
     pub(crate) fn new(roots: &'rt RootSet) -> Self {
-        Self { block: Block::new_local(), root_set: roots, next_limit: Self::MIN_GC_BYTES }
+        let block = Block::new_local();
+        Self::with_domain(block, roots)
     }
 
-    pub(crate) fn from_block(block: Block<false>, roots: &'rt RootSet) -> Self {
-        Block::assert_unique();
-        Context { block, root_set: roots, next_limit: Self::MIN_GC_BYTES }
+    fn with_domain(block: Block<false>, roots: &'rt RootSet) -> Self {
+        let domain_id = NEXT_DOMAIN
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("Heap domain identifiers exhausted");
+        Self {
+            block,
+            root_set: roots,
+            next_limit: Self::MIN_GC_BYTES,
+            domain_id,
+            buffer_properties: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn domain_id(&self) -> u64 {
+        self.domain_id
+    }
+    pub(crate) fn register_buffer_properties(&self, root: WeakBufferPropertyRoot) {
+        self.buffer_properties.borrow_mut().push(root);
     }
 
     pub(crate) fn bind<T>(&'ob self, obj: T) -> <T as WithLifetime<'ob>>::Out
@@ -183,6 +229,7 @@ impl<'ob, 'rt> Context<'rt> {
             return;
         }
 
+        self.block.uninterned_symbol_map.clear();
         let mut state = GcState::new();
         for x in self.root_set.roots.borrow().iter() {
             // SAFETY: The contract of root structs will ensure that it removes
@@ -192,6 +239,14 @@ impl<'ob, 'rt> Context<'rt> {
             }
         }
 
+        self.buffer_properties.borrow_mut().retain(|root| {
+            if let Some(root) = root.upgrade() {
+                root.trace_owned(self.domain_id, &mut state);
+                true
+            } else {
+                false
+            }
+        });
         state.trace_stack();
 
         self.next_limit = (state.to_space.allocated_bytes() * Self::GC_GROWTH_FACTOR) / 10;
@@ -234,6 +289,7 @@ pub(crate) unsafe fn collect_garbage_raw(
         return;
     }
 
+    block.uninterned_symbol_map.clear();
     let mut state = GcState::new();
     for x in root_set.roots.lock().unwrap().iter() {
         // SAFETY: The contract of root structs will ensure that it removes
@@ -354,5 +410,33 @@ mod test {
         assert_eq!(string, "string");
         assert_eq!(**float, 1.5);
         assert_eq!(int, 1);
+    }
+}
+
+#[cfg(test)]
+mod domain_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn local_block_has_no_safe_default_constructor() {
+        trait AmbiguousIfDefault<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfDefault<()> for T {}
+        impl<T: ?Sized + Default> AmbiguousIfDefault<u8> for T {}
+        let _ = <Block<false> as AmbiguousIfDefault<_>>::check;
+    }
+
+    #[test]
+    fn duplicate_context_rejection_preserves_original_owner() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let other_roots = RootSet::default();
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _second = Context::new(&other_roots);
+        }));
+        assert!(second.is_err());
+        assert_eq!(cx.add(7), 7);
+        cx.garbage_collect(true);
     }
 }

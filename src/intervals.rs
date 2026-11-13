@@ -7,7 +7,7 @@ use crate::{
         cons::Cons,
         error::{Type, TypeError},
         gc::{IntoRoot, Slot, Trace},
-        object::{NIL, Object, ObjectType, TagType, WithLifetime},
+        object::{NIL, Object, ObjectType, WithLifetime},
     },
     fns::eq,
     textprops::add_properties,
@@ -37,8 +37,6 @@ impl<'new> WithLifetime<'new> for IntervalTree<'_> {
         result
     }
 }
-
-unsafe impl Send for IntervalTree<'_> {}
 
 impl<'ob> IntervalTree<'ob> {
     pub fn new() -> Self {
@@ -450,7 +448,7 @@ mod reverse_interval_iterator_tests {
         let cx = Context::new(roots);
         let val = intern("test", &cx);
         let mut tree = IntervalTree::new();
-        tree.insert(10, 20, Slot::new(val.into()), &cx);
+        tree.insert(10, 20, Slot::new(val.into()), &cx).unwrap();
 
         let mut iter = ReverseIntervalIntersections::new(&tree, 0, 30);
         assert_eq!(iter.next(), Some((20..30, NIL)));
@@ -466,8 +464,8 @@ mod reverse_interval_iterator_tests {
         let val1 = intern("test1", &cx);
         let val2 = intern("test2", &cx);
         let mut tree = IntervalTree::new();
-        tree.insert(10, 20, Slot::new(val1.into()), &cx);
-        tree.insert(25, 35, Slot::new(val2.into()), &cx);
+        tree.insert(10, 20, Slot::new(val1.into()), &cx).unwrap();
+        tree.insert(25, 35, Slot::new(val2.into()), &cx).unwrap();
 
         let mut iter = ReverseIntervalIntersections::new(&tree, 0, 40);
         assert_eq!(iter.next(), Some((35..40, NIL)));
@@ -485,9 +483,9 @@ mod reverse_interval_iterator_tests {
         let val1 = intern("test1", &cx);
         let val2 = intern("test2", &cx);
         let mut tree = IntervalTree::new();
-        tree.insert(10, 20, Slot::new(val1.into()), &cx);
-        tree.insert(20, 30, Slot::new(val1.into()), &cx);
-        tree.insert(30, 40, Slot::new(val2.into()), &cx);
+        tree.insert(10, 20, Slot::new(val1.into()), &cx).unwrap();
+        tree.insert(20, 30, Slot::new(val1.into()), &cx).unwrap();
+        tree.insert(30, 40, Slot::new(val2.into()), &cx).unwrap();
 
         let mut iter = ReverseIntervalIntersections::new(&tree, 0, 50);
         assert_eq!(iter.next(), Some((40..50, NIL)));
@@ -518,7 +516,7 @@ mod interval_iterator_tests {
         let cx = Context::new(roots);
         let val = intern("test", &cx);
         let mut tree = IntervalTree::new();
-        tree.insert(10, 20, Slot::new(val.into()), &cx);
+        tree.insert(10, 20, Slot::new(val.into()), &cx).unwrap();
 
         let mut iter = IntervalIntersections::new(&tree, 0, 30);
         assert_eq!(iter.next(), Some((0..10, NIL)));
@@ -534,8 +532,8 @@ mod interval_iterator_tests {
         let val1 = intern("test1", &cx);
         let val2 = intern("test2", &cx);
         let mut tree = IntervalTree::new();
-        tree.insert(10, 20, Slot::new(val1.into()), &cx);
-        tree.insert(25, 35, Slot::new(val2.into()), &cx);
+        tree.insert(10, 20, Slot::new(val1.into()), &cx).unwrap();
+        tree.insert(25, 35, Slot::new(val2.into()), &cx).unwrap();
 
         let mut iter = IntervalIntersections::new(&tree, 0, 40);
         assert_eq!(iter.next(), Some((0..10, NIL)));
@@ -553,9 +551,9 @@ mod interval_iterator_tests {
         let val1 = intern("test1", &cx);
         let val2 = intern("test2", &cx);
         let mut tree = IntervalTree::new();
-        tree.insert(10, 20, Slot::new(val1.into()), &cx);
-        tree.insert(20, 30, Slot::new(val1.into()), &cx);
-        tree.insert(30, 40, Slot::new(val2.into()), &cx);
+        tree.insert(10, 20, Slot::new(val1.into()), &cx).unwrap();
+        tree.insert(20, 30, Slot::new(val1.into()), &cx).unwrap();
+        tree.insert(30, 40, Slot::new(val2.into()), &cx).unwrap();
         // merge the tree
         tree.clean();
 

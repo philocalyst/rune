@@ -69,7 +69,10 @@ pub(crate) struct GcHeap<T: ?Sized> {
     data: T,
 }
 
-unsafe impl<T: Sync> Sync for GcHeap<T> {}
+// Moving collection changes the header even when T is immutable. Therefore
+// &GcHeap<T> must not become Send through a blanket Sync implementation: a
+// foreign Context could otherwise retag that reference into its own roots.
+// Globally stable nonmoving handles opt in individually at their boundary.
 
 impl<T> GcHeap<T> {
     pub(in crate::core) const fn new(data: T, constant: bool) -> Self {

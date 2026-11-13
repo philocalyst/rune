@@ -17,6 +17,11 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 /// need to halt all running threads. This has not been implemented yet.
 pub(crate) struct SymbolCell(GcHeap<SymbolCellData>);
 
+// Built-in/global symbols live in shared static storage. Uninterned symbols
+// expose no safe reference-to-Symbol tagging operation; their !Send Symbol
+// handles remain confined to the heap that updates their name during GC.
+unsafe impl Sync for SymbolCell {}
+
 struct SymbolCellData {
     name: SymbolName,
     // We can't use AtomicCell due to this issue:
@@ -100,7 +105,8 @@ impl<'a> Symbol<'a> {
     }
 }
 
-unsafe impl Send for Symbol<'_> {}
+// Symbols can be uninterned and heap-local. Do not transfer the borrowed
+// handle across threads; global interning storage has its own audited boundary.
 
 // implement withlifetime for symbol
 impl<'new> WithLifetime<'new> for Symbol<'_> {
@@ -174,9 +180,13 @@ impl<'new> Symbol<'_> {
                 None => {
                     let sym = Symbol::new_uninterned(name.get(), bk);
                     if let Some(old_func) = self.get().get() {
-                        let new_func = old_func.clone_in(bk);
+                        // Function cells always refer to read-only global
+                        // storage. Cloning into a local block would violate
+                        // func(cx)'s lifetime extension and leave an untraced
+                        // moving pointer in this atomic cell. Share the stable
+                        // global function instead, including for local clones.
                         unsafe {
-                            sym.set_func(new_func).unwrap();
+                            sym.set_func(old_func).unwrap();
                         }
                     }
                     let new = sym.into_obj(bk);
@@ -376,7 +386,23 @@ pub(in crate::core) struct UninternedSymbolMap {
     map: std::cell::RefCell<Vec<(Symbol<'static>, Symbol<'static>)>>,
 }
 
+/// A cache is valid for one graph-copy operation only. Repeated occurrences
+/// within that graph retain identity, while separate transfers get fresh local
+/// uninterned identities. Clearing on unwind prevents stale heap pointers.
+pub(in crate::core) struct SymbolCloneSession<'a>(&'a UninternedSymbolMap);
+
+impl Drop for SymbolCloneSession<'_> {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
 impl UninternedSymbolMap {
+    pub(in crate::core) fn clone_session(&self) -> SymbolCloneSession<'_> {
+        self.clear();
+        SymbolCloneSession(self)
+    }
+
     fn get<'a>(&'a self, symbol: Symbol) -> Option<Symbol<'a>> {
         self.map.borrow().iter().find(|x| x.0 == symbol).map(|x| x.1)
     }
@@ -406,5 +432,78 @@ mod empty_name_regressions {
         let symbol = intern("", &cx);
         assert_eq!(symbol.name(), "");
         assert_eq!(symbol, intern("", &cx));
+    }
+}
+
+#[cfg(test)]
+mod function_domain_tests {
+    use super::*;
+    use crate::core::{
+        env::{Env, INTERNED_SYMBOLS, sym},
+        gc::RootSet,
+        object::NIL,
+    };
+    use rune_core::macros::{list, root};
+
+    #[test]
+    fn cloned_uninterned_function_remains_global_across_collection() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, new(Env), cx);
+        let source = Symbol::new_uninterned("local-function-symbol", &cx.block);
+        let lambda = list![sym::LAMBDA, NIL, 7; cx];
+        let function = lambda.try_into().unwrap();
+        INTERNED_SYMBOLS.lock().unwrap().set_func(source, function).unwrap();
+        let cloned = source.clone_in(&cx.block);
+        root!(cloned, cx);
+        for _ in 0..10 {
+            cx.garbage_collect(true);
+            let function = cloned.bind(cx).untag().func(cx).unwrap();
+            assert!(function.to_string().contains("lambda"));
+            assert!(function.to_string().contains('7'));
+        }
+        let _ = env;
+    }
+}
+
+#[cfg(test)]
+mod clone_session_tests {
+    use super::*;
+    use crate::core::{gc::RootSet, object::ObjectType};
+    use rune_core::macros::root;
+
+    #[test]
+    fn sessions_preserve_in_graph_aliases_but_not_cross_transfer_cache() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let symbol = Symbol::new_uninterned("copy-alias", &cx.block);
+        let value = cx.add(symbol);
+        let graph = cx.add(vec![value, value]);
+        root!(graph, cx);
+        for _ in 0..10 {
+            let copy = {
+                let _session = cx.block.clone_session();
+                graph.bind(cx).clone_in(&cx.block)
+            };
+            let ObjectType::Vec(values) = copy.untag() else { panic!("vector expected") };
+            assert!(values[0].get().ptr_eq(values[1].get()));
+            assert!(cx.block.uninterned_symbol_map.map.borrow().is_empty());
+            cx.garbage_collect(true);
+        }
+    }
+
+    #[test]
+    fn clone_cache_clears_on_unwind() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let source = Symbol::new_uninterned("copy-unwind", &cx.block);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _session = cx.block.clone_session();
+            let _copy = source.clone_in(&cx.block);
+            assert!(!cx.block.uninterned_symbol_map.map.borrow().is_empty());
+            panic!("abort copy");
+        }));
+        assert!(result.is_err());
+        assert!(cx.block.uninterned_symbol_map.map.borrow().is_empty());
     }
 }

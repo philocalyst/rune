@@ -10,6 +10,7 @@
 //! of the vm.
 
 mod buffer;
+mod buffer_properties;
 mod cell;
 pub(in crate::core) mod channel;
 mod chartab;
@@ -24,6 +25,7 @@ mod tagged;
 mod vector;
 
 pub(crate) use buffer::*;
+pub(crate) use buffer_properties::*;
 pub(super) use cell::*;
 pub(crate) use channel::*;
 pub(crate) use chartab::*;

@@ -5,20 +5,13 @@ use crate::core::{
     error::{Type, TypeError},
     gc::{Context, Rt},
     object::{
-        IntoObject, List, ListType, NIL, Number, Object, ObjectType, SubrFn, Symbol, WithLifetime,
+        HeapDomainValue, IntoObject, List, ListType, NIL, Number, Object, ObjectType, SubrFn,
+        Symbol,
     },
 };
 use anyhow::{Result, anyhow};
-use rune_core::{hashmap::HashSet, macros::list};
+use rune_core::macros::list;
 use rune_macros::defun;
-use std::sync::LazyLock;
-use std::sync::Mutex;
-
-/// Rust translation of the `features` variable: A list of symbols are the features
-/// of the executing Emacs. Used by [`featurep`](`crate::fns::featurep`) and [`require`](`crate::fns::require`),
-/// altered by [`provide`].
-pub(crate) static FEATURES: LazyLock<Mutex<HashSet<Symbol<'static>>>> =
-    LazyLock::new(Mutex::default);
 
 #[defun]
 pub(crate) fn fset<'ob>(symbol: Symbol<'ob>, definition: Object) -> Result<Symbol<'ob>> {
@@ -540,11 +533,13 @@ pub(crate) fn indirect_function<'ob>(object: Object<'ob>, cx: &'ob Context) -> R
 }
 
 #[defun]
-pub(crate) fn provide<'ob>(feature: Symbol<'ob>, _subfeatures: Option<&Cons>) -> Symbol<'ob> {
-    let mut features = FEATURES.lock().unwrap();
-    // TODO: SYMBOL - need to trace this
-    let feat = unsafe { feature.with_lifetime() };
-    features.insert(feat);
+pub(crate) fn provide<'ob>(
+    feature: Symbol<'ob>,
+    _subfeatures: Option<&Cons>,
+    env: &mut Rt<Env>,
+    cx: &Context,
+) -> Symbol<'ob> {
+    env.provide_feature(feature, cx);
     feature
 }
 
@@ -610,28 +605,47 @@ fn symbol_with_pos_p(_sym: Object) -> bool {
     false
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct LispError {
-    message: &'static Cons,
+    // Reuse the domain-owned slot store rather than hiding an unrooted static
+    // Cons in an anyhow error. The owned rendering remains safe after teardown
+    // and when an error is transferred to a different heap domain.
+    message: HeapDomainValue,
+    rendered: String,
+}
+
+// Host diagnostic comparison, not Lisp identity or condition matching. The
+// owned rendering intentionally compares safely even after heap retirement.
+impl PartialEq for LispError {
+    fn eq(&self, other: &Self) -> bool {
+        self.rendered == other.rendered
+    }
 }
 
 impl std::error::Error for LispError {}
 
 impl std::fmt::Display for LispError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let Self { message } = self;
-        write!(f, "Error: {message}")
+        write!(f, "Error: {}", self.rendered)
     }
 }
 
 defsym!(WRONG_NUMBER_OF_ARGUMENTS);
 impl LispError {
-    pub(crate) fn new(message: &Cons) -> Self {
-        Self { message: unsafe { message.with_lifetime() } }
+    pub(crate) fn new(message: &Cons, cx: &Context) -> Self {
+        Self {
+            message: HeapDomainValue::new(cx.add(message), cx),
+            rendered: message.to_string(),
+        }
     }
 
     pub(crate) fn bind<'ob>(&self, cx: &'ob Context) -> &'ob Cons {
-        cx.bind(self.message)
+        if let Ok(message) = self.message.bind(cx) {
+            return message.cons().expect("error message must be a cons");
+        }
+        // Foreign/retired heaps cannot safely recover original Lisp identity.
+        // Preserve the owned diagnostic without transmitting borrowed pointers.
+        Cons::new(sym::ERROR, self.rendered.as_str(), cx)
     }
 
     pub(crate) fn arg_cnt<'ob, T>(
@@ -642,12 +656,9 @@ impl LispError {
     ) -> Self {
         let func = func.into_obj(cx);
         let list = list![sym::WRONG_NUMBER_OF_ARGUMENTS, func, expected, actual; cx];
-        Self::new(list.try_into().unwrap())
+        Self::new(list.try_into().unwrap(), cx)
     }
 }
-
-unsafe impl Send for LispError {}
-unsafe impl Sync for LispError {}
 
 #[cfg(test)]
 mod test {
@@ -983,3 +994,65 @@ defsym!(CHANNEL_FULL);
 defsym!(CHANNEL_EMPTY);
 defsym!(CHANNEL_TIMEOUT);
 defsym!(THREAD_ERRORED);
+
+#[cfg(test)]
+mod error_ownership_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+
+    #[test]
+    fn owned_error_roots_structured_message_across_moving_collection() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let error = LispError::arg_cnt(sym::CAR, 1, 2, cx);
+        for _ in 0..10 {
+            cx.garbage_collect(true);
+            let message = error.bind(cx);
+            assert_eq!(message.car(), sym::WRONG_NUMBER_OF_ARGUMENTS);
+            assert_eq!(message.cadr().unwrap(), sym::CAR);
+            assert!(error.to_string().contains("wrong-number-of-arguments"));
+        }
+    }
+
+    #[test]
+    fn foreign_error_binding_is_owned_during_owner_collection() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let error = LispError::arg_cnt(sym::CAR, 1, 2, cx);
+        let thread = std::thread::spawn(move || {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            for _ in 0..30 {
+                let message = error.bind(&cx);
+                assert_eq!(message.car(), sym::ERROR);
+                let diagnostic = message.cdr();
+                assert!(matches!(diagnostic.untag(), ObjectType::String(_)));
+                assert!(diagnostic.to_string().contains("wrong-number-of-arguments"));
+            }
+        });
+        for _ in 0..30 {
+            cx.garbage_collect(true);
+        }
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn retired_error_transfers_owned_diagnostic_not_heap_pointers() {
+        let error = {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            LispError::arg_cnt(sym::CAR, 1, 2, &cx)
+        };
+        std::thread::spawn(move || {
+            let rendered = error.to_string();
+            assert!(rendered.contains("wrong-number-of-arguments"));
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            let message = error.bind(&cx);
+            assert_eq!(message.car(), sym::ERROR);
+            assert!(message.cdr().to_string().contains("wrong-number-of-arguments"));
+        })
+        .join()
+        .unwrap();
+    }
+}

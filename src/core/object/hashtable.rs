@@ -93,6 +93,9 @@ impl LispHashTable {
             HashTableType::Global(table) => {
                 let map = INTERNED_SYMBOLS.lock().unwrap();
                 let block = map.global_block();
+                // Keys and values share one copy session, preserving aliases
+                // inside this insertion without retaining stale external IDs.
+                let _clone_session = block.clone_session();
                 // Need to clone these objects in the global block since this
                 // hashtable is globally shared
                 let key = unsafe { key.clone_in(block).with_lifetime() };

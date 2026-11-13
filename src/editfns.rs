@@ -88,7 +88,7 @@ pub(crate) fn insert(args: ArgSlice, env: &mut Rt<Env>, cx: &Context) -> Result<
     let buffer = env.current_buffer.get_mut();
     let args = Rt::bind_slice(env.stack.arg_slice(args), cx);
     for arg in args {
-        buffer.insert(*arg)?;
+        buffer.insert(*arg, cx)?;
     }
     Ok(())
 }
@@ -122,8 +122,8 @@ pub(crate) fn point_marker(env: &mut Rt<Env>) -> usize {
 }
 
 #[defun]
-fn delete_region(start: usize, end: usize, env: &mut Rt<Env>) -> Result<()> {
-    env.current_buffer.get_mut().delete(start, end)
+fn delete_region(start: usize, end: usize, env: &mut Rt<Env>, cx: &Context) -> Result<()> {
+    env.current_buffer.get_mut().delete(start, end, cx)
 }
 
 #[defun]
@@ -270,7 +270,7 @@ mod test {
         insert(ArgSlice::new(2), env, cx).unwrap();
 
         assert_eq!(env.current_buffer.get(), "hello world");
-        delete_region(2, 4, env).unwrap();
+        delete_region(2, 4, env, cx).unwrap();
         assert_eq!(env.current_buffer.get(), "hlo world");
     }
 }

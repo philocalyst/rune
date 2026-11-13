@@ -31,8 +31,6 @@ pub(crate) struct RawObj {
     ptr: *const u8,
 }
 
-unsafe impl Send for RawObj {}
-
 impl RawObj {
     pub(crate) fn addr(self) -> usize {
         self.ptr as usize
@@ -70,8 +68,9 @@ pub(crate) struct Gc<T> {
     _data: PhantomData<T>,
 }
 
-// TODO need to find a better way to handle this
-unsafe impl<T> Send for Gc<T> {}
+// A borrowed heap pointer is deliberately !Send (its raw pointer field enforces
+// this). Cross-thread values must pass through the channel manager's deep-copy
+// boundary, not borrow a different Context's allocations.
 
 impl<T> Gc<T> {
     const fn new(ptr: *const u8) -> Self {
@@ -1165,7 +1164,7 @@ pub(crate) enum ObjectType<'ob> {
     ByteFn(&'ob ByteFn) = Tag::ByteFn as u8,
     SubrFn(&'static SubrFn) = Tag::SubrFn as u8,
     Buffer(&'static LispBuffer) = Tag::Buffer as u8,
-    CharTable(&'static CharTable) = Tag::CharTable as u8,
+    CharTable(&'ob CharTable) = Tag::CharTable as u8,
     BigInt(&'ob LispBigInt) = Tag::BigInt as u8,
     ChannelSender(&'ob ChannelSender) = Tag::ChannelSender as u8,
     ChannelReceiver(&'ob ChannelReceiver) = Tag::ChannelReceiver as u8,
@@ -1759,7 +1758,27 @@ impl<T> Eq for Gc<T> {}
 use std::hash::{Hash, Hasher};
 impl<T> Hash for Gc<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.ptr.hash(state);
+        // PartialEq has a structural fallback, so pointer-only hashes violate
+        // equal => equal hash for separately allocated values. Keep primitives
+        // efficient, but deliberately use tag-only hashes for mutable/recursive
+        // structures: walking them would fail on cycles or mutation. Explicit
+        // Lisp eq/eql/equal key wrappers can replace this conservative fallback.
+        // This does not make mutation of a key's equality while it is stored
+        // valid, nor make structural equality cycle-safe. Those remain separate
+        // hash-table semantics work. ObjectType's derived equality never equates
+        // distinct variants, so including the tag preserves every equal pair.
+        (self.as_obj().get_tag() as u8).hash(state);
+        match self.as_obj().untag() {
+            ObjectType::Int(value) => value.hash(state),
+            ObjectType::Symbol(value) => value.hash(state),
+            ObjectType::Float(value) => {
+                // Structural float equality equates both signed zeros.
+                let bits = if **value == 0.0 { 0 } else { value.to_bits() };
+                bits.hash(state);
+            }
+            ObjectType::BigInt(value) => (**value).hash(state),
+            _ => {}
+        }
     }
 }
 
@@ -1850,5 +1869,107 @@ mod test {
 
         cons.unwrap_cons().set_car(cons).unwrap();
         assert_eq!(format!("{cons}"), "(#0 . #0)");
+    }
+}
+
+#[cfg(test)]
+mod heap_thread_affinity_tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_heap_pointers_are_not_send() {
+        // If a type gains Send, both implementations match and inference fails.
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        let _ = <Object<'static> as AmbiguousIfSend<_>>::check;
+        let _ = <RawObj as AmbiguousIfSend<_>>::check;
+        let _ = <Symbol<'static> as AmbiguousIfSend<_>>::check;
+        let _ = <&'static LispFloat as AmbiguousIfSend<_>>::check;
+        let _ = <&'static LispBigInt as AmbiguousIfSend<_>>::check;
+        let _ = <&'static ChannelSender as AmbiguousIfSend<_>>::check;
+        let _ = <crate::core::gc::__HeapRoot<crate::core::gc::Slot<Object<'static>>> as AmbiguousIfSend<_>>::check;
+        let _ = <crate::intervals::IntervalTree<'static> as AmbiguousIfSend<_>>::check;
+    }
+}
+
+#[cfg(test)]
+mod object_hash_contract_tests {
+    use super::*;
+    use crate::core::gc::{Context, RootSet};
+    use std::collections::{HashMap, hash_map::DefaultHasher};
+
+    fn hash(value: Object) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[test]
+    fn separately_allocated_equal_values_have_equal_hashes() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let large = num_bigint::BigInt::from(1_u8) << 80_u32;
+        let pairs = [
+            (cx.add("equal string"), cx.add("equal string")),
+            (cx.add(vec![cx.add(7)]), cx.add(vec![cx.add(7)])),
+            (cx.add(large.clone()), cx.add(large)),
+            (cx.add(1.5), cx.add(1.5)),
+            (cx.add(0.0), cx.add(-0.0)),
+        ];
+        for (left, right) in pairs {
+            assert_eq!(left, right);
+            assert_eq!(hash(left), hash(right));
+            let mut map = HashMap::new();
+            map.insert(left, 42);
+            assert_eq!(map.get(&right), Some(&42));
+        }
+    }
+
+    #[test]
+    fn numeric_variant_and_nan_equality_implications_are_consistent() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let nan = cx.add(f64::NAN);
+        let values = [
+            cx.add(0_i64),
+            cx.add(7_i64),
+            cx.add(num_bigint::BigInt::from(0)),
+            cx.add(num_bigint::BigInt::from(7)),
+            cx.add(0.0),
+            cx.add(-0.0),
+            cx.add(7.0),
+            cx.add(f64::INFINITY),
+            cx.add(f64::NEG_INFINITY),
+            nan,
+            nan,
+            cx.add(f64::NAN),
+            cx.add(f64::from_bits(0x7ff8_0000_0000_0001)),
+        ];
+        assert_ne!(values[0], values[2]); // Int versus BigInt
+        assert_ne!(values[1], values[6]); // Int versus Float
+        assert_ne!(values[3], values[6]); // BigInt versus Float
+        for left in values {
+            for right in values {
+                if left == right {
+                    assert_eq!(hash(left), hash(right));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hashing_recursive_or_mutable_structure_does_not_walk_it() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let cons = Cons::new1(NIL, &cx);
+        let object = cx.add(cons);
+        let before = hash(object);
+        cons.set_cdr(object).unwrap();
+        assert_eq!(hash(object), before);
+        cons.set_car(cx.add("mutated")).unwrap();
+        assert_eq!(hash(object), before);
     }
 }

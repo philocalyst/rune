@@ -152,7 +152,8 @@ fn validate_property_mutation_range(data: &BufferData, start: usize, end: usize)
 pub fn text_properties_at<'ob>(
     position: usize,
     object: Option<Object<'ob>>,
-    env: &'ob mut Rt<Env>,
+    env: &mut Rt<Env>,
+    cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     let object = object.unwrap_or(NIL);
     if matches!(object.untag(), ObjectType::String(_)) {
@@ -168,7 +169,8 @@ pub fn text_properties_at<'ob>(
         if position == point_max {
             return Ok(NIL);
         }
-        let properties = data.textprops.find(position).map(|node| *node.val).unwrap_or(NIL);
+        let mut tree = data.textprops.lock(cx)?;
+        let properties = tree.find(position).map(|node| *node.val).unwrap_or(NIL);
         // The returned Lisp object belongs to the GC context, not to the
         // temporary buffer mutex guard used to look it up.
         Ok(unsafe { properties.with_lifetime() })
@@ -188,9 +190,10 @@ pub fn get_text_property<'ob>(
     position: usize,
     prop: Object<'ob>,
     object: Option<Object<'ob>>,
-    env: &'ob mut Rt<Env>,
+    env: &mut Rt<Env>,
+    cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    let props = text_properties_at(position, object, env)?;
+    let props = text_properties_at(position, object, env, &cx)?;
     // TODO see lookup_char_property, should also lookup
     // 1. category
     // 2. char_property_alias_alist
@@ -208,7 +211,7 @@ pub fn get_char_property_and_overlay<'ob>(
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    let value = get_text_property(position, prop, object, env)?;
+    let value = get_text_property(position, prop, object, env, &cx)?;
     Ok(Cons::new(value, NIL, cx).into())
 }
 
@@ -220,8 +223,9 @@ pub fn get_char_property<'ob>(
     prop: Object<'ob>,
     object: Option<Object<'ob>>,
     env: &'ob mut Rt<Env>,
+    cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    get_text_property(position, prop, object, env)
+    get_text_property(position, prop, object, env, &cx)
 }
 
 // Keep direct Rust callers safe even when passing an i64 outside the tagged
@@ -352,7 +356,7 @@ pub fn add_text_properties<'ob>(
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(false);
         }
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         let mut changed = false;
         // Normalize duplicate keys for uncovered gaps, where insertion stores
         // the incoming plist directly. GNU applies later assignments last.
@@ -390,13 +394,12 @@ pub fn put_text_property<'ob>(
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     let prop = list!(property, value; cx);
-    let prop = Slot::new(prop);
     modify_buffer_data(object, env, |data| {
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(());
         }
-        let tree = &mut data.textprops_with_lifetime();
-        tree.insert(start, end, prop, cx)
+        let mut tree = data.textprops.lock(cx)?;
+        tree.insert(start, end, Slot::new(prop), cx)
     })
 }
 /// Return the position of next property change.
@@ -430,7 +433,8 @@ pub fn next_property_change<'ob>(
             if position == 0 || position > point_max {
                 bail!("Buffer position {position} is out of range 1..={point_max}");
             }
-            let next = data.textprops.tree.find_intersect_min(position..point_max);
+            let mut tree = data.textprops.lock(cx)?;
+            let next = tree.tree.find_intersect_min(position..point_max);
             let boundary = match next {
                 Some(node) if node.key.start > position => node.key.start,
                 Some(node) => node.key.end.min(point_max),
@@ -439,7 +443,7 @@ pub fn next_property_change<'ob>(
             return Ok(cx.add(boundary));
         }
         let end = limit.unwrap_or(point_max);
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         let prop = tree.tree.find_intersect_min(position..end);
 
         match prop {
@@ -492,7 +496,7 @@ pub fn next_single_property_change<'ob>(
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let point_max = data.text.len_chars() + 1;
         let end = limit.unwrap_or(point_max);
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         let iter = tree.iter(position, end);
 
         let mut val = None;
@@ -538,7 +542,7 @@ pub fn previous_property_change<'ob>(
         let point_min = 1;
         let start = limit.unwrap_or(point_min);
         let end = position;
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         let prop = tree.tree.find_intersect_max(start..end);
 
         match prop {
@@ -595,7 +599,7 @@ pub fn previous_single_property_change<'ob>(
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let point_min = 1;
         let start = limit.unwrap_or(point_min);
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         let iter = tree.iter_reverse(start, position);
 
         let mut val = None;
@@ -666,7 +670,7 @@ pub fn set_text_properties<'ob>(
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(());
         }
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         tree.set_properties(start, end, properties);
         Ok(())
     })
@@ -697,7 +701,7 @@ pub fn remove_text_properties<'ob>(
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(false);
         }
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         // GNU textprop.c traverses candidate keys without validate_plist:
         // non-lists are no-ops, and a final key need not have a value.
         if !properties.is_nil() && properties.cons().is_none() {
@@ -740,7 +744,7 @@ pub fn remove_list_of_text_properties<'ob>(
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(false);
         }
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         tree.delete(start, end, list_of_properties, cx)
     })
 }
@@ -764,7 +768,7 @@ pub fn text_property_any<'ob>(
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         let iter = tree.iter(start, end);
         for (interval, props) in iter {
             let val = textget(props, property)?;
@@ -795,7 +799,7 @@ pub fn text_property_not_all<'ob>(
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
-        let tree = data.textprops_with_lifetime();
+        let mut tree = data.textprops.lock(cx)?;
         let iter = tree.iter(start, end);
         for (interval, props) in iter {
             let val = textget(props, property)?;
@@ -843,7 +847,7 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-property-noops"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdefg"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdefg"), &cx)?;
         let key: Object = intern("roadmap-face", &cx).into();
         let missing: Object = intern("roadmap-missing", &cx).into();
         let value = cx.add("bold");
@@ -1000,7 +1004,7 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-remove-candidates"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcde"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcde"), &cx)?;
         let a: Object = intern("roadmap-remove-a", &cx).into();
         let b: Object = intern("roadmap-remove-b", &cx).into();
         put_text_property(1, 5, a, cx.add(1), Some(buf), env, &cx)?;
@@ -1008,14 +1012,14 @@ mod tests {
         // GNU's CONSP candidate loop ignores a bare symbol, rather than
         // interpreting it as a property name or rejecting it.
         remove_text_properties(2, 4, a, Some(buf), env, &cx)?;
-        assert_eq!(plist_get(text_properties_at(2, Some(buf), env)?, a)?, 1);
+        assert_eq!(plist_get(text_properties_at(2, Some(buf), env, &cx)?, a)?, 1);
         assert_eq!(next_property_change(1, Some(buf), None, env, &cx)?, 5);
         // A final proper-list key is still a removal candidate with no value.
         remove_text_properties(2, 4, list![a; &cx], Some(buf), env, &cx)?;
-        assert!(plist_get(text_properties_at(2, Some(buf), env)?, a)?.is_nil());
-        assert_eq!(plist_get(text_properties_at(1, Some(buf), env)?, a)?, 1);
-        assert_eq!(plist_get(text_properties_at(4, Some(buf), env)?, a)?, 1);
-        assert_eq!(plist_get(text_properties_at(2, Some(buf), env)?, b)?, 2);
+        assert!(plist_get(text_properties_at(2, Some(buf), env, &cx)?, a)?.is_nil());
+        assert_eq!(plist_get(text_properties_at(1, Some(buf), env, &cx)?, a)?, 1);
+        assert_eq!(plist_get(text_properties_at(4, Some(buf), env, &cx)?, a)?, 1);
+        assert_eq!(plist_get(text_properties_at(2, Some(buf), env, &cx)?, b)?, 2);
         Ok(())
     }
 
@@ -1025,7 +1029,7 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-previous-single"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdefghij"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdefghij"), &cx)?;
         let key: Object = intern("roadmap-previous-key", &cx).into();
         let other: Object = intern("roadmap-previous-other", &cx).into();
         let value = cx.add("value");
@@ -1050,32 +1054,32 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-reversed-properties"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
         let a: Object = intern("roadmap-reversed-a", &cx).into();
         let b: Object = intern("roadmap-reversed-b", &cx).into();
         put_text_property(6, 2, a, cx.add(1), Some(buf), env, &cx)?;
-        assert!(get_text_property(1, a, Some(buf), env)?.is_nil());
-        assert_eq!(get_text_property(2, a, Some(buf), env)?, 1);
-        assert_eq!(get_text_property(5, a, Some(buf), env)?, 1);
-        assert!(get_text_property(6, a, Some(buf), env)?.is_nil());
+        assert!(get_text_property(1, a, Some(buf), env, &cx)?.is_nil());
+        assert_eq!(get_text_property(2, a, Some(buf), env, &cx)?, 1);
+        assert_eq!(get_text_property(5, a, Some(buf), env, &cx)?, 1);
+        assert!(get_text_property(6, a, Some(buf), env, &cx)?.is_nil());
         set_text_properties(5, 3, list![b, 2; &cx], Some(buf), env, &cx)?;
-        assert!(get_text_property(3, a, Some(buf), env)?.is_nil());
-        assert_eq!(get_text_property(3, b, Some(buf), env)?, 2);
-        assert_eq!(get_text_property(2, a, Some(buf), env)?, 1);
-        assert_eq!(get_text_property(5, a, Some(buf), env)?, 1);
+        assert!(get_text_property(3, a, Some(buf), env, &cx)?.is_nil());
+        assert_eq!(get_text_property(3, b, Some(buf), env, &cx)?, 2);
+        assert_eq!(get_text_property(2, a, Some(buf), env, &cx)?, 1);
+        assert_eq!(get_text_property(5, a, Some(buf), env, &cx)?, 1);
         remove_text_properties(4, 3, list![b, NIL; &cx], Some(buf), env, &cx)?;
-        assert!(text_properties_at(3, Some(buf), env)?.is_nil());
-        assert_eq!(get_text_property(4, b, Some(buf), env)?, 2);
+        assert!(text_properties_at(3, Some(buf), env, &cx)?.is_nil());
+        assert_eq!(get_text_property(4, b, Some(buf), env, &cx)?, 2);
         remove_list_of_text_properties(6, 4, list![a, b; &cx], Some(buf), env, &cx)?;
-        assert!(text_properties_at(4, Some(buf), env)?.is_nil());
-        assert!(text_properties_at(5, Some(buf), env)?.is_nil());
-        assert_eq!(get_text_property(2, a, Some(buf), env)?, 1);
+        assert!(text_properties_at(4, Some(buf), env, &cx)?.is_nil());
+        assert!(text_properties_at(5, Some(buf), env, &cx)?.is_nil());
+        assert_eq!(get_text_property(2, a, Some(buf), env, &cx)?, 1);
         // Normalization must leave empty ranges as no-ops.
         put_text_property(2, 2, a, cx.add(9), Some(buf), env, &cx)?;
         set_text_properties(2, 2, NIL, Some(buf), env, &cx)?;
         remove_text_properties(2, 2, list![a, NIL; &cx], Some(buf), env, &cx)?;
         remove_list_of_text_properties(2, 2, list![a; &cx], Some(buf), env, &cx)?;
-        assert_eq!(get_text_property(2, a, Some(buf), env)?, 1);
+        assert_eq!(get_text_property(2, a, Some(buf), env, &cx)?, 1);
         Ok(())
     }
 
@@ -1085,7 +1089,7 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-property-search"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
         let key: Object = intern("roadmap-search-key", &cx).into();
         let value = cx.add("same");
         put_text_property(2, 5, key, value, Some(buf), env, &cx)?;
@@ -1110,7 +1114,7 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-removal-results"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
         let key: Object = intern("roadmap-removal-result-key", &cx).into();
         let missing: Object = intern("roadmap-removal-result-missing", &cx).into();
         put_text_property(1, 6, key, NIL, Some(buf), env, &cx)?;
@@ -1120,9 +1124,9 @@ mod tests {
         // Presence, not a non-nil value, determines whether removal changed text.
         assert!(remove_text_properties(2, 4, list![key, 999; &cx], Some(buf), env, &cx)?);
         assert!(!remove_text_properties(2, 4, list![key, NIL; &cx], Some(buf), env, &cx)?);
-        assert!(!text_properties_at(1, Some(buf), env)?.is_nil());
-        assert!(text_properties_at(2, Some(buf), env)?.is_nil());
-        assert!(!text_properties_at(4, Some(buf), env)?.is_nil());
+        assert!(!text_properties_at(1, Some(buf), env, &cx)?.is_nil());
+        assert!(text_properties_at(2, Some(buf), env, &cx)?.is_nil());
+        assert!(!text_properties_at(4, Some(buf), env, &cx)?.is_nil());
         assert!(remove_list_of_text_properties(
             1,
             6,
@@ -1160,18 +1164,18 @@ mod tests {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
-        env.current_buffer.get_mut().insert(cx.add("abc"))?;
+        env.current_buffer.get_mut().insert(cx.add("abc"), &cx)?;
         let other = get_buffer_create(cx.add("roadmap-optional-other"), None, &cx)?;
-        other.buffer().unwrap().lock()?.insert(cx.add("abc"))?;
+        other.buffer().unwrap().lock()?.insert(cx.add("abc"), &cx)?;
         let key: Object = intern("roadmap-optional-key", &cx).into();
         put_text_property(1, 3, key, cx.add(1), None, env, &cx)?;
         set_text_properties(1, 3, list![key, 2; &cx], Some(other), env, &cx)?;
-        assert_eq!(get_text_property(1, key, None, env)?, 1);
-        assert_eq!(get_text_property(1, key, Some(other), env)?, 2);
+        assert_eq!(get_text_property(1, key, None, env, &cx)?, 1);
+        assert_eq!(get_text_property(1, key, Some(other), env, &cx)?, 2);
         assert!(remove_text_properties(1, 3, list![key, NIL; &cx], None, env, &cx)?);
-        assert_eq!(get_text_property(1, key, Some(other), env)?, 2);
+        assert_eq!(get_text_property(1, key, Some(other), env, &cx)?, 2);
         assert!(remove_list_of_text_properties(1, 3, list![key; &cx], Some(other), env, &cx)?);
-        assert!(get_text_property(1, key, Some(other), env)?.is_nil());
+        assert!(get_text_property(1, key, Some(other), env, &cx)?.is_nil());
         Ok(())
     }
 
@@ -1205,7 +1209,7 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-mutation-bounds"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"), &cx)?;
         let key: Object = intern("roadmap-mutation-bounds-key", &cx).into();
         put_text_property(1, 3, key, cx.add(7), Some(buf), env, &cx)?;
         for (start, end) in [(0, 2), (1, 4), (4, 1), (1, usize::MAX)] {
@@ -1219,9 +1223,9 @@ mod tests {
                 remove_list_of_text_properties(start, end, list![key; &cx], Some(buf), env, &cx)
                     .is_err()
             );
-            assert_eq!(get_text_property(1, key, Some(buf), env)?, 7);
-            assert_eq!(get_text_property(2, key, Some(buf), env)?, 7);
-            assert!(text_properties_at(3, Some(buf), env)?.is_nil());
+            assert_eq!(get_text_property(1, key, Some(buf), env, &cx)?, 7);
+            assert_eq!(get_text_property(2, key, Some(buf), env, &cx)?, 7);
+            assert!(text_properties_at(3, Some(buf), env, &cx)?.is_nil());
         }
         // GNU returns without validating the bounds of an empty range.
         put_text_property(usize::MAX, usize::MAX, key, NIL, Some(buf), env, &cx)?;
@@ -1235,10 +1239,10 @@ mod tests {
             env,
             &cx
         )?);
-        assert_eq!(get_text_property(1, key, Some(buf), env)?, 7);
+        assert_eq!(get_text_property(1, key, Some(buf), env, &cx)?, 7);
         // Endpoint3 is legal for two Unicode characters, regardless of bytes.
         assert!(remove_list_of_text_properties(3, 1, list![key; &cx], Some(buf), env, &cx)?);
-        assert!(text_properties_at(1, Some(buf), env)?.is_nil());
+        assert!(text_properties_at(1, Some(buf), env, &cx)?.is_nil());
         Ok(())
     }
 
@@ -1248,24 +1252,24 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-set-plist-copy"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abc"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abc"), &cx)?;
         let key: Object = intern("roadmap-set-plist-key", &cx).into();
         let value = cx.add("shared-value");
         let original = list![key, value; &cx];
         set_text_properties(1, 3, original, Some(buf), env, &cx)?;
-        assert!(!eq(text_properties_at(1, Some(buf), env)?, original));
-        assert!(eq(get_text_property(1, key, Some(buf), env)?, value));
+        assert!(!eq(text_properties_at(1, Some(buf), env, &cx)?, original));
+        assert!(eq(get_text_property(1, key, Some(buf), env, &cx)?, value));
         original.cons().unwrap().cdr().cons().unwrap().set_car(cx.add(99))?;
         original.cons().unwrap().set_cdr(NIL)?;
-        assert!(eq(get_text_property(1, key, Some(buf), env)?, value));
+        assert!(eq(get_text_property(1, key, Some(buf), env, &cx)?, value));
         // Odd input must fail before any existing interval changes, even for
         // an empty range: GNU validates the plist before range processing.
         let odd = list![key; &cx];
         assert!(set_text_properties(1, 3, odd, Some(buf), env, &cx).is_err());
         assert!(set_text_properties(2, 2, odd, Some(buf), env, &cx).is_err());
-        assert!(eq(get_text_property(1, key, Some(buf), env)?, value));
+        assert!(eq(get_text_property(1, key, Some(buf), env, &cx)?, value));
         set_text_properties(1, 3, key, Some(buf), env, &cx)?;
-        let installed = text_properties_at(1, Some(buf), env)?;
+        let installed = text_properties_at(1, Some(buf), env, &cx)?;
         assert_eq!(installed.to_string(), "(roadmap-set-plist-key nil)");
         Ok(())
     }
@@ -1284,7 +1288,7 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-add-properties"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
         let a: Object = intern("roadmap-add-a", &cx).into();
         let b: Object = intern("roadmap-add-b", &cx).into();
         let value = cx.add("same");
@@ -1293,10 +1297,10 @@ mod tests {
         assert!(add_text_properties(2, 5, incoming, Some(buf), env, &cx)?);
         assert!(!add_text_properties(3, 4, incoming, Some(buf), env, &cx)?);
         assert_eq!(next_property_change(2, Some(buf), None, env, &cx)?, 5);
-        assert!(eq(get_text_property(3, a, Some(buf), env)?, value));
-        assert_eq!(get_text_property(3, b, Some(buf), env)?, 9);
+        assert!(eq(get_text_property(3, a, Some(buf), env, &cx)?, value));
+        assert_eq!(get_text_property(3, b, Some(buf), env, &cx)?, 9);
         incoming.cons().unwrap().cdr().cons().unwrap().set_car(cx.add(8))?;
-        assert!(eq(get_text_property(3, a, Some(buf), env)?, value));
+        assert!(eq(get_text_property(3, a, Some(buf), env, &cx)?, value));
         assert!(add_text_properties(3, 4, list![a, cx.add("same"); &cx], Some(buf), env, &cx)?);
         assert!(add_text_properties(5, 2, list![a, value; &cx], Some(buf), env, &cx)?);
         assert_eq!(next_property_change(2, Some(buf), None, env, &cx)?, 5);
@@ -1307,8 +1311,8 @@ mod tests {
         assert!(!add_text_properties(usize::MAX, 0, NIL, Some(cx.add(42)), env, &cx)?);
         assert!(add_text_properties(0, 2, list![a, 1; &cx], Some(buf), env, &cx).is_err());
         assert!(add_text_properties(2, 5, list![a; &cx], Some(buf), env, &cx).is_err());
-        assert!(eq(get_text_property(3, a, Some(buf), env)?, value));
-        assert_eq!(get_text_property(3, b, Some(buf), env)?, 9);
+        assert!(eq(get_text_property(3, a, Some(buf), env, &cx)?, value));
+        assert_eq!(get_text_property(3, b, Some(buf), env, &cx)?, 9);
         Ok(())
     }
 
@@ -1318,15 +1322,15 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-add-duplicate-keys"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
         let key: Object = intern("roadmap-add-duplicate", &cx).into();
         // Initially uncovered text must end up with the last assignment.
         assert!(add_text_properties(2, 5, list![key, 1, key, 2; &cx], Some(buf), env, &cx)?);
-        assert_eq!(get_text_property(3, key, Some(buf), env)?, 2);
+        assert_eq!(get_text_property(3, key, Some(buf), env, &cx)?, 2);
         // Changing and then restoring the original value still reports t,
         // while final equal intervals must not acquire artificial boundaries.
         assert!(add_text_properties(3, 4, list![key, 1, key, 2; &cx], Some(buf), env, &cx)?);
-        assert_eq!(get_text_property(3, key, Some(buf), env)?, 2);
+        assert_eq!(get_text_property(3, key, Some(buf), env, &cx)?, 2);
         assert_eq!(next_property_change(2, Some(buf), None, env, &cx)?, 5);
         assert!(!add_text_properties(3, 4, list![key, 2, key, 2; &cx], Some(buf), env, &cx)?);
         // A range spanning both covered text and gaps applies the same final
@@ -1334,7 +1338,7 @@ mod tests {
         assert!(add_text_properties(1, 6, list![key, 9, key, NIL; &cx], Some(buf), env, &cx)?);
         for position in 1..6 {
             assert_eq!(
-                text_properties_at(position, Some(buf), env)?.to_string(),
+                text_properties_at(position, Some(buf), env, &cx)?.to_string(),
                 "(roadmap-add-duplicate nil)"
             );
         }
@@ -1393,16 +1397,16 @@ mod tests {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
-        env.current_buffer.get_mut().insert(cx.add("abcdef"))?;
+        env.current_buffer.get_mut().insert(cx.add("abcdef"), &cx)?;
         let other = get_buffer_create(cx.add("roadmap-query-other-buffer"), None, &cx)?;
-        other.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        other.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
         let key: Object = intern("roadmap-query-object-key", &cx).into();
         put_text_property(1, 3, key, cx.add(7), None, env, &cx)?;
         put_text_property(2, 5, key, cx.add(9), Some(other), env, &cx)?;
-        assert!(!text_properties_at(1, None, env)?.is_nil());
-        assert!(text_properties_at(1, Some(other), env)?.is_nil());
-        assert_eq!(get_text_property(2, key, None, env)?, 7);
-        assert_eq!(get_text_property(2, key, Some(other), env)?, 9);
+        assert!(!text_properties_at(1, None, env, &cx)?.is_nil());
+        assert!(text_properties_at(1, Some(other), env, &cx)?.is_nil());
+        assert_eq!(get_text_property(2, key, None, env, &cx)?, 7);
+        assert_eq!(get_text_property(2, key, Some(other), env, &cx)?, 9);
         assert_eq!(next_property_change(1, None, None, env, &cx)?, 3);
         assert_eq!(next_property_change(2, Some(other), None, env, &cx)?, 5);
         assert_eq!(next_single_property_change(1, key, None, None, env, &cx)?, 3);
@@ -1425,7 +1429,7 @@ mod tests {
         root!(env, new(Env), cx);
         let buf = get_buffer_create(cx.add("roadmap-true-limit"), None, &cx)?;
         assert_eq!(next_property_change(1, Some(buf), Some(TRUE), env, &cx)?, 1);
-        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂abcd"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂abcd"), &cx)?;
         let key: Object = intern("roadmap-true-limit-key", &cx).into();
         // Unpropertized text still returns the endpoint with t, not nil.
         assert_eq!(next_property_change(1, Some(buf), Some(TRUE), env, &cx)?, 7);
@@ -1461,27 +1465,27 @@ mod tests {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
-        env.current_buffer.get_mut().insert(cx.add("é🙂"))?;
+        env.current_buffer.get_mut().insert(cx.add("é🙂"), &cx)?;
         let key: Object = intern("roadmap-char-property-key", &cx).into();
         let value = cx.add("identity");
         put_text_property(1, 3, key, value, None, env, &cx)?;
-        assert!(eq(get_char_property(2, key, None, env)?, value));
+        assert!(eq(get_char_property(2, key, None, env, &cx)?, value));
         let pair = get_char_property_and_overlay(1, key, None, env, &cx)?;
         assert!(eq(pair.cons().unwrap().car(), value));
         assert!(pair.cons().unwrap().cdr().is_nil());
-        assert!(get_char_property(3, key, None, env)?.is_nil());
+        assert!(get_char_property(3, key, None, env, &cx)?.is_nil());
         assert_eq!(get_char_property_and_overlay(3, key, None, env, &cx)?.to_string(), "(nil)");
-        assert!(get_char_property(0, key, None, env).is_err());
+        assert!(get_char_property(0, key, None, env, &cx).is_err());
         assert!(get_char_property_and_overlay(4, key, None, env, &cx).is_err());
         let other = get_buffer_create(cx.add("roadmap-char-property-other"), None, &cx)?;
-        other.buffer().unwrap().lock()?.insert(cx.add("x"))?;
-        assert!(get_char_property(1, key, Some(other), env)?.is_nil());
+        other.buffer().unwrap().lock()?.insert(cx.add("x"), &cx)?;
+        assert!(get_char_property(1, key, Some(other), env, &cx)?.is_nil());
         assert_eq!(
             get_char_property_and_overlay(1, key, Some(other), env, &cx)?.to_string(),
             "(nil)"
         );
-        assert!(get_char_property(1, key, Some(cx.add(42)), env).is_err());
-        assert!(get_char_property(0, key, Some(cx.add("string")), env).is_err());
+        assert!(get_char_property(1, key, Some(cx.add(42)), env, &cx).is_err());
+        assert!(get_char_property(0, key, Some(cx.add("string")), env, &cx).is_err());
         Ok(())
     }
 
@@ -1500,7 +1504,7 @@ mod tests {
         root!(env, new(Env), cx);
         assert_eq!(next_char_property_change(1, None, env, &cx)?, 1);
         assert_eq!(previous_char_property_change(1, None, env, &cx)?, 1);
-        env.current_buffer.get_mut().insert(cx.add("é🙂abcd"))?;
+        env.current_buffer.get_mut().insert(cx.add("é🙂abcd"), &cx)?;
         let key: Object = intern("roadmap-char-scan-key", &cx).into();
         put_text_property(2, 5, key, cx.add(1), None, env, &cx)?;
         for (position, expected) in [(1, 2), (2, 5), (5, 7), (7, 7)] {
@@ -1551,7 +1555,7 @@ mod tests {
         root!(env, new(Env), cx);
         assert_eq!(next_single_char_property_change(1, cx.add(1), None, None, env, &cx)?, 1);
         assert_eq!(previous_single_char_property_change(1, cx.add(1), None, None, env, &cx)?, 1);
-        env.current_buffer.get_mut().insert(cx.add("é🙂abcd"))?;
+        env.current_buffer.get_mut().insert(cx.add("é🙂abcd"), &cx)?;
         let key: Object = intern("roadmap-single-char-key", &cx).into();
         let other_key: Object = intern("roadmap-single-char-other", &cx).into();
         let value = cx.add("same");
@@ -1577,7 +1581,7 @@ mod tests {
         assert_eq!(previous_single_char_property_change(2, key, None, Some(-1), env, &cx)?, 1);
         assert_eq!(previous_single_char_property_change(7, key, None, Some(6), env, &cx)?, 6);
         let other = get_buffer_create(cx.add("roadmap-single-char-buffer"), None, &cx)?;
-        other.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        other.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
         put_text_property(3, 6, key, cx.add(1), Some(other), env, &cx)?;
         assert_eq!(next_single_char_property_change(1, key, Some(other), None, env, &cx)?, 3);
         assert_eq!(previous_single_char_property_change(7, key, Some(other), None, env, &cx)?, 6);
@@ -1619,11 +1623,11 @@ mod tests {
         remove_text_properties(1, 10, list![a, 999; cx], Some(buf), env, cx)?;
 
         // Verify :a was removed
-        let props = text_properties_at(3, Some(buf), env)?;
+        let props = text_properties_at(3, Some(buf), env, &cx)?;
         assert!(props.is_nil());
 
         // Verify :b remains
-        let props = text_properties_at(5, Some(buf), env)?;
+        let props = text_properties_at(5, Some(buf), env, &cx)?;
         let val = plist_get(props, b)?;
         assert_eq!(val, cx.add(2));
 
@@ -1640,24 +1644,24 @@ mod tests {
         let cx = Context::new(&roots);
         root!(env, new(Env), cx);
         let current = cx.add(env.current_buffer.buf_ref);
-        env.current_buffer.get_mut().insert(cx.add("abc"))?;
+        env.current_buffer.get_mut().insert(cx.add("abc"), &cx)?;
         let key: Object = intern("roadmap-current-property", &cx).into();
         let value = cx.add("identity");
         put_text_property(1, 3, key, value, None, env, &cx)?;
         // Env already owns this buffer's guard. Explicit current-buffer reads
         // must use it rather than trying to lock the same mutex again.
-        let implicit = text_properties_at(1, None, env)?;
+        let implicit = text_properties_at(1, None, env, &cx)?;
         root!(implicit, cx);
-        let explicit = text_properties_at(1, Some(current), env)?;
+        let explicit = text_properties_at(1, Some(current), env, &cx)?;
         assert!(eq(implicit.bind(&cx), explicit));
-        assert!(eq(get_text_property(2, key, Some(current), env)?, value));
-        assert!(text_properties_at(4, Some(current), env)?.is_nil());
+        assert!(eq(get_text_property(2, key, Some(current), env, &cx)?, value));
+        assert!(text_properties_at(4, Some(current), env, &cx)?.is_nil());
 
         let deleted = get_buffer_create(cx.add("roadmap-deleted-property"), None, &cx)?;
         deleted.buffer().unwrap().lock()?.kill();
-        assert!(text_properties_at(1, Some(deleted), env).is_err());
-        assert!(text_properties_at(1, Some(cx.add(123)), env).is_err());
-        assert!(text_properties_at(0, Some(cx.add("string")), env).is_err());
+        assert!(text_properties_at(1, Some(deleted), env, &cx).is_err());
+        assert!(text_properties_at(1, Some(cx.add(123)), env, &cx).is_err());
+        assert!(text_properties_at(0, Some(cx.add("string")), env, &cx).is_err());
         Ok(())
     }
 
@@ -1669,21 +1673,21 @@ mod tests {
         let buf = get_buffer_create(cx.add("roadmap-property-read-bounds"), None, &cx)?;
         let key: Object = intern("roadmap-read-bounds-key", &cx).into();
         // An empty buffer has one legal position, but no character there.
-        assert!(text_properties_at(1, Some(buf), env)?.is_nil());
-        assert!(text_properties_at(0, Some(buf), env).is_err());
-        assert!(text_properties_at(2, Some(buf), env).is_err());
-        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"))?;
+        assert!(text_properties_at(1, Some(buf), env, &cx)?.is_nil());
+        assert!(text_properties_at(0, Some(buf), env, &cx).is_err());
+        assert!(text_properties_at(2, Some(buf), env, &cx).is_err());
+        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"), &cx)?;
         put_text_property(1, 3, key, cx.add(7), Some(buf), env, &cx)?;
-        assert_eq!(get_text_property(2, key, Some(buf), env)?, 7);
-        assert!(text_properties_at(3, Some(buf), env)?.is_nil());
-        assert!(get_text_property(3, key, Some(buf), env)?.is_nil());
+        assert_eq!(get_text_property(2, key, Some(buf), env, &cx)?, 7);
+        assert!(text_properties_at(3, Some(buf), env, &cx)?.is_nil());
+        assert!(get_text_property(3, key, Some(buf), env, &cx)?.is_nil());
         // Character counts, not UTF-8 bytes, determine the legal endpoint.
-        assert!(get_text_property(4, key, Some(buf), env).is_err());
-        assert!(get_text_property(0, key, Some(buf), env).is_err());
+        assert!(get_text_property(4, key, Some(buf), env, &cx).is_err());
+        assert!(get_text_property(0, key, Some(buf), env, &cx).is_err());
         env.set_buffer(buf.buffer().unwrap());
-        assert_eq!(get_text_property(2, key, None, env)?, 7);
-        assert!(text_properties_at(0, None, env).is_err());
-        assert!(text_properties_at(3, None, env)?.is_nil());
+        assert_eq!(get_text_property(2, key, None, env, &cx)?, 7);
+        assert!(text_properties_at(0, None, env, &cx).is_err());
+        assert!(text_properties_at(3, None, env, &cx)?.is_nil());
         Ok(())
     }
 
@@ -1695,14 +1699,14 @@ mod tests {
         root!(env, new(Env), cx);
 
         let buf = get_buffer_create(cx.add("test_text_properties_at"), None, cx)?;
-        let n = text_properties_at(1, Some(buf), env)?;
+        let n = text_properties_at(1, Some(buf), env, &cx)?;
         assert!(n.is_nil());
 
         let a = intern(":a", cx);
         let a = cx.add(a);
-        buf.buffer().unwrap().lock()?.insert(cx.add("x"))?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("x"), &cx)?;
         put_text_property(1, 2, a, cx.add(3), Some(buf), env, cx)?;
-        let n = text_properties_at(1, Some(buf), env)?;
+        let n = text_properties_at(1, Some(buf), env, &cx)?;
         let val = plist_get(n, a)?;
         assert!(eq(val, cx.add(3)));
 

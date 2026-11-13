@@ -35,7 +35,9 @@ struct GcState {
 impl GcState {
     fn new(roots_static: &'static ThreadSafeRootSet) -> Self {
         Self {
-            block: Block::new_local_unchecked(),
+            // SAFETY: ChannelManager exclusively owns this arena under its
+            // gc_state mutex and deep-copies every incoming/outgoing value.
+            block: unsafe { Block::new_local_unchecked() },
             roots_static,
             next_limit: Context::MIN_GC_BYTES,
         }
@@ -186,6 +188,7 @@ impl ChannelManager {
         let _gc_guard = self.gc_access.read().unwrap();
         let gc_state = self.gc_state.lock().unwrap();
         let cloned = unsafe {
+            let _clone_session = gc_state.block.clone_session();
             let obj_static = obj.clone_in(&gc_state.block);
             std::mem::transmute::<Object<'_>, Object<'static>>(obj_static)
         };
@@ -229,6 +232,7 @@ impl ChannelManager {
         let _gc_guard = self.gc_access.read().unwrap();
         let gc_state = self.gc_state.lock().unwrap();
         let cloned = unsafe {
+            let _clone_session = gc_state.block.clone_session();
             let obj_static = obj.clone_in(&gc_state.block);
             std::mem::transmute::<Object<'_>, Object<'static>>(obj_static)
         };
@@ -260,7 +264,10 @@ impl ChannelManager {
         if let Some(rooted) = data.queue.pop_front() {
             let _gc_guard = self.gc_access.read().unwrap();
             let obj: Object<'static> = rooted.get_inner();
-            let result = obj.clone_in(target_block);
+            let result = {
+                let _clone_session = target_block.clone_session();
+                obj.clone_in(target_block)
+            };
             drop(_gc_guard);
 
             // HeapRoot is dropped here, unrooting the object
@@ -306,7 +313,10 @@ impl ChannelManager {
         if let Some(rooted) = data.queue.pop_front() {
             let _gc_guard = self.gc_access.read().unwrap();
             let obj: Object<'static> = rooted.get_inner();
-            let result = obj.clone_in(target_block);
+            let result = {
+                let _clone_session = target_block.clone_session();
+                obj.clone_in(target_block)
+            };
             drop(_gc_guard);
 
             // HeapRoot is dropped here, unrooting the object
@@ -402,7 +412,9 @@ impl ChannelManager {
 //    - The mutex ensures no concurrent access to these RefCells
 //    - No references to Block internals escape the mutex guard
 // 3. The ThreadSafeRootSet uses Mutex internally and is 'static
-// 4. HeapRoot instances in channel queues are Send/Sync
+// 4. HeapRoot instances in channel queues do not independently implement
+//    Send/Sync for Object slots. They are confined to this manager's locks;
+//    public send/receive operations deep-copy into/out of the manager block.
 // 5. All public methods are designed to be called concurrently from multiple threads
 
 unsafe impl Send for ChannelManager {}

@@ -30,7 +30,7 @@
 use crate::core::{
     cons::Cons,
     env::{Env, sym},
-    gc::{Block, Context, RootSet},
+    gc::{Context, RootSet},
     object::{IntoObject, Object, make_channel_pair},
 };
 use rune_core::macros::root;
@@ -52,10 +52,9 @@ fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
 
     // Spawn thread to evaluate expression
     thread::spawn(move || {
-        // Create block inside the thread
-        let block = Block::new_local_unchecked();
+        // A worker owns the ordinary singleton Context on its fresh thread.
         let roots = &RootSet::default();
-        let cx = &mut Context::from_block(block, roots);
+        let cx = &mut Context::new(roots);
         root!(env, new(Env), cx);
         // Each worker has its own variable bindings, including the same built-in
         // defaults as the main interpreter. Root them before evaluation can GC.

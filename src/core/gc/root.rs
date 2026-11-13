@@ -206,15 +206,11 @@ impl<T: Trace> Drop for __HeapRoot<T> {
     }
 }
 
-// SAFETY: __HeapRoot<T> is Send/Sync because:
-// 1. It owns its data via Box<Rt<T>>, which is heap-allocated and can move between threads
-// 2. The root_ptr is a raw pointer to data inside self.data, so it moves with the HeapRoot
-// 3. The ThreadSafeRootSet synchronizes all modifications to the root set
-// 4. The root_ptr is only dereferenced during GC, which is synchronized by the owner's mutex
-// 5. T: Trace ensures the contained data can be safely traced during GC
-
-unsafe impl<T: Trace> Send for __HeapRoot<T> {}
-unsafe impl<T: Trace> Sync for __HeapRoot<T> {}
+// Moving the Box preserves its root address, but Trace alone says nothing
+// about thread safety. In particular, a rooted borrowed Object must not escape
+// its heap domain. ChannelManager supplies its own synchronized transfer boundary.
+unsafe impl<T: Trace + Send> Send for __HeapRoot<T> {}
+unsafe impl<T: Trace + Send + Sync> Sync for __HeapRoot<T> {}
 
 impl<T: Trace + Debug> Debug for __HeapRoot<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
