@@ -757,8 +757,8 @@ mod tests {
         put_text_property(1, 5, a, cx.add(1), buf, env, cx)?;
         put_text_property(5, 10, b, cx.add(2), buf, env, cx)?;
 
-        // Remove property :a
-        remove_text_properties(1, 10, a, buf, env, cx)?;
+        // Remove property :a; the supplied value is ignored.
+        remove_text_properties(1, 10, list![a, 999; cx], buf, env, cx)?;
 
         // Verify :a was removed
         let props = text_properties_at(3, buf, env)?;
@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(val, cx.add(2));
 
         // Try removing non-existent property
-        remove_text_properties(0, 10, a, buf, env, cx)?;
+        remove_text_properties(0, 10, list![a, NIL; cx], buf, env, cx)?;
 
         BUFFERS.lock().unwrap().clear();
         Ok(())
