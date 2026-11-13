@@ -11,6 +11,7 @@ members = [
   "crates/rune-tree",
   "crates/rune-text",
   "crates/rune-display",
+  "crates/rune-editor",
   "crates/text-buffer",
   "crates/rune-macros",
   "crates/rune-core",

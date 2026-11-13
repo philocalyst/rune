@@ -1,0 +1,13 @@
+[package]
+name = "rune-editor"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+rope = ["dep:rune-text"]
+display = ["rope", "dep:rune-display"]
+
+[dependencies]
+rune-text = { path = "../rune-text", optional = true }
+rune-display = { path = "../rune-display", optional = true }
