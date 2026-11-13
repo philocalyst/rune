@@ -661,44 +661,43 @@ pub(crate) fn compare_strings<'ob>(
     end2: Object<'ob>,
     ignore_case: OptionalFlag,
 ) -> Result<Object<'ob>> {
-    let start1 = match start1.untag() {
-        ObjectType::Int(x) => x,
-        ObjectType::NIL => 0,
-        _ => bail!(TypeError::new(Type::Int, start1)),
+    let bounds = |string: &str, start: Object, end: Object| -> Result<(usize, usize)> {
+        let len = string.chars().count() as i128;
+        let position = |value: Object, default: i128, clamp_end: bool| -> Result<usize> {
+            let value = match value.untag() {
+                ObjectType::Int(value) => value as i128,
+                ObjectType::NIL => default,
+                _ => bail!(TypeError::new(Type::Int, value)),
+            };
+            let value = if value < 0 { len + value } else { value };
+            let value = if clamp_end { value.min(len) } else { value };
+            ensure!(value >= 0 && value <= len, "compare-strings args out of range");
+            Ok(value as usize)
+        };
+        let start = position(start, 0, false)?;
+        // GNU preserves historical clipping of positive end positions above length.
+        let end = position(end, len, true)?;
+        ensure!(start <= end, "compare-strings args out of range");
+        Ok((start, end))
     };
-    let end1 = match end1.untag() {
-        ObjectType::Int(x) => x,
-        ObjectType::NIL => string1.chars().count() as i64,
-        _ => bail!(TypeError::new(Type::Int, end1)),
-    };
+    let (start1, end1) = bounds(string1, start1, end1)?;
+    let (start2, end2) = bounds(string2, start2, end2)?;
+    let s1 = string1.chars().skip(start1).take(end1 - start1);
+    let s2 = string2.chars().skip(start2).take(end2 - start2);
 
-    if end1 < start1 {
-        bail!("Args out of range: {string1}, {start1}, {end1}");
-    }
-
-    let s1 = string1.chars().skip(start1 as usize).take((end1 - start1) as usize);
-
-    let start2 = match start2.untag() {
-        ObjectType::Int(x) => x,
-        ObjectType::NIL => 0,
-        _ => bail!(TypeError::new(Type::Int, start2)),
-    };
-    let end2 = match end2.untag() {
-        ObjectType::Int(x) => x,
-        ObjectType::NIL => string2.chars().count() as i64,
-        _ => bail!(TypeError::new(Type::Int, end2)),
-    };
-
-    if end2 < start2 {
-        bail!("Args out of range: {string2}, {start2}, {end2}");
-    }
-    // TODO: check if byte strings are supported
-    let s2 = string2.chars().skip(start2 as usize).take((end2 - start2) as usize);
-
-    for ((c1, c2), leading) in s1.zip(s2).zip(1..) {
+    let mut s1 = s1;
+    let mut s2 = s2;
+    let mut leading: i64 = 1;
+    loop {
+        let (c1, c2) = match (s1.next(), s2.next()) {
+            (None, None) => return Ok(true.into()),
+            (None, Some(_)) => return Ok((-leading).into()),
+            (Some(_), None) => return Ok(leading.into()),
+            (Some(c1), Some(c2)) => (c1, c2),
+        };
         let (c1, c2) = if ignore_case.is_some() {
             //TODO: use case-table to determine the uppercase of a character
-            (c1.to_uppercase().next().unwrap(), c2.to_uppercase().next().unwrap())
+            (c1.to_uppercase().next().unwrap_or(c1), c2.to_uppercase().next().unwrap_or(c2))
         } else {
             (c1, c2)
         };
@@ -708,9 +707,8 @@ pub(crate) fn compare_strings<'ob>(
             std::cmp::Ordering::Greater => return Ok(leading.into()),
             std::cmp::Ordering::Equal => {}
         }
+        leading += 1;
     }
-
-    Ok(true.into())
 }
 
 #[defun]
@@ -1050,12 +1048,34 @@ fn base64_encode(string: &str, _line_break: bool, pad: bool, base64url: bool) ->
 
 #[cfg(test)]
 mod test {
-    use super::{string_search, substring};
+    use super::{compare_strings, string_search, substring};
+    use crate::core::object::NIL;
     use crate::{
         assert_elprop, fns::levenshtein_distance, interpreter::assert_lisp,
         library::elprop::arb_custom_string,
     };
     use proptest::prelude::*;
+
+    #[test]
+    fn compare_strings_prefix_and_character_bounds() {
+        assert_lisp("(compare-strings \"aé\" nil nil \"aéx\" nil nil)", "-3");
+        assert_lisp("(compare-strings \"aéx\" nil nil \"aé\" nil nil)", "3");
+        assert_lisp("(compare-strings \"aé🦀z\" -3 -1 \"é🦀\" nil nil)", "t");
+        assert_lisp("(compare-strings \"é\" nil 100 \"é\" nil nil)", "t");
+        assert_lisp("(compare-strings \"\" nil nil \"x\" nil nil)", "-1");
+    }
+
+    #[test]
+    fn compare_strings_rejects_invalid_bounds() {
+        for (start, end) in [(-5i64, 4i64), (5, 5), (3, 2), (0, -5), (i64::MIN, i64::MAX)] {
+            assert!(
+                compare_strings("aé🦀z", start.into(), end.into(), "", NIL, NIL, None).is_err()
+            );
+            assert!(
+                compare_strings("", NIL, NIL, "aé🦀z", start.into(), end.into(), None).is_err()
+            );
+        }
+    }
 
     #[test]
     fn string_search_uses_character_positions() {

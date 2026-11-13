@@ -403,7 +403,9 @@ pub fn previous_single_property_change<'ob>(
                     if eq(v, text_prop) {
                         continue;
                     } else {
-                        return Ok(cx.add(interval.start));
+                        // Walking backwards, the differing segment meets the
+                        // previously visited segment at its exclusive end.
+                        return Ok(cx.add(interval.end));
                     }
                 }
                 None => val = Some(text_prop),
@@ -765,6 +767,31 @@ mod tests {
         assert_eq!(plist_get(text_properties_at(1, buf, env)?, a)?, 1);
         assert_eq!(plist_get(text_properties_at(4, buf, env)?, a)?, 1);
         assert_eq!(plist_get(text_properties_at(2, buf, env)?, b)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_previous_single_change_reports_shared_boundary() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-previous-single"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abcdefghij"))?;
+        let key: Object = intern("roadmap-previous-key", &cx).into();
+        let other: Object = intern("roadmap-previous-other", &cx).into();
+        let value = cx.add("value");
+        put_text_property(2, 5, key, value, buf, env, &cx)?;
+        put_text_property(5, 8, key, cx.add("value"), buf, env, &cx)?;
+        // Equal-looking but non-eq strings have a real boundary at 5.
+        assert_eq!(previous_single_property_change(7, key, buf, None, env, &cx)?, 5);
+        assert_eq!(previous_single_property_change(5, key, buf, None, env, &cx)?, 2);
+        // A gap after a property range changes at the range's end, not start.
+        assert_eq!(previous_single_property_change(10, key, buf, None, env, &cx)?, 8);
+        // Unrelated boundaries do not interrupt the specific property scan.
+        put_text_property(3, 4, other, cx.add(1), buf, env, &cx)?;
+        assert_eq!(previous_single_property_change(5, key, buf, None, env, &cx)?, 2);
+        assert_eq!(previous_single_property_change(7, key, buf, Some(6), env, &cx)?, 6);
+        assert!(previous_single_property_change(2, key, buf, None, env, &cx)?.is_nil());
         Ok(())
     }
 

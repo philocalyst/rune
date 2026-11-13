@@ -185,7 +185,10 @@ pub(crate) fn stringp(object: Object) -> bool {
 
 #[defun]
 pub(crate) fn numberp(object: Object) -> bool {
-    matches!(object.untag(), ObjectType::Int(_) | ObjectType::Float(_))
+    matches!(
+        object.untag(),
+        ObjectType::Int(_) | ObjectType::BigInt(_) | ObjectType::Float(_)
+    )
 }
 
 #[defun]
@@ -219,7 +222,7 @@ pub(crate) fn keywordp(object: Object) -> bool {
 
 #[defun]
 pub(crate) fn integerp(object: Object) -> bool {
-    object.is_int()
+    matches!(object.untag(), ObjectType::Int(_) | ObjectType::BigInt(_))
 }
 
 #[defun]
@@ -598,6 +601,33 @@ mod test {
         assert_lisp("(string-to-number \"-ff\" 16)", "-255");
         assert_lisp("(string-to-number \"42\")", "42");
         assert_lisp("(string-to-number \"1.5\" 10)", "1.5");
+    }
+
+    #[test]
+    fn m0_numeric_predicates_include_bignums() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        for value in [
+            num_bigint::BigInt::from(i64::MAX) + 1_u8,
+            num_bigint::BigInt::from(i64::MIN) - 1_u8,
+        ] {
+            let object = cx.add(value);
+            assert!(numberp(object));
+            assert!(integerp(object));
+            assert!(!floatp(object));
+        }
+        let float = cx.add(1.5_f64);
+        assert!(numberp(float));
+        assert!(!integerp(float));
+        for nonnumber in [NIL, cx.add("123")] {
+            assert!(!numberp(nonnumber));
+            assert!(!integerp(nonnumber));
+        }
+        // The Lisp test helper creates its own context; release this one first.
+        drop(cx);
+        // Exercise the Lisp primitive dispatch paths as well as direct calls.
+        assert_lisp("(numberp 9223372036854775808)", "t");
+        assert_lisp("(integerp -9223372036854775809)", "t");
     }
 
     #[test]
