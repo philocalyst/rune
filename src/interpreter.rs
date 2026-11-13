@@ -470,20 +470,32 @@ impl Interpreter<'_, '_> {
         let prev_len = self.vars.len();
         // (let x ...)                   // (let)
         let Some(obj) = iter.next()? else { bail_err!(LispError::arg_cnt(sym::LET, 1, 0, cx)) };
-        let varbind_count = if parallel {
-            self.let_bind_parallel(obj, cx)
+        let mut varbind_count = 0;
+        let bindings = if parallel {
+            self.let_bind_parallel(obj, &mut varbind_count, cx)
         } else {
-            self.let_bind_serial(obj, cx)
-        }?;
-        let obj = rebind!(self.implicit_progn(iter, cx)?);
-        // Remove old bindings
+            self.let_bind_serial(obj, &mut varbind_count, cx)
+        };
+        let result = match bindings {
+            Ok(()) => match self.implicit_progn(iter, cx) {
+                Ok(object) => Ok(rebind!(object, cx)),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        // Restore both lexical and dynamic bindings on every exit, including
+        // failed let* initializers which have already installed some bindings.
         self.vars.truncate(prev_len);
         self.env.unbind(varbind_count, cx);
-        Ok(obj)
+        result
     }
 
-    fn let_bind_serial(&mut self, form: &Rto<Object>, cx: &mut Context) -> Result<u16, EvalError> {
-        let mut varbind_count = 0;
+    fn let_bind_serial(
+        &mut self,
+        form: &Rto<Object>,
+        varbind_count: &mut u16,
+        cx: &mut Context,
+    ) -> Result<(), EvalError> {
         rooted_iter!(bindings, form, cx);
         while let Some(binding) = bindings.next()? {
             match binding.untag(cx) {
@@ -493,24 +505,25 @@ impl Interpreter<'_, '_> {
                     let val = rebind!(self.let_bind_value(cons, cx)?);
                     let var: Symbol =
                         cons.untag(cx).car().try_into().context("let variable must be a symbol")?;
-                    varbind_count += self.create_let_binding(var, val, cx);
+                    self.create_let_binding(var, val, varbind_count, cx)?;
                 }
                 // (let (x))
                 ObjectType::Symbol(sym) => {
-                    varbind_count += self.create_let_binding(sym, NIL, cx);
+                    self.create_let_binding(sym, NIL, varbind_count, cx)?;
                 }
                 // (let (1))
                 x => bail_err!(TypeError::new(Type::Cons, x)),
             }
         }
-        Ok(varbind_count)
+        Ok(())
     }
 
     fn let_bind_parallel(
         &mut self,
         form: &Rto<Object>,
+        varbind_count: &mut u16,
         cx: &mut Context,
-    ) -> Result<u16, EvalError> {
+    ) -> Result<(), EvalError> {
         root!(let_bindings, new(Vec<(Slot<Symbol>, Slot<Object>)>), cx);
         rooted_iter!(bindings, form, cx);
         while let Some(binding) = bindings.next()? {
@@ -531,22 +544,29 @@ impl Interpreter<'_, '_> {
                 x => bail_err!(TypeError::new(Type::Cons, x)),
             }
         }
-        let mut sum = 0;
         for (var, val) in let_bindings.bind_ref(cx) {
-            sum += self.create_let_binding(**var, **val, cx);
+            self.create_let_binding(**var, **val, varbind_count, cx)?;
         }
-        Ok(sum)
+        Ok(())
     }
 
-    fn create_let_binding(&mut self, var: Symbol, val: Object, cx: &Context) -> u16 {
+    fn create_let_binding(
+        &mut self,
+        var: Symbol,
+        val: Object,
+        varbind_count: &mut u16,
+        cx: &Context,
+    ) -> Result<(), EvalError> {
         if var.is_special() {
+            let next = varbind_count
+                .checked_add(1)
+                .ok_or_else(|| error!("Too many dynamic let bindings"))?;
             self.env.varbind(var, val, cx);
-            // return 1 if the variable is bound
-            1
+            *varbind_count = next;
         } else {
             self.vars.push(Cons::new(var, val, cx));
-            0
         }
+        Ok(())
     }
 
     fn let_bind_value<'ob>(
@@ -905,6 +925,39 @@ mod test {
         check_interpreter("(let ((x 1)) (setq x 2) x)", 2, cx);
         check_interpreter("(let* ())", false, cx);
         check_interpreter("(let* ((x 1) (y x)) y)", 1, cx);
+    }
+
+    #[test]
+    fn m0_let_unwinds_bindings_on_errors_throws_and_partial_initialization() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        for source in [
+            "(let ((x 42)) (condition-case nil (let ((x 7)) (if)) (error x)))",
+            "(let ((x 42)) (condition-case nil (let* ((x 7) (y (if))) 0) (error x)))",
+            "(let ((x 42)) (condition-case nil (let* ((x 7) 1) 0) (error x)))",
+            "(let ((x 42)) (progn (catch 1 (let ((x 7)) (throw 1 9))) x))",
+            "(progn (defvar m0-let-unwind-dyn 42) (condition-case nil (let ((m0-let-unwind-dyn 7)) (if)) (error m0-let-unwind-dyn)))",
+            "(progn (defvar m0-let-unwind-dyn 42) (condition-case nil (let* ((m0-let-unwind-dyn 7) (y (if))) 0) (error m0-let-unwind-dyn)))",
+            "(progn (defvar m0-let-unwind-dyn 42) (catch 1 (let ((m0-let-unwind-dyn 7)) (throw 1 9))) m0-let-unwind-dyn)",
+        ] {
+            check_interpreter(source, 42_i64, cx);
+        }
+        check_interpreter(r#"(let ((x "kept")) (garbage-collect) x)"#, "kept", cx);
+    }
+
+    #[test]
+    fn m0_let_dynamic_count_overflow_is_checked_before_binding() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        root!(env, new(Env), cx);
+        root!(vars, new(Vec<Slot<&Cons>>), cx);
+        let variable = intern("m0-let-binding-count", cx);
+        variable.make_special();
+        let mut interpreter = Interpreter { vars, env };
+        let mut count = u16::MAX;
+        assert!(interpreter.create_let_binding(variable, 7_i64.into(), &mut count, cx).is_err());
+        assert_eq!(count, u16::MAX);
+        assert!(interpreter.env.vars.get(variable).is_none());
     }
 
     #[test]

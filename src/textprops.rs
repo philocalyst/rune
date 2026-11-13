@@ -224,7 +224,58 @@ pub fn get_char_property<'ob>(
     get_text_property(position, prop, object, env)
 }
 
-// TODO also missing `next-char-property-change` and 3 other similar functions.
+// Keep direct Rust callers safe even when passing an i64 outside the tagged
+// fixnum range. Lisp-facing LIMIT values currently enter through fixnums.
+fn property_scan_limit_object<'ob>(limit: i64, cx: &'ob Context) -> Object<'ob> {
+    use crate::core::object::IntoObject;
+    crate::arith::NumberValue::Big(limit.into())
+        .coerce_integer()
+        .into_obj(cx)
+        .into()
+}
+
+/// Return the next character-property boundary, or point-max if none exists.
+/// This is the text-only fallback until Rune has an overlay data model.
+#[defun]
+pub fn next_char_property_change<'ob>(
+    position: usize,
+    limit: Option<i64>,
+    env: &'ob mut Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    let point_max = env.current_buffer.get().text.len_chars() + 1;
+    if position == 0 || position > point_max {
+        bail!("Buffer position {position} is out of range 1..={point_max}");
+    }
+    let point_max = i64::try_from(point_max)?;
+    let limit = limit.unwrap_or(point_max).min(point_max);
+    if limit <= i64::try_from(position)? {
+        return Ok(property_scan_limit_object(limit, cx));
+    }
+    next_property_change(position, None, Some(property_scan_limit_object(limit, cx)), env, cx)
+}
+
+/// Return the previous character-property boundary, or point-min if none exists.
+/// Overlay boundaries will be included when the overlay data model is added.
+#[defun]
+pub fn previous_char_property_change<'ob>(
+    position: usize,
+    limit: Option<i64>,
+    env: &'ob mut Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    let point_max = env.current_buffer.get().text.len_chars() + 1;
+    if position == 0 || position > point_max {
+        bail!("Buffer position {position} is out of range 1..={point_max}");
+    }
+    let limit = limit.unwrap_or(1).max(1);
+    if limit >= i64::try_from(position)? {
+        return Ok(property_scan_limit_object(limit, cx));
+    }
+    previous_property_change(position, None, Some(usize::try_from(limit)?), env, cx)
+}
+
+// TODO also missing next/previous-single-char-property-change.
 
 /// Add or replace properties on text from START to END, preserving unrelated
 /// properties. Return t if any property actually changes, nil otherwise.
@@ -1388,6 +1439,57 @@ mod tests {
         crate::interpreter::assert_lisp(
             "(progn (insert \"abc\") (put-text-property 1 3 'a 7) (list (get-char-property 1 'a) (get-char-property 1 'a nil) (get-char-property-and-overlay 1 'a) (get-char-property-and-overlay 3 'a nil) (get-char-property 4 'a)))",
             "(7 7 (7) (nil) nil)",
+        );
+    }
+
+    #[test]
+    fn roadmap_m0_character_property_scans_return_endpoints_and_limits() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        assert_eq!(next_char_property_change(1, None, env, &cx)?, 1);
+        assert_eq!(previous_char_property_change(1, None, env, &cx)?, 1);
+        env.current_buffer.get_mut().insert(cx.add("é🙂abcd"))?;
+        let key: Object = intern("roadmap-char-scan-key", &cx).into();
+        put_text_property(2, 5, key, cx.add(1), None, env, &cx)?;
+        for (position, expected) in [(1, 2), (2, 5), (5, 7), (7, 7)] {
+            assert_eq!(next_char_property_change(position, None, env, &cx)?, expected);
+        }
+        for (position, expected) in [(7, 5), (5, 2), (2, 1), (1, 1)] {
+            assert_eq!(previous_char_property_change(position, None, env, &cx)?, expected);
+        }
+        assert_eq!(next_char_property_change(2, Some(3), env, &cx)?, 3);
+        assert_eq!(next_char_property_change(5, Some(99), env, &cx)?, 7);
+        assert_eq!(previous_char_property_change(7, Some(6), env, &cx)?, 6);
+        assert_eq!(previous_char_property_change(2, Some(0), env, &cx)?, 1);
+        assert_eq!(previous_char_property_change(7, Some(-1), env, &cx)?, 5);
+        assert_eq!(previous_char_property_change(7, Some(i64::MIN), env, &cx)?, 5);
+        assert_eq!(next_char_property_change(2, Some(-1), env, &cx)?, -1);
+        assert_eq!(
+            next_char_property_change(2, Some(i64::MIN), env, &cx)?.to_string(),
+            i64::MIN.to_string()
+        );
+        assert!(next_char_property_change(0, None, env, &cx).is_err());
+        assert!(previous_char_property_change(8, None, env, &cx).is_err());
+        put_text_property(1, 7, key, cx.add(2), None, env, &cx)?;
+        assert_eq!(next_char_property_change(1, None, env, &cx)?, 7);
+        assert_eq!(previous_char_property_change(7, None, env, &cx)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_character_property_scans_lisp_endpoints() {
+        crate::interpreter::assert_lisp(
+            "(list (next-char-property-change 1) (previous-char-property-change 1))",
+            "(1 1)",
+        );
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abcdef\") (put-text-property 2 5 'a 1) (list (next-char-property-change 1) (previous-char-property-change 7) (next-char-property-change 2 3) (previous-char-property-change 7 6)))",
+            "(2 5 3 6)",
+        );
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abcdef\") (put-text-property 2 5 'a 1) (list (next-char-property-change 2 -1) (previous-char-property-change 7 -1)))",
+            "(-1 5)",
         );
     }
 
