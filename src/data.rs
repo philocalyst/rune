@@ -231,7 +231,7 @@ pub(crate) fn consp(object: Object) -> bool {
 #[defun]
 pub(crate) fn keywordp(object: Object) -> bool {
     match object.untag() {
-        ObjectType::Symbol(s) => s.name().starts_with(':'),
+        ObjectType::Symbol(s) => s.interned() && s.name().starts_with(':'),
         _ => false,
     }
 }
@@ -262,9 +262,9 @@ fn subr_native_elisp_p(_: Object) -> bool {
 }
 
 #[defun]
-fn bufferp(_object: Object) -> bool {
-    // TODO: Implement once buffers are added
-    false
+fn bufferp(object: Object) -> bool {
+    // Killed buffers remain buffer objects; liveness is a separate predicate.
+    matches!(object.untag(), ObjectType::Buffer(_))
 }
 
 #[defun]
@@ -923,6 +923,42 @@ mod test {
         fmakunbound(a);
         assert_eq!(indirect_function(cx.add(a), &cx).unwrap(), NIL);
         assert_eq!(indirect_function(cx.add(42_i64), &cx).unwrap(), cx.add(42_i64));
+    }
+
+    #[test]
+    fn m0_keywordp_requires_an_interned_colon_symbol() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        for name in [":", ":m0-keyword"] {
+            let interned = crate::core::env::intern(name, &cx);
+            let uninterned = Symbol::new_uninterned(name, &cx);
+            assert!(keywordp(cx.add(interned)));
+            assert!(!keywordp(cx.add(uninterned)));
+        }
+        for nonkeyword in [
+            NIL,
+            cx.add(1_i64),
+            cx.add(":m0-keyword"),
+            cx.add(crate::core::env::intern("m0-not-keyword", &cx)),
+        ] {
+            assert!(!keywordp(nonkeyword));
+        }
+        drop(cx);
+        assert_lisp("(keywordp :m0-keyword)", "t");
+        assert_lisp("(keywordp (make-symbol \":m0-keyword\"))", "nil");
+        assert_lisp("(keywordp '#::m0-keyword)", "nil");
+    }
+
+    #[test]
+    fn m0_bufferp_recognizes_live_and_killed_buffer_objects() {
+        assert_lisp("(bufferp (get-buffer-create \"m0-bufferp-live\"))", "t");
+        assert_lisp(
+            "(let ((buffer (get-buffer-create \"m0-bufferp-killed\"))) (kill-buffer buffer) (bufferp buffer))",
+            "t",
+        );
+        assert_lisp("(bufferp \"m0-bufferp-live\")", "nil");
+        assert_lisp("(bufferp nil)", "nil");
+        assert_lisp("(bufferp 1)", "nil");
     }
 
     #[test]
