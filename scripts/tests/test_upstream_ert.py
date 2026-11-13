@@ -88,7 +88,9 @@ for kind,name in [('loaded','nil'),('selected','2'),('passed','a')]:
         ]
         for tail, status in cases:
             with self.subTest(status=status):
-                row = ert.run_file(Path('dummy.el'), [sys.executable, '-c', prefix + tail], .2)
+                # Allow cold interpreter startup on Windows CI before the first
+                # record; the timeout case remains bounded well below its sleep.
+                row = ert.run_file(Path('dummy.el'), [sys.executable, '-c', prefix + tail], 2)
                 self.assertEqual(row['status'], status)
                 self.assertEqual(row['tests'], {'a': 'passed'})
 

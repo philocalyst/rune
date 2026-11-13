@@ -1,0 +1,54 @@
+name: measurement tools
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/measurement-tools.yml'
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/measurement-tools.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  python-tools:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Check the documented floor on Linux; use modern Python on macOS
+          # and Windows rather than requiring old interpreter distributions.
+          - os: ubuntu-latest
+            python: '3.9'
+          - os: ubuntu-latest
+            python: '3.12'
+          - os: macos-latest
+            python: '3.12'
+          - os: windows-latest
+            python: '3.12'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile Python tools
+        run: python -m compileall -q scripts
+      - name: Run fixture and process-isolation tests
+        run: python -m unittest discover -s scripts/tests -v
+      - name: Smoke-test command line help
+        run: |
+          python scripts/run_upstream_ert.py --help
+          python scripts/census.py --help

@@ -43,3 +43,11 @@ name proves runtime availability. Stub/no-op declarations are present names.
 
 This is not the complete INF-05 package: C-variable coverage, preload ladder,
 package survey, CI publication and dashboard integration remain future work.
+
+## Tooling CI
+
+The `measurement tools` workflow checks Python 3.9 compatibility on Linux and
+runs the fixture suite on Linux, macOS and Windows with Python 3.12. It compiles
+the scripts, runs unit tests and checks CLI help without GNU Emacs or a Rust
+build. POSIX-only process-group tests are explicitly skipped on Windows. This
+protects the measurement tooling, not Lisp integration or a coverage baseline.
