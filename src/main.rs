@@ -103,7 +103,7 @@ fn main() -> Result<(), ()> {
     }
 
     for file in args.load {
-        load(&file, cx, env)?;
+        load_command_line_file(&file, cx, env)?;
     }
 
     if args.repl {
@@ -160,6 +160,22 @@ fn repl_with_input(mut input: impl io::BufRead, env: &mut Rt<Env>, cx: &mut Cont
         }
         buffer.clear();
     }
+}
+
+/// GNU startup.el's -load handler prefers an existing regular file in the
+/// invocation directory, but leaves library names for load-path resolution.
+fn command_line_load_name(file: &str) -> io::Result<String> {
+    if !std::path::Path::new(file).is_file() {
+        return Ok(file.to_owned());
+    }
+    std::fs::canonicalize(file)?.into_os_string().into_string().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "load file path is not valid UTF-8")
+    })
+}
+
+fn load_command_line_file(file: &str, cx: &mut Context, env: &mut Rt<Env>) -> Result<(), ()> {
+    let file = command_line_load_name(file).map_err(|error| eprintln!("Error: {error}"))?;
+    load(&file, cx, env)
 }
 
 fn load(file: &str, cx: &mut Context, env: &mut Rt<Env>) -> Result<(), ()> {
@@ -323,5 +339,53 @@ mod stdin_tests {
         sym::init_symbols();
         root!(env, new(Env), cx);
         assert_eq!(eval_stdin_with_input(input("("), cx, env), Err(()));
+    }
+}
+
+#[cfg(test)]
+mod command_line_load_tests {
+    use super::*;
+
+    struct Fixture(std::path::PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn relative_command_line_file_loads_outside_load_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let relative = format!(
+            "rune-cli-load-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let fixture = Fixture(std::env::current_dir().unwrap().join(&relative));
+        std::fs::create_dir(&fixture.0).unwrap();
+        let file = std::path::Path::new(&relative).join("relative file.el");
+        std::fs::write(&file, "(setq cli-relative-load-value 42)").unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(command_line_load_name(file.to_str().unwrap()).unwrap()),
+            std::fs::canonicalize(&file).unwrap()
+        );
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        // A nonempty unrelated path must not intercept explicit CLI files.
+        env.vars.insert(
+            sym::LOAD_PATH,
+            rune_core::macros::list!("/nonexistent/rune-cli-load-path"; cx),
+        );
+        load_command_line_file(file.to_str().unwrap(), cx, env).unwrap();
+        let variable = intern("cli-relative-load-value", cx);
+        let value = env.vars.get(variable).unwrap().bind(cx);
+        assert_eq!(value, 42_i64);
+        // Bootstrap/library calls keep the original search contract.
+        let library = format!("missing-library-{}", std::process::id());
+        assert_eq!(command_line_load_name(&library).unwrap(), library);
+        assert_eq!(command_line_load_name(&relative).unwrap(), relative);
     }
 }

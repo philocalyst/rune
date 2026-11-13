@@ -82,14 +82,14 @@ impl<'ob> TryFrom<Object<'ob>> for Option<usize> {
 impl TryFrom<Object<'_>> for bool {
     type Error = LispError;
     fn try_from(obj: Object) -> Result<Self, Self::Error> {
-        Ok(obj.is_nil())
+        Ok(!obj.is_nil())
     }
 }
 
 impl TryFrom<Object<'_>> for OptionalFlag {
     type Error = LispError;
     fn try_from(obj: Object) -> Result<Self, Self::Error> {
-        Ok(obj.is_nil().then_some(()))
+        Ok((!obj.is_nil()).then_some(()))
     }
 }
 
@@ -157,6 +157,25 @@ mod test {
     fn inner(arg0: Option<i64>, arg1: &Cons) -> i64 {
         let x: i64 = arg1.car().try_into().unwrap();
         arg0.unwrap() + x
+    }
+
+    #[test]
+    fn m0_truth_conversions_treat_only_nil_as_false() {
+        use crate::core::env::sym;
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        assert!(!bool::try_from(NIL).unwrap());
+        assert!(OptionalFlag::try_from(NIL).unwrap().is_none());
+        for truthy in [
+            cx.add(sym::TRUE),
+            cx.add(0_i64),
+            cx.add(""),
+            cx.add(Vec::<Object>::new()),
+            cx.add(sym::ERROR),
+        ] {
+            assert!(bool::try_from(truthy).unwrap());
+            assert!(OptionalFlag::try_from(truthy).unwrap().is_some());
+        }
     }
 
     #[test]

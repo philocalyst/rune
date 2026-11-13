@@ -119,33 +119,40 @@ fn eager_expand<'ob>(
 
 fn file_in_path(file: &str, path: &str) -> Option<PathBuf> {
     let path = Path::new(path).join(file);
-    if path.exists() {
-        Some(path)
-    } else {
-        let with_ext = path.with_extension("el");
-        with_ext.exists().then_some(with_ext)
-    }
+    // GNU openp appends suffixes to the whole name; with_extension would
+    // incorrectly turn package.extra into package.el. This source-only loader
+    // tries .el before the unsuffixed name; compiled/module suffixes remain open.
+    let mut source_name = path.as_os_str().to_os_string();
+    source_name.push(".el");
+    let source = PathBuf::from(source_name);
+    if source.is_file() { Some(source) } else { path.is_file().then_some(path) }
 }
 
 fn find_file_in_load_path(file: &str, cx: &Context, env: &Rt<Env>) -> Result<PathBuf> {
-    let load_path = env.vars.get(sym::LOAD_PATH).unwrap();
-    let paths = load_path.bind(cx).as_list().context("`load-path' was not a list")?;
-    let mut final_file = None;
+    let load_path = env.vars.get(sym::LOAD_PATH).context("`load-path' is unbound")?;
+    let load_path = load_path.bind(cx);
+    // GNU openp also searches the default directory for an empty load-path.
+    if Path::new(file).is_absolute() || load_path.is_nil() {
+        return file_in_path(file, "")
+            .ok_or_else(|| anyhow!("Unable to find file `{file}' in load-path"));
+    }
+    let paths = load_path.as_list().context("`load-path' was not a list")?;
     for path in paths {
-        match path?.untag() {
-            ObjectType::String(path) => {
-                if let Some(x) = file_in_path(file, path) {
-                    final_file = Some(x);
-                    break;
-                }
-            }
+        let found = match path?.untag() {
+            ObjectType::String(path) => file_in_path(file, path),
+            // A nil entry denotes the default directory. Rune currently uses
+            // the process directory, pending buffer default-directory support.
+            ObjectType::NIL => file_in_path(file, ""),
             x => {
                 return Err(TypeError::new(Type::String, x))
-                    .context("Found non-string in `load-path'");
+                    .context("Found non-string/non-nil in `load-path'");
             }
+        };
+        if let Some(found) = found {
+            return Ok(found);
         }
     }
-    final_file.ok_or_else(|| anyhow!("Unable to find file `{file}' in load-path"))
+    Err(anyhow!("Unable to find file `{file}' in load-path"))
 }
 
 #[defun]
@@ -159,15 +166,9 @@ pub(crate) fn load(
     let noerror = noerror.is_some();
     let nomessage = nomessage.is_some();
     let file: &str = file.untag(cx);
-    let final_file = if Path::new(file).exists() {
-        PathBuf::from(file)
-    } else {
-        match find_file_in_load_path(file, cx, env) {
-            Ok(x) => x,
-            Err(e) => {
-                return if noerror { Ok(false) } else { Err(e) };
-            }
-        }
+    let final_file = match find_file_in_load_path(file, cx, env) {
+        Ok(path) => path,
+        Err(error) => return if noerror { Ok(false) } else { Err(error) },
     };
 
     let filename = String::from(file);
@@ -243,7 +244,7 @@ mod test {
 
     use super::*;
     use crate::core::gc::RootSet;
-    use rune_core::macros::root;
+    use rune_core::macros::{list, root};
 
     #[test]
     fn read_from_string_returns_absolute_character_indices() {
@@ -304,6 +305,88 @@ mod test {
             (Some(i64::MIN), None),
         ] {
             assert!(read_from_string("\u{e9}42", start, end, &cx).is_err());
+        }
+    }
+
+    struct LoadFixture(PathBuf);
+
+    impl LoadFixture {
+        fn new() -> Self {
+            Self::in_directory(&std::env::temp_dir())
+        }
+
+        fn in_directory(base: &Path) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = base.join(format!(
+                "rune-load-search-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for LoadFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn source_suffix_is_appended_and_precedes_bare_file() {
+        let fixture = LoadFixture::new();
+        let directory = fixture.0.to_str().unwrap();
+        fs::write(fixture.0.join("package.el"), "wrong target").unwrap();
+        assert_eq!(file_in_path("package.extra", directory), None);
+        fs::write(fixture.0.join("package.extra.el"), "right source").unwrap();
+        fs::write(fixture.0.join("package.extra"), "bare fallback").unwrap();
+        assert_eq!(
+            file_in_path("package.extra", directory),
+            Some(fixture.0.join("package.extra.el"))
+        );
+        fs::remove_file(fixture.0.join("package.extra.el")).unwrap();
+        assert_eq!(file_in_path("package.extra", directory), Some(fixture.0.join("package.extra")));
+        fs::create_dir(fixture.0.join("only-directory")).unwrap();
+        assert_eq!(file_in_path("only-directory", directory), None);
+    }
+
+    #[test]
+    fn load_path_search_handles_nil_and_respects_directory_order() {
+        let fixture = LoadFixture::new();
+        fs::create_dir(fixture.0.join("first")).unwrap();
+        fs::create_dir(fixture.0.join("second")).unwrap();
+        fs::write(fixture.0.join("first/ordered.el"), "first").unwrap();
+        fs::write(fixture.0.join("second/ordered.el"), "second").unwrap();
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        let path = crate::core::env::intern("load-path", cx);
+        let directories = list!(fixture.0.join("first").to_str().unwrap(), fixture.0.join("second").to_str().unwrap(); cx);
+        env.vars.insert(path, directories);
+        assert_eq!(
+            find_file_in_load_path("ordered", cx, env).unwrap(),
+            fixture.0.join("first/ordered.el")
+        );
+        let current_fixture = LoadFixture::in_directory(&std::env::current_dir().unwrap());
+        fs::write(current_fixture.0.join("current.el"), "current directory").unwrap();
+        let relative = Path::new(current_fixture.0.file_name().unwrap()).join("current");
+        for directories in [NIL, list!(NIL; cx)] {
+            env.vars.insert(path, directories);
+            assert_eq!(
+                find_file_in_load_path(relative.to_str().unwrap(), cx, env).unwrap(),
+                relative.with_extension("el")
+            );
+        }
+        let absolute = fixture.0.join("second/ordered");
+        for directories in [NIL, list!(NIL; cx)] {
+            env.vars.insert(path, directories);
+            assert_eq!(
+                find_file_in_load_path(absolute.to_str().unwrap(), cx, env).unwrap(),
+                fixture.0.join("second/ordered.el")
+            );
         }
     }
 

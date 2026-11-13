@@ -144,6 +144,14 @@ impl<'ob> RootedVM<'_, '_, '_> {
         EvalError::signal(sym::RUNE_UNIMPLEMENTED.into(), data.into(), self.env)
     }
 
+    fn require_stack(&self, count: usize) -> Result<()> {
+        ensure!(
+            count <= self.env.stack.frame_len(),
+            "Bytecode operand stack underflow: need {count} values"
+        );
+        Ok(())
+    }
+
     fn stack_ref(&mut self, idx: u16, cx: &Context) -> Result<()> {
         ensure!(
             usize::from(idx) < self.env.stack.frame_len(),
@@ -174,6 +182,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
     fn varset(&mut self, idx: usize, cx: &Context) -> Result<()> {
         let obj = self.get_const(idx, cx)?;
         let symbol: Symbol = obj.try_into()?;
+        self.require_stack(1)?;
         let value = self.env.stack.pop(cx);
         crate::data::set(symbol, value, self.env)?;
         Ok(())
@@ -182,6 +191,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
     fn varbind(&mut self, idx: u16, cx: &'ob Context) -> Result<()> {
         // Validate the constant before consuming a stack value.
         let symbol: Symbol = self.get_const(idx as usize, cx)?.try_into()?;
+        self.require_stack(1)?;
         let value = self.env.stack.pop(cx);
         self.env.varbind(symbol, value, cx);
         Ok(())
@@ -255,6 +265,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
 
     fn call(&mut self, arg_cnt: u16, cx: &'ob mut Context) -> Result<(), EvalError> {
         let arg_cnt = usize::from(arg_cnt);
+        self.require_stack(arg_cnt + 1)?;
         let func: Function = self.env.stack[arg_cnt].bind(cx).try_into()?;
         let name = match func.untag() {
             FunctionType::Symbol(x) => x.name().to_owned(),
@@ -447,6 +458,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::PushCondtionCase => {
                     let jump_code = self.pc.arg2()?;
                     // pop before getting stack size, after validating operands
+                    self.require_stack(1)?;
                     let condition = self.env.stack.pop(cx);
                     let handler = Handler {
                         jump_code,
@@ -673,6 +685,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 }
                 op::GotoIfNil => {
                     let offset = self.pc.arg2()?;
+                    self.require_stack(1)?;
                     let cond = self.env.stack.pop(cx);
                     if cond.is_nil() {
                         self.pc.goto(usize::from(offset))?;
@@ -680,6 +693,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 }
                 op::GotoIfNonNil => {
                     let offset = self.pc.arg2()?;
+                    self.require_stack(1)?;
                     let cond = self.env.stack.pop(cx);
                     if !cond.is_nil() {
                         self.pc.goto(usize::from(offset))?;
@@ -687,6 +701,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 }
                 op::GotoIfNilElsePop => {
                     let offset = self.pc.arg2()?;
+                    self.require_stack(1)?;
                     if self.env.stack[0].bind(cx).is_nil() {
                         self.pc.goto(usize::from(offset))?;
                     } else {
@@ -695,6 +710,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 }
                 op::GotoIfNonNilElsePop => {
                     let offset = self.pc.arg2()?;
+                    self.require_stack(1)?;
                     if self.env.stack[0].bind(cx).is_nil() {
                         self.env.stack.pop(cx);
                     } else {
@@ -702,6 +718,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     }
                 }
                 op::Return => {
+                    self.require_stack(1)?;
                     if let Some((f, offset)) = self.env.stack.prev_bytecode_frame() {
                         self.set_current_frame(f.bind(cx), offset);
                         let top = self.env.stack.top().bind(cx);
@@ -829,6 +846,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::ConcatN => return Err(self.unsupported_opcode(op, cx)),
                 op::InsertN => return Err(self.unsupported_opcode(op, cx)),
                 op::Switch => {
+                    self.require_stack(2)?;
                     // Validate both operands and the target before consuming
                     // either stack value. General stack-depth validation is
                     // separate from checking switch operand types here.
@@ -1069,6 +1087,64 @@ mod test {
         let val = rebind!(call(bytecode, frame.arg_count(), "test", frame, cx).unwrap());
         let expect = expect.bind(cx);
         assert_eq!(val, expect);
+    }
+
+    #[test]
+    fn m0_control_opcodes_reject_missing_operands_without_using_caller_values() {
+        use OpCode as O;
+        for opcode in [
+            O::Call0,
+            O::Call5,
+            O::CallN,
+            O::CallN2,
+            O::Return,
+            O::GotoIfNil,
+            O::GotoIfNonNil,
+            O::GotoIfNilElsePop,
+            O::GotoIfNonNilElsePop,
+            O::PushCondtionCase,
+            O::Switch,
+            O::VarSet0,
+            O::VarBind0,
+        ] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            make_bytecode!(bytecode, 0, [opcode, 0, 0], [sym::FILL_COLUMN], cx);
+            root!(env, new(Env), cx);
+            env.stack.push(Object::from(99_i64));
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let before = frame.stack.len();
+            let error = call(bytecode, 0, "missing-control-operands", frame, cx).unwrap_err();
+            assert!(error.to_string().contains("Bytecode operand stack underflow"));
+            assert_eq!(frame.stack.len(), before);
+        }
+    }
+
+    #[test]
+    fn m0_calls_validate_argument_count_before_reading_target() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        make_bytecode!(missing_argument, 0, [O::Constant0, O::Call1], [sym::IDENTITY], cx);
+        root!(env, new(Env), cx);
+        {
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let before = frame.stack.len();
+            assert!(call(missing_argument, 0, "missing-call-argument", frame, cx).is_err());
+            assert_eq!(frame.stack.len(), before + 1);
+        }
+        make_bytecode!(
+            valid_call,
+            0,
+            [O::Constant0, O::Constant1, O::Call1, O::Return],
+            [sym::IDENTITY, 7],
+            cx
+        );
+        check_bytecode!(valid_call, [], 7, cx);
     }
 
     #[test]

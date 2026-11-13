@@ -275,7 +275,58 @@ pub fn previous_char_property_change<'ob>(
     previous_property_change(position, None, Some(usize::try_from(limit)?), env, cx)
 }
 
-// TODO also missing next/previous-single-char-property-change.
+/// Return the next boundary of PROP or the buffer endpoint, ignoring changes
+/// to unrelated properties. This implements the no-overlay buffer case.
+#[defun]
+pub fn next_single_char_property_change<'ob>(
+    position: usize,
+    prop: Object<'ob>,
+    object: Option<Object<'ob>>,
+    limit: Option<i64>,
+    env: &'ob mut Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    let point_max = character_property_scan_point_max(position, object, env)?;
+    let point_max = i64::try_from(point_max)?;
+    let limit = limit.unwrap_or(point_max).min(point_max);
+    if limit <= i64::try_from(position)? {
+        return Ok(property_scan_limit_object(limit, cx));
+    }
+    next_single_property_change(position, prop, object, Some(usize::try_from(limit)?), env, cx)
+}
+
+/// Return the previous boundary of PROP or point-min. Overlay and string
+/// support remain dependent on those data models, as for the other fallbacks.
+#[defun]
+pub fn previous_single_char_property_change<'ob>(
+    position: usize,
+    prop: Object<'ob>,
+    object: Option<Object<'ob>>,
+    limit: Option<i64>,
+    env: &'ob mut Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    character_property_scan_point_max(position, object, env)?;
+    let limit = limit.unwrap_or(1).max(1);
+    if limit >= i64::try_from(position)? {
+        return Ok(property_scan_limit_object(limit, cx));
+    }
+    previous_single_property_change(position, prop, object, Some(usize::try_from(limit)?), env, cx)
+}
+
+fn character_property_scan_point_max(
+    position: usize,
+    object: Option<Object<'_>>,
+    env: &mut Rt<Env>,
+) -> Result<usize> {
+    modify_buffer_data(object.unwrap_or(NIL), env, |data| {
+        let point_max = data.text.len_chars() + 1;
+        if position == 0 || position > point_max {
+            bail!("Buffer position {position} is out of range 1..={point_max}");
+        }
+        Ok(point_max)
+    })
+}
 
 /// Add or replace properties on text from START to END, preserving unrelated
 /// properties. Return t if any property actually changes, nil otherwise.
@@ -1490,6 +1541,56 @@ mod tests {
         crate::interpreter::assert_lisp(
             "(progn (insert \"abcdef\") (put-text-property 2 5 'a 1) (list (next-char-property-change 2 -1) (previous-char-property-change 7 -1)))",
             "(-1 5)",
+        );
+    }
+
+    #[test]
+    fn roadmap_m0_single_character_property_scans_ignore_other_keys() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        assert_eq!(next_single_char_property_change(1, cx.add(1), None, None, env, &cx)?, 1);
+        assert_eq!(previous_single_char_property_change(1, cx.add(1), None, None, env, &cx)?, 1);
+        env.current_buffer.get_mut().insert(cx.add("é🙂abcd"))?;
+        let key: Object = intern("roadmap-single-char-key", &cx).into();
+        let other_key: Object = intern("roadmap-single-char-other", &cx).into();
+        let value = cx.add("same");
+        put_text_property(2, 5, key, value, None, env, &cx)?;
+        put_text_property(3, 4, other_key, cx.add(9), None, env, &cx)?;
+        for (position, expected) in [(1, 2), (2, 5), (5, 7), (7, 7)] {
+            assert_eq!(
+                next_single_char_property_change(position, key, None, None, env, &cx)?,
+                expected
+            );
+        }
+        for (position, expected) in [(7, 5), (5, 2), (2, 1), (1, 1)] {
+            assert_eq!(
+                previous_single_char_property_change(position, key, None, None, env, &cx)?,
+                expected
+            );
+        }
+        put_text_property(3, 4, key, cx.add("same"), None, env, &cx)?;
+        assert_eq!(next_single_char_property_change(2, key, None, None, env, &cx)?, 3);
+        assert_eq!(previous_single_char_property_change(5, key, None, None, env, &cx)?, 4);
+        assert_eq!(next_single_char_property_change(2, key, None, Some(-1), env, &cx)?, -1);
+        assert_eq!(next_single_char_property_change(5, key, None, Some(99), env, &cx)?, 7);
+        assert_eq!(previous_single_char_property_change(2, key, None, Some(-1), env, &cx)?, 1);
+        assert_eq!(previous_single_char_property_change(7, key, None, Some(6), env, &cx)?, 6);
+        let other = get_buffer_create(cx.add("roadmap-single-char-buffer"), None, &cx)?;
+        other.buffer().unwrap().lock()?.insert(cx.add("abcdef"))?;
+        put_text_property(3, 6, key, cx.add(1), Some(other), env, &cx)?;
+        assert_eq!(next_single_char_property_change(1, key, Some(other), None, env, &cx)?, 3);
+        assert_eq!(previous_single_char_property_change(7, key, Some(other), None, env, &cx)?, 6);
+        assert!(next_single_char_property_change(0, key, None, None, env, &cx).is_err());
+        assert!(previous_single_char_property_change(8, key, None, None, env, &cx).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_single_character_property_scans_lisp_endpoints_and_limits() {
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abcdef\") (put-text-property 2 5 'a 1) (put-text-property 3 4 'b 2) (list (next-single-char-property-change 2 'a) (previous-single-char-property-change 5 'a) (next-single-char-property-change 5 'a nil 99) (previous-single-char-property-change 2 'a nil -1)))",
+            "(5 2 7 1)",
         );
     }
 
