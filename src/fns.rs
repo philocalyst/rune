@@ -951,20 +951,28 @@ fn copy_sequence<'ob>(arg: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>>
 }
 
 #[defun]
-fn substring(string: &str, from: Option<usize>, to: Option<usize>) -> Result<String> {
-    if from.unwrap_or_default() > string.len() || to.unwrap_or_default() > string.len() {
-        bail!("substring args out of range for {string} : {from:?} {to:?}");
-    }
-    let new_string = match (from, to) {
-        (None, None) => string,
-        (None, Some(t)) => &string[..t],
-        (Some(f), None) => &string[f..],
-        (Some(f), Some(t)) => {
-            let range = if f > t { t..f } else { f..t };
-            &string[range]
-        }
+fn substring(string: &str, from: Option<i64>, to: Option<i64>) -> Result<String> {
+    let char_len = string.chars().count();
+    let normalize = |position: i64| -> Result<usize> {
+        let position = if position < 0 {
+            char_len as i128 + position as i128
+        } else {
+            position as i128
+        };
+        ensure!(position >= 0 && position <= char_len as i128, "substring args out of range");
+        Ok(position as usize)
     };
-    Ok(new_string.to_owned())
+    let from = normalize(from.unwrap_or(0))?;
+    let to = match to {
+        Some(to) => normalize(to)?,
+        None => char_len,
+    };
+    ensure!(from <= to, "substring args out of range");
+    // Lisp indices count characters; only slice at offsets produced by char_indices.
+    let byte_offset = |position: usize| {
+        string.char_indices().nth(position).map_or(string.len(), |(offset, _)| offset)
+    };
+    Ok(string[byte_offset(from)..byte_offset(to)].to_owned())
 }
 
 defsym!(MD5);
@@ -1036,11 +1044,37 @@ fn base64_encode(string: &str, _line_break: bool, pad: bool, base64url: bool) ->
 
 #[cfg(test)]
 mod test {
+    use super::substring;
     use crate::{
         assert_elprop, fns::levenshtein_distance, interpreter::assert_lisp,
         library::elprop::arb_custom_string,
     };
     use proptest::prelude::*;
+
+    #[test]
+    fn substring_uses_character_positions() {
+        assert_eq!(substring("aé🦀z", Some(1), Some(3)).unwrap(), "é🦀");
+        assert_eq!(substring("aé🦀z", Some(-3), Some(-1)).unwrap(), "é🦀");
+        assert_eq!(substring("aé🦀z", None, Some(2)).unwrap(), "aé");
+        assert_eq!(substring("aé🦀z", Some(2), None).unwrap(), "🦀z");
+        assert_eq!(substring("aé🦀z", None, None).unwrap(), "aé🦀z");
+        assert_eq!(substring("aé🦀z", Some(4), None).unwrap(), "");
+        assert_eq!(substring("", None, None).unwrap(), "");
+    }
+
+    #[test]
+    fn substring_rejects_invalid_bounds() {
+        for (from, to) in [
+            (Some(2), Some(1)),
+            (Some(-1), Some(-2)),
+            (Some(-5), None),
+            (None, Some(5)),
+            (Some(i64::MIN), None),
+            (None, Some(i64::MAX)),
+        ] {
+            assert!(substring("aé🦀z", from, to).is_err());
+        }
+    }
 
     #[test]
     fn test_base64_encode_string() {

@@ -537,6 +537,45 @@ mod test {
     }
 
     #[test]
+    fn m0_aref_indexes_multibyte_strings_by_character() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        let string = cx.add("a\u{e9}\u{1f600}z");
+        for (idx, expected) in [(0, 97_i64), (1, 0xe9), (2, 0x1f600), (3, 122)] {
+            assert_eq!(aref(string, idx, &cx).unwrap(), cx.add(expected));
+        }
+        for idx in [4, 5, usize::MAX] {
+            assert_eq!(
+                aref(string, idx, &cx).unwrap_err().to_string(),
+                format!("index {idx} is out of bounds. Length was 4")
+            );
+        }
+    }
+
+    #[test]
+    fn m0_aref_preserves_raw_bytes_and_rejects_empty_string_indices() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        // These bytes deliberately do not form UTF-8 and must not be decoded.
+        let bytes = cx.add(vec![0_u8, 0x80, 0xff]);
+        for (idx, expected) in [(0, 0_i64), (1, 128), (2, 255)] {
+            assert_eq!(aref(bytes, idx, &cx).unwrap(), cx.add(expected));
+        }
+        assert_eq!(
+            aref(bytes, 3, &cx).unwrap_err().to_string(),
+            "index 3 is out of bounds. Length was 3"
+        );
+        for empty in [cx.add(""), cx.add(Vec::<u8>::new())] {
+            for idx in [0, usize::MAX] {
+                assert_eq!(
+                    aref(empty, idx, &cx).unwrap_err().to_string(),
+                    format!("index {idx} is out of bounds. Length was 0")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_functionp() {
         assert_lisp("(functionp '(lambda nil))", "t");
     }
