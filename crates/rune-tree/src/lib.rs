@@ -49,7 +49,7 @@ type Link<T> = Option<Arc<Node<T>>>;
 fn branch<T: Summarize>(left: Arc<Node<T>>, right: Arc<Node<T>>) -> Arc<Node<T>> {
     Arc::new(Node::Branch {
         summary: left.summary().combine(right.summary()),
-        len: left.len() + right.len(),
+        len: left.len().checked_add(right.len()).expect("tree item capacity overflow"),
         height: 1 + left.height().max(right.height()),
         left,
         right,
@@ -110,6 +110,16 @@ fn split<T: Summarize>(node: Link<T>, at: usize) -> (Link<T>, Link<T>) {
     }
 }
 
+/// Appending would exceed the addressable item-count coordinate space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TreeCapacityError;
+impl std::fmt::Display for TreeCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tree item capacity overflow")
+    }
+}
+impl std::error::Error for TreeCapacityError {}
+
 /// A persistent AVL sequence. Items may themselves share immutable storage.
 pub struct SumTree<T: Summarize> {
     root: Link<T>,
@@ -141,8 +151,16 @@ impl<T: Summarize> SumTree<T> {
     pub fn summary(&self) -> T::Summary {
         self.root.as_ref().map_or_else(T::Summary::default, |n| n.summary().clone())
     }
+    /// Panics if the combined item count exceeds usize::MAX. Payload-summary
+    /// arithmetic remains the responsibility of the Summary implementation.
     pub fn append(&self, right: &Self) -> Self {
-        Self { root: join(self.root.clone(), right.root.clone()) }
+        self.checked_append(right).expect("tree item capacity overflow")
+    }
+    /// Validate item capacity before joining either tree. Neither input is
+    /// modified on failure, including for arbitrarily shared zero-weight items.
+    pub fn checked_append(&self, right: &Self) -> Result<Self, TreeCapacityError> {
+        self.len().checked_add(right.len()).ok_or(TreeCapacityError)?;
+        Ok(Self { root: join(self.root.clone(), right.root.clone()) })
     }
     /// Split between items. An invalid index does not change either input.
     pub fn split(&self, at: usize) -> Option<(Self, Self)> {
@@ -383,5 +401,46 @@ mod tests {
             before += value;
         }
         assert!(tree.seek(before, |s| s.0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    #[derive(Clone, Default)]
+    struct Zero;
+    impl Summary for Zero {
+        fn combine(&self, _: &Self) -> Self {
+            Self
+        }
+    }
+    struct Item;
+    impl Summarize for Item {
+        type Summary = Zero;
+        fn summarize(&self) -> Zero {
+            Zero
+        }
+    }
+    #[test]
+    fn shared_zero_weight_items_cannot_wrap_item_count() {
+        let mut power = SumTree::singleton(Item);
+        let mut maximum = SumTree::new();
+        for bit in 0..usize::BITS {
+            maximum = maximum.checked_append(&power).unwrap();
+            if bit + 1 < usize::BITS {
+                power = power.checked_append(&power).unwrap();
+            }
+        }
+        assert_eq!(maximum.len(), usize::MAX);
+        assert!(maximum.get(usize::MAX - 1).is_some());
+        assert!(maximum.get(usize::MAX).is_none());
+        assert!(matches!(
+            maximum.checked_append(&SumTree::singleton(Item)),
+            Err(TreeCapacityError)
+        ));
+        assert!(matches!(power.checked_append(&power), Err(TreeCapacityError)));
+        assert!(std::panic::catch_unwind(|| maximum.append(&power)).is_err());
+        assert_eq!(maximum.checked_append(&SumTree::new()).unwrap().len(), usize::MAX);
+        assert_eq!(maximum.iter_range(usize::MAX - 1..usize::MAX).unwrap().count(), 1);
     }
 }
