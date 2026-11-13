@@ -88,6 +88,37 @@ pub fn plist_get<'ob>(plist: Object<'ob>, prop: Object<'ob>) -> Result<Object<'o
     Ok(NIL)
 }
 
+/// Mutate the first eq-matching value cell, or append a new property pair.
+#[defun]
+pub(crate) fn plist_put<'ob>(
+    plist: Object<'ob>,
+    prop: Object<'ob>,
+    value: Object<'ob>,
+    predicate: Option<Object>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    ensure!(predicate.is_none(), "plist-put predicate support not implemented");
+    let list: List = plist.try_into()?;
+    let mut cells = list.conses();
+    let mut last_value: Option<&Cons> = None;
+    while let Some(key) = cells.next() {
+        let key = key?;
+        let value_cell = cells.next().ok_or_else(|| anyhow!("Odd length property list"))??;
+        if eq(key.car(), prop) {
+            value_cell.set_car(value)?;
+            return Ok(plist);
+        }
+        last_value = Some(value_cell);
+    }
+    let pair = Cons::new(prop, Cons::new(value, NIL, cx), cx);
+    if let Some(last_value) = last_value {
+        last_value.set_cdr(pair.into())?;
+        Ok(plist)
+    } else {
+        Ok(pair.into())
+    }
+}
+
 #[defun]
 fn plist_member<'ob>(
     plist: Object<'ob>,
@@ -1184,6 +1215,34 @@ mod test {
         proptest! {|(string in arb_custom_string("[\x00-\x7F]*"))| {
             assert_elprop![r#"(base64-encode-string {} t)"#, string];
         }};
+    }
+
+    #[test]
+    fn plist_put_updates_first_pair_and_preserves_identity() {
+        assert_lisp("(plist-put nil 'a 1)", "(a 1)");
+        assert_lisp("(plist-put (list 'a 1) 'b 2)", "(a 1 b 2)");
+        assert_lisp("(plist-put (list 'a 1 'a 2) 'a 3)", "(a 3 a 2)");
+        assert_lisp("(let ((p (list 'a 1))) (eq p (plist-put p 'a nil)))", "t");
+        assert_lisp("(let ((p (list 'a 1))) (eq p (plist-put p 'b 2 nil)))", "t");
+        assert_lisp("(let ((key (list 1))) (plist-put (list (list 1) 2) key 3))", "((1) 2 (1) 3)");
+        assert_lisp("(plist-put (list 'a 1 'odd) 'a 2)", "(a 2 odd)");
+    }
+
+    #[test]
+    fn plist_put_rejects_malformed_lists_and_unsupported_predicate() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        let key = cx.add(1i64);
+        let value = cx.add(2i64);
+        assert!(super::plist_put(value, key, value, None, cx).is_err());
+        let odd = crate::core::cons::Cons::new(key, NIL, cx);
+        assert!(super::plist_put(odd.into(), key, value, None, cx).is_err());
+        let dotted = crate::core::cons::Cons::new(key, value, cx);
+        assert!(super::plist_put(dotted.into(), key, value, None, cx).is_err());
+        let circular = crate::core::cons::Cons::new(key, NIL, cx);
+        circular.set_cdr(circular.into()).unwrap();
+        assert!(super::plist_put(circular.into(), value, key, None, cx).is_err());
+        assert!(super::plist_put(NIL, key, value, Some(value), cx).is_err());
     }
 
     #[test]

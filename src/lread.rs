@@ -17,26 +17,18 @@ use rune_macros::defun;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn check_lower_bounds(idx: Option<i64>, len: usize) -> Result<usize> {
-    let len = len as i64;
-    let idx = idx.unwrap_or(0);
+/// GNU validate_subarray uses character positions, including negative bounds,
+/// and permits the empty interval at the end of a string.
+fn read_string_bounds(start: Option<i64>, end: Option<i64>, len: usize) -> Result<(usize, usize)> {
+    let len = i64::try_from(len).context("string length exceeds index range")?;
+    let normalize = |index: i64| if index < 0 { len + index } else { index };
+    let start = normalize(start.unwrap_or(0));
+    let end = normalize(end.unwrap_or(len));
     ensure!(
-        -len <= idx && idx < len,
-        "start index of {idx} is out of bounds for string of length {len}"
+        0 <= start && start <= end && end <= len,
+        "read-from-string bounds {start}..{end} are out of range for string of length {len}"
     );
-    let idx = if idx < 0 { len + idx } else { idx };
-    Ok(idx as usize)
-}
-
-fn check_upper_bounds(idx: Option<i64>, len: usize) -> Result<usize> {
-    let len = len as i64;
-    let idx = idx.unwrap_or(len);
-    ensure!(
-        -len <= idx && idx <= len,
-        "end index of {idx} is out of bounds for string of length {len}"
-    );
-    let idx = if idx < 0 { len + idx } else { idx };
-    Ok(idx as usize)
+    Ok((start as usize, end as usize))
 }
 
 #[defun]
@@ -46,18 +38,22 @@ pub(crate) fn read_from_string<'ob>(
     end: Option<i64>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    let len = string.len();
-    let start = check_lower_bounds(start, len)?;
-    let end = check_upper_bounds(end, len)?;
-
-    let (obj, new_pos) = match reader::read(&string[start..end], cx) {
+    let (start, end) = read_string_bounds(start, end, string.chars().count())?;
+    // The shared reader and loader use byte offsets internally; only this Lisp
+    // boundary accepts and returns character positions (GNU lread.c:2511+).
+    let start_byte = string.char_indices().nth(start).map_or(string.len(), |(pos, _)| pos);
+    let end_byte = string.char_indices().nth(end).map_or(string.len(), |(pos, _)| pos);
+    let input = &string[start_byte..end_byte];
+    let (obj, new_pos) = match reader::read(input, cx) {
         Ok((obj, pos)) => (obj, pos),
         Err(mut e) => {
-            e.update_pos(start);
+            // Keep reader diagnostics in their existing absolute byte units.
+            e.update_pos(start_byte);
             bail!(e);
         }
     };
-    Ok(Cons::new(obj, new_pos as i64, cx).into())
+    let final_index = start + input[..new_pos].chars().count();
+    Ok(Cons::new(obj, final_index as i64, cx).into())
 }
 
 pub(crate) fn load_internal(contents: &str, cx: &mut Context, env: &mut Rt<Env>) -> Result<bool> {
@@ -248,6 +244,68 @@ mod test {
     use super::*;
     use crate::core::gc::RootSet;
     use rune_core::macros::root;
+
+    #[test]
+    fn read_from_string_returns_absolute_character_indices() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, start, end, expected_value, expected_position) in [
+            ("xx 42", Some(3), None, 42_i64, 5_i64),
+            ("xx 42 tail", Some(3), Some(5), 42, 5),
+            ("\u{e9} 42", Some(2), None, 42, 4),
+            ("\u{e9} 42 tail", Some(2), Some(4), 42, 4),
+            ("\u{e9} 42 tail", Some(-7), Some(-5), 42, 4),
+            ("xx 42", Some(-2), Some(5), 42, 5),
+        ] {
+            let result = read_from_string(source, start, end, &cx).unwrap();
+            let ObjectType::Cons(pair) = result.untag() else {
+                panic!("expected reader pair");
+            };
+            let (value, position) = (pair.car(), pair.cdr());
+            assert_eq!(value, cx.add(expected_value), "{source}");
+            assert_eq!(position, cx.add(expected_position), "{source}");
+        }
+        let result = read_from_string("xx \"\u{e9}\u{1f600}\" tail", Some(3), None, &cx).unwrap();
+        let ObjectType::Cons(pair) = result.untag() else {
+            panic!("expected reader pair");
+        };
+        let (value, position) = (pair.car(), pair.cdr());
+        assert_eq!(value, cx.add("\u{e9}\u{1f600}"));
+        assert_eq!(position, cx.add(7_i64));
+    }
+
+    #[test]
+    fn read_from_string_bounds_do_not_panic_on_unicode_or_empty_slices() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        // Character 1 is after the complete multibyte scalar, not in its UTF-8 encoding.
+        let result = read_from_string("\u{e9}42", Some(1), Some(3), &cx).unwrap();
+        let ObjectType::Cons(pair) = result.untag() else {
+            panic!("expected reader pair");
+        };
+        let (value, position) = (pair.car(), pair.cdr());
+        assert_eq!(value, cx.add(42_i64));
+        assert_eq!(position, cx.add(3_i64));
+        for (source, start, end) in [
+            ("", None, None),
+            ("abc", Some(3), None),
+            ("abc", Some(1), Some(1)),
+            ("\u{e9}", Some(1), Some(1)),
+        ] {
+            let error = read_from_string(source, start, end, &cx).unwrap_err();
+            assert_eq!(error.downcast_ref::<reader::Error>(), Some(&reader::Error::EmptyStream));
+        }
+        for (start, end) in [
+            (Some(2), Some(1)),
+            (Some(4), None),
+            (Some(-4), None),
+            (None, Some(4)),
+            (None, Some(-4)),
+            (Some(i64::MIN), None),
+        ] {
+            assert!(read_from_string("\u{e9}42", start, end, &cx).is_err());
+        }
+    }
 
     #[test]
     fn test_load() {
