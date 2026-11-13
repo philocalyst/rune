@@ -15,6 +15,8 @@ use std::{
 pub(crate) struct InferiorEmacs {
     pub socket_name: String,
     daemon: Option<Child>,
+    batch_ready: bool,
+    selected_backend: Option<bool>,
     #[cfg(unix)]
     stream: Option<UnixStream>,
     #[cfg(target_os = "windows")]
@@ -28,6 +30,8 @@ impl Default for InferiorEmacs {
         Self {
             socket_name: format!("rune-proptest-{:?}", thread::current().id()),
             daemon: None,
+            batch_ready: false,
+            selected_backend: None,
             stream: None,
             #[cfg(target_os = "windows")]
             auth_string: None,
@@ -61,10 +65,28 @@ fn read_output(daemon: &mut Child) -> String {
 
 impl InferiorEmacs {
     pub(crate) fn is_ready(&self) -> bool {
-        self.stream.is_some()
+        self.batch_ready || self.stream.is_some()
+    }
+
+    fn select_backend(&mut self, batch: bool) -> Result<()> {
+        if self.selected_backend.is_some_and(|selected| selected != batch) {
+            bail!("RUNE_ELPROP_BACKEND cannot change after this test thread selects its backend");
+        }
+        self.selected_backend = Some(batch);
+        Ok(())
     }
 
     pub(crate) fn start(&mut self) -> Result<()> {
+        let batch = match env::var("RUNE_ELPROP_BACKEND").as_deref() {
+            Ok("batch") => true,
+            Ok("daemon") | Err(env::VarError::NotPresent) => false,
+            _ => bail!("RUNE_ELPROP_BACKEND must be batch or daemon"),
+        };
+        self.select_backend(batch)?;
+        if batch {
+            self.batch_ready = true;
+            return Ok(());
+        }
         if self.is_ready() {
             return Ok(());
         }
@@ -105,6 +127,9 @@ impl InferiorEmacs {
     }
 
     pub(crate) fn eval(&mut self, lisp: &str) -> Result<String> {
+        if self.batch_ready {
+            return super::batch_emacs::eval(lisp);
+        }
         if !self.is_ready() {
             bail!("Emacs daemon wasn't started");
         }
@@ -362,6 +387,21 @@ impl std::fmt::Display for Message {
             write!(f, "{body}")
         } else {
             write!(f, "N/A")
+        }
+    }
+}
+
+#[cfg(test)]
+mod backend_selection_tests {
+    use super::*;
+    #[test]
+    fn backend_selection_is_immutable_without_environment_mutation() {
+        for selected in [false, true] {
+            let mut oracle = InferiorEmacs::default();
+            oracle.select_backend(selected).unwrap();
+            oracle.select_backend(selected).unwrap();
+            assert!(oracle.select_backend(!selected).is_err());
+            assert_eq!(oracle.selected_backend, Some(selected));
         }
     }
 }

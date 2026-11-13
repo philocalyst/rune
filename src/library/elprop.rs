@@ -5,6 +5,7 @@ mod strategies;
 pub(crate) use strategies::*;
 
 use crate::library::elprop::inf_emacs::InferiorEmacs;
+mod batch_emacs;
 mod inf_emacs;
 
 thread_local! {
