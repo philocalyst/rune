@@ -95,7 +95,7 @@ enum Token<'a> {
     Splice(usize),
     Sharp(usize),
     Dot(usize),
-    QuestionMark(usize, char),
+    QuestionMark(usize, u32),
     Ident(&'a str),
     String(&'a str),
 }
@@ -231,7 +231,7 @@ impl<'a> Tokenizer<'a> {
                     let Some((_, chr)) = self.iter.next() else {
                         return Err(Error::MissingQuotedItem(start));
                     };
-                    let value = read_character_escape(chr, &mut self.iter, start)?;
+                    let value = read_character_literal_escape(chr, &mut self.iter, start)?;
                     if matches!(self.iter.peek(), Some((_, chr)) if symbol_char(*chr) && *chr != '?')
                     {
                         return Err(Error::InvalidEscape(start));
@@ -242,7 +242,7 @@ impl<'a> Tokenizer<'a> {
                         Some((i, chr)) if symbol_char(*chr) && *chr != '?' => {
                             Err(Error::UnexpectedChar(*chr, *i)) // ?aa
                         }
-                        _ => Ok(Token::QuestionMark(idx, item)), // ?a
+                        _ => Ok(Token::QuestionMark(idx, item as u32)), // ?a
                     }
                 }
             }
@@ -376,9 +376,64 @@ fn lisp_float(slice: &str) -> Option<f64> {
     slice.parse::<f64>().ok()
 }
 
+/// Decode integer-valued character literals independently of UTF-8 strings.
+/// GNU lread.c:read_char_escape accumulates ordinary modifiers, but counts
+/// Control prefixes because applying Control twice is not idempotent.
+fn read_character_literal_escape(
+    mut first: char,
+    chars: &mut Peekable<impl Iterator<Item = (usize, char)>>,
+    pos: usize,
+) -> Result<u32> {
+    // GNU lisp.h CHAR_ALT through CHAR_META, bits 22 through 27.
+    const CONTROL: u32 = 1 << 26;
+    let mut modifiers = 0;
+    let mut controls = 0_usize;
+    let mut character;
+    loop {
+        let modifier = match first {
+            'A' => 1 << 22,
+            's' if matches!(chars.peek(), Some((_, '-'))) => 1 << 23,
+            'H' => 1 << 24,
+            'S' => 1 << 25,
+            'M' => 1 << 27,
+            'C' | '^' => 0,
+            '\n' => return Err(Error::InvalidEscape(pos)),
+            _ => {
+                character = read_character_escape(first, chars, pos)? as u32;
+                break;
+            }
+        };
+        if first != '^' && chars.next().map(|(_, chr)| chr) != Some('-') {
+            return Err(Error::InvalidEscape(pos));
+        }
+        if matches!(first, 'C' | '^') {
+            controls += 1;
+        } else {
+            modifiers |= modifier;
+        }
+        let (_, target) = chars.next().ok_or(Error::InvalidEscape(pos))?;
+        if target == '\\' {
+            first = chars.next().ok_or(Error::InvalidEscape(pos))?.1;
+        } else {
+            character = target as u32;
+            break;
+        }
+    }
+    for _ in 0..controls {
+        if matches!(character, 0x40..=0x5f | 0x61..=0x7a) {
+            character &= 0x1f;
+        } else if character == u32::from('?') {
+            character = 127;
+        } else {
+            modifiers |= CONTROL;
+        }
+    }
+    Ok(character | modifiers)
+}
+
 /// Decode the scalar-valued subset that the current Rust UTF-8 string model can
-/// represent. Modified keycodes (Meta/Super/etc.) and raw-byte string metadata
-/// need the later character/string representation; never silently return NUL.
+/// represent. Modified characters in strings and raw-byte string metadata
+/// still need a richer string representation; never silently return NUL.
 fn read_character_escape(
     first: char,
     chars: &mut Peekable<impl Iterator<Item = (usize, char)>>,
@@ -1137,7 +1192,7 @@ mod m0_reader_regressions {
             (r"?\C-?", 127),
             (r"?\C-@", 0),
             (r"?\C-_", 31),
-            ("?\\C- ", 0),
+            ("?\\C- ", (1 << 26) | 32),
             (r"?\C-]", 29),
         ] {
             assert_eq!(read(source, &cx).unwrap().0, cx.add(value), "{source}");
@@ -1201,10 +1256,45 @@ mod m0_reader_regressions {
     }
 
     #[test]
-    fn m0_reader_unsupported_modifiers_do_not_silently_return_nul() {
+    fn character_literal_modifiers_use_gnu_keycode_bits() {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        for source in [r"?\M-a", r"?\H-a", r"?\C-%", r"?\C-"] {
+        for (source, expected) in [
+            (r"?\M-a", (1_i64 << 27) | 97),
+            (r"?\A-a", (1 << 22) | 97),
+            (r"?\s-a", (1 << 23) | 97),
+            (r"?\H-a", (1 << 24) | 97),
+            (r"?\S-a", (1 << 25) | 97),
+            (r"?\C-%", (1 << 26) | 37),
+            (r"?\M-\C-a", (1 << 27) | 1),
+            (r"?\C-\M-a", (1 << 27) | 1),
+            (r"?\C-\C-a", (1 << 26) | 1),
+            (r"?\C-\001", (1 << 26) | 1),
+            (r"?\M-\M-a", (1 << 27) | 97),
+            (
+                r"?\M-\S-\A-\H-\s-\C-q",
+                (1 << 27) | (1 << 25) | (1 << 22) | (1 << 24) | (1 << 23) | 17,
+            ),
+            (r"?\M-\n", (1 << 27) | 10),
+            ("?\\M-\u{e9}", (1 << 27) | 233),
+            (r"?\M-]", (1 << 27) | 93),
+        ] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(expected), "{source}");
+        }
+        assert_eq!(read(r"?\M-a next", &cx).unwrap().1, 5);
+        assert_eq!(read(r"[?\M-]]", &cx).unwrap().1, 7);
+        assert_eq!(read("?\\\n", &cx).unwrap_err(), Error::InvalidEscape(1));
+        // Prefix handling is iterative, including repeated modifier chains.
+        let source = "?".to_owned() + &r"\M-".repeat(10_000) + "a";
+        assert_eq!(read(&source, &cx).unwrap().0, cx.add((1_i64 << 27) | 97));
+        assert_eq!(read(r#""\M-a""#, &cx).unwrap_err(), Error::InvalidEscape(1));
+    }
+
+    #[test]
+    fn malformed_character_modifiers_and_unsupported_string_modifiers_are_errors() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for source in [r"?\M", r"?\H", r"?\S", r"?\A", r"?\C-", r"?\M-\"] {
             assert_eq!(read(source, &cx).unwrap_err(), Error::InvalidEscape(1), "{source}");
         }
     }

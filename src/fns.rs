@@ -722,10 +722,83 @@ pub(crate) fn length(sequence: Object) -> Result<usize> {
     Ok(size)
 }
 
+/// GNU length_internal counts cons cells only, stopping once LIMIT is reached.
+/// A negative result means the list has at least LIMIT cells.
+fn list_length_remainder(cons: &Cons, mut limit: i128) -> Result<i128> {
+    if limit < 0xffff {
+        // Small bounds deliberately terminate even on circular lists.
+        let mut tail: Object = cons.into();
+        while let Some(cons) = tail.cons() {
+            limit -= 1;
+            if limit <= 0 {
+                return Ok(-1);
+            }
+            tail = cons.cdr();
+        }
+    } else {
+        for cell in cons.conses() {
+            match cell {
+                Ok(_) => {
+                    limit -= 1;
+                    if limit <= 0 {
+                        return Ok(-1);
+                    }
+                }
+                Err(crate::core::cons::ConsError::NonNilCdr) => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(limit)
+}
+
+#[defun(name = "length=")]
+fn length_equal(sequence: Object, target: i64) -> Result<bool> {
+    // GNU returns nil before examining SEQUENCE for a negative target.
+    if target < 0 {
+        return Ok(false);
+    }
+    if let ObjectType::Cons(cons) = sequence.untag() {
+        return Ok(list_length_remainder(cons, target as i128 + 1)? == 1);
+    }
+    Ok(length(sequence)? as i128 == target as i128)
+}
+
+#[defun(name = "length<")]
+fn length_less(sequence: Object, target: i64) -> Result<bool> {
+    if let ObjectType::Cons(cons) = sequence.untag() {
+        return Ok(list_length_remainder(cons, target as i128)? != -1);
+    }
+    Ok((length(sequence)? as i128) < target as i128)
+}
+
+#[defun(name = "length>")]
+fn length_greater(sequence: Object, target: i64) -> Result<bool> {
+    if let ObjectType::Cons(cons) = sequence.untag() {
+        return Ok(list_length_remainder(cons, target as i128 + 1)? == -1);
+    }
+    Ok((length(sequence)? as i128) > target as i128)
+}
+
 #[defun]
 pub(crate) fn safe_length(sequence: Object) -> usize {
     match sequence.untag() {
-        ObjectType::Cons(cons) => cons.elements().take_while(|x| x.is_ok()).count(),
+        ObjectType::Cons(cons) => {
+            let mut count = 0_usize;
+            for element in cons.elements() {
+                match element {
+                    Ok(_) => count += 1,
+                    // Floyd detection can meet before visiting every distinct
+                    // cell in a prefixed cycle. Twice the visited count is an
+                    // upper bound, satisfying GNU safe-length's guarantee.
+                    Err(crate::core::cons::ConsError::CircularList) => {
+                        return count.saturating_mul(2);
+                    }
+                    Err(crate::core::cons::ConsError::NonNilCdr) => return count,
+                }
+            }
+            count
+        }
         _ => 0,
     }
 }
@@ -1273,6 +1346,65 @@ mod test {
         proptest! {|(string in arb_custom_string("[\x00-\x7F]*"))| {
             assert_elprop![r#"(base64-encode-string {} t)"#, string];
         }};
+    }
+
+    #[test]
+    fn safe_length_counts_prefixed_cycles_without_underreporting() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        let cells: Vec<_> = (0..8)
+            .map(|value| crate::core::cons::Cons::new(value as i64, NIL, cx))
+            .collect();
+        for pair in cells.windows(2) {
+            pair[0].set_cdr(pair[1].into()).unwrap();
+        }
+        // Prefix length5 followed by cycle length3: old Floyd count was6,
+        // below the8 distinct cells required by GNU's safe-length contract.
+        cells[7].set_cdr(cells[5].into()).unwrap();
+        assert!(super::safe_length(cells[0].into()) >= cells.len());
+        let singleton = crate::core::cons::Cons::new(1i64, NIL, cx);
+        singleton.set_cdr(singleton.into()).unwrap();
+        assert!(super::safe_length(singleton.into()) >= 1);
+        assert_eq!(super::safe_length(42i64.into()), 0);
+        assert_eq!(super::safe_length(NIL), 0);
+        let dotted = crate::core::cons::Cons::new(1i64, 2i64, cx);
+        assert_eq!(super::safe_length(dotted.into()), 1);
+    }
+
+    #[test]
+    fn length_comparisons_cover_sequences_and_short_circuit_lists() {
+        assert_lisp("(list (length= nil 0) (length< nil 1) (length> nil -1))", "(t t t)");
+        assert_lisp("(list (length= [1 2] 2) (length< [1 2] 2) (length> [1 2] 1))", "(t nil t)");
+        assert_lisp(
+            "(list (length= \"é🦀\" 2) (length< \"é🦀\" 3) (length> \"é🦀\" 2))",
+            "(t t nil)",
+        );
+        assert_lisp("(list (length= '(1 2) 2) (length< '(1 2) 3) (length> '(1 2) 2))", "(t t nil)");
+        assert_lisp(
+            "(list (length= '(1 . 2) 1) (length< '(1 . 2) 2) (length> '(1 . 2) 0))",
+            "(t t t)",
+        );
+        assert_lisp("(length= 42 -1)", "nil");
+        assert_lisp(
+            "(let ((p (list 1))) (setcdr p p) (list (length= p 3) (length< p 3) (length> p 3)))",
+            "(nil nil t)",
+        );
+    }
+
+    #[test]
+    fn length_comparisons_check_large_bounds_and_invalid_sequences() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        let bytes = cx.add(vec![0u8, 128, 255]);
+        assert!(super::length_equal(bytes, 3).unwrap());
+        assert!(super::length_less(bytes, i64::MAX).unwrap());
+        assert!(super::length_greater(bytes, i64::MIN).unwrap());
+        assert!(super::length_equal(42i64.into(), 0).is_err());
+        assert!(super::length_less(42i64.into(), -1).is_err());
+        assert!(super::length_greater(42i64.into(), -1).is_err());
+        let circular = crate::core::cons::Cons::new(1i64, NIL, cx);
+        circular.set_cdr(circular.into()).unwrap();
+        assert!(super::length_equal(circular.into(), i64::MAX).is_err());
     }
 
     #[test]

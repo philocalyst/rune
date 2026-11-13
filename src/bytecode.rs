@@ -48,8 +48,7 @@ impl ProgramCounter {
         Ok(())
     }
 
-    fn goto(&mut self, offset: u16) -> Result<()> {
-        let offset = usize::from(offset);
+    fn goto(&mut self, offset: usize) -> Result<()> {
         let len = self.range.end.addr() - self.range.start.addr();
         ensure!(offset < len, "Bytecode jump target {offset} is out of range");
         // Validate before pointer arithmetic: even creating an out-of-allocation
@@ -303,7 +302,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 self.unwind(handler.stack_frame, cx);
                 self.env.stack.truncate(handler.stack_size);
                 self.env.stack.push(Object::from(error));
-                self.pc.goto(handler.jump_code)?;
+                self.pc.goto(usize::from(handler.jump_code))?;
                 continue 'main;
             }
             return Err(err);
@@ -651,26 +650,26 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 }
                 op::Goto => {
                     let offset = self.pc.arg2()?;
-                    self.pc.goto(offset)?;
+                    self.pc.goto(usize::from(offset))?;
                 }
                 op::GotoIfNil => {
                     let offset = self.pc.arg2()?;
                     let cond = self.env.stack.pop(cx);
                     if cond.is_nil() {
-                        self.pc.goto(offset)?;
+                        self.pc.goto(usize::from(offset))?;
                     }
                 }
                 op::GotoIfNonNil => {
                     let offset = self.pc.arg2()?;
                     let cond = self.env.stack.pop(cx);
                     if !cond.is_nil() {
-                        self.pc.goto(offset)?;
+                        self.pc.goto(usize::from(offset))?;
                     }
                 }
                 op::GotoIfNilElsePop => {
                     let offset = self.pc.arg2()?;
                     if self.env.stack[0].bind(cx).is_nil() {
-                        self.pc.goto(offset)?;
+                        self.pc.goto(usize::from(offset))?;
                     } else {
                         self.env.stack.pop(cx);
                     }
@@ -680,7 +679,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     if self.env.stack[0].bind(cx).is_nil() {
                         self.env.stack.pop(cx);
                     } else {
-                        self.pc.goto(offset)?;
+                        self.pc.goto(usize::from(offset))?;
                     }
                 }
                 op::Return => {
@@ -797,16 +796,27 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::ConcatN => return Err(self.unsupported_opcode(op, cx)),
                 op::InsertN => return Err(self.unsupported_opcode(op, cx)),
                 op::Switch => {
-                    let ObjectType::HashTable(table) = self.env.stack.pop(cx).untag() else {
-                        unreachable!("switch table was not a hash table")
+                    // Validate both operands and the target before consuming
+                    // either stack value. General stack-depth validation is
+                    // separate from checking switch operand types here.
+                    let table = self.env.stack[0].bind(cx);
+                    let ObjectType::HashTable(table) = table.untag() else {
+                        bail_err!("Invalid bytecode switch table: expected hash table")
                     };
-                    let cond = self.env.stack.pop(cx);
+                    let cond = self.env.stack[1].bind(cx);
                     if let Some(offset) = table.get(cond) {
                         let ObjectType::Int(offset) = offset.untag() else {
-                            unreachable!("switch value was not a int")
+                            bail_err!("Invalid bytecode switch target: expected integer")
                         };
-                        self.pc.goto(offset as u16)?;
+                        let offset = usize::try_from(offset).map_err(|_| {
+                            anyhow::anyhow!(
+                                "Invalid bytecode switch target: negative or unrepresentable"
+                            )
+                        })?;
+                        self.pc.goto(offset)?;
                     }
+                    self.env.stack.pop(cx);
+                    self.env.stack.pop(cx);
                 }
                 op::Constant0
                 | op::Constant1
@@ -1044,7 +1054,7 @@ mod test {
         // Failed accesses/jumps leave the cursor unchanged.
         assert_eq!(pc.as_offset(), 1);
         assert!(pc.goto(2).is_err());
-        assert!(pc.goto(u16::MAX).is_err());
+        assert!(pc.goto(usize::from(u16::MAX)).is_err());
         assert_eq!(pc.arg1().unwrap(), 0x12);
         assert!(pc.arg1().is_err());
     }
@@ -1369,6 +1379,71 @@ mod test {
             cx
         );
         check_bytecode!(bytecode, [], 5, cx);
+    }
+
+    #[test]
+    fn m0_switch_rejects_invalid_tables_and_targets() {
+        use OpCode as O;
+        for offset in [-1_i64, 65_536] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            let mut table = HashTable::default();
+            table.insert(1.into(), offset.into());
+            make_bytecode!(
+                bytecode,
+                0,
+                [O::Constant0, O::Constant1, O::Switch, O::Constant2, O::Return],
+                [1, table, 9],
+                cx
+            );
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let before = frame.stack.len();
+            assert!(call(bytecode, 0, "invalid-switch-target", frame, cx).is_err());
+            assert_eq!(frame.stack.len(), before + 2);
+        }
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let mut table = HashTable::default();
+        table.insert(1.into(), cx.add("not-an-index"));
+        make_bytecode!(bad_target, 0, [O::Constant0, O::Constant1, O::Switch], [1, table], cx);
+        root!(env, new(Env), cx);
+        {
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let before = frame.stack.len();
+            assert!(call(bad_target, 0, "invalid-switch-type", frame, cx).is_err());
+            assert_eq!(frame.stack.len(), before + 2);
+        }
+        make_bytecode!(bad_table, 0, [O::Constant0, O::Constant1, O::Switch], [1, 7], cx);
+        let frame = &mut CallFrame::new(env);
+        frame.finalize_arguments();
+        let before = frame.stack.len();
+        assert!(call(bad_table, 0, "invalid-switch-table", frame, cx).is_err());
+        assert_eq!(frame.stack.len(), before + 2);
+    }
+
+    #[test]
+    fn m0_switch_preserves_targets_above_u16_range() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let mut table = HashTable::default();
+        table.insert(1.into(), 65_536_i64.into());
+        let constants: &LispVec =
+            vec![cx.add(1_i64), cx.add(table), cx.add(9_i64)].into_obj(cx).untag();
+        let mut bytes = vec![O::Return as u8; 65_538];
+        bytes[..3].copy_from_slice(&[O::Constant0 as u8, O::Constant1 as u8, O::Switch as u8]);
+        bytes[65_536..].copy_from_slice(&[O::Constant2 as u8, O::Return as u8]);
+        let codes: &ByteString = bytes.into_obj(cx).untag();
+        let function =
+            crate::alloc::make_byte_code(0, codes, constants, 10, None, None, &[], cx).unwrap();
+        root!(function, cx);
+        check_bytecode!(function, [], 9, cx);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::{
         env::Env,
         error::{Type, TypeError},
         gc::{Context, Rt, Slot},
-        object::{NIL, Object, ObjectType, WithLifetime},
+        object::{NIL, Object, ObjectType, TRUE, WithLifetime},
     },
     fns::eq,
     intervals::textget,
@@ -309,13 +309,29 @@ pub fn put_text_property<'ob>(
 pub fn next_property_change<'ob>(
     position: usize,
     object: Option<Object<'ob>>,
-    limit: Option<usize>,
+    limit: Option<Object<'ob>>,
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     let object = object.unwrap_or(NIL);
+    let limit = limit.filter(|limit| !limit.is_nil());
+    let next_interval = limit.is_some_and(|limit| eq(limit, TRUE));
+    let limit: Option<usize> =
+        if next_interval { None } else { limit.map(TryInto::try_into).transpose()? };
     modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
         let point_max = data.text.len_chars() + 1;
+        if next_interval {
+            if position == 0 || position > point_max {
+                bail!("Buffer position {position} is out of range 1..={point_max}");
+            }
+            let next = data.textprops.tree.find_intersect_min(position..point_max);
+            let boundary = match next {
+                Some(node) if node.key.start > position => node.key.start,
+                Some(node) => node.key.end.min(point_max),
+                None => point_max,
+            };
+            return Ok(cx.add(boundary));
+        }
         let end = limit.unwrap_or(point_max);
         let tree = data.textprops_with_lifetime();
         let prop = tree.tree.find_intersect_min(position..end);
@@ -795,10 +811,10 @@ mod tests {
         assert_eq!(change, cx.add(20)); // Change at end of third range
 
         // Test with limit
-        let change = next_property_change(1, Some(buf), Some(8), env, cx)?;
+        let change = next_property_change(1, Some(buf), Some(cx.add(8)), env, cx)?;
         assert_eq!(change, cx.add(5)); // Change within limit
 
-        let change = next_property_change(5, Some(buf), Some(8), env, cx)?;
+        let change = next_property_change(5, Some(buf), Some(cx.add(8)), env, cx)?;
         assert_eq!(change, cx.add(8)); // Limit reached
 
         // Test no change case
@@ -1294,6 +1310,44 @@ mod tests {
         assert_eq!(text_property_not_all(1, 7, key, cx.add(7), None, env, &cx)?, 3);
         assert_eq!(text_property_not_all(1, 7, key, cx.add(9), Some(other), env, &cx)?, 1);
         Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_next_property_change_true_limit_returns_interval_boundary() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-true-limit"), None, &cx)?;
+        assert_eq!(next_property_change(1, Some(buf), Some(TRUE), env, &cx)?, 1);
+        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂abcd"))?;
+        let key: Object = intern("roadmap-true-limit-key", &cx).into();
+        // Unpropertized text still returns the endpoint with t, not nil.
+        assert_eq!(next_property_change(1, Some(buf), Some(TRUE), env, &cx)?, 7);
+        assert!(next_property_change(1, Some(buf), None, env, &cx)?.is_nil());
+        put_text_property(2, 5, key, cx.add(1), Some(buf), env, &cx)?;
+        for (position, expected) in [(1, 2), (2, 5), (4, 5), (5, 7), (7, 7)] {
+            assert_eq!(next_property_change(position, Some(buf), Some(TRUE), env, &cx)?, expected);
+        }
+        assert!(next_property_change(0, Some(buf), Some(TRUE), env, &cx).is_err());
+        assert!(next_property_change(8, Some(buf), Some(TRUE), env, &cx).is_err());
+        assert!(next_property_change(1, Some(buf), Some(cx.add("bad limit")), env, &cx).is_err());
+        assert_eq!(next_property_change(2, Some(buf), Some(cx.add(3)), env, &cx)?, 3);
+        put_text_property(1, 7, key, cx.add(2), Some(buf), env, &cx)?;
+        assert_eq!(next_property_change(1, Some(buf), Some(TRUE), env, &cx)?, 7);
+        assert!(next_property_change(1, Some(buf), None, env, &cx)?.is_nil());
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_next_property_change_true_limit_lisp() {
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (list (next-property-change 1 nil t) (next-property-change 1)))",
+            "(4 nil)",
+        );
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abcdef\") (put-text-property 2 5 'a 1) (list (next-property-change 1 nil t) (next-property-change 2 nil t) (next-property-change 5 nil t)))",
+            "(2 5 7)",
+        );
     }
 
     #[test]

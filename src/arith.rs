@@ -65,19 +65,24 @@ impl NumberValue {
 pub(crate) fn arith(
     cur: NumberValue,
     next: NumberValue,
-    int_fn: fn(i64, i64) -> i64,
+    int_fn: fn(i64, i64) -> Option<i64>,
     float_fn: fn(f64, f64) -> f64,
     big_fn: fn(BigInt, BigInt) -> BigInt,
 ) -> NumberValue {
     use NumberValue as N;
     match (cur, next) {
-        (N::Int(l), N::Int(r)) => N::Int(int_fn(l, r)),
+        (N::Int(l), N::Int(r)) => {
+            match int_fn(l, r).filter(|value| (MIN_FIXNUM..=MAX_FIXNUM).contains(value)) {
+                Some(value) => N::Int(value),
+                None => N::Big(big_fn(l.into(), r.into())).coerce_integer(),
+            }
+        }
         (N::Int(l), N::Float(r)) => N::Float(float_fn(l as f64, r)),
         (N::Float(l), N::Int(r)) => N::Float(float_fn(l, r as f64)),
         (N::Float(l), N::Float(r)) => N::Float(float_fn(l, r)),
-        (N::Int(l), N::Big(r)) => N::Big(big_fn(l.into(), r)),
-        (N::Big(l), N::Int(r)) => N::Big(big_fn(l, r.into())),
-        (N::Big(l), N::Big(r)) => N::Big(big_fn(l, r)),
+        (N::Int(l), N::Big(r)) => N::Big(big_fn(l.into(), r)).coerce_integer(),
+        (N::Big(l), N::Int(r)) => N::Big(big_fn(l, r.into())).coerce_integer(),
+        (N::Big(l), N::Big(r)) => N::Big(big_fn(l, r)).coerce_integer(),
         (N::Float(l), N::Big(r)) => N::Float(float_fn(l, r.to_f64().unwrap())), // TODO: Should round to nearest float on error
         (N::Big(l), N::Float(r)) => N::Float(float_fn(l.to_f64().unwrap(), r)), // TODO: Should round to nearest float on error
     }
@@ -104,9 +109,14 @@ impl Neg for NumberValue {
     type Output = Self;
     fn neg(self) -> Self::Output {
         match self {
-            NumberValue::Int(x) => NumberValue::Int(-x),
+            NumberValue::Int(x) => {
+                match x.checked_neg().filter(|value| (MIN_FIXNUM..=MAX_FIXNUM).contains(value)) {
+                    Some(value) => NumberValue::Int(value),
+                    None => NumberValue::Big(-BigInt::from(x)).coerce_integer(),
+                }
+            }
             NumberValue::Float(x) => NumberValue::Float(-x),
-            NumberValue::Big(x) => NumberValue::Big(-x),
+            NumberValue::Big(x) => NumberValue::Big(-x).coerce_integer(),
         }
     }
 }
@@ -114,35 +124,35 @@ impl Neg for NumberValue {
 impl Add for NumberValue {
     type Output = Self;
     fn add(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, Add::add, Add::add, Add::add)
+        arith(self, rhs, i64::checked_add, Add::add, Add::add)
     }
 }
 
 impl Sub for NumberValue {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, Sub::sub, Sub::sub, Sub::sub)
+        arith(self, rhs, i64::checked_sub, Sub::sub, Sub::sub)
     }
 }
 
 impl Mul for NumberValue {
     type Output = Self;
     fn mul(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, Mul::mul, Mul::mul, Mul::mul)
+        arith(self, rhs, i64::checked_mul, Mul::mul, Mul::mul)
     }
 }
 
 impl Div for NumberValue {
     type Output = Self;
     fn div(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, Div::div, Div::div, Div::div)
+        arith(self, rhs, i64::checked_div, Div::div, Div::div)
     }
 }
 
 impl Rem for NumberValue {
     type Output = Self;
     fn rem(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, Rem::rem, Rem::rem, Rem::rem)
+        arith(self, rhs, i64::checked_rem, Rem::rem, Rem::rem)
     }
 }
 
@@ -422,6 +432,47 @@ mod test {
         assert_eq!(add(&[7.into(), 13.into()]), NumberValue::Int(20));
         assert_eq!(add(&[1.into(), cx.add_as(2.5)]), NumberValue::Float(3.5));
         assert_eq!(add(&[0.into(), (-1).into()]), NumberValue::Int(-1));
+    }
+
+    #[test]
+    fn m0_integer_arithmetic_promotes_instead_of_clamping_or_overflowing() {
+        assert_eq!(
+            NumberValue::Int(MAX_FIXNUM) + NumberValue::Int(1),
+            NumberValue::Big(BigInt::from(MAX_FIXNUM) + 1_u8)
+        );
+        assert_eq!(
+            NumberValue::Int(MIN_FIXNUM) - NumberValue::Int(1),
+            NumberValue::Big(BigInt::from(MIN_FIXNUM) - 1_u8)
+        );
+        assert_eq!(-NumberValue::Int(MIN_FIXNUM), NumberValue::Big(-BigInt::from(MIN_FIXNUM)));
+        assert_eq!(
+            NumberValue::Int(i64::MAX) + NumberValue::Int(1),
+            NumberValue::Big(BigInt::from(i64::MAX) + 1_u8)
+        );
+        assert_eq!(
+            NumberValue::Int(i64::MIN) - NumberValue::Int(1),
+            NumberValue::Big(BigInt::from(i64::MIN) - 1_u8)
+        );
+        assert_eq!(-NumberValue::Int(i64::MIN), NumberValue::Big(-BigInt::from(i64::MIN)));
+        assert_eq!(
+            NumberValue::Int(i64::MAX) * NumberValue::Int(i64::MAX),
+            NumberValue::Big(BigInt::from(i64::MAX).pow(2))
+        );
+        assert_eq!(
+            NumberValue::Big(BigInt::from(MAX_FIXNUM) + 1_u8) - NumberValue::Int(1),
+            NumberValue::Int(MAX_FIXNUM)
+        );
+        for (source, expected) in [
+            ("(+ 36028797018963967 1)", "36028797018963968"),
+            ("(- -36028797018963968 1)", "-36028797018963969"),
+            ("(- -36028797018963968)", "36028797018963968"),
+            ("(* 36028797018963967 2)", "72057594037927934"),
+            ("(1+ 36028797018963967)", "36028797018963968"),
+            ("(1- -36028797018963968)", "-36028797018963969"),
+            ("(eq (- 36028797018963968 1) 36028797018963967)", "t"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
     }
 
     #[test]

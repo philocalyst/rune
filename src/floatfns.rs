@@ -358,7 +358,10 @@ fn abs(arg: Number) -> NumberValue {
 
 #[defun]
 fn ldexp(s: Number, e: i64) -> f64 {
-    coerce(s) * 2f64.powi(e as i32)
+    // Match GNU Fldexp's C-int exponent clamp. Scaling directly avoids both
+    // wrapping casts and an overflowing/underflowing intermediate power of 2.
+    let exponent = e.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    libm::scalbn(coerce(s), exponent)
 }
 
 #[defun]
@@ -461,5 +464,36 @@ mod m0_nonfinite_rounding_regressions {
         assert_lisp("(condition-case nil (truncate 1.0e+INF 1) (error 'caught))", "caught");
         assert_lisp("(floor 5 1.0e+INF)", "0");
         assert_lisp("(condition-case nil (ceiling 5 0.0e+NaN) (error 'caught))", "caught");
+    }
+}
+
+#[cfg(test)]
+mod m0_ldexp_regressions {
+    use super::*;
+    use crate::{
+        core::gc::{Context, RootSet},
+        interpreter::assert_lisp,
+    };
+
+    #[test]
+    fn ldexp_scales_without_intermediate_overflow_or_wrapping_exponents() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let half = cx.add_as(0.5);
+        assert_eq!(ldexp(half, 1024), f64::from_bits(0x7fe0_0000_0000_0000));
+        assert_eq!(ldexp(cx.add_as(1.0), -1074), f64::from_bits(1));
+        assert!(ldexp(half, 1_i64 << 32).is_infinite());
+        assert_eq!(ldexp(half, -(1_i64 << 32)), 0.0);
+        for exponent in [i64::MIN, i64::MAX] {
+            let zero = ldexp(cx.add_as(-0.0), exponent);
+            assert_eq!(zero, 0.0);
+            assert!(zero.is_sign_negative());
+            assert_eq!(ldexp(cx.add_as(f64::INFINITY), exponent), f64::INFINITY);
+        }
+        assert!(ldexp(cx.add_as(f64::NAN), 100).is_nan());
+        drop(cx);
+        assert_lisp("(ldexp 0.5 4)", "8.0");
+        assert_lisp("(ldexp 0.5 4294967296)", "1.0e+INF");
+        assert_lisp("(ldexp 0.5 -4294967296)", "0.0");
     }
 }
