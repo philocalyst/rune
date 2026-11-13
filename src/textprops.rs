@@ -435,6 +435,31 @@ pub fn previous_single_property_change<'ob>(
     })
 }
 
+/// Validate and shallow-copy the plist spine before storing it in a buffer.
+/// Property keys/values retain Lisp identity, but caller cons mutations must not
+/// silently change installed text properties. GNU also accepts an atom as a
+/// shorthand for a single property with a nil value.
+fn copy_text_property_plist<'ob>(properties: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
+    if properties.is_nil() {
+        return Ok(NIL);
+    }
+    if properties.cons().is_none() {
+        return Ok(list![properties, NIL; cx]);
+    }
+    let mut pairs = Vec::new();
+    let mut properties = properties.as_list()?;
+    while let Some(key) = properties.next() {
+        let key = key?;
+        let value = properties.next().ok_or_else(|| anyhow!("Odd length text property list"))??;
+        pairs.push((key, value));
+    }
+    let mut result = NIL;
+    for (key, value) in pairs.into_iter().rev() {
+        result = Cons::new(key, Cons::new(value, result, cx), cx).into();
+    }
+    Ok(result)
+}
+
 /// Completely replace properties of text from START to END.
 /// The third argument PROPERTIES is the new property list.
 /// If the optional fourth argument OBJECT is a buffer (or nil, which means
@@ -449,10 +474,12 @@ pub fn set_text_properties<'ob>(
     properties: Object<'ob>,
     object: Option<Object<'ob>>,
     env: &mut Rt<Env>,
+    cx: &'ob Context,
 ) -> Result<()> {
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     modify_buffer_data(object, env, |data| -> Result<()> {
+        let properties = copy_text_property_plist(properties, cx)?;
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(());
         }
@@ -846,7 +873,7 @@ mod tests {
         assert_eq!(get_text_property(2, a, buf, env)?, 1);
         assert_eq!(get_text_property(5, a, buf, env)?, 1);
         assert!(get_text_property(6, a, buf, env)?.is_nil());
-        set_text_properties(5, 3, list![b, 2; &cx], Some(buf), env)?;
+        set_text_properties(5, 3, list![b, 2; &cx], Some(buf), env, &cx)?;
         assert!(get_text_property(3, a, buf, env)?.is_nil());
         assert_eq!(get_text_property(3, b, buf, env)?, 2);
         assert_eq!(get_text_property(2, a, buf, env)?, 1);
@@ -860,7 +887,7 @@ mod tests {
         assert_eq!(get_text_property(2, a, buf, env)?, 1);
         // Normalization must leave empty ranges as no-ops.
         put_text_property(2, 2, a, cx.add(9), Some(buf), env, &cx)?;
-        set_text_properties(2, 2, NIL, Some(buf), env)?;
+        set_text_properties(2, 2, NIL, Some(buf), env, &cx)?;
         remove_text_properties(2, 2, list![a, NIL; &cx], Some(buf), env, &cx)?;
         remove_list_of_text_properties(2, 2, list![a; &cx], Some(buf), env, &cx)?;
         assert_eq!(get_text_property(2, a, buf, env)?, 1);
@@ -953,7 +980,7 @@ mod tests {
         other.buffer().unwrap().lock()?.insert(cx.add("abc"))?;
         let key: Object = intern("roadmap-optional-key", &cx).into();
         put_text_property(1, 3, key, cx.add(1), None, env, &cx)?;
-        set_text_properties(1, 3, list![key, 2; &cx], Some(other), env)?;
+        set_text_properties(1, 3, list![key, 2; &cx], Some(other), env, &cx)?;
         assert_eq!(get_text_property(1, key, NIL, env)?, 1);
         assert_eq!(get_text_property(1, key, other, env)?, 2);
         assert!(remove_text_properties(1, 3, list![key, NIL; &cx], None, env, &cx)?);
@@ -998,7 +1025,7 @@ mod tests {
         put_text_property(1, 3, key, cx.add(7), Some(buf), env, &cx)?;
         for (start, end) in [(0, 2), (1, 4), (4, 1), (1, usize::MAX)] {
             assert!(put_text_property(start, end, key, cx.add(8), Some(buf), env, &cx).is_err());
-            assert!(set_text_properties(start, end, NIL, Some(buf), env).is_err());
+            assert!(set_text_properties(start, end, NIL, Some(buf), env, &cx).is_err());
             assert!(
                 remove_text_properties(start, end, list![key, NIL; &cx], Some(buf), env, &cx)
                     .is_err()
@@ -1013,7 +1040,7 @@ mod tests {
         }
         // GNU returns without validating the bounds of an empty range.
         put_text_property(usize::MAX, usize::MAX, key, NIL, Some(buf), env, &cx)?;
-        set_text_properties(0, 0, NIL, Some(buf), env)?;
+        set_text_properties(0, 0, NIL, Some(buf), env, &cx)?;
         assert!(!remove_text_properties(0, 0, list![key; &cx], Some(buf), env, &cx)?);
         assert!(!remove_list_of_text_properties(
             usize::MAX,
@@ -1028,6 +1055,42 @@ mod tests {
         assert!(remove_list_of_text_properties(3, 1, list![key; &cx], Some(buf), env, &cx)?);
         assert!(text_properties_at(1, buf, env)?.is_nil());
         Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_set_properties_copies_plist_spine_and_validates() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buf = get_buffer_create(cx.add("roadmap-set-plist-copy"), None, &cx)?;
+        buf.buffer().unwrap().lock()?.insert(cx.add("abc"))?;
+        let key: Object = intern("roadmap-set-plist-key", &cx).into();
+        let value = cx.add("shared-value");
+        let original = list![key, value; &cx];
+        set_text_properties(1, 3, original, Some(buf), env, &cx)?;
+        assert!(!eq(text_properties_at(1, buf, env)?, original));
+        assert!(eq(get_text_property(1, key, buf, env)?, value));
+        original.cons().unwrap().cdr().cons().unwrap().set_car(cx.add(99))?;
+        original.cons().unwrap().set_cdr(NIL)?;
+        assert!(eq(get_text_property(1, key, buf, env)?, value));
+        // Odd input must fail before any existing interval changes, even for
+        // an empty range: GNU validates the plist before range processing.
+        let odd = list![key; &cx];
+        assert!(set_text_properties(1, 3, odd, Some(buf), env, &cx).is_err());
+        assert!(set_text_properties(2, 2, odd, Some(buf), env, &cx).is_err());
+        assert!(eq(get_text_property(1, key, buf, env)?, value));
+        set_text_properties(1, 3, key, Some(buf), env, &cx)?;
+        let installed = text_properties_at(1, buf, env)?;
+        assert_eq!(installed.to_string(), "(roadmap-set-plist-key nil)");
+        Ok(())
+    }
+
+    #[test]
+    fn roadmap_m0_set_properties_do_not_alias_lisp_input() {
+        crate::interpreter::assert_lisp(
+            "(progn (insert \"abc\") (let ((p (list 'a 7))) (set-text-properties 1 3 p) (setcar (cdr p) 9) (get-text-property 1 'a nil)))",
+            "7",
+        );
     }
 
     #[test]
