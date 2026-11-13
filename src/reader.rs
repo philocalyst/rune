@@ -94,6 +94,7 @@ enum Token<'a> {
     Unquote(usize),
     Splice(usize),
     Sharp(usize),
+    Dot(usize),
     QuestionMark(usize, char),
     Ident(&'a str),
     String(&'a str),
@@ -111,6 +112,7 @@ impl Display for Token<'_> {
             Token::Unquote(_) => write!(f, ","),
             Token::Splice(_) => write!(f, ",@"),
             Token::Sharp(_) => write!(f, "#"),
+            Token::Dot(_) => write!(f, "."),
             Token::QuestionMark(_, chr) => write!(f, "?{chr}"),
             Token::Ident(x) => write!(f, "{x}"),
             Token::String(x) => write!(f, "\"{x}\""),
@@ -141,6 +143,7 @@ impl<'a> Tokenizer<'a> {
             | Token::Unquote(x)
             | Token::Splice(x)
             | Token::Sharp(x)
+            | Token::Dot(x)
             | Token::QuestionMark(x, _) => x,
             Token::Ident(slice) | Token::String(slice) => {
                 let beg = self.slice.as_ptr() as usize;
@@ -265,6 +268,17 @@ impl<'a> Iterator for Tokenizer<'a> {
             ',' => Ok(self.get_macro_char(idx)),
             '`' => Ok(Token::Backquote(idx)),
             '#' => Ok(Token::Sharp(idx)),
+            // GNU lread.c's dot dispatch deliberately excludes adjacent ')' and
+            // ']': `.)` reads the symbol '.', but `. )` is dotted-list syntax.
+            '.' if self.iter.peek().is_none_or(|(_, chr)| {
+                matches!(
+                    *chr,
+                    '\x00'..=' ' | '\u{a0}' | '"' | '\'' | ';' | '(' | '[' | '#' | '?' | '`' | ','
+                )
+            }) =>
+            {
+                Ok(Token::Dot(idx))
+            }
             '?' => self.read_quoted_char(idx),
             '"' => self.get_string(idx),
             other if symbol_char(other) => self.get_symbol(idx, other),
@@ -476,13 +490,12 @@ impl<'a, 'ob> Reader<'a, 'ob> {
     /// '(1 2 3 . 45)
     ///           ^^^
     /// ```
-    fn read_cdr(&mut self, delim: usize) -> Result<Option<Object<'ob>>> {
+    fn read_cdr(&mut self, delim: usize) -> Result<Object<'ob>> {
         match self.tokens.next() {
-            Some(Ok(Token::CloseParen(_))) => Ok(None),
             Some(Ok(sexp)) => {
                 let obj = self.read_sexp(sexp)?;
                 match self.tokens.next() {
-                    Some(Ok(Token::CloseParen(_))) => Ok(Some(obj)),
+                    Some(Ok(Token::CloseParen(_))) => Ok(obj),
                     Some(Ok(token)) => Err(Error::ExtraItemInCdr(self.tokens.relative_pos(token))),
                     Some(Err(e)) => Err(e),
                     None => Err(Error::MissingCloseParen(delim)),
@@ -498,12 +511,12 @@ impl<'a, 'ob> Reader<'a, 'ob> {
         while let Some(token) = self.tokens.next() {
             match token? {
                 Token::CloseParen(_) => return Ok(fns::slice_into_list(&objects, None, self.cx)),
-                Token::Ident(".") => {
-                    let cdr = self.read_cdr(delim)?;
-                    if cdr.is_none() {
-                        objects.push(parse_symbol(".", self.cx));
+                Token::Dot(pos) => {
+                    if objects.is_empty() {
+                        return Err(Error::UnexpectedChar('.', pos));
                     }
-                    return Ok(fns::slice_into_list(&objects, cdr, self.cx));
+                    let cdr = self.read_cdr(delim)?;
+                    return Ok(fns::slice_into_list(&objects, Some(cdr), self.cx));
                 }
                 tok => objects.push(self.read_sexp(tok)?),
             }
@@ -638,6 +651,7 @@ impl<'a, 'ob> Reader<'a, 'ob> {
             Token::Splice(i) => self.quote_item(i, sym::SPLICE),
             Token::Backquote(i) => self.quote_item(i, sym::BACKQUOTE),
             Token::Sharp(i) => self.read_sharp(i),
+            Token::Dot(i) => Err(Error::UnexpectedChar('.', i)),
             Token::QuestionMark(_, c) => Ok((c as i64).into()),
             Token::Ident(x) => Ok(parse_symbol(x, self.cx)),
             Token::String(x) => unescape_string(x, self.tokens.relative_pos(token), self.cx),
@@ -669,7 +683,7 @@ mod test {
         assert_eq!(iter.next(), Some(Ok(Token::Ident("foo"))));
         assert_eq!(iter.next(), Some(Ok(Token::OpenParen(6))));
         assert_eq!(iter.next(), Some(Ok(Token::String("bar"))));
-        assert_eq!(iter.next(), Some(Ok(Token::Ident("."))));
+        assert_eq!(iter.next(), Some(Ok(Token::Dot(13))));
         assert_eq!(iter.next(), Some(Ok(Token::Ident("1.3"))));
         assert_eq!(iter.next(), Some(Ok(Token::CloseParen(18))));
         assert_eq!(iter.next(), None);
@@ -863,7 +877,48 @@ baz""#,
 #[cfg(test)]
 mod m0_reader_regressions {
     use super::*;
-    use crate::core::{gc::RootSet, object::ObjectType};
+    use crate::core::{cons::Cons, gc::RootSet, object::ObjectType};
+
+    #[test]
+    fn dotted_lists_require_one_cdr_after_a_nonempty_prefix() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, expected) in [
+            ("(1 . 2)", Cons::new(1, 2, &cx)),
+            ("(1 .?a)", Cons::new(1, 97, &cx)),
+            ("(1 .(2))", Cons::new(1, list!(2; &cx), &cx)),
+            ("(1 .; comment\n2)", Cons::new(1, 2, &cx)),
+        ] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(expected), "{source}");
+        }
+        for (source, position) in
+            [(".", 0), (". ", 0), ("(. 1)", 1), ("[. 1]", 1), ("(1 . . 2)", 5)]
+        {
+            assert_eq!(
+                read(source, &cx).unwrap_err(),
+                Error::UnexpectedChar('.', position),
+                "{source}"
+            );
+        }
+        assert_eq!(read("(1 . )", &cx).unwrap_err(), Error::ExtraCloseParen(5));
+        assert_eq!(read("(1 . 2 3)", &cx).unwrap_err(), Error::ExtraItemInCdr(7));
+        assert_eq!(read("(1 . 2", &cx).unwrap_err(), Error::MissingCloseParen(0));
+    }
+
+    #[test]
+    fn adjacent_close_delimiter_and_quoted_dots_remain_symbols() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let dot = intern(".", &cx);
+        for source in ["(1 .)", r"(1 \.)"] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(list!(1, dot; &cx)), "{source}");
+        }
+        assert_eq!(read("[.]", &cx).unwrap().0, cx.add(vec![cx.add(dot)]));
+        assert_eq!(read(r"\.", &cx).unwrap().0, cx.add(dot));
+        for source in [".5", "1.", "...", ".foo"] {
+            assert!(read(source, &cx).is_ok(), "{source}");
+        }
+    }
 
     #[test]
     fn decimal_literals_normalize_at_fixnum_boundaries() {

@@ -550,9 +550,30 @@ pub(crate) fn defvaralias<'ob>(
     new_alias
 }
 
+defsym!(SUBFEATURES);
+
 #[defun]
-// TODO: implement
-pub(crate) fn featurep(_feature: Symbol, _subfeature: Option<Symbol>) {}
+pub(crate) fn featurep(
+    feature: Symbol,
+    subfeature: Option<Object>,
+    env: &Rt<Env>,
+    cx: &Context,
+) -> Result<bool> {
+    // Share the registry used by provide/require, without extending any symbol lifetime.
+    let present = crate::data::FEATURES
+        .lock()
+        .map_err(|_| anyhow!("Feature registry lock is poisoned"))?
+        .iter()
+        .any(|provided| *provided == feature);
+    if !present {
+        return Ok(false);
+    }
+    let Some(subfeature) = subfeature.filter(|value| !value.is_nil()) else {
+        return Ok(true);
+    };
+    let subfeatures = crate::data::get(feature, sym::SUBFEATURES, env, cx);
+    Ok(!member(subfeature, subfeatures.try_into()?)?.is_nil())
+}
 
 #[defun]
 pub(crate) fn require<'ob>(
@@ -1215,6 +1236,23 @@ mod test {
         proptest! {|(string in arb_custom_string("[\x00-\x7F]*"))| {
             assert_elprop![r#"(base64-encode-string {} t)"#, string];
         }};
+    }
+
+    #[test]
+    fn featurep_observes_provide_and_subfeature_properties() {
+        assert_lisp("(featurep 'roadmap-feature-absent)", "nil");
+        assert_lisp(
+            "(progn (provide 'roadmap-feature-present) (list (featurep 'roadmap-feature-present) (featurep 'roadmap-feature-present nil) (featurep 'roadmap-feature-present 'missing)))",
+            "(t t nil)",
+        );
+        assert_lisp(
+            "(progn (provide 'roadmap-feature-with-subfeatures) (put 'roadmap-feature-with-subfeatures 'subfeatures (list 'one (list 1 2))) (list (featurep 'roadmap-feature-with-subfeatures 'one) (featurep 'roadmap-feature-with-subfeatures (list 1 2)) (featurep 'roadmap-feature-with-subfeatures 'two)))",
+            "(t t nil)",
+        );
+        assert_lisp(
+            "(progn (put 'roadmap-feature-unprovided 'subfeatures '(one)) (featurep 'roadmap-feature-unprovided 'one))",
+            "nil",
+        );
     }
 
     #[test]

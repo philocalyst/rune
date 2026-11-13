@@ -302,7 +302,10 @@ pub(crate) fn num_ne(number: Number, numbers: &[Number]) -> bool {
 fn cmp(number: Number, numbers: &[Number], cmp: fn(&NumberValue, &NumberValue) -> bool) -> bool {
     numbers
         .iter()
-        .try_fold(number.val(), |acc, &x| cmp(&acc, &x.val()).then_some(NumberValue::Int(0)))
+        .try_fold(number.val(), |previous, &x| {
+            let next = x.val();
+            cmp(&previous, &next).then_some(next)
+        })
         .is_some()
 }
 
@@ -471,6 +474,31 @@ mod test {
         assert!(less_than(1.into(), &[cx.add_as(1.1)]));
         assert!(!less_than(cx.add_as(1.0), &[1.into()]));
         assert!(less_than(cx.add_as(1.0), &[cx.add_as(1.1), 2.into(), cx.add_as(2.1)]));
+    }
+
+    #[test]
+    fn m0_comparison_chains_compare_adjacent_operands() {
+        for (source, expected) in [
+            ("(< 1 2 1)", "nil"),
+            ("(< -3 -2 -1)", "t"),
+            ("(> 3 2 1)", "t"),
+            ("(> -1 -2 -1)", "nil"),
+            ("(<= 1 2 1)", "nil"),
+            ("(<= -3 -2 -2)", "t"),
+            ("(>= 3 2 1)", "t"),
+            ("(>= -1 -2 -1)", "nil"),
+            ("(< 1 2 2)", "nil"),
+            ("(> 3 2 2)", "nil"),
+            ("(<= 2 2 2)", "t"),
+            ("(>= -2 -2 -2)", "t"),
+            ("(< 1 2.0 1)", "nil"),
+            ("(> 3.0 2 1.0)", "t"),
+            ("(< 1 9223372036854775808 2)", "nil"),
+            ("(> 9223372036854775809 9223372036854775808 2)", "t"),
+            ("(< 1 0.0e+NaN 3)", "nil"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
     }
 
     #[test]
