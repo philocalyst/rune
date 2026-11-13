@@ -1,5 +1,6 @@
 //! Arithmetic operators.
 use crate::core::object::{Gc, IntoObject, Number, NumberType, ObjectType};
+use anyhow::{Result, anyhow};
 use float_cmp::ApproxEq;
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, ToPrimitive, Zero};
@@ -229,8 +230,45 @@ pub(crate) fn mul(numbers: &[Number]) -> NumberValue {
 }
 
 #[defun(name = "/")]
-pub(crate) fn div(number: Number, divisors: &[Number]) -> NumberValue {
-    divisors.iter().fold(number.val(), |acc, x| acc / x.val())
+pub(crate) fn div(number: Number, divisors: &[Number]) -> Result<NumberValue> {
+    fn float_value(number: Number) -> Result<f64> {
+        match number.untag() {
+            NumberType::Int(value) => Ok(value as f64),
+            NumberType::Float(value) => Ok(**value),
+            NumberType::Big(value) => value.to_f64().ok_or_else(|| anyhow!("float overflow")),
+        }
+    }
+    fn integer_value(number: Number) -> BigInt {
+        match number.untag() {
+            NumberType::Int(value) => value.into(),
+            NumberType::Big(value) => (**value).clone(),
+            NumberType::Float(_) => unreachable!("float division was selected first"),
+        }
+    }
+
+    // GNU Fquo selects floating point for the whole operation if any operand
+    // is a float, even a late divisor. Float zero uses IEEE infinity/NaN.
+    let floating = number.is_float() || divisors.iter().any(Number::is_float);
+    let denominators = if divisors.is_empty() { std::slice::from_ref(&number) } else { divisors };
+    if floating {
+        let mut result = if divisors.is_empty() { 1.0 } else { float_value(number)? };
+        for &denominator in denominators {
+            result /= float_value(denominator)?;
+        }
+        return Ok(NumberValue::Float(result));
+    }
+
+    let mut result = if divisors.is_empty() { BigInt::from(1) } else { integer_value(number) };
+    for &denominator in denominators {
+        let denominator = integer_value(denominator);
+        if denominator.is_zero() {
+            return Err(anyhow!("(arith-error)"));
+        }
+        // BigInt also handles fixed-width MIN / -1 and tagged-fixnum overflow
+        // without panicking or silently clamping the quotient.
+        result /= denominator;
+    }
+    Ok(NumberValue::Big(result).coerce_integer())
 }
 
 #[defun(name = "1+")]
@@ -366,8 +404,49 @@ mod test {
         let roots = &RootSet::default();
         let cx = &Context::new(roots);
 
-        assert_eq!(div(cx.add_as(12.0), &[]), NumberValue::Float(12.0));
-        assert_eq!(div(12.into(), &[5.into(), 2.into()]), NumberValue::Int(1));
+        assert_eq!(div(cx.add_as(12.0), &[]).unwrap(), NumberValue::Float(1.0 / 12.0));
+        assert_eq!(div(12.into(), &[5.into(), 2.into()]).unwrap(), NumberValue::Int(1));
+    }
+
+    #[test]
+    fn m0_division_rejects_integer_zero_and_preserves_float_rules() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let zero = cx.add_as(BigInt::from(0));
+        for dividend in [Number::from(-1073741824_i64), cx.add_as(BigInt::from(i64::MAX) + 1_u8)] {
+            for denominator in [Number::from(0_i64), zero] {
+                assert!(div(dividend, &[denominator]).is_err());
+            }
+        }
+        assert!(div(0_i64.into(), &[]).is_err());
+        assert_eq!(div(2_i64.into(), &[]).unwrap(), NumberValue::Int(0));
+        assert_eq!(div((-1_i64).into(), &[]).unwrap(), NumberValue::Int(-1));
+        assert_eq!(
+            div(MIN_FIXNUM.into(), &[(-1_i64).into()]).unwrap(),
+            NumberValue::Big(-BigInt::from(MIN_FIXNUM))
+        );
+        assert_eq!(
+            div(10_i64.into(), &[3_i64.into(), cx.add_as(2.0)]).unwrap(),
+            NumberValue::Float(10.0 / 3.0 / 2.0)
+        );
+        let NumberValue::Float(infinity) =
+            div(2_i64.into(), &[0_i64.into(), cx.add_as(2.0)]).unwrap()
+        else {
+            panic!("any float operand must select floating division");
+        };
+        assert!(infinity.is_infinite());
+        let NumberValue::Float(nan) = div(cx.add_as(0.0), &[0_i64.into()]).unwrap() else {
+            panic!("float zero division must remain floating");
+        };
+        assert!(nan.is_nan());
+        drop(cx);
+        crate::interpreter::assert_lisp(
+            "(condition-case nil (/ -1073741824 0) (error 'caught))",
+            "caught",
+        );
+        crate::interpreter::assert_lisp("(condition-case nil (/ 0) (error 'caught))", "caught");
+        crate::interpreter::assert_lisp("(/ 18446744073709551616 2)", "9223372036854775808");
+        crate::interpreter::assert_lisp("(/ 2.0)", "0.5");
     }
 
     #[test]
