@@ -2,7 +2,7 @@
 use crate::core::{
     env::{intern, sym},
     gc::Context,
-    object::{Object, Symbol},
+    object::{Object, RecordBuilder, Symbol},
 };
 use crate::fns;
 use num_bigint::BigInt;
@@ -28,6 +28,8 @@ pub(crate) enum Error {
     ParseInt(u8, usize),
     MalformedUnicdoe(usize),
     InvalidEscape(usize),
+    InvalidRecord(usize),
+    UnsupportedHashTableRecord(usize),
     EmptyStream,
 }
 
@@ -42,6 +44,10 @@ impl Display for Error {
             Error::UnexpectedChar(chr, i) => write!(f, "Unexpected character {chr}: at {i}"),
             Error::MalformedUnicdoe(i) => write!(f, "Malformed unicode: at {i}"),
             Error::InvalidEscape(i) => write!(f, "Invalid or unsupported character escape: at {i}"),
+            Error::InvalidRecord(i) => write!(f, "Invalid record reader syntax: at {i}"),
+            Error::UnsupportedHashTableRecord(i) => {
+                write!(f, "Hash-table record reader syntax is not implemented: at {i}")
+            }
             Error::EmptyStream => write!(f, "Empty Stream"),
             Error::ExtraItemInCdr(i) => write!(f, "Extra item in cdr: at {i}"),
             Error::MissingQuotedItem(i) => write!(f, "Missing element after quote: at {i}"),
@@ -66,6 +72,8 @@ impl Error {
             | Error::UnexpectedChar(_, i)
             | Error::MalformedUnicdoe(i)
             | Error::InvalidEscape(i)
+            | Error::InvalidRecord(i)
+            | Error::UnsupportedHashTableRecord(i)
             | Error::ExtraItemInCdr(i)
             | Error::ExtraCloseParen(i)
             | Error::ExtraCloseBracket(i)
@@ -655,6 +663,31 @@ impl<'a, 'ob> Reader<'a, 'ob> {
         Ok(self.cx.add(symbol))
     }
 
+    /// GNU #s(...) record literals contain a mandatory tag followed by slots.
+    /// The hash-table tag is reserved for a different serialized representation.
+    fn read_record(&mut self, pos: usize) -> Result<Object<'ob>> {
+        let open = self.tokens.cur_pos();
+        if self.tokens.read_char() != Some('(') {
+            return Err(Error::InvalidRecord(pos));
+        }
+        let mut fields = self.cx.vec_new();
+        while let Some(token) = self.tokens.next() {
+            match token? {
+                Token::CloseParen(_) => {
+                    if fields.is_empty() {
+                        return Err(Error::InvalidRecord(pos));
+                    }
+                    if fields[0] == self.cx.add(sym::HASH_TABLE) {
+                        return Err(Error::UnsupportedHashTableRecord(pos));
+                    }
+                    return Ok(self.cx.add(RecordBuilder(fields)));
+                }
+                token => fields.push(self.read_sexp(token)?),
+            }
+        }
+        Err(Error::MissingCloseParen(open))
+    }
+
     /// read a sharp quoted character. This could be used for reader macro's in
     /// the future, but right now it just handles the special cases from elisp.
     fn read_sharp(&mut self, pos: usize) -> Result<Object<'ob>> {
@@ -670,6 +703,7 @@ impl<'a, 'ob> Reader<'a, 'ob> {
                 }
                 None => Err(Error::MissingQuotedItem(pos)),
             },
+            Some('s') => self.read_record(pos),
             Some('b' | 'B') => self.read_radix(pos, 2),
             Some('o' | 'O') => self.read_radix(pos, 8),
             Some('x' | 'X') => self.read_radix(pos, 16),
@@ -939,6 +973,53 @@ baz""#,
 mod m0_reader_regressions {
     use super::*;
     use crate::core::{cons::Cons, gc::RootSet, object::ObjectType};
+
+    #[test]
+    fn ordinary_record_literals_preserve_tags_slots_and_reader_offsets() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let tag = intern("reader-record-tag", &cx);
+        let mut fields = cx.vec_new();
+        fields.push(cx.add(tag));
+        fields.push(cx.add(1_i64));
+        fields.push(cx.add("\u{e9}"));
+        fields.push(cx.add(list!(2, 3; &cx)));
+        let expected = cx.add(RecordBuilder(fields));
+        let source = "#s(reader-record-tag 1 \"\u{e9}\" (2 3)) trailing";
+        assert_eq!(read(source, &cx).unwrap(), (expected, source.find(" trailing").unwrap()));
+        let ObjectType::Record(record) = read("#s(tag-only)", &cx).unwrap().0.untag() else {
+            panic!("record dispatch must allocate a record, not a list");
+        };
+        assert_eq!(record.len(), 1);
+        assert_eq!(record[0].get(), cx.add(intern("tag-only", &cx)));
+        // make-record accepts arbitrary tag objects; do not add a symbol-only restriction.
+        let ObjectType::Record(record) = read("#s(7 nil)", &cx).unwrap().0.untag() else {
+            panic!("arbitrary record tag must remain readable");
+        };
+        assert_eq!(record[0].get(), cx.add(7_i64));
+        assert_eq!(record[1].get(), cx.add(false));
+        let ObjectType::Record(outer) = read("#s(outer #s(inner 42))", &cx).unwrap().0.untag()
+        else {
+            panic!("nested record");
+        };
+        assert!(matches!(outer[1].get().untag(), ObjectType::Record(_)));
+        assert!(matches!(read("[#s(tag)]", &cx).unwrap().0.untag(), ObjectType::Vec(_)));
+    }
+
+    #[test]
+    fn record_literal_shape_errors_are_not_silently_reinterpreted() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for source in ["#s", "#s ()", "#s[]", "#s()"] {
+            assert_eq!(read(source, &cx).unwrap_err(), Error::InvalidRecord(0), "{source}");
+        }
+        assert_eq!(read("#s(tag", &cx).unwrap_err(), Error::MissingCloseParen(2));
+        assert_eq!(read("#s(tag . 1)", &cx).unwrap_err(), Error::UnexpectedChar('.', 7));
+        assert_eq!(read("#s(tag]", &cx).unwrap_err(), Error::ExtraCloseBracket(6));
+        assert_eq!(read("#s(hash-table)", &cx).unwrap_err(), Error::UnsupportedHashTableRecord(0));
+        // Uppercase #S is not a GNU record dispatch.
+        assert_eq!(read("#S(tag)", &cx).unwrap_err(), Error::UnknownMacroCharacter('S', 0));
+    }
 
     #[test]
     fn gnu_reader_whitespace_and_nbsp_delimit_symbols() {

@@ -144,6 +144,25 @@ impl<'ob> RootedVM<'_, '_, '_> {
         EvalError::signal(sym::RUNE_UNIMPLEMENTED.into(), data.into(), self.env)
     }
 
+    fn stack_ref(&mut self, idx: u16, cx: &Context) -> Result<()> {
+        ensure!(
+            usize::from(idx) < self.env.stack.frame_len(),
+            "Bytecode stack reference out of range"
+        );
+        ensure!(self.env.stack.can_push(), "Bytecode stack depth exceeded");
+        self.env.stack.push_ref(idx, cx);
+        Ok(())
+    }
+
+    fn stack_set(&mut self, idx: u16) -> Result<()> {
+        ensure!(
+            usize::from(idx) < self.env.stack.frame_len(),
+            "Bytecode stack assignment out of range"
+        );
+        self.env.stack.set_ref(idx);
+        Ok(())
+    }
+
     fn varref(&mut self, idx: u16, cx: &'ob Context) -> Result<()> {
         let symbol: Symbol = self.get_const(idx as usize, cx)?.try_into()?;
         let Some(var) = self.env.vars.get(symbol) else { bail!("Void Variable: {symbol}") };
@@ -330,27 +349,27 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 println!("op :{byte_offset}: {op:?}");
             }
             match op {
-                op::StackRef0 => self.env.stack.push_ref(0, cx),
-                op::StackRef1 => self.env.stack.push_ref(1, cx),
-                op::StackRef2 => self.env.stack.push_ref(2, cx),
-                op::StackRef3 => self.env.stack.push_ref(3, cx),
-                op::StackRef4 => self.env.stack.push_ref(4, cx),
-                op::StackRef5 => self.env.stack.push_ref(5, cx),
+                op::StackRef0 => self.stack_ref(0, cx)?,
+                op::StackRef1 => self.stack_ref(1, cx)?,
+                op::StackRef2 => self.stack_ref(2, cx)?,
+                op::StackRef3 => self.stack_ref(3, cx)?,
+                op::StackRef4 => self.stack_ref(4, cx)?,
+                op::StackRef5 => self.stack_ref(5, cx)?,
                 op::StackRefN => {
                     let idx = self.pc.arg1()?;
-                    self.env.stack.push_ref(idx, cx);
+                    self.stack_ref(idx, cx)?;
                 }
                 op::StackRefN2 => {
                     let idx = self.pc.arg2()?;
-                    self.env.stack.push_ref(idx, cx);
+                    self.stack_ref(idx, cx)?;
                 }
                 op::StackSetN => {
                     let idx = self.pc.arg1()?;
-                    self.env.stack.set_ref(idx);
+                    self.stack_set(idx)?;
                 }
                 op::StackSetN2 => {
                     let idx = self.pc.arg2()?;
-                    self.env.stack.set_ref(idx);
+                    self.stack_set(idx)?;
                 }
                 op::VarRef0 => self.varref(0, cx)?,
                 op::VarRef1 => self.varref(1, cx)?,
@@ -694,6 +713,9 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     }
                 }
                 op::Discard => {
+                    if self.env.stack.frame_len() == 0 {
+                        bail_err!("Bytecode stack discard out of range");
+                    }
                     self.env.stack.pop(cx);
                 }
                 op::DiscardN => {
@@ -701,6 +723,10 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let cur_len = self.env.stack.len();
                     let keep_tos = (arg & 0x80) != 0;
                     let count = (arg & 0x7F) as usize;
+                    let available = self.env.stack.frame_len();
+                    if count > available || (keep_tos && count == available) {
+                        bail_err!("Bytecode stack discard out of range");
+                    }
                     if keep_tos {
                         let top = self.env.stack.top().bind(cx);
                         self.env.stack.truncate(cur_len - count);
@@ -709,10 +735,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                         self.env.stack.truncate(cur_len - count);
                     }
                 }
-                op::Duplicate => {
-                    let top = self.env.stack[0].bind(cx);
-                    self.env.stack.push(top);
-                }
+                op::Duplicate => self.stack_ref(0, cx)?,
                 op::SaveExcursion => return Err(self.unsupported_opcode(op, cx)),
                 op::SaveRestriction => return Err(self.unsupported_opcode(op, cx)),
                 op::UnwindProtect => return Err(self.unsupported_opcode(op, cx)),
@@ -787,11 +810,21 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 }
                 op::ListN => {
                     let size = self.pc.arg1()? as usize;
-                    let slice = Rt::bind_slice(&self.env.stack[..size], cx);
-                    let list = alloc::list(slice, cx);
-                    let len = self.env.stack.len();
-                    self.env.stack.truncate(len - (size - 1));
-                    self.env.stack.top().set(list);
+                    if size > self.env.stack.frame_len() {
+                        bail_err!("Bytecode list count out of range");
+                    }
+                    if size == 0 {
+                        if !self.env.stack.can_push() {
+                            bail_err!("Bytecode stack depth exceeded");
+                        }
+                        self.env.stack.push(NIL);
+                    } else {
+                        let slice = Rt::bind_slice(&self.env.stack[..size], cx);
+                        let list = alloc::list(slice, cx);
+                        let len = self.env.stack.len();
+                        self.env.stack.truncate(len - (size - 1));
+                        self.env.stack.top().set(list);
+                    }
                 }
                 op::ConcatN => return Err(self.unsupported_opcode(op, cx)),
                 op::InsertN => return Err(self.unsupported_opcode(op, cx)),
@@ -1036,6 +1069,89 @@ mod test {
         let val = rebind!(call(bytecode, frame.arg_count(), "test", frame, cx).unwrap());
         let expect = expect.bind(cx);
         assert_eq!(val, expect);
+    }
+
+    #[test]
+    fn m0_stack_operand_checks_do_not_cross_frames_or_mutate_on_error() {
+        use OpCode as O;
+        for (opcode, operand) in [
+            (O::StackRef0, 0),
+            (O::StackRefN, 0),
+            (O::StackRefN2, 0),
+            (O::StackSetN, 0),
+            (O::StackSetN2, 0),
+            (O::Duplicate, 0),
+            (O::Discard, 0),
+            (O::DiscardN, 1),
+            (O::DiscardN, 0x80),
+            (O::ListN, 1),
+        ] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            make_bytecode!(bytecode, 0, [opcode, operand, 0], [], cx);
+            root!(env, new(Env), cx);
+            // A caller value is present, but inaccessible to the empty callee.
+            env.stack.push(Object::from(99_i64));
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let before = frame.stack.len();
+            assert!(call(bytecode, 0, "invalid-stack-operand", frame, cx).is_err());
+            assert_eq!(frame.stack.len(), before);
+        }
+    }
+
+    #[test]
+    fn m0_stack_growth_checks_declared_depth_before_mutation() {
+        use OpCode as O;
+        for opcode in [O::StackRef0, O::Duplicate, O::ListN] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            // Ten required arguments already fill make_bytecode!'s depth10.
+            make_bytecode!(bytecode, 2570, [opcode, 0], [], cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.push_arg_slice(&[Object::from(1_i64); 10]);
+            frame.finalize_arguments();
+            let before = frame.stack.len();
+            let error = call(bytecode, 10, "full-stack", frame, cx).unwrap_err();
+            assert!(error.to_string().contains("Bytecode stack depth exceeded"));
+            assert_eq!(frame.stack.len(), before);
+        }
+    }
+
+    #[test]
+    fn m0_list_zero_and_valid_stack_operations() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        make_bytecode!(empty_list, 0, [O::ListN, 0, O::Return], [], cx);
+        check_bytecode!(empty_list, [], NIL, cx);
+        make_bytecode!(discard_zero, 0, [O::DiscardN, 0, O::Constant0, O::Return], [7], cx);
+        check_bytecode!(discard_zero, [], 7, cx);
+        make_bytecode!(
+            set_and_ref,
+            0,
+            [
+                O::Constant0,
+                O::Constant1,
+                O::StackSetN,
+                1,
+                O::StackRef0,
+                O::ListN,
+                2,
+                O::Return
+            ],
+            [1, 2],
+            cx
+        );
+        root!(env, new(Env), cx);
+        let frame = &mut CallFrame::new(env);
+        frame.finalize_arguments();
+        let result = call(set_and_ref, 0, "valid-stack-operations", frame, cx).unwrap();
+        assert_eq!(result.to_string(), "(2 2)");
     }
 
     #[test]

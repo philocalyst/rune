@@ -420,6 +420,19 @@ fn rassq<'ob>(key: Object<'ob>, alist: List<'ob>) -> Result<Object<'ob>> {
     Ok(NIL)
 }
 
+/// Return the first alist entry whose complete cdr is equal to KEY.
+#[defun]
+fn rassoc<'ob>(key: Object<'ob>, alist: List<'ob>) -> Result<Object<'ob>> {
+    for element in alist {
+        if let Some(entry) = element?.cons()
+            && (eq(key, entry.cdr()) || equal(key, entry.cdr()))
+        {
+            return Ok(entry.into());
+        }
+    }
+    Ok(NIL)
+}
+
 #[defun]
 pub(crate) fn assoc<'ob>(
     key: &Rto<Object<'ob>>,
@@ -1145,6 +1158,12 @@ fn maphash(
 fn copy_sequence<'ob>(arg: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
     match arg.untag() {
         ObjectType::Vec(x) => Ok(cx.add(x.to_vec())),
+        ObjectType::Record(record) => {
+            let mut slots = cx.vec_with_capacity(record.len());
+            slots.extend(record.iter().map(|cell| cell.get()));
+            Ok(crate::core::object::RecordBuilder(slots).into_obj(cx).into())
+        }
+        ObjectType::ByteString(string) => Ok(cx.add(string.to_vec())),
         ObjectType::Cons(x) => {
             // TODO: remove this temp vector
             let mut elements = Vec::new();
@@ -1158,7 +1177,8 @@ fn copy_sequence<'ob>(arg: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>>
             }
             Ok(slice_into_list(&elements, tail, cx))
         }
-        ObjectType::String(x) => Ok(cx.add(x.to_owned())),
+        // Calling to_owned on &LispString clones the reference, not its text.
+        ObjectType::String(x) => Ok(cx.add(String::from(&**x))),
         ObjectType::NIL => Ok(NIL),
         _ => Err(TypeError::new(Type::Sequence, arg).into()),
     }
@@ -1346,6 +1366,61 @@ mod test {
         proptest! {|(string in arb_custom_string("[\x00-\x7F]*"))| {
             assert_elprop![r#"(base64-encode-string {} t)"#, string];
         }};
+    }
+
+    #[test]
+    fn rassoc_compares_cdrs_structurally_and_returns_first_original_entry() {
+        assert_lisp("(rassoc 2 '((a . 1) (b . 2) (c . 2)))", "(b . 2)");
+        assert_lisp("(rassoc '(1 2) '((a 1 2) (b 1 2)))", "(a 1 2)");
+        assert_lisp("(rassoc \"é\" (list nil 99 (cons 'a (concat \"é\"))))", "(a . \"é\")");
+        assert_lisp("(rassoc nil '(ignored (a . nil) (b . nil)))", "(a)");
+        assert_lisp("(rassoc 9 '((a . 1) nil ignored))", "nil");
+        assert_lisp("(rassoc 1 nil)", "nil");
+        assert_lisp(
+            "(let ((entry (cons 'a (list 1 2)))) (eq (rassoc (list 1 2) (list entry)) entry))",
+            "t",
+        );
+    }
+
+    #[test]
+    fn rassoc_rejects_malformed_outer_alists_without_panicking() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        let dotted = crate::core::cons::Cons::new(1i64, 2i64, cx);
+        assert!(super::rassoc(42i64.into(), dotted.into()).is_err());
+        let circular = crate::core::cons::Cons::new(1i64, NIL, cx);
+        circular.set_cdr(circular.into()).unwrap();
+        assert!(super::rassoc(42i64.into(), circular.into()).is_err());
+    }
+
+    #[test]
+    fn copy_sequence_records_are_shallow_and_independent() {
+        assert_lisp(
+            "(let* ((item (list 1)) (source (record 'tag item 2)) (copy (copy-sequence source))) (list (eq source copy) (eq (aref source 1) (aref copy 1)) (aref copy 0)))",
+            "(nil t tag)",
+        );
+        assert_lisp(
+            "(let* ((source (record 'tag 1 2)) (copy (copy-sequence source))) (aset copy 1 9) (list (aref source 1) (aref copy 1) (type-of copy)))",
+            "(1 9 tag)",
+        );
+        assert_lisp("(aref (copy-sequence (record 'tag)) 0)", "tag");
+    }
+
+    #[test]
+    fn copy_sequence_preserves_raw_bytes_and_storage_kind() {
+        let roots = &crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(roots);
+        let bytes = cx.add(vec![0u8, 128, 255]);
+        let copy = super::copy_sequence(bytes, cx).unwrap();
+        assert!(matches!(copy.untag(), crate::core::object::ObjectType::ByteString(_)));
+        assert!(!super::eq(bytes, copy));
+        assert_eq!(bytes, copy);
+        let unicode = cx.add("é🦀");
+        let unicode_copy = super::copy_sequence(unicode, cx).unwrap();
+        assert!(matches!(unicode_copy.untag(), crate::core::object::ObjectType::String(_)));
+        assert!(!super::eq(unicode, unicode_copy));
+        assert_eq!(unicode, unicode_copy);
+        assert!(super::copy_sequence(42i64.into(), cx).is_err());
     }
 
     #[test]

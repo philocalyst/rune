@@ -196,6 +196,15 @@ impl<'a> RootedLispStack<'a> {
         self.vec.len()
     }
 
+    /// Operand values accessible in this frame, excluding its caller's stack.
+    pub(crate) fn frame_len(&self) -> usize {
+        self.len().saturating_sub(self.current.start)
+    }
+
+    pub(crate) fn can_push(&self) -> bool {
+        self.len() < self.current.end
+    }
+
     pub(crate) fn set_depth(&mut self, depth: usize) {
         let end = self.current.start + depth;
         self.current.end = end;
