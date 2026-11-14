@@ -671,6 +671,7 @@ fn type_of(object: Object) -> Object {
         ObjectType::Frame(_) => sym::FRAME.into(),
         ObjectType::Overlay(_) => sym::OVERLAY.into(),
         ObjectType::Marker(_) => sym::MARKER.into(),
+        ObjectType::Obarray(_) => sym::OBARRAY.into(),
     }
 }
 
@@ -1504,3 +1505,5 @@ mod binary_numeric_cookie_tests {
 defsym!(CYCLIC_FUNCTION_INDIRECTION);
 
 defsym!(MARKER);
+
+defsym!(OBARRAY);

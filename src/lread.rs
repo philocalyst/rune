@@ -408,31 +408,30 @@ fn load_with_options(
     result
 }
 
-#[defun]
-pub(crate) fn intern<'ob>(string: &str, cx: &'ob Context) -> Symbol<'ob> {
-    crate::core::env::intern(string, cx)
+pub(crate) fn intern<'a>(string:&str,cx:&'a Context)->Symbol<'a> {crate::core::env::intern(string,cx)}
+#[defun(name = "intern")]
+pub(crate) fn intern_lisp<'a>(string:Object,obarray:Option<Object<'a>>,env:&mut Rt<Env>,cx:&'a Context)->Result<Symbol<'a>> {
+    crate::obarray::intern(string,obarray,env,cx)
 }
-
-#[defun]
-pub(crate) fn intern_soft(string: Object, obarray: OptionalFlag) -> Result<Symbol> {
-    ensure!(obarray.is_none(), "intern-soft obarray not implemented");
-    match string.untag() {
-        ObjectType::Symbol(sym) => {
-            if sym.interned() {
-                Ok(sym)
-            } else {
-                Ok(sym::NIL)
-            }
-        }
-        ObjectType::String(string) => {
-            let map = crate::core::env::INTERNED_SYMBOLS.lock().unwrap();
-            match map.get(string) {
-                Some(sym) => Ok(unsafe { sym.with_lifetime() }),
-                None => Ok(sym::NIL),
-            }
-        }
-        x => Err(TypeError::new(Type::String, x).into()),
-    }
+// Internal Rust face-name lookup keeps its existing no-callback global-only
+// signature. Lisp calls use the fully validated owner-aware wrapper below.
+pub(crate) fn intern_soft<'a>(string:Object<'a>,obarray:OptionalFlag)->Result<Symbol<'a>> {
+    ensure!(obarray.is_none(), "internal intern-soft only supports global namespace");
+    let (name, expected) = match string.untag() {
+        ObjectType::NIL => ("nil".to_owned(),Some(sym::NIL)),
+        ObjectType::Symbol(symbol) => {ensure!(symbol.name().len()<=65536,"internal symbol name limit exceeded");(symbol.name().to_owned(),Some(symbol))},
+        ObjectType::String(name) => {ensure!(name.as_bytes().len()<=65536,"internal symbol name limit exceeded");(name.inner().to_owned(),None)},
+        _ => bail!("internal intern-soft expects a symbol or multibyte string"),
+    };
+    let map=crate::core::env::INTERNED_SYMBOLS.lock().unwrap();
+    let found=map.get(&name).filter(|symbol|expected.is_none_or(|expected|*symbol==expected));
+    // Only global arena symbols are stored in INTERNED_SYMBOLS; their storage
+    // outlives this lock and does not move with any owner Context.
+    Ok(found.map(|symbol|unsafe{symbol.with_lifetime()}).unwrap_or(sym::NIL))
+}
+#[defun(name = "intern-soft")]
+pub(crate) fn intern_soft_lisp<'a>(string:Object<'a>,obarray:Option<Object<'a>>,env:&mut Rt<Env>,cx:&'a Context)->Result<Symbol<'a>> {
+    crate::obarray::intern_soft(string,obarray,env,cx)
 }
 
 defsym!(INTERNAL_MACROEXPAND_FOR_LOAD);

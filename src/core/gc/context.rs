@@ -4,7 +4,7 @@ use crate::core::object::GcString;
 use crate::core::object::WeakBufferPropertyRoot;
 use crate::core::object::{
     ByteFn, ChannelReceiver, ChannelSender, CharTable, FrameRegistry, LispBigInt, LispFrame,
-    LispHashTable, LispOverlay, LispMarker, LispProcess, OverlayRegistry, MarkerRegistry, ProcessRegistry,
+    LispHashTable, LispOverlay, LispMarker, LispObarray, LispProcess, OverlayRegistry, MarkerRegistry, ProcessRegistry,
 };
 use crate::core::object::{Gc, IntoObject, Object, UninternedSymbolMap, WithLifetime};
 use bumpalo::collections::Vec as GcVec;
@@ -83,6 +83,7 @@ pub(crate) struct Block<const CONST: bool> {
     pub(in crate::core) lisp_receivers: RefCell<Vec<*const ChannelReceiver>>,
     pub(in crate::core) lisp_overlays: RefCell<Vec<*const LispOverlay>>,
     pub(in crate::core) lisp_markers: RefCell<Vec<*const LispMarker>>,
+    pub(in crate::core) lisp_obarrays: RefCell<Vec<*const LispObarray>>,
     pub(in crate::core) lisp_frames: RefCell<Vec<*const LispFrame>>,
     pub(in crate::core) lisp_processes: RefCell<Vec<*const LispProcess>>,
     pub(in crate::core) uninterned_symbol_map: UninternedSymbolMap,
@@ -101,6 +102,7 @@ pub(crate) struct DeferredEndpointFinalizers {
     frames: Vec<LispFrame>,
     overlays: Vec<LispOverlay>,
     markers: Vec<LispMarker>,
+    obarrays: Vec<LispObarray>,
     copy_tables: Vec<LispHashTable>,
     copy_chartables: Vec<CharTable>,
     copy_integers: Vec<LispBigInt>,
@@ -136,6 +138,7 @@ pub(in crate::core) enum CopyAllocation {
     Frame(*const LispFrame),
     Overlay(*const LispOverlay),
     Marker(*const LispMarker),
+    Obarray(*const LispObarray),
     Table(*const LispHashTable),
     CharTable(*const CharTable),
     Integer(*const LispBigInt),
@@ -155,7 +158,7 @@ impl<const C: bool> Drop for CopyFailureScope<'_, C> {
 pub(crate) struct CopyTransaction<'a, const C: bool> {
     block: &'a Block<C>,
     deferred: &'a mut DeferredEndpointFinalizers,
-    lengths: [usize; 9],
+    lengths: [usize; 10],
     committed: bool,
 }
 impl<const C: bool> CopyTransaction<'_, C> {
@@ -180,6 +183,7 @@ impl<const C: bool> Drop for CopyTransaction<'_, C> {
         self.block.lisp_frames.borrow_mut().truncate(self.lengths[3]);
         self.block.lisp_overlays.borrow_mut().truncate(self.lengths[7]);
         self.block.lisp_markers.borrow_mut().truncate(self.lengths[8]);
+        self.block.lisp_obarrays.borrow_mut().truncate(self.lengths[9]);
         self.block.lisp_hashtables.borrow_mut().truncate(self.lengths[4]);
         self.block.lisp_chartables.borrow_mut().truncate(self.lengths[5]);
         self.deferred
@@ -197,6 +201,7 @@ impl<const C: bool> Drop for CopyTransaction<'_, C> {
                     CopyAllocation::Frame(p) => self.deferred.frames.push(std::ptr::read(p)),
                     CopyAllocation::Overlay(p) => self.deferred.overlays.push(std::ptr::read(p)),
                     CopyAllocation::Marker(p) => self.deferred.markers.push(std::ptr::read(p)),
+                    CopyAllocation::Obarray(p) => self.deferred.obarrays.push(std::ptr::read(p)),
                     CopyAllocation::Table(p) => self.deferred.copy_tables.push(std::ptr::read(p)),
                     CopyAllocation::CharTable(p) => {
                         self.deferred.copy_chartables.push(std::ptr::read(p))
@@ -261,6 +266,14 @@ fn collect_endpoint_finalizers(block: &Block<false>, deferred: &mut DeferredEndp
             true
         } else {
             deferred.markers.push(unsafe { std::ptr::read(*pointer) });
+            false
+        }
+    });    block.lisp_obarrays.borrow_mut().retain_mut(|pointer| {
+        if let Some(new) = unsafe { &**pointer }.forwarding_ptr() {
+            *pointer = new.as_ptr().cast();
+            true
+        } else {
+            deferred.obarrays.push(unsafe { std::ptr::read(*pointer) });
             false
         }
     });
@@ -381,6 +394,7 @@ impl<const CONST: bool> Block<CONST> {
             lisp_frames: RefCell::default(),
             lisp_overlays: RefCell::default(),
             lisp_markers: RefCell::default(),
+            lisp_obarrays: RefCell::default(),
             uninterned_symbol_map: UninternedSymbolMap::default(),
         }
     }
@@ -465,6 +479,7 @@ impl<const CONST: bool> Block<CONST> {
             self.drop_stack.borrow().len(),
             self.lisp_overlays.borrow().len(),
             self.lisp_markers.borrow().len(),
+            self.lisp_obarrays.borrow().len(),
         ];
         let mut active = self.copy_allocations.borrow_mut();
         assert!(active.is_none(), "nested native copy transaction");

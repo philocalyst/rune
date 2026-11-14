@@ -21,6 +21,7 @@ mod channel_manager;
 mod channels;
 mod character;
 mod chartab;
+mod obarray;
 mod syntax;
 mod coding;
 mod completion;

@@ -77,6 +77,7 @@ struct DumpState {
     env: Vec<DumpedBinding>,
     unsupported_overlay: bool,
     unsupported_marker: bool,
+    unsupported_obarray: bool,
     unsupported_string_properties: bool,
     unsupported_char_table: bool,
 }
@@ -157,6 +158,7 @@ impl DumpState {
             env: Vec::new(),
             unsupported_overlay: false,
             unsupported_marker: false,
+            unsupported_obarray: false,
             unsupported_string_properties: false,
             unsupported_char_table: false,
         }
@@ -249,6 +251,7 @@ impl DumpState {
             ObjectType::ChannelReceiver(_) => DumpedObject::ChannelReceiver,
             ObjectType::Process(_) => DumpedObject::Nil,
             ObjectType::Frame(_) => DumpedObject::Nil,
+            ObjectType::Obarray(_) => { self.unsupported_obarray=true; DumpedObject::Nil }
             ObjectType::Marker(_) => { self.unsupported_marker=true; DumpedObject::Nil }
             ObjectType::Overlay(_) => {
                 // Internal cycle-building placeholder only. into_output rejects
@@ -299,6 +302,7 @@ impl DumpState {
     }
 
     fn into_output(self) -> std::io::Result<std::string::String> {
+        if self.unsupported_obarray {return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"Obarray persistence is unsupported"));}
         if self.unsupported_marker {
             return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"Marker persistence is unsupported"));
         }

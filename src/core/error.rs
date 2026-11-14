@@ -27,6 +27,7 @@ pub(crate) enum Type {
     Frame,
     Overlay,
     Marker,
+    Obarray,
 }
 
 /// Error provided if object was the wrong type
