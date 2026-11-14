@@ -246,6 +246,40 @@ fn internal_get_lisp_face_attribute<'a>(
     let index = attribute_index(attribute)?;
     Ok(checked_vector(scoped_vector(face, frame, env, cx)?)?[index].get())
 }
+// Validate structured box metadata without evaluating or allocating Lisp data.
+// GNU xfaces.c accepts nonzero scalar widths, integer pairs and a keyword list.
+// Cyclic/oversized lists fail closed before any face/cache mutation.
+fn valid_box(value: Object) -> bool {
+    fn integer(value: Object) -> bool { matches!(value.untag(), ObjectType::Int(_)) }
+    fn nonzero(value: Object) -> bool { matches!(value.untag(), ObjectType::Int(n) if n != 0) }
+    fn nonempty(value: Object) -> bool { matches!(value.untag(), ObjectType::String(s) if !s.is_empty()) }
+    if value.is_nil() || nonzero(value) || nonempty(value) { return true; }
+    let ObjectType::Cons(pair) = value.untag() else { return false; };
+    if integer(pair.car()) && integer(pair.cdr()) { return true; }
+    let mut tail = value;
+    for _ in 0..256 {
+        if tail.is_nil() { return true; }
+        let ObjectType::Cons(key_cell) = tail.untag() else { return false; };
+        let key = key_cell.car();
+        tail = key_cell.cdr();
+        // GNU accepts a trailing keyword alone: after taking its car the
+        // remaining tail is nil. Preserve that observed representation rule.
+        if tail.is_nil() { return true; }
+        let ObjectType::Cons(value_cell) = tail.untag() else { return false; };
+        let item = value_cell.car();
+        let ObjectType::Symbol(key) = key.untag() else { return false; };
+        if !key.interned() { return false; }
+        let valid = match key.name() {
+            ":line-width" => nonzero(item) || matches!(item.untag(), ObjectType::Cons(p) if nonzero(p.car()) && nonzero(p.cdr())),
+            ":color" => item.is_nil() || nonempty(item),
+            ":style" => item.is_nil() || matches!(item.untag(), ObjectType::Symbol(s) if s.interned() && ["pressed-button", "released-button", "flat-button"].contains(&s.name())),
+            _ => false,
+        };
+        if !valid { return false; }
+        tail = value_cell.cdr();
+    }
+    tail.is_nil()
+}
 fn validate_attribute<'a>(index: usize, value: Object<'a>) -> Result<Object<'a>> {
     if value == sym::UNSPECIFIED {
         return Ok(value);
@@ -254,6 +288,7 @@ fn validate_attribute<'a>(index: usize, value: Object<'a>) -> Result<Object<'a>>
         ObjectType::Symbol(s) if s.interned() => Some(s),
         _ => None,
     };
+    let value = if index == 14 && value == TRUE { 1_i64.into() } else { value };
     let valid = match index {
         1 | 2 | 9 | 10 | 17 | 18 => {
             matches!(value.untag(), ObjectType::String(_)) || value.is_nil()
@@ -306,7 +341,7 @@ fn validate_attribute<'a>(index: usize, value: Object<'a>) -> Result<Object<'a>>
         }
         8 | 19 => value.is_nil() || value == TRUE,
         11 => value.is_nil(),
-        14 => value.is_nil() || matches!(value.untag(), ObjectType::Int(_) | ObjectType::String(_)),
+        14 => valid_box(value),
         15 => value.is_nil() || matches!(value.untag(), ObjectType::String(_)),
         16 => value.is_nil() || value.is_symbol() || matches!(value.untag(), ObjectType::Cons(_)),
         _ => false,
@@ -352,6 +387,36 @@ fn internal_set_lisp_face_attribute<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cyclic_box_metadata_has_bounded_validation() {
+        use super::*;
+        let roots = crate::core::gc::RootSet::default();
+        let cx = &Context::new(&roots);
+        let key: Object = crate::lread::intern(":line-width", cx).into();
+        let first = Cons::new(key, NIL, cx);
+        let second = Cons::new(1_i64, Object::from(first), cx);
+        first.set_cdr(second.into()).unwrap();
+        assert!(!valid_box(first.into()));
+        let mut bounded = NIL;
+        for _ in 0..256 {
+            bounded = Cons::new(key, Object::from(Cons::new(1_i64, bounded, cx)), cx).into();
+        }
+        assert!(valid_box(bounded));
+        bounded = Cons::new(key, Object::from(Cons::new(1_i64, bounded, cx)), cx).into();
+        assert!(!valid_box(bounded));
+    }
+    #[test]
+    fn box_metadata_matches_gnu_and_preserves_input_identity() {
+        for value in ["nil", "t", "1", "-1", "'(0 . 0)", "\"red\"", "'(:line-width 1 :style released-button)", "'(:line-width (-1 . 2) :color \"red\" :style flat-button)", "'(:color nil :style nil)", "'(:line-width)"] {
+            crate::assert_elprop!("{}", &format!("(progn (internal-make-lisp-face 'rune-box) (let ((v {value})) (internal-set-lisp-face-attribute 'rune-box :box v t) (list (equal (internal-get-lisp-face-attribute 'rune-box :box t) (if (eq v t) 1 v)) (eq (internal-get-lisp-face-attribute 'rune-box :box t) (if (eq v t) 1 v)))))"));
+        }
+    }
+    #[test]
+    fn malformed_box_metadata_is_rejected_before_mutation() {
+        for value in ["0", "\"\"", "'(:line-width 0)", "'(:line-width (1 . 0))", "'(:style sunken)", "'(:color \"\")", "'(:unknown t)", "'(:line-width . 1)"] {
+            crate::assert_elprop!("{}", &format!("(progn (internal-make-lisp-face 'rune-box-invalid) (internal-set-lisp-face-attribute 'rune-box-invalid :box 2 t) (condition-case nil (internal-set-lisp-face-attribute 'rune-box-invalid :box {value} t) (error nil)) (internal-get-lisp-face-attribute 'rune-box-invalid :box t))"));
+        }
+    }
     #[test]
     fn minibuffer_prompt_policy_has_real_c_default_then_lisp_face_append() {
         use super::*;
