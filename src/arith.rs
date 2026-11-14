@@ -143,25 +143,28 @@ fn greater_than_or_eq_lisp(number: Number, numbers: &[Object]) -> Result<bool> {
     cmp_objects(number, numbers, |order| order != std::cmp::Ordering::Less)
 }
 
+// Convert operands one at a time: a later non-number must not mask an
+// earlier float rejected by the integer operation. Lisp argument expressions
+// have already all evaluated before this adapter is called.
 #[defun]
-pub(crate) fn logior(ints_or_markers: &[Number]) -> Result<NumberValue> {
-    Ok(ints_or_markers
-        .iter()
-        .try_fold(NumberValue::Int(0), |value, next| value.bit_or(next.val()))?)
+pub(crate) fn logior(ints_or_markers: &[Object]) -> Result<NumberValue> {
+    Ok(ints_or_markers.iter().try_fold(NumberValue::Int(0), |value, next| {
+        value.bit_or(Number::try_from(*next)?.val()).map_err(anyhow::Error::from)
+    })?)
 }
 
 #[defun]
-fn logand(int_or_markers: &[Number]) -> Result<NumberValue> {
-    Ok(int_or_markers
-        .iter()
-        .try_fold(NumberValue::Int(-1), |value, next| value.bit_and(next.val()))?)
+fn logand(int_or_markers: &[Object]) -> Result<NumberValue> {
+    Ok(int_or_markers.iter().try_fold(NumberValue::Int(-1), |value, next| {
+        value.bit_and(Number::try_from(*next)?.val()).map_err(anyhow::Error::from)
+    })?)
 }
 
 #[defun]
-fn logxor(integers: &[Number]) -> Result<NumberValue> {
-    Ok(integers
-        .iter()
-        .try_fold(NumberValue::Int(0), |value, next| value.bit_xor(next.val()))?)
+fn logxor(integers: &[Object]) -> Result<NumberValue> {
+    Ok(integers.iter().try_fold(NumberValue::Int(0), |value, next| {
+        value.bit_xor(Number::try_from(*next)?.val()).map_err(anyhow::Error::from)
+    })?)
 }
 
 #[defun]
@@ -605,6 +608,33 @@ mod test {
             min(cx.add_as(1.1), &[cx.add_as(1.0), cx.add_as(2.1), cx.add_as(1.0)]),
             NumberValue::Float(1.0)
         );
+    }
+
+    #[test]
+    fn bitwise_validation_preserves_left_to_right_failure_order() {
+        {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            let float = cx.add(1.0);
+            let symbol = crate::sym::NIL.into();
+            for operation in [logand, logior, logxor] {
+                let error = operation(&[float, symbol]).unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<crate::core::object::NumericError>(),
+                    Some(crate::core::object::NumericError::ExpectedInteger)
+                ));
+                // An absorbing zero still does not skip operand validation.
+                assert!(operation(&[0_i64.into(), symbol]).is_err());
+            }
+        }
+        for operation in ["logand", "logior", "logxor"] {
+            crate::interpreter::assert_lisp(
+                &format!(
+                    "(let ((seen 0)) (condition-case nil ({operation} 1.0 (progn (setq seen 1) 'bad)) (error nil)) seen)"
+                ),
+                "1",
+            );
+        }
     }
 
     #[test]

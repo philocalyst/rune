@@ -227,8 +227,8 @@ fn ftruncate(num: &LispFloat) -> f64 {
 }
 
 #[defun]
-fn float(arg: Number) -> NumberValue {
-    NumberValue::Float(coerce(arg))
+fn float<'ob>(arg: Number<'ob>, cx: &'ob Context) -> Object<'ob> {
+    if arg.is_float() { arg.as_obj_copy() } else { cx.add(coerce(arg)) }
 }
 
 #[defun]
@@ -267,8 +267,12 @@ fn isnan(arg: &LispFloat) -> bool {
 }
 
 #[defun]
-fn copysign(x: &LispFloat, y: &LispFloat) -> f64 {
-    x.copysign(**y)
+fn copysign<'ob>(x: &'ob LispFloat, y: &LispFloat, cx: &'ob Context) -> Object<'ob> {
+    if x.is_sign_negative() == y.is_sign_negative() {
+        cx.add(x)
+    } else {
+        cx.add(-**x)
+    }
 }
 
 #[defun]
@@ -288,10 +292,14 @@ fn expt(
 
 #[defun]
 fn log(arg: Number, base: Option<f64>) -> f64 {
-    if let Some(base) = base {
-        coerce(arg).log(base)
-    } else {
-        coerce(arg).log(std::f64::consts::E)
+    // GNU uses dedicated libm operations for the common bases, not a ratio
+    // of natural logs. The latter loses exact powers (e.g. log(1000, 10)).
+    let value = coerce(arg);
+    match base {
+        None => value.ln(),
+        Some(2.0) => value.log2(),
+        Some(10.0) => value.log10(),
+        Some(base) => value.ln() / base.ln(),
     }
 }
 
@@ -301,11 +309,14 @@ fn sqrt(arg: Number) -> f64 {
 }
 
 #[defun]
-fn abs(arg: Number) -> NumberValue {
+fn abs<'ob>(arg: Number<'ob>, cx: &'ob Context) -> Object<'ob> {
+    // GNU returns the original heap number when its sign needs no change.
+    // Besides avoiding allocation, this is observable through Lisp `eq`.
     match arg.untag() {
-        NumberType::Int(i) => NumberValue::Int(i.abs()),
-        NumberType::Float(f) => NumberValue::Float(f.abs()),
-        NumberType::Big(b) => NumberValue::Big(b.abs()),
+        NumberType::Int(i) if i < 0 => cx.add(NumberValue::Int(-i)),
+        NumberType::Float(f) if f.is_sign_negative() => cx.add(-**f),
+        NumberType::Big(b) if b.is_negative() => cx.add(NumberValue::Big(-(**b).clone())),
+        _ => arg.as_obj_copy(),
     }
 }
 
@@ -357,6 +368,59 @@ fn frexp_f(f: f64) -> (f64, i64) {
 mod m0_rounding_regressions {
     use super::*;
     use crate::interpreter::assert_lisp;
+
+    #[test]
+    fn sign_preserving_primitives_retain_heap_number_identity() {
+        for source in [
+            "(let ((x 1.5)) (eq x (float x)))",
+            "(let ((x -0.0)) (eq x (float x)))",
+            "(let ((x 0.0e+NaN)) (eq x (float x)))",
+            "(let ((x 1.5)) (eq x (abs x)))",
+            "(let ((x 0.0e+NaN)) (eq x (abs x)))",
+            "(let ((x 18446744073709551616)) (eq x (abs x)))",
+            "(let ((x 1.5)) (eq x (copysign x 1.0)))",
+            "(let ((x -0.0)) (eq x (copysign x -1.0)))",
+            "(let ((x -0.0e+NaN)) (eq x (copysign x -1.0)))",
+            "(let ((x -0.0)) (if (eq x (abs x)) nil t))",
+            "(let ((x -1.5)) (if (eq x (abs x)) nil t))",
+            "(let ((x -18446744073709551616)) (if (eq x (abs x)) nil t))",
+            "(let ((x 1.5)) (if (eq x (copysign x -1.0)) nil t))",
+            "(let ((x 1.5)) (let ((y (float x))) (garbage-collect) (eq x y)))",
+        ] {
+            assert_lisp(source, "t");
+        }
+    }
+
+    #[test]
+    fn logarithms_recover_all_finite_binary_powers() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        for exponent in -1074..=1023 {
+            let value = libm::scalbn(1.0, exponent);
+            assert_eq!(log(cx.add_as(value), Some(2.0)), f64::from(exponent));
+        }
+        for exponent in -307..=308 {
+            let value: f64 = format!("1e{exponent}").parse().unwrap();
+            assert_eq!(log(cx.add_as(value), Some(10.0)), f64::from(exponent));
+        }
+    }
+
+    #[test]
+    fn logarithms_use_dedicated_common_base_operations() {
+        for (source, expected) in [
+            ("(log 1000 10)", "3.0"),
+            ("(log 1e-300 10)", "-300.0"),
+            ("(log 8 2)", "3.0"),
+            ("(log 0.125 2)", "-3.0"),
+            ("(log 5e-324 2)", "-1074.0"),
+            ("(log 1)", "0.0"),
+            ("(log 0)", "-1.0e+INF"),
+            ("(isnan (log -1))", "t"),
+            ("(log 16 4)", "2.0"),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
 
     #[test]
     fn unary_rounding_uses_the_same_even_midpoints_as_division() {

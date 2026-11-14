@@ -54,6 +54,12 @@ legacy unchecked storage API, not the new numeric construction contract.
   boundaries instead of duplicate conversion rules.
 * Unary `round` and `fround` select even midpoints, matching the existing exact
   divisor-rounding path rather than Rust's away-from-zero midpoint policy.
+* Default finite float printing follows GNU's precision search and `%g`
+  notation rules, preserving exact read-back while avoiding Rust's long fixed
+  decimal spellings. Custom `float-output-format` bindings are not implemented.
+  The reference policies are Emacs 30.1's
+  [float printer](https://github.com/emacs-mirror/emacs/blob/emacs-30.1/src/print.c)
+  and [gnulib dtoastr](https://github.com/emacs-mirror/emacs/blob/emacs-30.1/lib/ftoastr.c).
 
 ## Deliberate limits and next interfaces
 
@@ -78,6 +84,20 @@ it should not move owned numeric policy back into evaluator-specific modules.
 
 ## Qualification
 
+Latest recovered verification on checkpoint `98fbdf8` plus the finite-printer
+change: four actual Rune float tests passed; the whole Rune unit suite passed
+435 tests with two ignored, using the batch GNU backend and `PROPTEST_CASES=32`.
+The default finite formatter matched GNU Emacs 30.1 in 5,648 cases, including
+random finite values and subnormal/normal boundaries. An extracted formatter
+also probed 100,000 deterministic bit patterns, checking exact round trips for
+every finite case. The in-tree
+matrix uses 4,096 patterns and bounds every output at 25 bytes.
+
+These are test-target and bounded-oracle results, not a full Lisp bootstrap,
+native-window test, exhaustive property run, million-case differential pass,
+or roadmap completion gate. The earlier pending statuses below are historical;
+the latest unit run covers nonignored regressions present in this checkout.
+
 Kernel unit/property tests cover arbitrary i64 construction, exact mixed
 comparisons, IEEE classes, arithmetic against a BigInt reference, zero division,
 width-limited shifts, and canonical object allocation. Primitive tests exercise
@@ -98,14 +118,15 @@ build or evidence that those excluded tests passed.
 The subsequent source-only review checked the `defun` parser's qualified
 `Rt<Env>`/`Context` handling and the build script's `logcount` symbol discovery.
 It also added unary midpoint and signed-zero rounding regressions. Those new
-rounding regressions have not been compiled, run, or oracle-checked after the
-disk-capacity restriction; they are pending qualification. GNU's installed
+rounding regressions were initially uncompiled and unrun during the
+disk-capacity restriction. GNU's installed
 documentation permits platform-dependent midpoint choices, so the even policy
 is an explicit consistency choice, not a claim about every GNU platform.
 
 ## Subsequent source-only integration supplements
 
-These changes are prepared but not compiled or runtime-qualified:
+These changes were initially prepared without compilation; their nonignored
+regressions are included in the latest unit run described above:
 
 * Generic `Object` to `f64` conversion delegates to `Number::to_float`, so
   general numeric primitive parameters do not reject bignums or bypass kernel
@@ -134,14 +155,14 @@ before claiming integrated runtime compatibility.
 
 V3 additionally validates the width setting through the owned kernel's signed
 machine-domain conversion. Six boundary primitive expectations were prepared
-alongside direct kernel conversion regressions; their Rust execution remains
-pending. GNU binding-time rejection is still not implemented: the adapter
+alongside direct kernel conversion regressions. GNU binding-time rejection is
+still not implemented: the adapter
 rejects invalid settings when a migrated arithmetic primitive consumes them,
 whereas GNU rejects the invalid assignment/binding even without arithmetic.
 
 Subsequent GNU-only observations ran the 12-form conversion batch and 11
 bootstrap invariants. They exposed the float-only parameter distinction above;
 13 strict-float and general numeric-argument expectations then passed against
-GNU Emacs 30.1. The corresponding Rust signature changes and regressions remain
-uncompiled and unrun. Earlier frozen patch versions without these strict
+GNU Emacs 30.1. Their Rust qualification was pending at that stage. Earlier
+frozen patch versions without these strict
 signatures must not be mistaken for the corrected aggregate.
