@@ -26,7 +26,8 @@ pub(crate) fn validate_function_clone(object: Object<'_>) -> Result<()> {
     while let Some(task) = tasks.pop() {
         let (object, depth) = match task {
             Task::Leave(key) => {
-                debug_assert_eq!(active.pop(), Some(key));
+                let finished = active.pop();
+                debug_assert_eq!(finished, Some(key));
                 continue;
             }
             Task::Enter(object, depth) => (object, depth),
@@ -222,6 +223,17 @@ mod tests {
         assert!(validate_function_clone(table.into()).is_err());
         table.untag().set_parent(None).unwrap();
         assert!(validate_function_clone(table.into()).is_ok());
+    }
+    #[test]
+    fn completed_shared_subgraphs_are_not_retained_as_active_ancestors() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let leaf = cx.add(vec![Object::from(7)]);
+        let branch = cx.add(vec![leaf, leaf]);
+        let dag = cx.add(vec![branch, branch, leaf]);
+        assert!(validate_function_clone(dag).is_ok());
+        // Each invocation must also begin with an empty active path.
+        assert!(validate_function_clone(dag).is_ok());
     }
     #[test]
     fn repeated_dag_expansion_and_deep_acyclic_graphs_have_bounded_rejection() {

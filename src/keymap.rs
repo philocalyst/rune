@@ -14,6 +14,9 @@ use rune_macros::defun;
 defsym!(KEYMAP);
 defsym!(GLOBAL_MAP);
 defsym!(UNDEFINED);
+// GNU keyboard.c::syms_of_keyboard: real global sparse special-event authority.
+defvar!(SPECIAL_EVENT_MAP, crate::keymap::make_sparse_keymap(None, cx));
+defvar!(LAST_INPUT_EVENT);
 // GNU keyboard.c::syms_of_keyboard and init_kboard: separate real maps,
 // with the logical terminal's local map inheriting the original global object.
 defvar!(FUNCTION_KEY_MAP, crate::keymap::make_sparse_keymap(None, cx));
@@ -680,6 +683,24 @@ pub(crate) fn dispatch_native_event(
     cx: &mut Context,
 ) -> Result<NativeDispatch> {
     use rune_core::macros::root;
+    // Special events are consumed independently of ordinary key prefixes.
+    // This is owner native dispatch, not an OS signal/unread-event reader.
+    let special_event: Object = match event {
+        NativeEvent::Character(c) => i64::from(c).into(),
+        NativeEvent::Named(name) => crate::lread::intern(name, cx).into(),
+    };
+    root!(special_event, cx);
+    let special_map = env.variable_value(sym::SPECIAL_EVENT_MAP, cx)?.unwrap_or(NIL);
+    if !special_map.is_nil() {
+        let special_key = cx.add(vec![special_event.bind(cx)]);
+        let special_definition = lookup_key(special_map, special_key, None, env, cx)?;
+        root!(special_definition, cx);
+        if !special_definition.bind(cx).is_nil() {
+            env.set_var_context(sym::LAST_INPUT_EVENT, special_event.bind(cx), cx)?;
+            call_interactively(special_definition, None, None, env, cx)?;
+            return Ok(NativeDispatch::Executed);
+        }
+    }
     if env.native_key_sequence != Some(sequence) {
         cancel_native_prefix(env)
     }
@@ -870,3 +891,37 @@ fn map_keymap_internal<'a>(function:&crate::core::gc::Rto<Object>,keymap:&crate:
 
 mod translation;
 pub(crate) fn initial_local_function_map<'a>(env:&Rt<Env>,cx:&'a Context)->Object<'a>{translation::initial_local_map(env,cx)}
+
+#[cfg(test)]
+mod special_event_tests {
+    use super::*;
+    use crate::editor_document::with_lisp_runtime_owner;
+    #[test]
+    fn special_event_preserves_pending_prefix_and_failure_is_not_replayed() {
+        with_lisp_runtime_owner(80,24,|mut host| {
+            use rune_editor::EditorHost;
+            host.evaluate_source(r#"(setq special-hit 0 special-active (make-sparse-keymap)) (define-key special-active [120 121] '(lambda () (interactive) (setq special-hit (+ special-hit 10)))) (use-global-map special-active) (define-key special-event-map [sigusr1] '(lambda () (interactive) (setq special-hit (+ special-hit 1)))) (define-key special-event-map [sigusr2] '(lambda () (interactive) (setq special-hit (+ special-hit 100)) (signal 'error '("special failed"))))"#).map_err(anyhow::Error::msg)?;
+            let snapshot=host.snapshot()?;let view=snapshot.views.iter().find(|v|v.id==snapshot.selected_window).unwrap();let(w,b)=(view.id.as_u64(),view.view.buffer.as_u64());drop(snapshot);
+            host.dispatch_native_key(w,b,"x",false,false,false).map_err(anyhow::Error::msg)?;
+            host.dispatch_native_key(w,b,"sigusr1",false,false,false).map_err(anyhow::Error::msg)?;
+            host.evaluate_source(r#"(garbage-collect)"#).map_err(anyhow::Error::msg)?;
+            host.dispatch_native_key(w,b,"y",false,false,false).map_err(anyhow::Error::msg)?;
+            assert!(host.dispatch_native_key(w,b,"sigusr2",false,false,false).is_err());
+            host.evaluate_source(r#"(if (= special-hit 111) nil (signal 'error '("prefix or partial effects wrong")))"#).map_err(anyhow::Error::msg)?;
+            Ok(())
+        }).unwrap();
+    }
+    #[test]
+    fn real_special_map_consumes_owner_event_before_normal_map_and_survives_gc() {
+        with_lisp_runtime_owner(80,24,|mut host| {
+            use rune_editor::EditorHost;
+            host.evaluate_source(r#"(setq special-hit 0) (define-key special-event-map [sigusr1] '(lambda () (interactive) (setq special-hit (+ special-hit 1)))) (setq special-active (make-sparse-keymap)) (define-key special-active [sigusr1] '(lambda () (interactive) (setq special-hit 99))) (use-global-map special-active) (garbage-collect)"#).map_err(anyhow::Error::msg)?;
+            let snapshot=host.snapshot()?; let view=snapshot.views.iter().find(|v|v.id==snapshot.selected_window).unwrap(); let(w,b)=(view.id.as_u64(),view.view.buffer.as_u64());drop(snapshot);
+            host.dispatch_native_key(w,b,"sigusr1",false,false,false).map_err(anyhow::Error::msg)?;
+            host.evaluate_source(r#"(if (and (= special-hit 1) (eq last-input-event 'sigusr1)) nil (signal 'error '("special event not consumed"))) (define-key special-event-map [sigusr1] nil)"#).map_err(anyhow::Error::msg)?;
+            host.dispatch_native_key(w,b,"sigusr1",false,false,false).map_err(anyhow::Error::msg)?;
+            host.evaluate_source(r#"(if (= special-hit 99) nil (signal 'error '("removed special binding still active")))"#).map_err(anyhow::Error::msg)?;
+            Ok(())
+        }).unwrap();
+    }
+}
