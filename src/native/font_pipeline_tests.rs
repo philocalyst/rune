@@ -22,36 +22,72 @@ fn actual_headless_owner_font_fifo_reprojects_partial_errors_without_replay() {
     let passed = Rc::new(Cell::new(false));
     let result = passed.clone();
     Application::headless().run(move|cx|{
-        let test=(||->anyhow::Result<()>{
+        let test=(||->anyhow::Result<(gpui::Entity<FrameView>,gpui::Task<()>,Arc<rune_display::FrameFontPlan>,Rc<rune_gpui::NativeFontVariantBank>)>{
             let base=NativeFont::measure(gpui::font("DejaVu Sans Mono"),17.,3.,cx).map_err(anyhow::Error::msg)?;
             let bank=Rc::new(rune_gpui::NativeFontVariantBank::measure(&base,cx).map_err(anyhow::Error::msg)?);
             let cap=bank.capabilities(cx).map_err(anyhow::Error::msg)?;
             anyhow::ensure!(cap.bold,"diagnostic needs a real measured bold face");
             let (font_publisher,font_receiver)=font_plan_mailbox();
-            let (publisher,mut updates)=host_updates();let (sender,_replies,pending)=pending_editor_transport(8,publisher);
+            let (publisher,mut updates)=host_updates();let wake_publisher=publisher.clone();let (sender,replies,pending)=pending_editor_transport(8,publisher);
+            // Single UI producer queues requests before the owner constructs its host.
+            sender.try_send(OwnerEvent::Evaluate{request_id:8101,source:"(aset (internal-lisp-face-p 'pipeline-face (selected-frame)) 5 'bold) (error \"after font edit\")".into()}).unwrap();
+            sender.try_send(OwnerEvent::Evaluate{request_id:8102,source:"(setq font-pipeline-count (1+ font-pipeline-count)) (put-text-property 1 3 'face '(:weight semibold))".into()}).unwrap();
+            sender.try_send(OwnerEvent::Evaluate{request_id:8103,source:"(if (/= font-pipeline-count 1) (error \"replayed\")) (put-text-property 1 3 'face 'pipeline-face) (garbage-collect)".into()}).unwrap();
             let metrics=FixedMetrics(cap.metrics);
             let owner=std::thread::spawn(move||with_lisp_runtime_owner(80,24,|mut host|{
                 host.evaluate_source("(insert \"ab\") (setq font-pipeline-count 0) (internal-make-lisp-face 'default (selected-frame)) (internal-make-lisp-face 'pipeline-face (selected-frame)) (put-text-property 1 3 'face 'pipeline-face)").map_err(anyhow::Error::msg)?;
                 let bridge=EditorBridge::new(host,metrics,Rect{x:0.,y:0.,width:metrics.0.advance*80.,height:metrics.0.line_height()*24.}).map_err(|e|anyhow::anyhow!("{e:?}"))?;
                 let mut worker=pending.bind_font_initialized(bridge,cap,crate::editor_document::native_font_projection,font_publisher).map_err(|e|anyhow::anyhow!("{e:?}"))?.with_evaluator(evaluate_source);
                 let initial=worker.bridge().prepared_font_plan().unwrap();let sequence=worker.bridge().snapshot().map_err(|e|anyhow::anyhow!("{e:?}"))?.sequence;
-                sender.try_send(OwnerEvent::Evaluate{request_id:8101,source:"(aset (internal-lisp-face-p 'pipeline-face (selected-frame)) 5 'bold) (error \"after font edit\")".into()}).unwrap();
                 let partial=worker.try_step().unwrap();assert_eq!(partial.evaluation.as_ref().unwrap().request_id,8101);assert!(partial.evaluation.unwrap().outcome.is_err());assert!(partial.edit.unwrap());assert!(partial.render_error.is_none());assert_eq!(worker.bridge().snapshot().map_err(|e|anyhow::anyhow!("{e:?}"))?.sequence,sequence);
                 let bold=worker.bridge().prepared_font_plan().unwrap();assert!(bold.frame().generation>initial.frame().generation);assert!(bold.assignments().iter().any(|a|a.variant==V::Bold));
-                sender.try_send(OwnerEvent::Evaluate{request_id:8102,source:"(setq font-pipeline-count (1+ font-pipeline-count)) (put-text-property 1 3 'face '(:weight semibold))".into()}).unwrap();
                 let failed=worker.try_step().unwrap();assert!(failed.evaluation.unwrap().outcome.is_ok());assert!(failed.render_error.is_some());assert!(Arc::ptr_eq(&bold,&worker.bridge().prepared_font_plan().unwrap()));assert!(worker.retry_frame().is_err());
-                sender.try_send(OwnerEvent::Evaluate{request_id:8103,source:"(if (/= font-pipeline-count 1) (error \"replayed\")) (put-text-property 1 3 'face 'pipeline-face) (garbage-collect)".into()}).unwrap();
                 let repaired=worker.try_step().unwrap();assert!(repaired.evaluation.unwrap().outcome.is_ok());assert!(repaired.render_error.is_none());
                 let final_plan=worker.bridge().prepared_font_plan().unwrap();let snapshot=worker.bridge().snapshot().map_err(|e|anyhow::anyhow!("{e:?}"))?;let view=snapshot.views.iter().find(|v|v.id==snapshot.selected_window).unwrap();assert_eq!(snapshot.buffers.iter().find(|b|b.id==view.view.buffer).unwrap().document.to_text(),"ab");
                 Ok((initial,bold,final_plan))
             }));
             let (initial,bold,final_plan)=owner.join().map_err(|_|anyhow::anyhow!("owner panicked"))??;
             let published=font_receiver.latest().map_err(anyhow::Error::msg)?.unwrap();assert!(Arc::ptr_eq(&published,&final_plan));assert!(published.matches_frame(&take_frame(&mut updates)));
-            for plan in [initial,bold,published]{let native=rune_gpui::NativeFrameFontPlan::new((*plan).clone(),&base,bank.clone(),cx).map_err(anyhow::Error::msg)?;for assignment in plan.assignments(){assert_eq!(native.font_for_face(assignment.face_id,cx).map_err(anyhow::Error::msg)?,bank.get_compatible_font(cap.bank_id,cap.metrics,assignment.variant,cx).map_err(anyhow::Error::msg)?);}}
-            println!("HEADLESS_OWNER_FONT_FIFO_GATE_PASS exact_arc_pair=true direct_mutation_reprojected=true partial_error_preserved=true callback_not_replayed=true");Ok(())
+            for plan in [initial.clone(),bold.clone(),published.clone()]{let native=rune_gpui::NativeFrameFontPlan::new((*plan).clone(),&base,bank.clone(),cx).map_err(anyhow::Error::msg)?;for assignment in plan.assignments(){assert_eq!(native.font_for_face(assignment.face_id,cx).map_err(anyhow::Error::msg)?,bank.get_compatible_font(cap.bank_id,cap.metrics,assignment.variant,cx).map_err(anyhow::Error::msg)?);}}
+            println!("HEADLESS_OWNER_FONT_FIFO_GATE_PASS exact_arc_pair=true direct_mutation_reprojected=true partial_error_preserved=true callback_not_replayed=true");
+            let view=cx.new(|cx|FrameView::new_font_editor(initial.clone(),bank.clone(),base.clone(),sender,replies,Arc::new(AtomicBool::new(false)),Rc::new(|_|{}),Rc::new(|_|{}),cx).expect("matching initial font plan"));
+            view.update(cx,|view,cx|{
+                assert!(!view.present_measured_font_plan(initial.clone(),bank.clone(),cx).unwrap());
+                assert!(view.present(initial.frame().clone(),cx).is_err());
+                let wrong=rune_display::FrameFontPlan::new(bold.frame().clone(),cap.bank_id.checked_add(1).unwrap(),cap.metrics,bold.assignments().to_vec()).unwrap();
+                assert!(view.present_measured_font_plan(Arc::new(wrong),bank.clone(),cx).is_err());
+                assert!(view.present_measured_font_plan(bold.clone(),bank.clone(),cx).unwrap());
+                assert!(!view.present_measured_font_plan(bold.clone(),bank.clone(),cx).unwrap());
+                assert!(!view.present_measured_font_plan(initial.clone(),bank.clone(),cx).unwrap());
+                assert!(view.present(published.frame().clone(),cx).is_err());
+            });
+            // A capacity-only wake must still consume the latest paired frame.
+            wake_publisher.input_capacity_available().map_err(anyhow::Error::msg)?;drop(wake_publisher);
+            let task=view.update(cx,|_,cx|FrameView::watch_font_updates(updates,font_receiver,bank.clone(),cx));
+            Ok((view,task,published,bank))
         })();
-        match test{Ok(())=>result.set(true),Err(e)=>eprintln!("HEADLESS_OWNER_FONT_FIFO_GATE_ERROR {e:#}")}
-        rune_gpui::quit_on_next_foreground_turn(cx);
+        match test{
+            Ok((view,task,final_plan,bank))=>{
+                cx.spawn(async move|cx|{
+                    task.await;
+                    // Keep the entity alive through the watcher, then verify it
+                    // advanced to the final generation and closed disconnected input.
+                    let checked=view.update(cx,|view,cx|{
+                        let current=view.present_measured_font_plan(final_plan,bank,cx);
+                        (current,view.input_readiness())
+                    });
+                    match checked{
+                        Ok((Ok(false),rune_gpui::InputReadiness::Disconnected))=>{
+                            result.set(true);
+                            println!("HEADLESS_FRAMEVIEW_ENTITY_WATCHER_GATE_PASS constructor=true generation_and_bank_guards=true capacity_wake_admitted_pair=true input_closed=true");
+                        },
+                        _=>eprintln!("HEADLESS_FRAMEVIEW_ENTITY_WATCHER_GATE_ERROR final generation or lifecycle mismatch"),
+                    }
+                    let _=cx.update(|app|rune_gpui::quit_on_next_foreground_turn(app));
+                }).detach();
+            },
+            Err(e)=>{eprintln!("HEADLESS_OWNER_FONT_FIFO_GATE_ERROR {e:#}");rune_gpui::quit_on_next_foreground_turn(cx);}
+        }
     });
     assert!(passed.get(), "owner/font pipeline failed");
 }
