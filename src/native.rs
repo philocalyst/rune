@@ -82,6 +82,7 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                     };
                     worker
                         .with_interruptible_evaluator(evaluate_source_with_quit, owner_quit)
+                        .with_visited_saver(save_selected_visited)
                         .run_with_outcome(|step| {
                             if let Some(evaluation) = step.evaluation {
                                 if let Err(error) = &evaluation.outcome {
@@ -91,6 +92,9 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                                     );
                                 }
                                 owner_reports.evaluation(evaluation);
+                            }
+                            if let Some(save) = step.save {
+                                owner_reports.save(save);
                             }
                             if let Err(error) = step.edit {
                                 eprintln!("native owner input: {error:?}");
@@ -167,15 +171,23 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                                 quit,
                                 Rc::new(move |e| {
                                     let message = format!("Input not delivered: {:?}", e.reason);
-                                    if let OwnerEvent::Evaluate { request_id, .. } = e.event {
-                                        rejected_reports.evaluation(
-                                            rune_gpui::editor_transport::EvaluationOutcome {
-                                                request_id,
-                                                outcome: Err(message),
-                                            },
-                                        );
-                                    } else {
-                                        rejected_reports.notice(message);
+                                    match e.event {
+                                        OwnerEvent::Evaluate { request_id, .. } => rejected_reports
+                                            .evaluation(
+                                                rune_gpui::editor_transport::EvaluationOutcome {
+                                                    request_id,
+                                                    outcome: Err(message),
+                                                },
+                                            ),
+                                        OwnerEvent::SaveVisited { request_id, .. } => {
+                                            rejected_reports.save(
+                                                rune_gpui::editor_transport::SaveReply {
+                                                    request_id,
+                                                    outcome: Err(message),
+                                                },
+                                            )
+                                        }
+                                        _ => rejected_reports.notice(message),
                                     }
                                 }),
                                 Rc::new(move |ack| {
@@ -224,6 +236,25 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
 fn evaluate_source(host: &mut LispRuntimeHost<'_, '_, '_>, source: &str) -> Result<(), String> {
     host.evaluate_source(source)
 }
+fn save_selected_visited(
+    host: &mut LispRuntimeHost<'_, '_, '_>,
+    max_bytes: usize,
+) -> Result<rune_gpui::editor_transport::VisitedSave, String> {
+    let saved = host.save_selected_visited(max_bytes)?;
+    Ok(rune_gpui::editor_transport::VisitedSave {
+        kind: match saved.kind {
+            crate::editor_document::SaveKind::Saved => {
+                rune_gpui::editor_transport::VisitedSaveKind::Saved
+            }
+            crate::editor_document::SaveKind::Unchanged => {
+                rune_gpui::editor_transport::VisitedSaveKind::Unchanged
+            }
+        },
+        path: saved.path,
+        bytes: saved.bytes,
+    })
+}
+
 fn evaluate_source_with_quit(
     host: &mut LispRuntimeHost<'_, '_, '_>,
     source: &str,

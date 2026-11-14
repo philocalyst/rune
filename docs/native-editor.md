@@ -97,7 +97,7 @@ later retry. Definite rejection retains the draft; no outcome triggers resend.
 A separate foreground-woken report mailbox shows correlated completion/error
 status, input/publication notices on a separate line, and a bounded 8-outcome
 history (latest 3 visible). Startup sources and one manual attempt bound pending
-outcomes to 65; rejected attempts remain gated until their callback is consumed.
+outcomes to 66 including one save; rejected attempts remain gated until their callback is consumed.
 Error display payloads are truncated to 240 characters. Wakes occur after report
 locks drop and do not keep the document owner's publication channel alive.
 
@@ -105,3 +105,35 @@ This is a command runner, not a value-printing REPL: successful evaluation repor
 completion, while buffer changes are visible in the editor. Arbitrary Lisp return
 objects are not passed to GPUI. OS keyboard/IME/focus behavior, candidate placement
 and visual appearance still require a supported native window test.
+
+
+## Save the selected visited document
+
+Ctrl+S or Command+S sends one typed SaveVisited action through the same owner
+FIFO. It is not an evaluator form and never uses an evaluator-local `set-buffer`
+binding as its target. The owner captures the selected native document's fixed
+visited association and a checked snapshot; file I/O runs outside editor borrows,
+then a conditional checkpoint marks that exact version saved.
+
+Only an existing association is eligible. Unassociated scratch buffers report an
+error without I/O. There is no native file chooser, Save As, filename guessing or
+new visit/read interface in this increment. Shift+Ctrl/Command+S is consumed with a visible unsupported Save As status; it never falls back to ordinary existing-path Save.
+Saving is bounded to 16 MiB of UTF-8 text. A clean buffer with an existing target is
+not rewritten, even if an external actor changed that target; a missing visited
+target is recreated. This is narrow visited saving, not coding detection, file
+handlers, backups, locking/hooks or external-file conflict resolution.
+
+Held shortcuts and another pending save cannot enqueue duplicate I/O. Unsettled
+document preedit/commit must be resolved first. A typed save receipt (path and
+bytes written and explicit Saved/Unchanged kind) is distinct from later frame
+errors. Saved includes an empty zero-byte snapshot; Unchanged means no file write.
+The UI maps the typed kind and never guesses from a zero byte count. Failure or a missing reply never triggers a save replay. Errors
+that follow a committed snapshot say that it may already have been written.
+The bounded status/history reports save results separately from evaluation; the
+private producer bound is now 64 startup plus one manual evaluation plus one save.
+
+Headless native tests execute real selected-file saving with Unicode, an unrelated
+Lisp current-buffer binding, frame failure, retry without I/O, clean external
+content preservation, missing-target recreation and later dirty edits. They are
+not OS shortcut, dialog or window tests. Existing symlink/nonregular targets are
+unsupported; the backend does not claim hostile-filesystem race resistance.

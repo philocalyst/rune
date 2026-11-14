@@ -18,6 +18,11 @@ pub struct CompositionRequest {
 #[derive(Debug)]
 pub enum OwnerEvent {
     Input(InputEvent),
+    /// Save only the owner-selected, already-associated visited file.
+    SaveVisited {
+        request_id: u64,
+        max_bytes: usize,
+    },
     /// Owned source only: no runtime Object, Context or gateway crosses threads.
     Evaluate {
         request_id: u64,
@@ -54,6 +59,23 @@ pub struct NativeEditorOwner {
     reply: Arc<Mutex<ReplyState>>,
     publisher: HostPublisher,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisitedSaveKind {
+    Saved,
+    Unchanged,
+}
+#[derive(Debug)]
+pub struct VisitedSave {
+    pub kind: VisitedSaveKind,
+    pub path: std::path::PathBuf,
+    pub bytes: usize,
+}
+#[derive(Debug)]
+pub struct SaveReply {
+    pub request_id: u64,
+    pub outcome: Result<VisitedSave, String>,
+}
+pub type VisitedSaver<H> = fn(&mut H, usize) -> Result<VisitedSave, String>;
 pub type InterruptibleEvaluator<H> =
     fn(&mut H, &str, Arc<std::sync::atomic::AtomicBool>) -> Result<(), String>;
 pub struct NativeEditorWorker<H: EditorHost>
@@ -65,6 +87,7 @@ where
     reply: Arc<Mutex<ReplyState>>,
     publisher: HostPublisher,
     initialized: bool,
+    visited_saver: Option<VisitedSaver<H>>,
     evaluator: Option<fn(&mut H, &str) -> Result<(), String>>,
     interruptible: Option<(InterruptibleEvaluator<H>, crate::evaluation_quit::EvaluationQuit)>,
     platform: Option<crate::platform_context::PlatformPublisher>,
@@ -89,6 +112,7 @@ pub struct InitializationFailure {
 pub struct OwnerStep {
     pub edit: Result<bool, BridgeError>,
     pub evaluation: Option<EvaluationOutcome>,
+    pub save: Option<SaveReply>,
     pub render_error: Option<BridgeError>,
 }
 #[derive(Debug)]
@@ -130,6 +154,7 @@ impl NativeEditorOwner {
             reply: self.reply,
             publisher: self.publisher,
             initialized: false,
+            visited_saver: None,
             evaluator: None,
             interruptible: None,
             platform: None,
@@ -248,6 +273,12 @@ where
     /// caller's UI failure path; no success ack is manufactured on setup failure.
     pub fn run(self) -> Result<(), InitializationFailure> {
         self.run_with_outcome(|step| {
+            if let Some(save) = step.save {
+                if let Err(error) = save.outcome {
+                    eprintln!("native save {} failed: {error}", save.request_id);
+                }
+            }
+
             if let Some(evaluation) = step.evaluation {
                 if let Err(error) = evaluation.outcome {
                     eprintln!("native evaluation {} failed: {error}", evaluation.request_id);
@@ -295,6 +326,12 @@ where
         self.interruptible = Some((evaluate, signal));
         self
     }
+    /// Owner-only selected visited-file callback. Never replay a save because
+    /// its reply or subsequent publication failed; path authority stays in H.
+    pub fn with_visited_saver(mut self, save: VisitedSaver<H>) -> Self {
+        self.visited_saver = Some(save);
+        self
+    }
     /// Retry preparation/publication only. Never replay a committed command or
     /// composition request to recover a later rendering failure.
     pub fn retry_frame(&mut self) -> Result<(), BridgeError> {
@@ -307,7 +344,42 @@ where
     }
     fn process(&mut self, event: OwnerEvent) -> OwnerStep {
         let mut evaluation = None;
+        let mut save = None;
+        let mut preserve_context = false;
         let edit = match event {
+            OwnerEvent::SaveVisited { request_id, max_bytes } => {
+                match self.bridge.snapshot().map(|snapshot| snapshot.sequence) {
+                    Err(error) => {
+                        save = Some(SaveReply {
+                            request_id,
+                            outcome: Err(format!("Save not started: {error:?}")),
+                        });
+                        Err(error)
+                    }
+                    Ok(before) => {
+                        let outcome = if let Some(callback) = self.visited_saver {
+                            self.bridge.save_with(callback, max_bytes)
+                        } else {
+                            Err("no visited-file saver configured".into())
+                        };
+                        let success = outcome.is_ok();
+                        save = Some(SaveReply { request_id, outcome });
+                        match self.bridge.snapshot() {
+                            Ok(after) => {
+                                let changed = before != after.sequence;
+                                preserve_context = !changed;
+                                Ok(success || changed)
+                            }
+                            Err(error) => {
+                                if let Some(platform) = &self.platform {
+                                    let _ = platform.invalidate();
+                                }
+                                Err(error)
+                            }
+                        }
+                    }
+                }
+            }
             OwnerEvent::Evaluate { request_id, source } => {
                 let before = self.bridge.snapshot().map(|s| s.sequence);
                 match before {
@@ -367,7 +439,7 @@ where
         // Invalidate context before wake when an edit/point transition happened.
         // A failed subsequent preparation cannot leave an old writable IME scope.
         let mut render_error = None;
-        if matches!(edit, Ok(true)) {
+        if matches!(edit, Ok(true)) && !preserve_context {
             if let Some(platform) = &self.platform {
                 if let Err(error) = platform.invalidate() {
                     render_error = Some(error);
@@ -380,7 +452,7 @@ where
                 render_error = Some(error);
             }
         }
-        OwnerStep { edit, evaluation, render_error }
+        OwnerStep { edit, evaluation, save, render_error }
     }
 }
 #[cfg(test)]
@@ -640,5 +712,60 @@ mod tests {
         }
         assert_eq!(worker.bridge().snapshot().unwrap().buffers[0].document.to_text(), "partial");
         TEST_SIGNAL.with(|slot| *slot.borrow_mut() = None);
+    }
+    thread_local! { static SAVE_CALLS: std::cell::Cell<usize> = const {std::cell::Cell::new(0)}; }
+    fn counted_save(host: &mut Session<RopeDocument>, limit: usize) -> Result<VisitedSave, String> {
+        SAVE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let current = host.current_buffer();
+        let bytes = host.document(current).map_err(|e| e.to_string())?.to_text().len();
+        if bytes > limit {
+            return Err("save byte limit".into());
+        }
+        host.mark_saved(current).map_err(|e| e.to_string())?;
+        Ok(VisitedSave { kind: VisitedSaveKind::Saved, path: "/owner/fixed-path".into(), bytes })
+    }
+    #[test]
+    fn save_outcome_survives_frame_failure_and_retry_never_replays_callback() {
+        SAVE_CALLS.with(|calls| calls.set(0));
+        let (publisher, updates) = host_updates();
+        let (sender, _replies, worker) = editor_transport(bridge(), 4, publisher);
+        let mut worker = worker.initialize().unwrap().with_visited_saver(counted_save);
+        drop(updates);
+        sender
+            .try_send(OwnerEvent::Command(rune_editor::Command::Insert("save me".into())))
+            .unwrap();
+        worker.try_step().unwrap().edit.unwrap();
+        sender
+            .try_send(OwnerEvent::SaveVisited { request_id: 3, max_bytes: 64 })
+            .unwrap();
+        let step = worker.try_step().unwrap();
+        assert!(step.edit.unwrap());
+        assert!(step.render_error.is_some());
+        let reply = step.save.unwrap();
+        assert_eq!(reply.request_id, 3);
+        assert_eq!(reply.outcome.unwrap().bytes, 7);
+        assert!(worker.retry_frame().is_err());
+        assert!(worker.retry_frame().is_err());
+        SAVE_CALLS.with(|calls| assert_eq!(calls.get(), 1));
+        assert!(!worker.bridge().snapshot().unwrap().buffers[0].modified);
+        sender
+            .try_send(OwnerEvent::Command(rune_editor::Command::Insert("!".into())))
+            .unwrap();
+        worker.try_step().unwrap().edit.unwrap();
+        assert!(worker.bridge().snapshot().unwrap().buffers[0].modified);
+    }
+    #[test]
+    fn unconfigured_save_reports_explicit_failure_without_mutation() {
+        let (publisher, _updates) = host_updates();
+        let (sender, _replies, mut worker) = editor_transport(bridge(), 1, publisher);
+        sender
+            .try_send(OwnerEvent::SaveVisited { request_id: 9, max_bytes: 64 })
+            .unwrap();
+        let step = worker.try_step().unwrap();
+        assert!(!step.edit.unwrap());
+        assert!(step.render_error.is_none());
+        let reply = step.save.unwrap();
+        assert_eq!(reply.request_id, 9);
+        assert_eq!(reply.outcome.unwrap_err(), "no visited-file saver configured");
     }
 }

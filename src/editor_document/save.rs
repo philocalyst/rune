@@ -802,3 +802,41 @@ mod save_kind_tests {
         .unwrap();
     }
 }
+#[cfg(all(test, feature = "native"))]
+mod native_fifo_tests {
+    use super::*;
+    use rune_display::{FixedMetrics, Rect, host_updates};
+    use rune_editor::{Command, EditorHost};
+    use rune_gpui::{
+        editor_bridge::EditorBridge,
+        editor_transport::{OwnerEvent, VisitedSave, pending_editor_transport},
+    };
+    struct OwnedDir(PathBuf);
+    impl Drop for OwnedDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn real_selected_save_fifo_preserves_receipt_and_never_replays_on_frame_failure() {
+        super::super::with_lisp_runtime_owner(80,24,|host|{
+            let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+            let dir=std::env::temp_dir().join(format!("rune-native-save-fifo-{}-{stamp}",std::process::id()));fs::create_dir(&dir)?;let cleanup=OwnedDir(dir);let path=cleanup.0.join("selected");fs::write(&path,"initial")?;
+            let snapshot=host.snapshot()?;let selected=snapshot.views.iter().find(|v|v.id==snapshot.selected_window).unwrap().view.buffer;drop(snapshot);
+            let gateway=host.owner.gateway.clone();let handle=gateway.inner.borrow().buffer_handle(selected,host.owner.cx)?;
+            gateway.set_file_association(handle,0,Some(&path),host.owner.cx)?;
+            let (publisher,updates)=host_updates();let(sender,_replies,pending)=pending_editor_transport(8,publisher);
+            let bridge=EditorBridge::new(host,FixedMetrics::default(),Rect{x:0.,y:0.,width:640.,height:480.}).map_err(|e|anyhow::anyhow!("{e:?}"))?;
+            let mut worker=pending.bind_initialized(bridge).map_err(|e|anyhow::anyhow!("{e:?}"))?.with_evaluator(|host,source|host.evaluate_source(source)).with_visited_saver(|host,limit|{let saved=host.save_selected_visited(limit)?;Ok(VisitedSave{kind:match saved.kind {SaveKind::Saved=>rune_gpui::editor_transport::VisitedSaveKind::Saved,SaveKind::Unchanged=>rune_gpui::editor_transport::VisitedSaveKind::Unchanged},path:saved.path,bytes:saved.bytes})});
+            sender.try_send(OwnerEvent::Evaluate{request_id:1,source:r#"(insert "selected λ🙂") (set-buffer (get-buffer-create "other-save-fifo")) (insert "other")"#.into()}).unwrap();assert!(worker.try_step().unwrap().evaluation.unwrap().outcome.is_ok());drop(updates);
+            sender.try_send(OwnerEvent::SaveVisited{request_id:2,max_bytes:64}).unwrap();let step=worker.try_step().unwrap();assert!(step.render_error.is_some());let reply=step.save.unwrap();assert_eq!(reply.request_id,2);let saved=reply.outcome.unwrap();assert_eq!(saved.kind,rune_gpui::editor_transport::VisitedSaveKind::Saved);assert_eq!(saved.path,path);assert_eq!(saved.bytes,"selected λ🙂".len());assert_eq!(fs::read_to_string(&path)?,"selected λ🙂");assert!(!worker.bridge().snapshot().unwrap().buffers.iter().find(|b|b.id==selected).unwrap().modified);
+            fs::write(&path,"external")?;assert!(worker.retry_frame().is_err());assert_eq!(fs::read_to_string(&path)?,"external");
+            sender.try_send(OwnerEvent::SaveVisited{request_id:3,max_bytes:64}).unwrap();let unchanged=worker.try_step().unwrap().save.unwrap().outcome.unwrap();assert_eq!(unchanged.kind,rune_gpui::editor_transport::VisitedSaveKind::Unchanged);assert_eq!(unchanged.bytes,0);assert_eq!(fs::read_to_string(&path)?,"external");
+            fs::remove_file(&path)?;sender.try_send(OwnerEvent::SaveVisited{request_id:4,max_bytes:64}).unwrap();assert_eq!(worker.try_step().unwrap().save.unwrap().outcome.unwrap().bytes,"selected λ🙂".len());assert_eq!(fs::read_to_string(&path)?,"selected λ🙂");
+            sender.try_send(OwnerEvent::Command(Command::Insert("!".into()))).unwrap();worker.try_step().unwrap().edit.unwrap();assert!(worker.bridge().snapshot().unwrap().buffers.iter().find(|b|b.id==selected).unwrap().modified);assert_eq!(fs::read_to_string(&path)?,"selected λ🙂");
+            sender.try_send(OwnerEvent::Evaluate{request_id:5,source:"(erase-buffer)".into()}).unwrap();assert!(worker.try_step().unwrap().evaluation.unwrap().outcome.is_ok());
+            sender.try_send(OwnerEvent::SaveVisited{request_id:6,max_bytes:64}).unwrap();let empty=worker.try_step().unwrap().save.unwrap().outcome.unwrap();assert_eq!(empty.kind,rune_gpui::editor_transport::VisitedSaveKind::Saved);assert_eq!(empty.bytes,0);assert_eq!(fs::read_to_string(&path)?,"");
+            drop(worker);drop(cleanup);Ok(())
+        }).unwrap();
+    }
+}

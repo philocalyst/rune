@@ -224,6 +224,27 @@ impl FrameView {
             FrameInput::Legacy(_) => false,
         }
     }
+    #[cfg(feature = "editor")]
+    pub fn has_platform_preedit(&self) -> bool {
+        self.ime.as_ref().is_some_and(|ime| ime.state.borrow().composing())
+    }
+    #[cfg(feature = "editor")]
+    pub fn platform_text_unsettled(&self) -> bool {
+        self.ime.as_ref().is_some_and(|ime| {
+            let state = ime.state.borrow();
+            state.composing() || state.awaiting_ack()
+        })
+    }
+    #[cfg(feature = "editor")]
+    pub fn submit_visited_save(&self, request_id: u64, max_bytes: usize) -> bool {
+        match &self.input {
+            FrameInput::Owner(input) => owner_input::OwnerInput::submit(
+                input,
+                editor_transport::OwnerEvent::SaveVisited { request_id, max_bytes },
+            ),
+            FrameInput::Legacy(_) => false,
+        }
+    }
     /// Consume explicit composition outcomes before retrying the owner FIFO.
     /// This order frees its reserved reply slot without letting input overtake.
     pub fn retry_input(&mut self) -> Result<(), std::sync::mpsc::TrySendError<()>> {

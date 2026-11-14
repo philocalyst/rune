@@ -1,26 +1,34 @@
 //! Native evaluator overlay; API checks are not OS/window verification.
-use crate::native_command_model::CommandDraft;
+use crate::native_command_model::{CommandDraft, SaveShortcut, save_shortcut};
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Context, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton,
     MouseDownEvent, Pixels, Point, Render, ShapedLine, SharedString, TextRun, UTF16Selection,
     UnderlineStyle, Window, canvas, div, fill, point, prelude::*, px, rgb, rgba, size,
 };
-use rune_gpui::{FrameView, editor_transport::EvaluationOutcome, evaluation_quit::EvaluationQuit};
+use rune_gpui::{
+    FrameView,
+    editor_transport::{EvaluationOutcome, SaveReply},
+    evaluation_quit::EvaluationQuit,
+};
 use std::{
     collections::VecDeque,
     ops::Range,
     sync::{Arc, Mutex},
 };
 
-/// Private producer bound: at most64 startup sources plus one manual pending
-/// source. Notices coalesce separately and cannot erase an explicit outcome.
+/// Private producer bound: at most64 startup sources plus one manual evaluation
+/// and one save pending. Notices coalesce separately and cannot erase an explicit outcome.
 #[derive(Clone)]
 pub(crate) struct Reports(Arc<Mutex<ReportState>>, rune_display::HostPublisher);
 #[derive(Default)]
 struct ReportState {
-    outcomes: VecDeque<EvaluationOutcome>,
+    outcomes: VecDeque<TerminalOutcome>,
     notice: Option<String>,
+}
+enum TerminalOutcome {
+    Evaluation(EvaluationOutcome),
+    Save(SaveReply),
 }
 impl Reports {
     pub(crate) fn channel() -> (Self, rune_display::HostUpdates) {
@@ -31,8 +39,23 @@ impl Reports {
         if let Err(error) = &mut outcome.outcome {
             *error = short(error);
         }
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).outcomes.push_back(outcome);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .outcomes
+            .push_back(TerminalOutcome::Evaluation(outcome));
         let _ = self.1.input_capacity_available(); // Never wake under report lock.
+    }
+    pub(crate) fn save(&self, mut reply: SaveReply) {
+        if let Err(error) = &mut reply.outcome {
+            *error = short(error);
+        }
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .outcomes
+            .push_back(TerminalOutcome::Save(reply));
+        let _ = self.1.input_capacity_available();
     }
     pub(crate) fn notice(&self, text: String) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).notice = Some(short(&text));
@@ -67,6 +90,17 @@ fn short(text: &str) -> String {
     result
 }
 
+fn save_status(id: u64, saved: &rune_gpui::editor_transport::VisitedSave) -> String {
+    match saved.kind {
+        rune_gpui::editor_transport::VisitedSaveKind::Saved => {
+            format!("Saved #{id}: {} ({} bytes written)", saved.path.display(), saved.bytes)
+        }
+        rune_gpui::editor_transport::VisitedSaveKind::Unchanged => {
+            format!("Save #{id} unchanged: {} (no write)", saved.path.display())
+        }
+    }
+}
+
 pub(crate) struct CommandInput {
     draft: CommandDraft,
     focus: FocusHandle,
@@ -77,6 +111,8 @@ pub(crate) struct CommandInput {
     notice: Option<String>,
     history: VecDeque<String>,
     errors: u64,
+    next_save: u64,
+    saving: Option<u64>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     last_text: String,
@@ -125,6 +161,8 @@ impl CommandInput {
             notice: None,
             history: VecDeque::new(),
             errors: 0,
+            next_save: 1,
+            saving: None,
             last_layout: None,
             last_bounds: None,
             last_text: String::new(),
@@ -161,28 +199,71 @@ impl CommandInput {
     }
     fn drain(&mut self) {
         let (outcomes, notice) = {
-            let mut r = self.reports.0.lock().unwrap_or_else(|e| e.into_inner());
-            (r.outcomes.drain(..).collect::<Vec<_>>(), r.notice.take())
+            let mut reports = self.reports.0.lock().unwrap_or_else(|e| e.into_inner());
+            (reports.outcomes.drain(..).collect::<Vec<_>>(), reports.notice.take())
         };
-        for outcome in outcomes {
-            if outcome.outcome.is_err() {
-                self.errors = self.errors.saturating_add(1);
-            }
-            self.draft.complete(outcome.request_id);
-            self.status = match outcome.outcome {
-                Ok(()) => format!("#{} completed", outcome.request_id),
-                Err(error) => {
-                    format!("#{}: {} (Alt+Up recalls source)", outcome.request_id, short(&error))
+        for terminal in outcomes {
+            self.status = match terminal {
+                TerminalOutcome::Evaluation(outcome) => {
+                    if outcome.outcome.is_err() {
+                        self.errors = self.errors.saturating_add(1);
+                    }
+                    self.draft.complete(outcome.request_id);
+                    match outcome.outcome {
+                        Ok(()) => format!("#{} completed", outcome.request_id),
+                        Err(error) => format!(
+                            "#{}: {} (Alt+Up recalls source)",
+                            outcome.request_id,
+                            short(&error)
+                        ),
+                    }
+                }
+                TerminalOutcome::Save(reply) => {
+                    if self.saving == Some(reply.request_id) {
+                        self.saving = None;
+                    }
+                    match reply.outcome {
+                        Ok(saved) => save_status(reply.request_id, &saved),
+                        Err(error) => {
+                            self.errors = self.errors.saturating_add(1);
+                            format!("Save #{}: {} (not replayed)", reply.request_id, short(&error))
+                        }
+                    }
                 }
             };
             if self.history.len() == 8 {
                 self.history.pop_front();
             }
-            self.history.push_back(self.status.clone());
+            self.history.push_back(short(&self.status));
         }
         if let Some(notice) = notice {
             self.notice = Some(notice);
         }
+    }
+    fn save(&mut self, cx: &mut Context<Self>) {
+        if self.saving.is_some() {
+            self.status = "Save outcome pending; not resubmitted".into();
+            cx.notify();
+            return;
+        }
+        let id = self.next_save;
+        let Some(next) = id.checked_add(1) else {
+            self.status = "Save request IDs exhausted".into();
+            cx.notify();
+            return;
+        };
+        self.next_save = next;
+        // Same FIFO, selected visited file only; never a UI-chosen path.
+        self.saving = Some(id);
+        let accepted = self
+            .editor
+            .update(cx, |editor, _| editor.submit_visited_save(id, 16 * 1024 * 1024));
+        self.status = if accepted {
+            format!("Save #{id} pending")
+        } else {
+            format!("Save #{id} not admitted; awaiting rejection, no automatic retry")
+        };
+        cx.notify();
     }
     fn submit(&mut self, cx: &mut Context<Self>) {
         match self.draft.prepare() {
@@ -576,11 +657,12 @@ impl Render for CommandInput {
                 .h(px(24.)),
             )
             .child(format!(
-                "{}{} • {} request error(s)",
+                "{}{}{} • {} request error(s)",
                 short(&self.status),
                 self.draft
                     .pending()
                     .map_or(String::new(), |id| format!(" • #{id} outcome pending")),
+                self.saving.map_or(String::new(), |id| format!(" • save #{id} outcome pending")),
                 self.errors
             ))
             .when_some(self.notice.clone(), |div, notice| {
@@ -622,7 +704,49 @@ impl NativeShell {
             window.prevent_default();
             cx.stop_propagation();
             cx.notify();
-        } else if self.open && k.key == "escape" && !self.command.read(cx).draft.composing() {
+            return;
+        }
+        match save_shortcut(
+            &k.key,
+            k.modifiers.control,
+            k.modifiers.platform,
+            k.modifiers.alt,
+            k.modifiers.shift,
+            event.is_held,
+        ) {
+            SaveShortcut::Unrelated => {}
+            SaveShortcut::UnsupportedSaveAs => {
+                self.command.update(cx, |command, cx| {
+                    command.status =
+                        "Save As is unsupported; this shortcut submitted no request and chose no path".into();
+                    cx.notify();
+                });
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
+            SaveShortcut::Held => {
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
+            SaveShortcut::Save => {
+                if self.editor.read(cx).platform_text_unsettled() {
+                    self.command.update(cx,|command,cx|{command.status="Confirm or resolve document composition before saving; no save submitted".into();cx.notify();});
+                    if !self.editor.read(cx).has_platform_preedit() {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
+                self.command.update(cx, |command, cx| command.save(cx));
+                window.prevent_default();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
+        if self.open && k.key == "escape" && !self.command.read(cx).draft.composing() {
             self.open = false;
             window.focus(&self.editor.read(cx).focus_handle());
             window.prevent_default();
@@ -707,8 +831,11 @@ mod tests {
         );
         let state = reports.0.lock().unwrap();
         assert_eq!(state.outcomes.len(), 1);
-        assert_eq!(state.outcomes[0].request_id, 64);
-        assert_eq!(state.outcomes[0].outcome.as_ref().unwrap_err(), "evaluation error");
+        let TerminalOutcome::Evaluation(outcome) = &state.outcomes[0] else {
+            panic!("wrong terminal kind")
+        };
+        assert_eq!(outcome.request_id, 64);
+        assert_eq!(outcome.outcome.as_ref().unwrap_err(), "evaluation error");
         assert_eq!(state.notice.as_deref(), Some("later publication failure"));
     }
     #[test]
@@ -726,7 +853,7 @@ mod tests {
             state
                 .outcomes
                 .iter()
-                .all(|o| o.outcome.as_ref().unwrap_err().chars().count() <= 240)
+                .all(|o| matches!(o,TerminalOutcome::Evaluation(outcome) if outcome.outcome.as_ref().unwrap_err().chars().count()<=240))
         );
         assert!(short(&" ".repeat(100_000)).is_empty());
     }
@@ -775,7 +902,11 @@ mod tests {
         assert!(draft.prepare().is_err());
         drop(sender);
         thread.join().unwrap();
-        let result = reports.0.lock().unwrap().outcomes.pop_front().unwrap();
+        let TerminalOutcome::Evaluation(result) =
+            reports.0.lock().unwrap().outcomes.pop_front().unwrap()
+        else {
+            panic!("wrong terminal kind")
+        };
         assert_eq!(result.request_id, submission.id);
         assert!(result.outcome.is_ok());
         assert!(draft.complete(result.request_id));
@@ -794,5 +925,37 @@ mod tests {
             .map(|c| c.text.as_ref())
             .collect::<String>();
         assert!(rendered.contains("palette λ🙂"));
+    }
+    #[test]
+    fn evaluation_and_save_terminal_reports_preserve_arrival_order() {
+        let (reports, _) = Reports::channel();
+        reports.save(SaveReply { request_id: 1, outcome: Err("no visited file".into()) });
+        reports.evaluation(EvaluationOutcome { request_id: 64, outcome: Ok(()) });
+        let mut state = reports.0.lock().unwrap();
+        assert!(matches!(
+            state.outcomes.pop_front(),
+            Some(TerminalOutcome::Save(SaveReply { request_id: 1, .. }))
+        ));
+        assert!(matches!(
+            state.outcomes.pop_front(),
+            Some(TerminalOutcome::Evaluation(EvaluationOutcome { request_id: 64, .. }))
+        ));
+    }
+    #[test]
+    fn saved_empty_and_unchanged_statuses_use_kind_not_byte_count() {
+        use rune_gpui::editor_transport::{VisitedSave, VisitedSaveKind};
+        let saved =
+            VisitedSave { kind: VisitedSaveKind::Saved, path: "/owned/visited".into(), bytes: 0 };
+        let unchanged = VisitedSave {
+            kind: VisitedSaveKind::Unchanged,
+            path: "/owned/visited".into(),
+            bytes: 0,
+        };
+        let a = save_status(1, &saved);
+        let b = save_status(2, &unchanged);
+        assert!(a.starts_with("Saved #1"));
+        assert!(b.contains("unchanged"));
+        assert!(b.contains("no write"));
+        assert_ne!(a, b);
     }
 }

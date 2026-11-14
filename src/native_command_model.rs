@@ -1,6 +1,33 @@
 //! Bounded UI-local evaluator draft. Never a runtime buffer or source authority.
 use std::ops::Range;
 pub const MAX_SOURCE_BYTES: usize = 65_536;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SaveShortcut {
+    Unrelated,
+    Save,
+    UnsupportedSaveAs,
+    Held,
+}
+pub fn save_shortcut(
+    key: &str,
+    control: bool,
+    platform: bool,
+    alt: bool,
+    shift: bool,
+    held: bool,
+) -> SaveShortcut {
+    if key != "s" || !(control || platform) || alt {
+        return SaveShortcut::Unrelated;
+    }
+    if shift {
+        return SaveShortcut::UnsupportedSaveAs;
+    }
+    if held {
+        return SaveShortcut::Held;
+    }
+    SaveShortcut::Save
+}
+
 #[derive(Clone, Debug)]
 pub struct Submission {
     pub id: u64,
@@ -345,5 +372,26 @@ mod tests {
         assert_eq!(draft.text(), "source");
         assert!(draft.complete(s.id));
         assert!(draft.prepare().unwrap().id > s.id);
+    }
+    #[test]
+    fn save_as_and_held_shortcuts_never_select_a_write_intent() {
+        use SaveShortcut::*;
+        assert_eq!(save_shortcut("s", true, false, false, false, false), Save);
+        assert_eq!(save_shortcut("s", false, true, false, false, false), Save);
+        let mut writes = 0;
+        for (control, platform, shift, held, expected) in [
+            (true, false, true, false, UnsupportedSaveAs),
+            (false, true, true, false, UnsupportedSaveAs),
+            (true, false, true, true, UnsupportedSaveAs),
+            (true, false, false, true, Held),
+        ] {
+            let intent = save_shortcut("s", control, platform, false, shift, held);
+            assert_eq!(intent, expected);
+            if matches!(intent, Save) {
+                writes += 1;
+            }
+        }
+        assert_eq!(writes, 0);
+        assert_eq!(save_shortcut("s", true, false, true, false, false), Unrelated);
     }
 }

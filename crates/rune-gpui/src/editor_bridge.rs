@@ -62,6 +62,13 @@ where
     ) -> Result<(), String> {
         evaluate(&mut self.host, source, token)
     }
+    pub(crate) fn save_with(
+        &mut self,
+        save: crate::editor_transport::VisitedSaver<H>,
+        max_bytes: usize,
+    ) -> Result<crate::editor_transport::VisitedSave, String> {
+        save(&mut self.host, max_bytes)
+    }
     pub fn new(mut host: H, metrics: FixedMetrics, bounds: Rect) -> Result<Self, BridgeError> {
         if !bounds.valid() || !metrics.0.valid() {
             return Err(LayoutError("invalid editor geometry").into());
