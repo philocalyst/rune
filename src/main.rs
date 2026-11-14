@@ -75,6 +75,9 @@ struct Args {
     /// Evaluate startup source on the native owner, in input order.
     #[arg(long, requires = "native", value_name = "SOURCE")]
     native_eval: Vec<String>,
+    /// Open one existing UTF-8 file; enable guarded native Ctrl-S (16 MiB).
+    #[arg(long, requires = "native", value_name = "FILE")]
+    native_file: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<(), ()> {
@@ -92,7 +95,7 @@ fn main() -> Result<(), ()> {
             return Err(());
         }
         #[cfg(feature = "native")]
-        return native::run(args.native_eval);
+        return native::run(args.native_eval, args.native_file);
         #[cfg(not(feature = "native"))]
         {
             eprintln!("--native requires building with --features native");
@@ -454,5 +457,31 @@ mod native_cli_args_tests {
         assert!(args.native);
         assert_eq!(args.native_eval, ["(setq x 1)", "(insert \"λ\")"]);
         assert!(Args::try_parse_from(["rune", "--eval-stdin"]).unwrap().eval_stdin);
+    }
+    #[test]
+    fn native_file_is_explicit_requires_native_and_keeps_startup_source() {
+        assert!(Args::try_parse_from(["rune", "--native-file", "existing.txt"]).is_err());
+        let args = Args::try_parse_from([
+            "rune",
+            "--native",
+            "--native-file",
+            "existing.txt",
+            "--native-eval",
+            "(insert \"x\")",
+        ])
+        .unwrap();
+        assert_eq!(args.native_file, Some(std::path::PathBuf::from("existing.txt")));
+        assert_eq!(args.native_eval, ["(insert \"x\")"]);
+        assert!(
+            Args::try_parse_from([
+                "rune",
+                "--native",
+                "--native-file",
+                "existing.txt",
+                "--load",
+                "code.el"
+            ])
+            .is_err()
+        );
     }
 }

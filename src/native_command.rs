@@ -681,6 +681,7 @@ pub(crate) struct NativeShell {
     editor: Entity<FrameView>,
     command: Entity<CommandInput>,
     open: bool,
+    guarded_file_mode: bool,
 }
 impl NativeShell {
     pub(crate) fn new(
@@ -688,13 +689,14 @@ impl NativeShell {
         reports: Reports,
         updates: rune_display::HostUpdates,
         quit: EvaluationQuit,
+        guarded_file_mode: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let command =
             cx.new(|cx| CommandInput::new(editor.clone(), reports, updates, quit, window, cx));
         cx.observe(&command, |_, _, cx| cx.notify()).detach();
-        Self { editor, command, open: false }
+        Self { editor, command, open: false, guarded_file_mode }
     }
     fn capture(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
@@ -770,7 +772,8 @@ impl Render for NativeShell {
                     .top(px(4.))
                     .right(px(4.))
                     .max_w(px(560.))
-                    .max_h(px(28.))
+                    .max_h(px(64.))
+                    .flex_col()
                     .overflow_hidden()
                     .occlude()
                     .px_2()
@@ -792,6 +795,11 @@ impl Render for NativeShell {
                         }),
                     )
                     .child(label)
+                    .child(gpui::div().text_size(px(11.)).child(if self.guarded_file_mode {
+                        "Guarded native Save; Lisp save-buffer remains ordinary"
+                    } else {
+                        "Ordinary native/Lisp visited save"
+                    }))
                     .child(format!(
                         " • {}",
                         self.command.read(cx).notice.as_ref().map_or_else(

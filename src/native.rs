@@ -17,11 +17,12 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
+pub(crate) fn run(sources: Vec<String>, native_file: Option<std::path::PathBuf>) -> Result<(), ()> {
     if sources.len() > 64 || sources.iter().any(|s| s.len() > 65_536) {
         eprintln!("native startup permits at most 64 sources of at most 65536 bytes each");
         return Err(());
     }
+    let guarded_file_mode = native_file.is_some();
     let failed = Arc::new(AtomicBool::new(false));
     let startup_failed = failed.clone();
     Application::new().run(move |cx: &mut App| {
@@ -68,7 +69,9 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
             let keepalive = publisher;
             let mut unbound = Some(owner);
             let result = (|| -> Result<(), (String, Vec<OwnerEvent>)> {
-                with_lisp_runtime_owner(80, 24, |host| {
+                with_lisp_runtime_owner(80, 24, |mut host| {
+                    prepare_explicit_file(&mut host, native_file.as_deref())
+                        .map_err(anyhow::Error::msg)?;
                     let bridge = EditorBridge::new(host, metrics, bounds)
                         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
                     let owner = unbound.take().expect("owner binds once");
@@ -80,37 +83,35 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                             return Err(anyhow::anyhow!("native IME initialization failed"));
                         }
                     };
-                    worker
-                        .with_interruptible_evaluator(evaluate_source_with_quit, owner_quit)
-                        .with_visited_saver(save_selected_visited)
-                        .run_with_outcome(|step| {
-                            if let Some(evaluation) = step.evaluation {
-                                if let Err(error) = &evaluation.outcome {
-                                    eprintln!(
-                                        "native evaluation {}: {error}",
-                                        evaluation.request_id
-                                    );
-                                }
-                                owner_reports.evaluation(evaluation);
+                    configure_native_saver(
+                        worker.with_interruptible_evaluator(evaluate_source_with_quit, owner_quit),
+                        guarded_file_mode,
+                    )
+                    .run_with_outcome(|step| {
+                        if let Some(evaluation) = step.evaluation {
+                            if let Err(error) = &evaluation.outcome {
+                                eprintln!("native evaluation {}: {error}", evaluation.request_id);
                             }
-                            if let Some(save) = step.save {
-                                owner_reports.save(save);
-                            }
-                            if let Err(error) = step.edit {
-                                eprintln!("native owner input: {error:?}");
-                                owner_reports.notice(format!("Owner input: {error:?}"));
-                            }
-                            if let Some(error) = step.render_error {
-                                eprintln!("native publication after input: {error:?}");
-                                owner_reports
-                                    .notice(format!("Publication after input failed: {error:?}"));
-                            }
-                        })
-                        .map_err(|error| {
-                            *report.lock().expect("startup failure slot") =
-                                Some((format!("{:?}", error.error), error.undelivered));
-                            anyhow::anyhow!("native owner stopped")
-                        })
+                            owner_reports.evaluation(evaluation);
+                        }
+                        if let Some(save) = step.save {
+                            owner_reports.save(save);
+                        }
+                        if let Err(error) = step.edit {
+                            eprintln!("native owner input: {error:?}");
+                            owner_reports.notice(format!("Owner input: {error:?}"));
+                        }
+                        if let Some(error) = step.render_error {
+                            eprintln!("native publication after input: {error:?}");
+                            owner_reports
+                                .notice(format!("Publication after input failed: {error:?}"));
+                        }
+                    })
+                    .map_err(|error| {
+                        *report.lock().expect("startup failure slot") =
+                            Some((format!("{:?}", error.error), error.undelivered));
+                        anyhow::anyhow!("native owner stopped")
+                    })
                 })
                 .map_err(|error| (error.to_string(), vec![]))
             })();
@@ -214,6 +215,7 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                                 reports,
                                 report_updates,
                                 evaluation_quit,
+                                guarded_file_mode,
                                 window,
                                 cx,
                             )
@@ -233,6 +235,57 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
     });
     if failed.load(Ordering::Relaxed) { Err(()) } else { Ok(()) }
 }
+const MAX_NATIVE_FILE_BYTES: usize = 16 * 1024 * 1024;
+fn prepare_explicit_file(
+    host: &mut LispRuntimeHost<'_, '_, '_>,
+    path: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if let Some(path) = path {
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "visited".into());
+        let label = format!(
+            "file: {}",
+            filename
+                .chars()
+                .map(|c| if c.is_control() { '�' } else { c })
+                .take(255)
+                .collect::<String>()
+        );
+        host.open_selected_trusted_file(&label, path, MAX_NATIVE_FILE_BYTES)?;
+    }
+    Ok(())
+}
+fn configure_native_saver<'a, 'roots, 'env>(
+    worker: rune_gpui::editor_transport::NativeEditorWorker<LispRuntimeHost<'a, 'roots, 'env>>,
+    guarded: bool,
+) -> rune_gpui::editor_transport::NativeEditorWorker<LispRuntimeHost<'a, 'roots, 'env>> {
+    if guarded {
+        worker.with_visited_saver(save_selected_guarded_visited)
+    } else {
+        worker.with_visited_saver(save_selected_visited)
+    }
+}
+fn save_selected_guarded_visited(
+    host: &mut LispRuntimeHost<'_, '_, '_>,
+    max_bytes: usize,
+) -> Result<rune_gpui::editor_transport::VisitedSave, String> {
+    let saved = host.save_selected_guarded_visited(max_bytes)?;
+    Ok(rune_gpui::editor_transport::VisitedSave {
+        kind: match saved.kind {
+            crate::editor_document::SaveKind::Saved => {
+                rune_gpui::editor_transport::VisitedSaveKind::Saved
+            }
+            crate::editor_document::SaveKind::Unchanged => {
+                rune_gpui::editor_transport::VisitedSaveKind::Unchanged
+            }
+        },
+        path: saved.path,
+        bytes: saved.bytes,
+    })
+}
+
 fn evaluate_source(host: &mut LispRuntimeHost<'_, '_, '_>, source: &str) -> Result<(), String> {
     host.evaluate_source(source)
 }
@@ -266,7 +319,7 @@ fn evaluate_source_with_quit(
 #[cfg(test)]
 mod joined_owner_tests {
     use super::*;
-    use rune_editor::Document;
+    use rune_editor::{Document, EditorHost};
 
     #[test]
     fn actual_persistent_lisp_host_runs_fifo_with_partial_error_and_native_undo() {
@@ -403,7 +456,125 @@ mod joined_owner_tests {
     }
     #[test]
     fn startup_source_caps_reject_before_application_or_window_creation() {
-        assert!(run(vec![String::new(); 65]).is_err());
-        assert!(run(vec!["x".repeat(65_537)]).is_err());
+        assert!(run(vec![String::new(); 65], None).is_err());
+        assert!(run(vec!["x".repeat(65_537)], None).is_err());
+    }
+    struct OwnedStartupDirectory(std::path::PathBuf);
+    impl OwnedStartupDirectory {
+        fn new() -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("rune-native-open-{}-{stamp}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for OwnedStartupDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn explicit_open_failure_rejects_original_queued_requests_once_before_bind() {
+        use std::{cell::Cell, sync::mpsc::TrySendError};
+        let dir = OwnedStartupDirectory::new();
+        let missing = dir.0.join("missing");
+        let (publisher, mut updates) = host_updates();
+        let keepalive = publisher.clone();
+        let (sender, mut replies, pending) = pending_editor_transport(4, publisher);
+        for (id, source) in [(101, "(insert \"not-run λ🙂\")"), (102, "(setq never-run t)")] {
+            sender
+                .try_send(OwnerEvent::Evaluate { request_id: id, source: source.into() })
+                .unwrap();
+        }
+        let mut unbound = Some(pending);
+        let bound = Cell::new(false);
+        let result = with_lisp_runtime_owner(80, 24, |mut host| {
+            prepare_explicit_file(&mut host, Some(&missing)).map_err(anyhow::Error::msg)?;
+            bound.set(true);
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!bound.get());
+        let rejected = unbound.take().unwrap().reject_unbound();
+        assert_eq!(rejected.len(), 2);
+        assert!(
+            matches!(&rejected[0],OwnerEvent::Evaluate{request_id:101,source}if source=="(insert \"not-run λ🙂\")")
+        );
+        assert!(
+            matches!(&rejected[1],OwnerEvent::Evaluate{request_id:102,source}if source=="(setq never-run t)")
+        );
+        assert!(
+            matches!(sender.try_send(OwnerEvent::Evaluate{request_id:103,source:"late".into()}),Err(TrySendError::Disconnected(OwnerEvent::Evaluate{request_id:103,source}))if source=="late")
+        );
+        assert!(replies.take().is_none());
+        // A failure record exists before the last publication handle closes.
+        let failure_record = (result.unwrap_err().to_string(), rejected);
+        assert!(!failure_record.0.is_empty());
+        drop(keepalive);
+        use std::{
+            future::Future,
+            task::{Context as TaskContext, Poll, Waker},
+        };
+        let mut next = std::pin::pin!(updates.next());
+        let mut cx = TaskContext::from_waker(Waker::noop());
+        assert!(matches!(next.as_mut().poll(&mut cx), Poll::Ready(None)));
+    }
+    #[test]
+    fn explicit_file_policy_uses_guarded_native_save_and_does_not_force_conflict() {
+        for guarded in [true, false] {
+            let dir = OwnedStartupDirectory::new();
+            let path = dir.0.join("file.txt");
+            std::fs::write(&path, "original").unwrap();
+            with_lisp_runtime_owner(80, 24, |mut host| {
+                prepare_explicit_file(&mut host, Some(&path)).map_err(anyhow::Error::msg)?;
+                let (publisher, _updates) = host_updates();
+                let (sender, _replies, pending) = pending_editor_transport(4, publisher);
+                let bridge = EditorBridge::new(
+                    host,
+                    FixedMetrics::default(),
+                    Rect { x: 0., y: 0., width: 640., height: 480. },
+                )
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                let worker = pending
+                    .bind_initialized(bridge)
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                    .with_evaluator(evaluate_source);
+                let mut worker = configure_native_saver(worker, guarded);
+                sender
+                    .try_send(OwnerEvent::Evaluate {
+                        request_id: 1,
+                        source: "(erase-buffer) (insert \"edited\")".into(),
+                    })
+                    .unwrap();
+                assert!(worker.try_step().unwrap().evaluation.unwrap().outcome.is_ok());
+                std::fs::write(&path, "external")?;
+                sender
+                    .try_send(OwnerEvent::SaveVisited { request_id: 2, max_bytes: 64 })
+                    .unwrap();
+                let reply = worker.try_step().unwrap().save.unwrap();
+                if guarded {
+                    assert!(reply.outcome.is_err());
+                    assert_eq!(std::fs::read_to_string(&path)?, "external");
+                    std::fs::remove_file(&path)?;
+                    sender
+                        .try_send(OwnerEvent::SaveVisited { request_id: 3, max_bytes: 64 })
+                        .unwrap();
+                    assert!(worker.try_step().unwrap().save.unwrap().outcome.is_err());
+                    assert!(!path.exists());
+                } else {
+                    assert_eq!(
+                        reply.outcome.unwrap().kind,
+                        rune_gpui::editor_transport::VisitedSaveKind::Saved
+                    );
+                    assert_eq!(std::fs::read_to_string(&path)?, "edited");
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
     }
 }

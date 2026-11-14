@@ -137,3 +137,24 @@ Lisp current-buffer binding, frame failure, retry without I/O, clean external
 content preservation, missing-target recreation and later dirty edits. They are
 not OS shortcut, dialog or window tests. Existing symlink/nonregular targets are
 unsupported; the backend does not claim hostile-filesystem race resistance.
+
+### Explicit trusted file (opt-in)
+
+`rune --native --native-file existing.org` opens one existing UTF-8 regular file
+(up to 16 MiB) on the owner thread before the first editor frame. The path is
+explicit and lossless; no filename is guessed and file contents are not evaluated.
+Repeatable `--native-eval` sources run afterward in the same persistent owner.
+Missing, invalid UTF-8 or oversized files abort initialization; queued requests are
+returned as definitely undelivered, not acknowledged as executed.
+
+With this flag, **native Ctrl/Command-S only** uses the trusted baseline guard:
+detected external changes, an unknown baseline or a deleted target cause a visible failure,
+with no automatic overwrite, recreation or force retry. A concurrent writer can still
+change the target between the precommit check and rename; this is not atomic overwrite
+protection, even for non-hostile concurrent writers. The toolbar identifies this mode. Without the flag, ordinary visited-save behavior is unchanged. Crucially,
+Lisp `(save-buffer)` remains ordinary and unguarded even in this mode; the palette
+is not a sandbox. Ctrl/Command-Shift-S still reports unsupported Save As and writes
+nothing. This is plain text editing, not an Org-mode or email client implementation.
+
+The explicit-open and guarded-save pipeline has linked headless owner tests.
+Actual native window rendering, OS keyboard/IME and scrolling remain unverified.
