@@ -7,6 +7,8 @@ use anyhow::{Result, anyhow};
 use rune_macros::Trace;
 use std::sync::{LazyLock, Mutex};
 
+mod quit;
+pub(crate) use quit::QuitTokenGuard;
 mod stack;
 mod symbol_map;
 pub(crate) use stack::*;
@@ -38,6 +40,8 @@ pub(crate) struct Env<'a> {
     pub(crate) current_buffer: OwnerBufferHandle,
     #[no_trace]
     editor_gateway: RuntimeEditorGateway,
+    #[no_trace]
+    quit: quit::QuitControl,
     pub(crate) stack: LispStack<'a>,
 }
 
@@ -61,6 +65,7 @@ impl<'a> Env<'a> {
             features: Default::default(),
             current_buffer,
             editor_gateway,
+            quit: Default::default(),
             stack: Default::default(),
         })
     }
@@ -85,6 +90,27 @@ impl<'a> Env<'a> {
 
 // RootedEnv created by #[derive(Trace)]
 impl<'a> RootedEnv<'a> {
+    pub(crate) fn install_quit_token(
+        &self,
+        token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> QuitTokenGuard {
+        self.quit.install(token)
+    }
+    pub(crate) fn poll_quit(&self, cx: &Context) -> Result<(), crate::eval::EvalError> {
+        let inhibited = self.vars.get(sym::INHIBIT_QUIT).is_some_and(|v| !v.bind(cx).is_nil());
+        if self.quit.consume(inhibited) {
+            return Err(crate::eval::EvalError::signal(
+                sym::QUIT.into(),
+                crate::core::object::NIL,
+                cx,
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn inhibit_cleanup_quit(&self) -> quit::CleanupGuard {
+        self.quit.cleanup()
+    }
+
     pub(crate) fn has_feature(&self, feature: Symbol, cx: &Context) -> bool {
         if feature.get().interned() {
             return INTERNED_FEATURES.lock().unwrap().0.contains(&feature);

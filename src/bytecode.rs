@@ -338,13 +338,47 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 if matches!(&err.error, ErrorType::Throw(_)) {
                     continue;
                 }
+                if err.is_quit(cx) {
+                    let accepts = match handler.condition.untag() {
+                        ObjectType::Symbol(sym::QUIT) => true,
+                        ObjectType::Cons(list) => {
+                            list.into_iter().any(|c| c.is_ok_and(|c| c == sym::QUIT))
+                        }
+                        _ => false,
+                    };
+                    if !accepts {
+                        continue;
+                    }
+                } else {
+                    let quit_only = match handler.condition.untag() {
+                        ObjectType::Cons(list) => {
+                            let mut any = false;
+                            let mut other = false;
+                            for item in list {
+                                let item = item?;
+                                any |= item == sym::QUIT;
+                                other |= item != sym::QUIT;
+                            }
+                            any && !other
+                        }
+                        _ => false,
+                    };
+                    if quit_only {
+                        continue;
+                    }
+                }
                 match handler.condition.untag() {
+                    ObjectType::Symbol(sym::QUIT) if err.is_quit(cx) => {}
+                    ObjectType::Symbol(sym::QUIT) => continue,
                     ObjectType::Symbol(sym::ERROR) => {}
                     ObjectType::Cons(conditions) => {
                         for condition in conditions {
                             let condition = condition?;
                             // TODO: Handle different error symbols
-                            if condition != sym::DEBUG && condition != sym::ERROR {
+                            if condition != sym::DEBUG
+                                && condition != sym::ERROR
+                                && condition != sym::QUIT
+                            {
                                 bail_err!("non-error conditions {condition} not yet supported")
                             }
                         }
@@ -379,6 +413,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
         use crate::{alloc, arith, data, fns};
         use opcode::OpCode as op;
         loop {
+            self.env.poll_quit(cx)?;
             let instruction = self.pc.fetch().map_err(anyhow::Error::from)?;
             let op = instruction.opcode;
             self.check_instruction_stack(instruction)?;
@@ -2062,6 +2097,47 @@ mod test {
             let error = call(bytecode, 0, "nonsymbol-constant", frame, cx).unwrap_err();
             assert!(matches!(error.error, ErrorType::Err(_)));
         }
+    }
+
+    #[test]
+    fn pending_quit_vm_safe_point_resumes_quit_handler() {
+        use OpCode as O;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let condition = Cons::new1(sym::QUIT, cx);
+        make_bytecode!(
+            bytecode,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                9,
+                0,
+                O::Constant2,
+                O::VarSet1,
+                O::Constant2,
+                O::PopHandler,
+                O::Return,
+                O::Constant3,
+                O::Return
+            ],
+            [condition, sym::INHIBIT_QUIT, NIL, 7],
+            cx
+        );
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        env.set_var(sym::INHIBIT_QUIT, crate::core::object::TRUE).unwrap();
+        let token = Arc::new(AtomicBool::new(true));
+        let _scope = env.install_quit_token(token.clone());
+        let mut frame = CallFrame::new(env);
+        frame.finalize_arguments().unwrap();
+        assert_eq!(call(bytecode, 0, "quit-safe-point", &mut frame, cx).unwrap(), Object::from(7));
+        assert!(!token.load(Ordering::Relaxed));
+        assert_eq!(frame.binding_depth(), 0);
     }
 
     #[test]

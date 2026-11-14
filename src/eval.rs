@@ -138,6 +138,10 @@ impl EvalError {
         Self { backtrace: Vec::new(), error: ErrorType::Err(error) }
     }
 
+    pub(crate) fn is_quit(&self, cx: &Context) -> bool {
+        matches!(&self.error, ErrorType::Signal(payload) if payload.condition(cx).car() == sym::QUIT)
+    }
+
     pub(crate) fn signal(error_symbol: Object, data: Object, cx: &Context) -> Self {
         Self {
             backtrace: Vec::new(),
@@ -883,3 +887,7 @@ mod checked_argument_tests {
         assert!(result.is_nil());
     }
 }
+
+// QUIT is not an ERROR subtype.
+defsym!(QUIT);
+defvar!(INHIBIT_QUIT);

@@ -45,6 +45,7 @@ pub(crate) fn eval<'ob>(
 
 impl Interpreter<'_, '_> {
     fn eval_form<'ob>(&mut self, rt: &Rto<Object>, cx: &'ob mut Context) -> EvalResult<'ob> {
+        self.env.poll_quit(cx)?;
         match rt.untag(cx) {
             ObjectType::Symbol(sym) => self.var_ref(sym, cx),
             ObjectType::Cons(_) => {
@@ -641,10 +642,12 @@ impl Interpreter<'_, '_> {
         match self.eval_form(body, cx) {
             Ok(x) => {
                 root!(x, cx);
+                let _cleanup = self.env.inhibit_cleanup_quit();
                 self.implicit_progn(forms, cx)?;
                 Ok(x.bind(cx))
             }
             Err(e) => {
+                let _cleanup = self.env.inhibit_cleanup_quit();
                 self.implicit_progn(forms, cx)?;
                 Err(e)
             }
@@ -694,7 +697,38 @@ impl Interpreter<'_, '_> {
                 ObjectType::Cons(cons) => {
                     // Check that conditions match
                     let condition = cons.car();
+                    if err.is_quit(cx) {
+                        let accepts = match condition.untag() {
+                            ObjectType::Symbol(sym::QUIT) => true,
+                            ObjectType::Cons(list) => {
+                                list.into_iter().any(|c| c.is_ok_and(|c| c == sym::QUIT))
+                            }
+                            _ => false,
+                        };
+                        if !accepts {
+                            continue;
+                        }
+                    } else {
+                        let quit_only = match condition.untag() {
+                            ObjectType::Cons(list) => {
+                                let mut any = false;
+                                let mut other = false;
+                                for item in list {
+                                    let item = item?;
+                                    any |= item == sym::QUIT;
+                                    other |= item != sym::QUIT;
+                                }
+                                any && !other
+                            }
+                            _ => false,
+                        };
+                        if quit_only {
+                            continue;
+                        }
+                    }
                     match condition.untag() {
+                        ObjectType::Symbol(sym::QUIT) if err.is_quit(cx) => {}
+                        ObjectType::Symbol(sym::QUIT) => continue,
                         ObjectType::Symbol(sym::ERROR | sym::VOID_VARIABLE) => {}
                         // TODO: Remove this once error handling is correctly implemented
                         ObjectType::Symbol(s) if s.name() == "cl--generic-cyclic-definition" => {}
@@ -702,7 +736,10 @@ impl Interpreter<'_, '_> {
                             for condition in conditions {
                                 let condition = condition?;
                                 // TODO: Handle different error symbols
-                                if condition != sym::DEBUG && condition != sym::ERROR {
+                                if condition != sym::DEBUG
+                                    && condition != sym::ERROR
+                                    && condition != sym::QUIT
+                                {
                                     bail_err!("non-error conditions {condition} not yet supported")
                                 }
                             }
@@ -1003,6 +1040,47 @@ mod test {
         let obj = crate::reader::read(test_str, cx).unwrap().0;
         root!(obj, cx);
         assert!(eval(obj, None, env, cx).is_err());
+    }
+
+    #[test]
+    fn pending_quit_waits_for_inhibit_and_runs_cleanup_before_handler() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        env.set_var(sym::INHIBIT_QUIT, TRUE).unwrap();
+        let token = Arc::new(AtomicBool::new(true));
+        let scope = env.install_quit_token(token.clone());
+        let form = crate::reader::read("(condition-case nil (unwind-protect (progn (setq inhibit-quit nil) 1) (setq quit-clean 7)) (error 'wrong) (quit quit-clean))", cx).unwrap().0;
+        root!(form, cx);
+        assert_eq!(eval(form, None, env, cx).unwrap(), Object::from(7_i64));
+        assert!(!token.load(Ordering::Relaxed));
+        drop(scope);
+        assert_eq!(env.binding_depth(), 0);
+        let form = crate::reader::read("(+ 1 2)", cx).unwrap().0;
+        root!(form, cx);
+        assert_eq!(eval(form, None, env, cx).unwrap(), Object::from(3_i64));
+    }
+
+    #[test]
+    fn quit_is_not_error_and_cleanup_preserves_exit() {
+        for (source, expected) in [
+            ("(condition-case q (signal 'quit nil) (error 'wrong) (quit (car q)))", "quit"),
+            (
+                "(condition-case nil (condition-case nil (error \"x\") ((quit) 'wrong)) (error 'right))",
+                "right",
+            ),
+            (
+                "(progn (setq quit-clean 0) (list (condition-case nil (unwind-protect (signal 'quit nil) (setq quit-clean 1)) (quit 'stopped)) quit-clean))",
+                "(stopped 1)",
+            ),
+        ] {
+            assert_lisp(source, expected);
+        }
     }
 
     #[test]
