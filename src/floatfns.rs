@@ -162,48 +162,68 @@ where
 }
 
 #[defun]
-fn floor(num: Number, divisor: Option<Number>) -> Result<NumberValue> {
-    rounding_driver(
+fn floor<'ob>(num: Number<'ob>, divisor: Option<Number>, cx: &'ob Context) -> Result<Object<'ob>> {
+    if divisor.is_none() && !num.is_float() {
+        return Ok(num.as_obj_copy());
+    }
+    Ok(cx.add(rounding_driver(
         num.val(),
         divisor.map(|d| d.val()),
         |f| f.floor(),
         |n, d| num_integer::Integer::div_floor(&n, &d),
         |n, d| n.div_floor(&d),
-    )
+    )?))
 }
 
 #[defun]
-fn ceiling(num: Number, divisor: Option<Number>) -> Result<NumberValue> {
-    rounding_driver(
+fn ceiling<'ob>(
+    num: Number<'ob>,
+    divisor: Option<Number>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    if divisor.is_none() && !num.is_float() {
+        return Ok(num.as_obj_copy());
+    }
+    Ok(cx.add(rounding_driver(
         num.val(),
         divisor.map(|d| d.val()),
         |f| f.ceil(),
         |n, d| num_integer::Integer::div_ceil(&n, &d),
         |n, d| n.div_ceil(&d),
-    )
+    )?))
 }
 
 #[defun]
-fn round(num: Number, divisor: Option<Number>) -> Result<NumberValue> {
-    rounding_driver(
+fn round<'ob>(num: Number<'ob>, divisor: Option<Number>, cx: &'ob Context) -> Result<Object<'ob>> {
+    if divisor.is_none() && !num.is_float() {
+        return Ok(num.as_obj_copy());
+    }
+    Ok(cx.add(rounding_driver(
         num.val(),
         divisor.map(|d| d.val()), //
         // Use the same even-midpoint policy as the exact divisor path.
         |f| f.round_ties_even(),
         round2,
         round2,
-    )
+    )?))
 }
 
 #[defun]
-fn truncate(num: Number, divisor: Option<Number>) -> Result<NumberValue> {
-    rounding_driver(
+fn truncate<'ob>(
+    num: Number<'ob>,
+    divisor: Option<Number>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    if divisor.is_none() && !num.is_float() {
+        return Ok(num.as_obj_copy());
+    }
+    Ok(cx.add(rounding_driver(
         num.val(),
         divisor.map(|d| d.val()), //
         |f| f,
         |n, d| n.div(&d),
         |n, d| n.div(&d),
-    )
+    )?))
 }
 
 #[defun]
@@ -370,6 +390,22 @@ mod m0_rounding_regressions {
     use crate::interpreter::assert_lisp;
 
     #[test]
+    fn unary_integer_rounding_preserves_existing_bignum_objects() {
+        for operation in ["floor", "ceiling", "round", "truncate"] {
+            for value in ["18446744073709551616", "-18446744073709551616"] {
+                for divisor in ["", " nil"] {
+                    assert_lisp(
+                        &format!(
+                            "(let ((x {value})) (let ((y ({operation} x{divisor}))) (garbage-collect) (eq x y)))"
+                        ),
+                        "t",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sign_preserving_primitives_retain_heap_number_identity() {
         for source in [
             "(let ((x 1.5)) (eq x (float x)))",
@@ -528,18 +564,18 @@ mod m0_nonfinite_rounding_regressions {
         for operation in [floor, ceiling, round, truncate] {
             for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
                 let value = cx.add_as(value);
-                assert!(operation(value, None).is_err());
-                assert!(operation(value, Some(1_i64.into())).is_err());
+                assert!(operation(value, None, &cx).is_err());
+                assert!(operation(value, Some(1_i64.into()), &cx).is_err());
                 if matches!(value.untag(), NumberType::Float(f) if f.is_nan()) {
-                    assert!(operation(1_i64.into(), Some(value)).is_err());
+                    assert!(operation(1_i64.into(), Some(value), &cx).is_err());
                 }
             }
             for infinity in [f64::INFINITY, f64::NEG_INFINITY] {
                 assert_eq!(
-                    operation(5_i64.into(), Some(cx.add_as(infinity))).unwrap(),
-                    NumberValue::Int(0)
+                    operation(5_i64.into(), Some(cx.add_as(infinity)), &cx).unwrap(),
+                    Object::from(0_i64)
                 );
-                assert!(operation(cx.add_as(infinity), Some(cx.add_as(infinity))).is_err());
+                assert!(operation(cx.add_as(infinity), Some(cx.add_as(infinity)), &cx).is_err());
             }
         }
         drop(cx);
