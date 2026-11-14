@@ -5,7 +5,6 @@ use crate::core::error::{Type, TypeError};
 use crate::core::gc::{Rt, Rto};
 use crate::core::object::{
     FnArgs, Function, HeapDomainValue, LispString, NIL, ObjectType, Symbol, TagType, WithLifetime,
-    display_slice,
 };
 use crate::core::{
     gc::Context,
@@ -80,6 +79,60 @@ impl Display for EvalError {
     }
 }
 
+// Error-path diagnostics must not invoke general Lisp printers: ByteFn
+// constants may point back to the function, container locks may already be
+// held, and even an acyclic argument graph may be arbitrarily deep/large.
+const DIAGNOSTIC_ARGUMENTS: usize = 16;
+const DIAGNOSTIC_CHARACTERS: usize = 64;
+
+fn diagnostic_text(text: &str) -> String {
+    let mut characters = text.chars();
+    let mut output: String = characters
+        .by_ref()
+        .take(DIAGNOSTIC_CHARACTERS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if characters.next().is_some() {
+        output.push('…');
+    }
+    output
+}
+
+fn diagnostic_object(object: Object) -> String {
+    match object.untag() {
+        ObjectType::Int(value) => value.to_string(),
+        ObjectType::Symbol(value) => diagnostic_text(value.name()),
+        ObjectType::String(value) => format!("\"{}\"", diagnostic_text(value)),
+        // Type labels inspect only the tag: never follow graph edges, acquire
+        // a Lisp container mutex, or format arbitrarily large integer payloads.
+        value => format!("<{:?}>", value.get_type()),
+    }
+}
+
+fn diagnostic_arguments(arguments: &[Rto<Object>]) -> String {
+    let mut output = String::from("[");
+    for (index, argument) in arguments.iter().take(DIAGNOSTIC_ARGUMENTS).enumerate() {
+        if index != 0 {
+            output.push(' ');
+        }
+        // SAFETY: this synchronous diagnostic path never collects, invokes
+        // Lisp/extension callbacks, or retains the copied value. Rooted call
+        // arguments remain in their owning thread; only bounded primitive
+        // reads or tag inspection occur before the borrow ends.
+        let object = unsafe { argument.bind_unchecked() };
+        output.push_str(&diagnostic_object(object));
+    }
+    if arguments.len() > DIAGNOSTIC_ARGUMENTS {
+        output.push_str(" …");
+    }
+    output.push(']');
+    output
+}
+
+fn diagnostic_trace(name: &str, arguments: &[Rto<Object>]) -> Box<str> {
+    format!("{} {}", diagnostic_text(name), diagnostic_arguments(arguments)).into_boxed_str()
+}
+
 impl EvalError {
     pub(crate) fn new_error(error: anyhow::Error) -> Self {
         Self { backtrace: Vec::new(), error: ErrorType::Err(error) }
@@ -101,14 +154,12 @@ impl EvalError {
     }
 
     pub(crate) fn with_trace(error: anyhow::Error, name: &str, args: &[Rto<Object>]) -> Self {
-        let display = display_slice(args);
-        let trace = format!("{name} {display}").into_boxed_str();
+        let trace = diagnostic_trace(name, args);
         Self { backtrace: vec![trace], error: ErrorType::Err(error) }
     }
 
     pub(crate) fn add_trace(mut self, name: &str, args: &[Rto<Object>]) -> Self {
-        let display = display_slice(args);
-        self.backtrace.push(format!("{name} {display}").into_boxed_str());
+        self.backtrace.push(diagnostic_trace(name, args));
         self
     }
 
@@ -180,23 +231,31 @@ pub(crate) fn apply<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob mut Context,
 ) -> Result<Object<'ob>> {
-    let arg_slice = env.stack.arg_slice(arguments);
-    if !arg_slice.is_empty() {
-        let last = arg_slice.last().unwrap().bind(cx);
-        let len = env.stack.len();
-        let beg = len - arg_slice.len();
-        let end = len - 1;
-        env.stack.extend_as_vec_from_within(beg..end);
-        for element in last.as_list()? {
-            let e = cx.bind(element?);
-            env.stack.push(e);
+    // Stage without mutating the caller stack. Improper lists, count overflow,
+    // and reservation failures cannot leave a partially appended call behind.
+    root!(staged, new(Vec), cx);
+    let arguments = env.stack.arg_slice(arguments);
+    if let Some((tail, prefix)) = arguments.split_last() {
+        ensure!(
+            prefix.len() <= usize::from(u16::MAX),
+            "Call argument count exceeds supported range"
+        );
+        staged.bind_mut(cx).try_reserve(prefix.len())?;
+        for argument in prefix {
+            staged.push(argument.bind(cx));
         }
-        let args = env.stack.len() - len;
-        let frame = &mut CallFrame::new_with_args(env, args);
-        function.call(frame, None, cx).map_err(Into::into)
-    } else {
-        function.call(&mut CallFrame::new(env), None, cx).map_err(Into::into)
+        for element in tail.bind(cx).as_list()? {
+            ensure!(
+                staged.len() < usize::from(u16::MAX),
+                "Call argument count exceeds supported range"
+            );
+            staged.bind_mut(cx).try_reserve(1)?;
+            staged.push(element?);
+        }
     }
+    let mut frame = CallFrame::new(env);
+    frame.push_arg_slice(Rt::bind_slice(staged, cx));
+    function.call(&mut frame, None, cx).map_err(Into::into)
 }
 
 #[defun]
@@ -206,10 +265,16 @@ pub(crate) fn funcall<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob mut Context,
 ) -> Result<Object<'ob>> {
-    let beg = env.stack.len() - arguments.len();
-    env.stack.extend_as_vec_from_within(beg..);
-    let frame = &mut CallFrame::new_with_args(env, arguments.len());
-    function.call(frame, None, cx).map_err(Into::into)
+    let count = arguments.len();
+    ensure!(count <= usize::from(u16::MAX), "Call argument count exceeds supported range");
+    root!(staged, new(Vec), cx);
+    staged.bind_mut(cx).try_reserve(count)?;
+    for argument in env.stack.arg_slice(arguments) {
+        staged.push(argument.bind(cx));
+    }
+    let mut frame = CallFrame::new(env);
+    frame.push_arg_slice(Rt::bind_slice(staged, cx));
+    function.call(&mut frame, None, cx).map_err(Into::into)
 }
 
 #[defun]
@@ -260,10 +325,14 @@ fn run_hook_with_args<'ob>(
                         rooted_iter!(hooks, hook_list, cx);
                         while let Some(hook) = hooks.next()? {
                             let func: &Rto<Function> = hook.try_as()?;
-                            let beg = env.stack.len() - args.len();
-                            env.stack.extend_as_vec_from_within(beg..);
-                            let frame = &mut CallFrame::new_with_args(env, args.len());
-                            func.call(frame, None, cx)?;
+                            root!(staged, new(Vec), cx);
+                            staged.bind_mut(cx).try_reserve(args.len())?;
+                            for argument in env.stack.arg_slice(args) {
+                                staged.push(argument.bind(cx));
+                            }
+                            let mut frame = CallFrame::new(env);
+                            frame.push_arg_slice(Rt::bind_slice(staged, cx));
+                            func.call(&mut frame, None, cx)?;
                         }
                     }
                     ObjectType::NIL => {}
@@ -434,7 +503,7 @@ pub(crate) fn throw_value(
     if env.catch_stack.iter().any(|entry| entry.bind(cx).ptr_eq(tag)) {
         EvalError::throw(tag, value, cx)
     } else {
-        EvalError::new_error(anyhow!("No catch for {tag}"))
+        EvalError::new_error(anyhow!("No catch for {}", diagnostic_object(tag)))
     }
 }
 
@@ -486,7 +555,7 @@ impl Rto<Function<'_>> {
     ) -> EvalResult<'ob> {
         debug!("calling: {self}");
         let name = name.unwrap_or("lambda");
-        frame.finalize_arguments();
+        frame.finalize_arguments()?;
         let arg_cnt = frame.arg_count();
         cx.garbage_collect(false);
         match self.untag(cx) {
@@ -653,5 +722,164 @@ mod pending_exit_tests {
         })
         .join()
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod exit_diagnostic_tests {
+    use super::*;
+    use crate::core::{gc::RootSet, object::IntoObject};
+
+    #[test]
+    fn diagnostics_do_not_traverse_self_referential_bytecode_constants() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let constants = vec![NIL].into_obj(&cx.block);
+        root!(constants, cx);
+        let codes = vec![135u8].into_obj(&cx.block);
+        let function = crate::alloc::make_byte_code(
+            0,
+            codes.untag(),
+            constants.bind(cx).untag(),
+            1,
+            None,
+            None,
+            &[],
+            cx,
+        )
+        .unwrap();
+        root!(function, cx);
+        constants.bind(cx).untag().try_mut().unwrap()[0].set(function.bind(cx).into());
+        root!(env, new(Env), cx);
+        let mut frame = CallFrame::new(env);
+        frame.push_arg(Object::from(function.bind(cx)));
+        frame.finalize_arguments().unwrap();
+        let throwing = EvalError::throw(Object::from(17), function.bind(cx).into(), cx)
+            .add_trace("throw", frame.arg_slice());
+        assert_eq!(&*throwing.backtrace[0], "throw [<Func>]");
+        let ErrorType::Throw(payload) = &throwing.error else { panic!("expected throw") };
+        assert!(payload.bind(cx).unwrap().cdr().ptr_eq(Object::from(function.bind(cx))));
+        let signal = EvalError::signal(sym::ERROR.into(), function.bind(cx).into(), cx)
+            .add_trace("signal", frame.arg_slice());
+        assert_eq!(&*signal.backtrace[0], "signal [<Func>]");
+        let host = EvalError::with_trace(anyhow!("host diagnostic"), "host", frame.arg_slice());
+        assert_eq!(&*host.backtrace[0], "host [<Func>]");
+        let unmatched = throw_value(function.bind(cx).into(), NIL, &mut frame, cx);
+        assert!(unmatched.to_string().contains("No catch for <Func>"));
+    }
+
+    #[test]
+    fn argument_and_text_diagnostics_are_bounded_and_escape_control_characters() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, new(Env), cx);
+        let mut frame = CallFrame::new(env);
+        let text = "界\n".repeat(1000);
+        for _ in 0..100 {
+            frame.push_arg(cx.add(text.as_str()));
+        }
+        frame.finalize_arguments().unwrap();
+        let error = EvalError::with_trace(
+            anyhow!("host diagnostic"),
+            &"name".repeat(1000),
+            frame.arg_slice(),
+        );
+        let trace = &error.backtrace[0];
+        assert!(trace.len() < 12_000);
+        assert!(trace.contains('…'));
+        assert!(trace.contains("\\n"));
+        assert!(!trace.contains('\n'));
+        assert_eq!(trace.matches('"').count(), DIAGNOSTIC_ARGUMENTS * 2);
+    }
+}
+
+#[cfg(test)]
+mod checked_argument_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+
+    #[test]
+    fn checked_arguments_reject_oversized_apply_and_reuse_original_environment() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        let list = crate::fns::slice_into_list(&vec![NIL; usize::from(u16::MAX) + 1], None, cx);
+        root!(list, cx);
+        let function: Function = crate::core::env::intern("list", cx).into();
+        root!(function, cx);
+        for _ in 0..3 {
+            let mut frame = CallFrame::new(env);
+            frame.push_arg(Object::from(list.bind(cx)));
+            frame.finalize_arguments().unwrap();
+            let before = frame.stack.len();
+            let depth = frame.stack.current_frame();
+            let error = apply(function, ArgSlice::new(1), &mut frame, cx).unwrap_err();
+            assert!(error.to_string().contains("argument count exceeds supported range"));
+            assert_eq!(frame.stack.len(), before);
+            assert_eq!(frame.stack.current_frame(), depth);
+            assert_eq!(frame.arg_count(), 1);
+        }
+    }
+
+    #[test]
+    fn checked_arguments_maximum_apply_count_is_accepted() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        let list =
+            crate::fns::slice_into_list(&vec![Object::from(0); usize::from(u16::MAX)], None, cx);
+        root!(list, cx);
+        let function: Function = crate::core::env::intern("+", cx).into();
+        root!(function, cx);
+        let mut frame = CallFrame::new(env);
+        frame.push_arg(Object::from(list.bind(cx)));
+        frame.finalize_arguments().unwrap();
+        assert_eq!(apply(function, ArgSlice::new(1), &mut frame, cx).unwrap(), Object::from(0));
+        assert_eq!(frame.arg_count(), 1);
+    }
+
+    #[test]
+    fn checked_arguments_improper_apply_tail_does_not_append_partial_arguments() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        let function: Function = crate::core::env::intern("list", cx).into();
+        root!(function, cx);
+        let improper = Cons::new(Object::from(7), Object::from(9), cx);
+        root!(improper, cx);
+        let mut frame = CallFrame::new(env);
+        frame.push_arg(Object::from(3));
+        frame.push_arg(Object::from(improper.bind(cx)));
+        frame.finalize_arguments().unwrap();
+        let before = frame.stack.len();
+        assert!(apply(function, ArgSlice::new(2), &mut frame, cx).is_err());
+        assert_eq!(frame.stack.len(), before);
+        assert_eq!(frame.arg_count(), 2);
+    }
+
+    #[test]
+    fn checked_arguments_direct_native_call_overflow_is_a_lisp_error() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        let function: Function = crate::core::env::intern("list", cx).into();
+        root!(function, cx);
+        {
+            let mut frame = CallFrame::new(env);
+            for _ in 0..=u16::MAX {
+                frame.push_arg(NIL);
+            }
+            let error = function.call(&mut frame, Some("list"), cx).unwrap_err();
+            assert!(error.to_string().contains("argument count exceeds supported range"));
+        }
+        assert_eq!(env.stack.current_frame(), 0);
+        assert_eq!(env.stack.len(), 0);
+        let mut frame = CallFrame::new(env);
+        let result = function.call(&mut frame, Some("list"), cx).unwrap();
+        assert!(result.is_nil());
     }
 }

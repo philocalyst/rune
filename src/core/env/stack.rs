@@ -172,13 +172,25 @@ impl<'a> RootedLispStack<'a> {
         Ok(())
     }
 
-    pub(crate) fn push_frame(&mut self, arg_cnt: usize) {
-        assert!(arg_cnt <= self.len());
-        let start = self.len() - arg_cnt;
-        assert!(self.current.start <= start);
+    fn push_empty_frame(&mut self) {
         self.frames.push(FrameStore::new(self.current));
-        self.current =
-            Frame { start, arg_cnt: (u16::try_from(arg_cnt).unwrap(), false), ..Frame::default() };
+        self.current = Frame { start: self.len(), ..Frame::default() };
+    }
+
+    fn push_frame(&mut self, arg_cnt: usize, cx: &Context) -> Result<()> {
+        // Validate before publishing a frame: an error leaves every operand
+        // and the caller's argument metadata untouched.
+        ensure!(arg_cnt <= self.frame_len(), "Call arguments exceed current frame");
+        let count = u16::try_from(arg_cnt)
+            .map_err(|_| anyhow::anyhow!("Call argument count exceeds supported range"))?;
+        self.frames
+            .bind_mut(cx)
+            .try_reserve(1)
+            .map_err(|error| anyhow::anyhow!("Cannot reserve call frame: {error}"))?;
+        let start = self.len() - arg_cnt;
+        self.frames.push(FrameStore::new(self.current));
+        self.current = Frame { start, arg_cnt: (count, false), ..Frame::default() };
+        Ok(())
     }
 
     /// Remove all the stack variables in the current frame and switch to the
@@ -340,14 +352,19 @@ impl<'brw, 'rt> CallFrame<'brw, 'rt> {
     /// Create a new function call frame with a drop guard to be removed when
     /// this goes out of scope.
     pub(crate) fn new(env: &'brw mut Rt<super::Env<'rt>>) -> Self {
-        Self::new_with_args(env, 0)
+        env.stack.push_empty_frame();
+        Self { env }
     }
 
     /// Create a new function call frame with the top args on the stack. This
     /// frame will be removed when the `CallFrame` goes out of scope.
-    pub(crate) fn new_with_args(env: &'brw mut Rt<super::Env<'rt>>, args: usize) -> Self {
-        env.stack.push_frame(args);
-        Self { env }
+    pub(crate) fn new_with_args(
+        env: &'brw mut Rt<super::Env<'rt>>,
+        args: usize,
+        cx: &Context,
+    ) -> Result<Self> {
+        env.stack.push_frame(args, cx)?;
+        Ok(Self { env })
     }
 
     /// Push an argument onto the stack as part of this call frame
@@ -356,9 +373,11 @@ impl<'brw, 'rt> CallFrame<'brw, 'rt> {
     }
 
     /// Set the total argument count before a function call
-    pub(crate) fn finalize_arguments(&mut self) {
-        let args = self.env.stack.arg_count().try_into().unwrap();
+    pub(crate) fn finalize_arguments(&mut self) -> Result<()> {
+        let args = u16::try_from(self.env.stack.arg_count())
+            .map_err(|_| anyhow::anyhow!("Call argument count exceeds supported range"))?;
         self.env.stack.set_arg_count(args, false);
+        Ok(())
     }
 
     pub(crate) fn arg_count(&self) -> usize {
@@ -395,5 +414,50 @@ impl<'rt> Deref for CallFrame<'_, 'rt> {
 impl DerefMut for CallFrame<'_, '_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.env
+    }
+}
+
+#[cfg(test)]
+mod checked_argument_tests {
+    use super::*;
+    use crate::core::{env::Env, gc::RootSet};
+    use rune_core::macros::root;
+
+    #[test]
+    fn checked_arguments_boundary_finalization_is_atomic() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, new(Env), cx);
+        let mut frame = CallFrame::new(env);
+        for _ in 0..u16::MAX {
+            frame.push_arg(NIL);
+        }
+        frame.finalize_arguments().unwrap();
+        assert_eq!(frame.arg_count(), usize::from(u16::MAX));
+        frame.push_arg(NIL);
+        assert!(frame.finalize_arguments().is_err());
+        assert_eq!(frame.stack.current.arg_cnt, (u16::MAX, false));
+        assert_eq!(frame.stack.frame_len(), usize::from(u16::MAX) + 1);
+    }
+
+    #[test]
+    fn checked_arguments_frame_entry_rejects_overflow_and_caller_prefix_access() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, new(Env), cx);
+        for _ in 0..=u16::MAX {
+            env.stack.push(NIL);
+        }
+        let before = env.stack.len();
+        assert!(CallFrame::new_with_args(env, usize::from(u16::MAX) + 1, cx).is_err());
+        assert_eq!(env.stack.current_frame(), 0);
+        assert_eq!(env.stack.len(), before);
+        let mut frame = CallFrame::new(env);
+        frame.push_arg(Object::from(7));
+        let depth = frame.stack.current_frame();
+        assert!(CallFrame::new_with_args(&mut frame, 2, cx).is_err());
+        assert_eq!(frame.stack.current_frame(), depth);
+        assert_eq!(frame.stack.frame_len(), 1);
+        assert_eq!(frame.stack[0].bind(cx), Object::from(7));
     }
 }

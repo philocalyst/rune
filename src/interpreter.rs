@@ -1334,6 +1334,22 @@ mod test {
     }
 
     #[test]
+    fn cyclic_native_exit_values_preserve_identity_without_recursive_diagnostics() {
+        assert_lisp(
+            "(let ((tag (list 17)) (value (list 7))) (setcdr tag tag) (setcdr value value) (eq (catch tag (throw tag value)) value))",
+            "t",
+        );
+        assert_lisp(
+            "(let ((value (list 7))) (setcdr value value) (eq (condition-case e (signal 'error value) (error (cdr e))) value))",
+            "t",
+        );
+        assert_lisp(
+            "(let ((tag (list 17))) (setcdr tag tag) (condition-case nil (throw tag 7) (error 9)))",
+            "9",
+        );
+    }
+
+    #[test]
     fn pending_exits_survive_cleanup_local_handled_exits() {
         assert_lisp(
             "(catch 'outer (unwind-protect (throw 'outer 1) (catch 'inner (throw 'inner 2))))",
