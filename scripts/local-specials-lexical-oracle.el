@@ -1,0 +1,18 @@
+(dolist (pair '(
+("(progn (defvar vm-local-unbound) (list (boundp 'vm-local-unbound) (special-variable-p 'vm-local-unbound)))" "(nil nil)")
+("(let ((vm-local-x 1)) (defvar vm-local-x) (let ((vm-local-x 2)) vm-local-x))" "1")
+("(progn (defvar vm-local-x) (funcall (function (lambda (vm-local-x) (funcall (function (lambda () vm-local-x))))) 7))" "7")
+("(progn (defvar vm-local-x) (funcall (function (lambda (&optional vm-local-x) vm-local-x))))" "nil")
+("(progn (defvar vm-local-x) (funcall (function (lambda (&rest vm-local-x) vm-local-x)) 1 2))" "(1 2)")
+("(let ((f (progn (defvar vm-local-x) (function (lambda () (let ((vm-local-x 7)) (garbage-collect) vm-local-x)))))) (funcall f))" "7")
+("(progn (defvar vm-local-x) (catch 'done (funcall (function (lambda (vm-local-x) (throw 'done vm-local-x))) 7)) (boundp 'vm-local-x))" "nil")
+)) (let ((value (eval (read (car pair)) t)) (expected (read (cadr pair)))) (unless (equal value expected) (error "mismatch %S: %S" pair value))))
+(princ "local special oracle passed\n")
+(dolist (p '(
+("(progn (fset 'vm-read-local (function (lambda () vm-scope-y))) (condition-case nil (error \"x\") (error (defvar vm-scope-y))) (let ((vm-scope-y 7)) (vm-read-local)))" "7")
+("(progn (fset 'vm-read-local (function (lambda () vm-scope-x))) (condition-case nil (progn (defvar vm-scope-x) (error \"x\")) (error nil)) (let ((vm-scope-x 7)) (vm-read-local)))" "7")
+("(progn (fset 'vm-read-init (function (lambda () vm-init-x))) (let ((other (progn (defvar vm-init-x) 0))) nil) (let ((vm-init-x 7)) (vm-read-init)))" "7")
+("(progn (fset 'vm-read-serial (function (lambda () vm-serial-x))) (let* ((other 0) (other2 (progn (defvar vm-serial-x) 0))) nil) (let ((vm-serial-x 7)) (condition-case nil (vm-read-serial) (void-variable 'unbound))))" "unbound")
+("(progn (fset 'vm-read-empty (function (lambda () vm-empty-x))) (let () (defvar vm-empty-x)) (let ((vm-empty-x 7)) (vm-read-empty)))" "7")
+("(progn (fset 'vm-read-isolated (function (lambda () vm-isolated-x))) (let ((other 0)) (defvar vm-isolated-x)) (let ((vm-isolated-x 7)) (condition-case nil (vm-read-isolated) (void-variable 'unbound))))" "unbound")
+)) (let ((actual (eval (read (car p)) t))) (unless (equal actual (read (cadr p))) (error "scope mismatch %S" p)))) (princ "scope oracle passed\n")

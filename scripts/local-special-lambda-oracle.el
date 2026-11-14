@@ -1,0 +1,11 @@
+(dolist (p '(
+("(progn (defvar vm-px) (funcall (function (lambda (vm-px) (let ((vm-px 9)) vm-px))) 7))" "7")
+("(let ((vm-px 1)) (defvar vm-px) (funcall (function (lambda (vm-px) (let ((vm-px 9)) vm-px))) 7))" "7")
+("(progn (defvar vm-px) (funcall (function (lambda (vm-px) (let ((vm-px 9)) (setq vm-px 10)) vm-px)) 7))" "10")
+("(let ((vm-param-x 1)) (defvar vm-param-x) (funcall (function (lambda (vm-param-x) vm-param-x)) 7))" "7")
+("(let ((vm-param-x 1)) (defvar vm-param-x) (funcall (function (lambda (&optional vm-param-x) vm-param-x))))" "nil")
+("(let ((vm-param-x 1)) (defvar vm-param-x) (funcall (function (lambda (&rest vm-param-x) vm-param-x)) 7 8))" "(7 8)")
+("(let ((vm-param-x 1)) (defvar vm-param-x) (let ((f (funcall (function (lambda (vm-param-x) (function (lambda () vm-param-x)))) 7))) (garbage-collect) (funcall f)))" "7")
+("(progn (defvar integer-width) (funcall (function (lambda (integer-width) integer-width)) nil))" "nil")
+("(let ((integer-width 128)) (defvar integer-width) (list (funcall (function (lambda (integer-width) (setq integer-width nil) integer-width)) 7) integer-width))" "(nil 128)")
+)) (let ((actual (eval (read (car p)) t))) (unless (equal actual (read (cadr p))) (error "lambda mismatch %S" p)))) (princ "lambda oracle passed\n")

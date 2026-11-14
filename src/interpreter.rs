@@ -29,6 +29,8 @@ enum BindingLocation {
 struct Interpreter<'brw, 'rt> {
     vars: &'brw mut Rt<Vec<Slot<&'rt Cons>>>,
     env: &'brw mut Rt<Env<'rt>>,
+    local_specials: &'brw mut Rt<Vec<Slot<Symbol<'rt>>>>,
+    declaration_scopes: Vec<Option<usize>>,
 }
 
 #[defun]
@@ -40,14 +42,18 @@ pub(crate) fn eval<'ob>(
 ) -> Result<Object<'ob>, anyhow::Error> {
     cx.garbage_collect(false);
     root!(vars, new(Vec<Slot<&Cons>>), cx);
+    root!(local_specials, new(Vec<Slot<Symbol>>), cx);
     if let Some(ObjectType::Cons(cons)) = lexical.map(|x| x.untag(cx)) {
         for var in cons.elements() {
-            if let Some(binding) = var?.cons() {
-                vars.push(binding);
+            match var?.untag() {
+                ObjectType::Cons(binding) => vars.push(binding),
+                ObjectType::TRUE => break,
+                ObjectType::Symbol(symbol) => local_specials.push(symbol),
+                _ => {}
             }
         }
     }
-    let mut interpreter = Interpreter { vars, env };
+    let mut interpreter = Interpreter { vars, env, local_specials, declaration_scopes: Vec::new() };
     interpreter.eval_form(form, cx).map_err(Into::into)
 }
 
@@ -175,7 +181,12 @@ impl Interpreter<'_, '_> {
             // (defvar x y)
             Some(value) => rebind!(self.eval_form(value, cx)?),
             // (defvar x)
-            None => NIL,
+            None => {
+                if !self.local_specials.iter().any(|s| s.bind(cx) == name.bind(cx)) {
+                    self.local_specials.push(name.bind(cx));
+                }
+                return Ok(name.bind(cx).into());
+            }
         };
         self.env.defvar(name.bind(cx), value)?;
         Ok(value)
@@ -267,6 +278,9 @@ impl Interpreter<'_, '_> {
         let env = {
             let vars = self.vars.bind_ref(cx);
             let mut tail = Object::from(Cons::new1(true, cx));
+            for special in self.local_specials.bind_ref(cx) {
+                tail = Cons::new(**special, tail, cx).into();
+            }
             for var in vars {
                 tail = Cons::new(**var, tail, cx).into();
             }
@@ -531,6 +545,7 @@ impl Interpreter<'_, '_> {
         let prev_len = self.vars.len();
         // (let x ...)                   // (let)
         let Some(obj) = iter.next()? else { bail_err!(LispError::arg_cnt(sym::LET, 1, 0, cx)) };
+        self.declaration_scopes.push(None);
         let mut varbind_count = 0;
         let bindings = if parallel {
             self.let_bind_parallel(obj, &mut varbind_count, cx)
@@ -547,6 +562,9 @@ impl Interpreter<'_, '_> {
         // Restore both lexical and dynamic bindings on every exit, including
         // failed let* initializers which have already installed some bindings.
         self.vars.truncate(prev_len);
+        if let Some(depth) = self.declaration_scopes.pop().expect("let declaration scope") {
+            self.local_specials.truncate(depth);
+        }
         self.env.unbind(varbind_count, cx);
         result
     }
@@ -618,13 +636,18 @@ impl Interpreter<'_, '_> {
         varbind_count: &mut u16,
         cx: &Context,
     ) -> Result<(), EvalError> {
-        if var.is_special() {
+        if var.is_special() || self.local_specials.iter().any(|symbol| symbol.bind(cx) == var) {
             let next = varbind_count
                 .checked_add(1)
                 .ok_or_else(|| error!("Too many dynamic let bindings"))?;
             self.env.varbind(var, val, cx)?;
             *varbind_count = next;
         } else {
+            if let Some(checkpoint) = self.declaration_scopes.last_mut() {
+                if checkpoint.is_none() {
+                    *checkpoint = Some(self.local_specials.len());
+                }
+            }
             self.vars.push(Cons::new(var, val, cx));
         }
         Ok(())
@@ -780,10 +803,12 @@ pub(crate) fn call_closure<'ob>(
         ObjectType::Symbol(sym::CLOSURE) => {
             rooted_iter!(forms, closure.cdr(), cx);
             let args = Rt::bind_slice(&env.stack[..arg_cnt], cx);
-            let vars = bind_variables(&mut forms, args, name, cx)?;
+            let (vars, local_specials) = bind_variables(&mut forms, args, name, cx)?;
             debug!("call vars: {vars:?}");
             root!(vars, cx);
-            Interpreter { vars, env }.implicit_progn(forms, cx)
+            root!(local_specials, cx);
+            Interpreter { vars, env, local_specials, declaration_scopes: Vec::new() }
+                .implicit_progn(forms, cx)
         }
         other => Err(TypeError::new(Type::Func, other).into()),
     }
@@ -794,37 +819,41 @@ fn bind_variables<'a>(
     args: &[Object<'a>],
     name: &str,
     cx: &'a Context,
-) -> AnyResult<Vec<&'a Cons>> {
+) -> AnyResult<(Vec<&'a Cons>, Vec<Symbol<'a>>)> {
     // Add closure environment to variables
     // (closure ((x . 1) (y . 2) t) ...)
     //          ^^^^^^^^^^^^^^^^^^^
     let Some(env) = forms.next()? else { bail!("Closure missing environment") };
-    let mut vars = parse_closure_env(env.bind(cx))?;
+    let (mut vars, local_specials) = parse_closure_env(env.bind(cx))?;
 
     // Add function arguments to variables
     // (closure (t) (x y &rest z) ...)
     //              ^^^^^^^^^^^^^
     let Some(arg_list) = forms.next()? else { bail!("Closure missing argument list") };
+    // In this lexical profile parameters always create lexical cells, even
+    // when a captured declaration changes subsequent LET binding storage.
     bind_args(arg_list.bind(cx), args, &mut vars, name, cx)?;
-    Ok(vars)
+    Ok((vars, local_specials))
 }
 
-fn parse_closure_env(obj: Object<'_>) -> AnyResult<Vec<&Cons>> {
+fn parse_closure_env(obj: Object<'_>) -> AnyResult<(Vec<&Cons>, Vec<Symbol<'_>>)> {
     let forms = obj.as_list()?;
     let mut env = Vec::new();
+    let mut local_specials = Vec::new();
     for form in forms {
         match form?.untag() {
             ObjectType::Cons(pair) => {
                 env.push(pair);
             }
             ObjectType::TRUE => break,
+            ObjectType::Symbol(symbol) => local_specials.push(symbol),
             x => bail!("Invalid closure environment member: {x}"),
         }
     }
     // The highest priority bindings are at the start of the closure list, but
     // the end of the enviroment vector
     env.reverse();
-    Ok(env)
+    Ok((env, local_specials))
 }
 
 fn bind_args<'a>(
@@ -1047,6 +1076,151 @@ mod test {
             let result = rebind!(eval(form, None, env, cx).unwrap(), cx);
             let expected = crate::reader::read(expected, cx).unwrap().0;
             assert_eq!(result, expected);
+        }
+    }
+
+    #[test]
+    fn uninterned_local_declaration_and_parameter_survive_body_collection() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        let symbol = Symbol::new_uninterned("local-special-gc", &cx.block);
+        root!(symbol, cx);
+        let closure = list![sym::CLOSURE, list![symbol.bind(cx), TRUE; cx],
+            list![symbol.bind(cx); cx], list![sym::GARBAGE_COLLECT; cx], symbol.bind(cx); cx];
+        root!(closure, cx);
+        let form: Object =
+            list![sym::FUNCALL, list![sym::QUOTE, closure.bind(cx); cx], 7; cx].into();
+        root!(form, cx);
+        let before = Object::from(symbol.bind(cx)).into_raw().addr();
+        assert_eq!(eval(form, None, env, cx).unwrap(), Object::from(7));
+        assert_ne!(
+            before,
+            Object::from(symbol.bind(cx)).into_raw().addr(),
+            "body GC must move the captured symbol"
+        );
+        assert_eq!(env.binding_depth(), 0);
+        assert!(env.vars.get(symbol.bind(cx)).is_none());
+    }
+
+    #[test]
+    fn declared_let_does_not_hide_lexical_lambda_parameter() {
+        for (source, expected) in [
+            (
+                "(progn (defvar vm-px) (funcall (function (lambda (vm-px) (let ((vm-px 9)) vm-px))) 7))",
+                "7",
+            ),
+            (
+                "(let ((vm-px 1)) (defvar vm-px) (funcall (function (lambda (vm-px) (let ((vm-px 9)) vm-px))) 7))",
+                "7",
+            ),
+            (
+                "(progn (defvar vm-px) (funcall (function (lambda (vm-px) (let ((vm-px 9)) (setq vm-px 10)) vm-px)) 7))",
+                "10",
+            ),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn local_declarations_do_not_make_lambda_parameters_dynamic() {
+        for (source, expected) in [
+            (
+                "(let ((vm-param-x 1)) (defvar vm-param-x) (funcall (function (lambda (vm-param-x) vm-param-x)) 7))",
+                "7",
+            ),
+            (
+                "(let ((vm-param-x 1)) (defvar vm-param-x) (funcall (function (lambda (&optional vm-param-x) vm-param-x))))",
+                "nil",
+            ),
+            (
+                "(let ((vm-param-x 1)) (defvar vm-param-x) (funcall (function (lambda (&rest vm-param-x) vm-param-x)) 7 8))",
+                "(7 8)",
+            ),
+            (
+                "(let ((vm-param-x 1)) (defvar vm-param-x) (let ((f (funcall (function (lambda (vm-param-x) (function (lambda () vm-param-x)))) 7))) (garbage-collect) (funcall f)))",
+                "7",
+            ),
+            (
+                "(progn (defvar integer-width) (funcall (function (lambda (integer-width) integer-width)) nil))",
+                "nil",
+            ),
+            (
+                "(let ((integer-width 128)) (defvar integer-width) (list (funcall (function (lambda (integer-width) (setq integer-width nil) integer-width)) 7) integer-width))",
+                "(nil 128)",
+            ),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn handler_and_body_declarations_extend_surrounding_local_scope() {
+        for (source, expected) in [
+            (
+                "(progn (fset 'vm-read-local (function (lambda () vm-scope-y))) (condition-case nil (error \"x\") (error (defvar vm-scope-y))) (let ((vm-scope-y 7)) (vm-read-local)))",
+                "7",
+            ),
+            (
+                "(progn (fset 'vm-read-local (function (lambda () vm-scope-x))) (condition-case nil (progn (defvar vm-scope-x) (error \"x\")) (error nil)) (let ((vm-scope-x 7)) (vm-read-local)))",
+                "7",
+            ),
+            (
+                "(progn (fset 'vm-read-init (function (lambda () vm-init-x))) (let ((other (progn (defvar vm-init-x) 0))) nil) (let ((vm-init-x 7)) (vm-read-init)))",
+                "7",
+            ),
+            (
+                "(progn (fset 'vm-read-serial (function (lambda () vm-serial-x))) (let* ((other 0) (other2 (progn (defvar vm-serial-x) 0))) nil) (let ((vm-serial-x 7)) (condition-case nil (vm-read-serial) (void-variable 'unbound))))",
+                "unbound",
+            ),
+            (
+                "(progn (fset 'vm-read-empty (function (lambda () vm-empty-x))) (let () (defvar vm-empty-x)) (let ((vm-empty-x 7)) (vm-read-empty)))",
+                "7",
+            ),
+            (
+                "(progn (fset 'vm-read-isolated (function (lambda () vm-isolated-x))) (let ((other 0)) (defvar vm-isolated-x)) (let ((vm-isolated-x 7)) (condition-case nil (vm-read-isolated) (void-variable 'unbound))))",
+                "unbound",
+            ),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn local_special_declarations_capture_without_global_symbol_mutation() {
+        for (source, expected) in [
+            (
+                "(progn (defvar vm-local-unbound) (list (boundp 'vm-local-unbound) (special-variable-p 'vm-local-unbound)))",
+                "(nil nil)",
+            ),
+            (
+                "(let ((vm-local-x 1)) (defvar vm-local-x) (let ((vm-local-x 2)) vm-local-x))",
+                "1",
+            ),
+            (
+                "(progn (defvar vm-local-x) (funcall (function (lambda (vm-local-x) (funcall (function (lambda () vm-local-x))))) 7))",
+                "7",
+            ),
+            (
+                "(progn (defvar vm-local-x) (funcall (function (lambda (&optional vm-local-x) vm-local-x))))",
+                "nil",
+            ),
+            (
+                "(progn (defvar vm-local-x) (funcall (function (lambda (&rest vm-local-x) vm-local-x)) 1 2))",
+                "(1 2)",
+            ),
+            (
+                "(let ((f (progn (defvar vm-local-x) (function (lambda () (let ((vm-local-x 7)) (garbage-collect) vm-local-x)))))) (funcall f))",
+                "7",
+            ),
+            (
+                "(progn (defvar vm-local-x) (catch 'done (funcall (function (lambda (vm-local-x) (throw 'done vm-local-x))) 7)) (boundp 'vm-local-x))",
+                "nil",
+            ),
+        ] {
+            assert_lisp(source, expected);
         }
     }
 
@@ -1344,7 +1518,9 @@ mod test {
         root!(vars, new(Vec<Slot<&Cons>>), cx);
         let variable = intern("m0-let-binding-count", cx);
         variable.make_special();
-        let mut interpreter = Interpreter { vars, env };
+        root!(local_specials, new(Vec<Slot<Symbol>>), cx);
+        let mut interpreter =
+            Interpreter { vars, env, local_specials, declaration_scopes: Vec::new() };
         let mut count = u16::MAX;
         assert!(interpreter.create_let_binding(variable, 7_i64.into(), &mut count, cx).is_err());
         assert_eq!(count, u16::MAX);
