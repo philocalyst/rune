@@ -40,6 +40,7 @@ mod fns;
 mod interpreter;
 mod intervals;
 mod keymap;
+mod overlay_arrow;
 mod keyboard_state;
 mod library;
 mod lisp;
