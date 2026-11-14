@@ -12,6 +12,9 @@ defsym!(UNSPECIFIED);
 // GNU Emacs src/emacs.c initializes the X-resource policy switch to false.
 // Terminal frame capability, not a forced true flag, avoids X resource calls.
 defvar_bool!(INHIBIT_X_RESOURCES, false);
+// GNU minibuf.c initializes only the read-only pair; original faces.el adds
+// its prompt face later. Prompt field/stickiness are separate input-engine work.
+defvar!(MINIBUFFER_PROMPT_PROPERTIES, crate::fns::slice_into_list(&[crate::lread::intern("read-only", cx).into(), crate::core::object::TRUE], None, cx));
 defvar!(FACE__NEW_FRAME_DEFAULTS, crate::face_attributes::new_table(cx));
 const VECTOR_SIZE: usize = 20;
 pub(crate) fn new_table<'a>(cx: &'a Context) -> Object<'a> {
@@ -349,6 +352,19 @@ fn internal_set_lisp_face_attribute<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn minibuffer_prompt_policy_has_real_c_default_then_lisp_face_append() {
+        use super::*;
+        use rune_core::macros::root;
+        let roots = crate::core::gc::RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        crate::lread::load_internal("(if (equal minibuffer-prompt-properties '(read-only t)) nil (error \"wrong C prompt default\")) (setq minibuffer-prompt-properties (append minibuffer-prompt-properties '(face minibuffer-prompt)))", cx, env).unwrap();
+        cx.garbage_collect(true);
+        crate::lread::load_internal("(if (equal minibuffer-prompt-properties '(read-only t face minibuffer-prompt)) nil (error \"wrong prompt face policy\"))", cx, env).unwrap();
+    }
     #[test]
     fn x_resource_policy_has_real_native_false_default_and_remains_settable() {
         use crate::core::gc::RootSet;use rune_core::macros::root;use super::*;

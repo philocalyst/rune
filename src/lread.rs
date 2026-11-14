@@ -56,6 +56,35 @@ pub(crate) fn read_from_string<'ob>(
     Ok(Cons::new(obj, final_index as i64, cx).into())
 }
 
+/// Default diagnostics expose only a bounded call identifier/type and byte
+/// range, never literal values, comments, argument graphs or full source text.
+fn load_error_excerpt<'a>(
+    content: &'a str,
+    form: Object<'_>,
+    start: usize,
+    debug: bool,
+) -> std::borrow::Cow<'a, str> {
+    if debug {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let head = match form.untag() {
+        ObjectType::Cons(pair) => match pair.car().untag() {
+            ObjectType::Symbol(symbol) => {
+                let mut chars = symbol.name().chars();
+                let mut name: String =
+                    chars.by_ref().take(48).flat_map(char::escape_default).collect();
+                if chars.next().is_some() {
+                    name.push_str("...");
+                }
+                format!("({name} ...)")
+            }
+            _ => "<Cons>".into(),
+        },
+        value => format!("<{:?}>", value.get_type()),
+    };
+    format!("source bytes {start}..{}: {head}", start.saturating_add(content.len())).into()
+}
+
 pub(crate) fn load_internal(contents: &str, cx: &mut Context, env: &mut Rt<Env>) -> Result<bool> {
     let mut pos = 0;
     root!(declarations, new(Vec<Slot<Symbol>>), cx);
@@ -86,7 +115,9 @@ pub(crate) fn load_internal(contents: &str, cx: &mut Context, env: &mut Rt<Env>)
         };
         if let Err(e) = result {
             let content = &contents[pos..(new_pos + pos)];
-            println!("-----LOAD ERROR START-----\n {content}");
+            let excerpt =
+                load_error_excerpt(content, obj.bind(cx), pos, crate::debug::debug_enabled());
+            println!("-----LOAD ERROR START-----\n {excerpt}");
             println!("-----LOAD ERROR END-----");
             return Err(e);
         }
@@ -650,5 +681,42 @@ mod file_declaration_tests {
             env.vars.get(intern("vm-inner-isolated", cx)).unwrap().bind(cx),
             Object::from(intern("isolated", cx))
         );
+    }
+}
+
+#[cfg(test)]
+mod bounded_load_error_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn default_excerpt_omits_literal_secrets_comments_and_argument_graphs() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let source = "(setq key \"PRIVATE-SECRET\") ; PRIVATE-COMMENT";
+        let form = reader::read(source, cx).unwrap().0;
+        let excerpt = load_error_excerpt(source, form, 17, false);
+        assert!(excerpt.contains("(setq ...)"));
+        assert!(!excerpt.contains("PRIVATE"));
+        assert!(!excerpt.contains("key"));
+        let cycle = Cons::new(NIL, NIL, cx);
+        cycle.set_car(cycle.into()).unwrap();
+        cycle.set_cdr(cycle.into()).unwrap();
+        assert!(load_error_excerpt(source, cycle.into(), 0, false).contains("<Cons>"));
+        let text = cx.add("PRIVATE-SECRET");
+        assert!(!load_error_excerpt(source, text, 0, false).contains("PRIVATE"));
+    }
+    #[test]
+    fn identifiers_are_bounded_ascii_escaped_and_debug_is_explicit_full_source() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let name = crate::core::env::intern(&format!("\x1b\n{}", "é".repeat(10000)), cx);
+        let form = Cons::new(name, NIL, cx);
+        let source = "PRIVATE\x1b\nSOURCE";
+        let excerpt = load_error_excerpt(source, form.into(), 0, false);
+        assert!(!excerpt.contains('\x1b'));
+        assert!(!excerpt.contains('\n'));
+        assert!(excerpt.len() < 600);
+        assert!(excerpt.is_ascii());
+        assert_eq!(load_error_excerpt(source, form.into(), 0, true), source);
     }
 }
