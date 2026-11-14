@@ -46,6 +46,15 @@ fn display_graphic_p(frame: Option<Object>, cx: &Context) -> Result<bool> {
     let _frame = live_frame(frame, cx)?;
     Ok(false)
 }
+/// Number of color cells supplied by this backend. A logical terminal without
+/// an attached terminal color driver has none, matching GNU batch terminals.
+#[defun]
+fn display_color_cells(frame: Option<Object>, cx: &Context) -> Result<i64> {
+    let frame = live_frame(frame, cx)?;
+    match frame.backend() {
+        crate::core::object::FrameBackend::Terminal => Ok(0),
+    }
+}
 /// Return the window-system symbol for a validated owner frame. The current
 /// logical terminal has no window-system connection, so its genuine value is nil.
 #[defun]
@@ -98,6 +107,17 @@ fn frame_parameter<'a>(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_color_cells_match_gnu_batch_and_validate_frame() {
+        crate::assert_elprop!("(list (display-color-cells) (display-color-cells nil) (display-color-cells (selected-frame)))");
+        let roots = crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(&roots);
+        assert!(super::display_color_cells(Some(42_i64.into()), cx).is_err());
+        let frame = cx.selected_frame().unwrap();
+        frame.delete(cx).unwrap();
+        assert!(super::display_color_cells(Some(frame.into()), cx).is_err());
+        assert!(super::display_color_cells(None, cx).is_err());
+    }
     #[test]
     fn terminal_window_system_matches_gnu_batch() {
         crate::assert_elprop!("(list (window-system) (window-system (selected-frame)))");

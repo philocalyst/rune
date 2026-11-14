@@ -578,6 +578,14 @@ pub(crate) struct OwnerBufferHandle {
     owner: u64,
     buffer: rune_editor::BufferId,
 }
+impl OwnerBufferHandle {
+    /// Immutable owner stamp only. No editor borrow, liveness or membership proof.
+    /// Attachment construction still requires the authenticated pair transaction
+    /// and separate Context/Buffer liveness witnesses.
+    pub(crate) fn belongs_to(&self, cx: &Context) -> bool {
+        self.owner == cx.domain_id()
+    }
+}
 impl RuntimeEditor {
     pub(crate) fn buffer_handle(
         &self,
@@ -2264,5 +2272,28 @@ mod overlay_pair_gateway_tests {
         g.remove_marker_pair(target,pair,&cx).unwrap();g.remove_marker_pair(target,pair,&cx).unwrap();
         assert_eq!(g.marker_pair_positions(target,pair,&cx).unwrap(),None);
         g.kill(source,true,&cx).unwrap();assert!(!token.is_live());assert!(target_live.is_live());
+    }
+}
+
+#[cfg(test)]
+mod overlay_handle_owner_stamp_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn owner_stamp_never_borrows_editor_and_is_not_liveness_authority() {
+        let old_handle;
+        {
+            let roots=RootSet::default();let cx=Context::new(&roots);
+            let gateway=RuntimeEditorGateway::new(&cx,80,24).unwrap();
+            old_handle=gateway.create("stamp","",&cx).unwrap();
+            let borrow=gateway.inner.borrow_mut();
+            assert!(old_handle.belongs_to(&cx));
+            drop(borrow);
+            gateway.kill(old_handle,true,&cx).unwrap();
+            assert!(old_handle.belongs_to(&cx)); // Stamp is deliberately not liveness.
+            assert!(gateway.read(old_handle,&cx).is_err());
+        }
+        let roots=RootSet::default();let cx=Context::new(&roots);
+        assert!(!old_handle.belongs_to(&cx));
     }
 }
