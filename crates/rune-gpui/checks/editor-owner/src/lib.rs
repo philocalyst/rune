@@ -28,3 +28,6 @@ pub mod platform_state;
 
 #[path = "../../../src/evaluation_quit.rs"]
 pub mod evaluation_quit;
+
+#[path = "../../../src/key_provenance.rs"]
+mod key_provenance;

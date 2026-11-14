@@ -150,11 +150,45 @@ returned as definitely undelivered, not acknowledged as executed.
 With this flag, **native Ctrl/Command-S only** uses the trusted baseline guard:
 detected external changes, an unknown baseline or a deleted target cause a visible failure,
 with no automatic overwrite, recreation or force retry. A concurrent writer can still
-change the target between the precommit check and rename; this is not atomic overwrite
-protection, even for non-hostile concurrent writers. The toolbar identifies this mode. Without the flag, ordinary visited-save behavior is unchanged. Crucially,
+change the target between the precommit check and rename; this is not atomic
+overwrite protection, even for non-hostile concurrent writers. The toolbar identifies this
+mode. Without the flag, ordinary visited-save behavior is unchanged. Crucially,
 Lisp `(save-buffer)` remains ordinary and unguarded even in this mode; the palette
 is not a sandbox. Ctrl/Command-Shift-S still reports unsupported Save As and writes
 nothing. This is plain text editing, not an Org-mode or email client implementation.
 
 The explicit-open and guarded-save pipeline has linked headless owner tests.
 Actual native window rendering, OS keyboard/IME and scrolling remain unverified.
+
+### Owner-side sparse Lisp keymaps (narrow integration)
+
+Native key commands can resolve the persistent owner's `current-global-map`.
+Sparse maps support string/vector sequences, prefix maps, inherited lookup,
+explicit nil shadowing, default-event lookup and no-argument interpreted
+interactive commands. Map cells and pending prefixes are GC-rooted in the owner;
+only plain key data crosses the UI FIFO. An owner sequence change cancels a stale
+prefix. Key errors retain partial edits and do not replay the command.
+
+Only a single-scalar callback matching an unconsumed physical printable keydown
+uses this lookup before ordinary insertion. The token is consumed once and cleared
+on key release, preedit, pointer/focus/lifecycle changes or a mismatching callback.
+Ambiguous callbacks (including paste/accessibility without a matching keydown)
+default to literal text. Explicit Ctrl/Command-V and IME composition commits remain literal,
+so a pasted or composed character does not also execute its key binding. Other
+multi-character text callbacks remain literal. This is not a complete Emacs input-method implementation or durable OS event
+deduplication.
+
+This is not full Doom/Emacs keymap compatibility: local/minor/overriding maps,
+menus/remapping, keyboard macros, interactive argument prompts, and bytecompiled
+interactive metadata are not implemented. `make-keymap` currently uses sparse
+storage, not GNU's full char-table representation. Native palette/save/cancel
+shortcuts remain reserved. Real OS key delivery and window behavior are untested.
+
+Mutable direct keymap function definitions are rooted per persistent owner Env,
+not published as mutable global Lisp graphs. Immutable symbol-alias edges remain
+in the existing global function namespace. Assigning a direct owner keymap retires
+the prior global callable; another Env does not acquire that owner's map. Replacing
+it with an ordinary function uses the normal global publication path again. This
+owner-local/cross-Env distinction is narrower than GNU's single global function
+namespace. Failed normal publication preserves the prior owner map. It is not a
+general function-shadowing mechanism.

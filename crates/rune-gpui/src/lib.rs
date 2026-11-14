@@ -3,7 +3,7 @@
 //! The host owns scheduling: on a newer mailbox generation, update FrameView
 //! and notify once. Idle views do not request animation frames.
 use gpui::{
-    App, Bounds, ContentMask, Context, FocusHandle, IntoElement, KeyDownEvent, MouseButton,
+    App, Bounds, ContentMask, Context, FocusHandle, IntoElement, KeyDownEvent, KeyUpEvent, MouseButton,
     MouseDownEvent, Pixels, Point, Render, ScrollWheelEvent, TextRun, Window, canvas, div, fill,
     point, prelude::*, px, rgba, size,
 };
@@ -22,6 +22,8 @@ mod font_geometry;
 mod input_policy;
 #[cfg(feature = "editor")]
 mod wheel;
+#[cfg(feature = "editor")]
+mod key_provenance;
 use input_policy::InputPolicy;
 pub use input_policy::{InputReadiness, RejectionReason};
 
@@ -472,6 +474,8 @@ impl Render for FrameView {
         #[cfg(feature = "editor")]
         let ime_for_key = self.ime.clone();
         #[cfg(feature = "editor")]
+        let ime_for_keyup = self.ime.clone();
+        #[cfg(feature = "editor")]
         let ime_for_pointer = self.ime.clone();
         #[cfg(feature = "editor")]
         let ime_for_paint = self.ime.clone();
@@ -502,6 +506,10 @@ impl Render for FrameView {
                     },
                 );
                 cx.stop_propagation();
+            })
+            .on_key_up(move |_event:&KeyUpEvent,_,_| {
+                #[cfg(feature = "editor")]
+                if let Some(ime)=&ime_for_keyup {ime.state.borrow_mut().clear_plain_key();}
             })
             .on_any_mouse_down(move |event: &MouseDownEvent, window, cx| {
                 let Some(bounds) = pointer_bounds.get() else {

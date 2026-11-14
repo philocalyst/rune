@@ -188,6 +188,8 @@ pub(crate) fn keydown(
 ) {
     let key = &event.keystroke;
     let composing = ime.state.borrow().composing();
+    ime.state.borrow_mut().record_plain_key(key.key_char.as_deref(),!key.modifiers.control&&!key.modifiers.platform&&!key.modifiers.alt);
+
     match ime_keys::route(
         &key.key,
         key.modifiers.control,
@@ -223,9 +225,23 @@ pub(crate) fn keydown(
             window.refresh();
         }
         ImeKey::Command(command) => {
+            let identity = ime.state.borrow().key_identity();
             ime.state.borrow_mut().defer_scoped_input();
-            if let FrameInput::Owner(input) = input {
-                OwnerInput::submit(input, OwnerEvent::Command(command));
+            if let (FrameInput::Owner(input), Some(identity)) = (input, identity) {
+                OwnerInput::submit(
+                    input,
+                    OwnerEvent::NativeKey {
+                        request: crate::editor_transport::NativeKeyRequest {
+                            window_id: identity.window_id,
+                            buffer_id: identity.buffer_id,
+                            key: key.key.clone(),
+                            control: key.modifiers.control || key.modifiers.platform,
+                            meta: key.modifiers.alt,
+                            shift: key.modifiers.shift,
+                        },
+                        fallback: Some(command),
+                    },
+                );
             }
             window.prevent_default();
             cx.stop_propagation();
@@ -252,10 +268,28 @@ pub(crate) fn keydown(
             cx.stop_propagation();
         }
         ImeKey::Unsupported => {
-            ime.report(
-                ImeOperation::Shortcut(format!("{key:?}")),
-                "unsupported native IME shortcut/selection policy",
-            );
+            let identity = ime.state.borrow().key_identity();
+            if let (FrameInput::Owner(input), Some(identity)) = (input, identity) {
+                OwnerInput::submit(
+                    input,
+                    OwnerEvent::NativeKey {
+                        request: crate::editor_transport::NativeKeyRequest {
+                            window_id: identity.window_id,
+                            buffer_id: identity.buffer_id,
+                            key: key.key.clone(),
+                            control: key.modifiers.control || key.modifiers.platform,
+                            meta: key.modifiers.alt,
+                            shift: key.modifiers.shift,
+                        },
+                        fallback: None,
+                    },
+                );
+            } else {
+                ime.report(
+                    ImeOperation::Shortcut(format!("{key:?}")),
+                    "native key context unavailable",
+                );
+            }
             window.prevent_default();
             cx.stop_propagation();
         }
@@ -312,8 +346,12 @@ impl EntityInputHandler for FrameView {
         let Some(ime) = self.ime.clone() else {
             return;
         };
+        let key_text=ime.state.borrow_mut().take_plain_key(range.is_none(),text);
         let result = ime.state.borrow_mut().commit(range.clone(), text);
         match result {
+            Ok(OwnerEvent::TextInsertion { window_id, buffer_id, text }) if key_text => {
+                self.enqueue_platform(OwnerEvent::KeyText { window_id, buffer_id, text })
+            }
             Ok(event) => self.enqueue_platform(event),
             Err(error) => ime.report(ImeOperation::Replace { range, text: text.into() }, error),
         }

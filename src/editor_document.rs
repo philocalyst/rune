@@ -2021,3 +2021,61 @@ mod raw_readonly_owner_tests {
  }
 
 }
+
+impl LispRuntimeHost<'_, '_, '_> {
+    pub(crate) fn dispatch_native_key(
+        &mut self,
+        window_id: u64,
+        buffer_id: u64,
+        key: &str,
+        control: bool,
+        meta: bool,
+        shift: bool,
+    ) -> Result<bool, String> {
+        use rune_editor::EditorHost;
+        if (control && !meta && key == "g") || (!control && !meta && key == "escape") {
+            crate::keymap::cancel_native_prefix(self.env);
+            return Ok(true);
+        }
+        let snapshot = self.owner.snapshot().map_err(|e| e.to_string())?;
+        let view = snapshot
+            .views
+            .iter()
+            .find(|v| v.id == snapshot.selected_window)
+            .ok_or("Missing selected editor view")?;
+        if view.id.as_u64() != window_id || view.view.buffer.as_u64() != buffer_id {
+            return Err("Stale native key target".into());
+        }
+        let (selected, sequence) = (view.view.buffer, snapshot.sequence);
+        drop(snapshot);
+        let handle = self
+            .owner
+            .gateway
+            .inner
+            .try_borrow()
+            .map_err(|e| e.to_string())?
+            .buffer_handle(selected, self.owner.cx)
+            .map_err(|e| e.to_string())?;
+        self.env.set_current_buffer(handle, self.owner.cx).map_err(|e| e.to_string())?;
+        let encoded=crate::keymap::encode_native_key(key,control,meta,shift);
+        let event=match &encoded {crate::keymap::EncodedNativeKey::Character(code)=>crate::keymap::NativeEvent::Character(*code),crate::keymap::EncodedNativeKey::Named(name)=>crate::keymap::NativeEvent::Named(name)};
+        crate::keymap::dispatch_native_event(event, sequence, self.env, self.owner.cx)
+            .map(|outcome| outcome != crate::keymap::NativeDispatch::Unbound)
+            .map_err(|e| e.to_string())
+    }
+}
+impl LispRuntimeHost<'_, '_, '_> {
+    pub(crate) fn dispatch_native_key_with_quit(
+        &mut self,
+        window: u64,
+        buffer: u64,
+        key: &str,
+        control: bool,
+        meta: bool,
+        shift: bool,
+        token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<bool, String> {
+        let _scope = self.env.install_quit_token(token);
+        self.dispatch_native_key(window, buffer, key, control, meta, shift)
+    }
+}

@@ -770,6 +770,11 @@ where
         unsafe { &mut *self.inner_mut().0.get() }
     }
 
+    /// Reserve before a caller publishes an external namespace change.
+    pub(crate) fn try_reserve(&mut self, additional: usize) -> anyhow::Result<()> {
+        self.as_mut().try_reserve(additional).map_err(Into::into)
+    }
+
     pub(crate) fn insert<Kx: IntoRoot<K>, Vx: IntoRoot<V>>(&mut self, k: Kx, v: Vx) {
         unsafe {
             self.as_mut().insert(k.into_root(), v.into_root());

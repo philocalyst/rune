@@ -18,6 +18,15 @@ pub struct CompositionRequest {
 #[derive(Debug)]
 pub enum OwnerEvent {
     Input(InputEvent),
+    NativeKey {
+        request: NativeKeyRequest,
+        fallback: Option<rune_editor::Command>,
+    },
+    KeyText {
+        window_id: u64,
+        buffer_id: u64,
+        text: String,
+    },
     ScrollWindow {
         window_id: u64,
         buffer_id: u64,
@@ -42,6 +51,17 @@ pub enum OwnerEvent {
     },
     Composition(CompositionRequest),
 }
+#[derive(Clone, Debug)]
+pub struct NativeKeyRequest {
+    pub window_id: u64,
+    pub buffer_id: u64,
+    pub key: String,
+    pub control: bool,
+    pub meta: bool,
+    pub shift: bool,
+}
+pub type NativeKeyDispatcher<H> =
+    fn(&mut H, &NativeKeyRequest, Arc<std::sync::atomic::AtomicBool>) -> Result<bool, String>;
 #[derive(Debug)]
 pub struct CompositionAck {
     pub token: CompositionToken,
@@ -94,6 +114,7 @@ where
     publisher: HostPublisher,
     initialized: bool,
     visited_saver: Option<VisitedSaver<H>>,
+    key_dispatcher: Option<(NativeKeyDispatcher<H>, crate::evaluation_quit::EvaluationQuit)>,
     evaluator: Option<fn(&mut H, &str) -> Result<(), String>>,
     interruptible: Option<(InterruptibleEvaluator<H>, crate::evaluation_quit::EvaluationQuit)>,
     platform: Option<crate::platform_context::PlatformPublisher>,
@@ -119,6 +140,7 @@ pub struct OwnerStep {
     pub edit: Result<bool, BridgeError>,
     pub evaluation: Option<EvaluationOutcome>,
     pub save: Option<SaveReply>,
+    pub key_outcome: Option<Result<(), String>>,
     pub render_error: Option<BridgeError>,
 }
 #[derive(Debug)]
@@ -161,6 +183,7 @@ impl NativeEditorOwner {
             publisher: self.publisher,
             initialized: false,
             visited_saver: None,
+            key_dispatcher: None,
             evaluator: None,
             interruptible: None,
             platform: None,
@@ -250,6 +273,14 @@ impl<H: EditorHost> NativeEditorWorker<H>
 where
     H::Doc: DisplayDocument,
 {
+    pub fn with_key_dispatcher(
+        mut self,
+        dispatch: NativeKeyDispatcher<H>,
+        quit: crate::evaluation_quit::EvaluationQuit,
+    ) -> Self {
+        self.key_dispatcher = Some((dispatch, quit));
+        self
+    }
     pub fn bridge(&self) -> &EditorBridge<H> {
         &self.bridge
     }
@@ -350,6 +381,8 @@ where
     }
     fn process(&mut self, event: OwnerEvent) -> OwnerStep {
         let mut evaluation = None;
+        let mut key_outcome = None;
+        let mut force_frame = false;
         let mut save = None;
         let mut preserve_context = false;
         let edit = match event {
@@ -428,7 +461,114 @@ where
                     }
                 }
             }
-            OwnerEvent::Input(e) => self.bridge.apply(&e),
+            OwnerEvent::NativeKey { request, fallback } => {
+                force_frame = true;
+                if let Some((dispatch, channel)) = &self.key_dispatcher {
+                    let dispatch = *dispatch;
+                    let channel = channel.clone();
+                    let before = if request.key.len()>128 {Err(BridgeError::UnsupportedInput)} else {self.bridge.snapshot().map(|s|s.sequence)};
+                    match before {
+                        Err(error) => Err(error),
+                        Ok(before) => {
+                            let outcome = {
+                                match channel.begin() {
+                                    Ok(scope) => self.bridge.dispatch_key_with(
+                                        dispatch,
+                                        &request,
+                                        scope.token(),
+                                    ),
+                                    Err(error) => Err(error.into()),
+                                }
+                            };
+                            let handled = outcome.as_ref().copied().unwrap_or(true);
+                            key_outcome = Some(outcome.map(|_| ()));
+                            if !handled {
+                                if let Some(command) = fallback {
+                                    self.bridge.execute_command(command)
+                                } else {
+                                    Err(BridgeError::UnsupportedInput)
+                                }
+                            } else {
+                                self.bridge.snapshot().map(|s| s.sequence != before)
+                            }
+                        }
+                    }
+                } else if let Some(command) = fallback {
+                    self.bridge.execute_command(command)
+                } else {
+                    Err(BridgeError::UnsupportedInput)
+                }
+            }
+            OwnerEvent::KeyText { window_id, buffer_id, text } => {
+                force_frame = true;
+                if let Some((dispatch, channel)) = &self.key_dispatcher {
+                    let dispatch = *dispatch;
+                    let channel = channel.clone();
+                    let before = self.bridge.snapshot().map(|s| s.sequence);
+                    match before {
+                        Err(error) => Err(error),
+                        Ok(before) => {
+                            let request = NativeKeyRequest {
+                                window_id,
+                                buffer_id,
+                                key: text.clone(),
+                                control: false,
+                                meta: false,
+                                shift: false,
+                            };
+                            let outcome = if text.chars().count() != 1 {
+                                Err("key text must contain one scalar".into())
+                            } else {
+                                match channel.begin() {
+                                    Ok(scope) => self.bridge.dispatch_key_with(
+                                        dispatch,
+                                        &request,
+                                        scope.token(),
+                                    ),
+                                    Err(error) => Err(error.into()),
+                                }
+                            };
+                            let handled = outcome.as_ref().copied().unwrap_or(true);
+                            key_outcome = Some(outcome.map(|_| ()));
+                            if !handled {
+                                self.bridge.commit_text(window_id, buffer_id, text)
+                            } else {
+                                self.bridge.snapshot().map(|s| s.sequence != before)
+                            }
+                        }
+                    }
+                } else {
+                    self.bridge.commit_text(window_id, buffer_id, text)
+                }
+            }
+            OwnerEvent::Input(e) => {
+                if let rune_display::InputEvent::Key { key, control, meta, shift, .. } = &e {
+                    if (*control && !*meta && key == "g")
+                        || (!*control && !*meta && key == "escape")
+                    {
+                        if let Some((dispatch, _)) = &self.key_dispatcher {
+                            let request = NativeKeyRequest {
+                                window_id: 0,
+                                buffer_id: 0,
+                                key: key.clone(),
+                                control: *control,
+                                meta: *meta,
+                                shift: *shift,
+                            };
+                            key_outcome = Some(
+                                self.bridge
+                                    .dispatch_key_with(
+                                        *dispatch,
+                                        &request,
+                                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                    )
+                                    .map(|_| ()),
+                            );
+                        }
+                    }
+                }
+                self.bridge.apply(&e)
+            }
             OwnerEvent::ScrollWindow { window_id, buffer_id, expected_sequence, lines } => {
                 self.bridge.scroll_window(window_id, buffer_id, expected_sequence, lines)
             }
@@ -456,12 +596,12 @@ where
             }
         }
         let _ = self.publisher.input_capacity_available();
-        if matches!(edit, Ok(true)) {
+        if matches!(edit, Ok(true)) || force_frame {
             if let Err(error) = self.retry_frame() {
                 render_error = Some(error);
             }
         }
-        OwnerStep { edit, evaluation, save, render_error }
+        OwnerStep { edit, evaluation, save, key_outcome, render_error }
     }
 }
 #[cfg(test)]

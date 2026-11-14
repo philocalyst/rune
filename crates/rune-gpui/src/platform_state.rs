@@ -46,6 +46,7 @@ pub struct PlatformInputState {
     bundle: Option<Arc<PlatformFrame>>,
     input: Option<Arc<PlatformInputSnapshot>>,
     last_identity: Option<crate::ime_context::ImeIdentity>,
+    plain_key: crate::key_provenance::PlainKeyProvenance,
     composition: CompositionState,
     draft: Option<Draft>,
     overlay: Option<Arc<FrameDisplay>>,
@@ -63,6 +64,7 @@ impl PlatformInputState {
             bundle: None,
             input: None,
             last_identity: None,
+            plain_key: Default::default(),
             composition: CompositionState::new()?,
             draft: None,
             overlay: None,
@@ -126,6 +128,7 @@ impl PlatformInputState {
         self.last_identity = None;
     }
     fn cancel_draft(&mut self) {
+        self.plain_key.invalidate();
         self.composition.invalidate();
         self.draft = None;
         self.overlay = None;
@@ -145,6 +148,21 @@ impl PlatformInputState {
     }
     pub fn composing(&self) -> bool {
         self.draft.as_ref().is_some_and(|d| !d.emitted)
+    }
+    pub(crate) fn record_plain_key(&mut self,text:Option<&str>,allowed:bool) {
+        let allowed=allowed&&self.active&&!self.composing()&&!self.awaiting_ack();
+        self.plain_key.keydown(text,allowed);
+    }
+    pub(crate) fn clear_plain_key(&mut self){self.plain_key.invalidate();}
+    pub(crate) fn take_plain_key(&mut self,unscoped:bool,text:&str)->bool {
+        let allowed=self.active&&!self.composing()&&!self.awaiting_ack();
+        self.plain_key.take_callback(unscoped&&allowed,text)
+    }
+    pub(crate) fn key_identity(&self) -> Option<crate::ime_context::ImeIdentity> {
+        if !self.active || self.composing() || self.awaiting_ack() {
+            return None;
+        }
+        self.input.as_ref().map(|i| i.identity()).or(self.last_identity)
     }
     pub(crate) fn wheel_identity(&self) -> Option<crate::ime_context::ImeIdentity> {
         if !self.active || self.composing() || self.awaiting_ack() {
@@ -214,6 +232,7 @@ impl PlatformInputState {
         text: &str,
         selected: Option<Range<usize>>,
     ) -> Result<(), PlatformError> {
+        self.clear_plain_key();
         self.edit(range, text, selected)?;
         self.rebuild_overlay();
         Ok(())
@@ -571,6 +590,15 @@ mod tests {
         let mut state = PlatformInputState::new(reader, FixedMetrics::default()).unwrap();
         state.sync();
         (state, publisher)
+    }
+    #[test]
+    fn platform_key_provenance_fails_closed_for_ime_accessibility_and_released_keys() {
+        let (mut s,_publisher)=fixture();
+        assert!(!s.take_plain_key(true,"x"));
+        s.record_plain_key(Some("x"),true);assert!(s.take_plain_key(true,"x"));assert!(!s.take_plain_key(true,"x"));
+        s.record_plain_key(Some("x"),true);s.clear_plain_key();assert!(!s.take_plain_key(true,"x"));
+        s.record_plain_key(Some("x"),true);s.replace_and_mark(None,"λ",None).unwrap();assert!(!s.take_plain_key(true,"x"));
+        s.cancel_preedit();s.record_plain_key(Some("x"),true);s.active(false);assert!(!s.take_plain_key(true,"x"));
     }
     #[test]
     fn virtual_preedit_and_expanded_replacement_commit_once() {

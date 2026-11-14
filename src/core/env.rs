@@ -38,6 +38,10 @@ pub(crate) struct Env<'a> {
     #[no_trace]
     binding_targets: Vec<Option<OwnerBufferHandle>>,
     pub(crate) match_data: Slot<Object<'a>>,
+    pub(crate) native_key_prefix: Slot<Object<'a>>,
+    pub(crate) keymap_functions: ObjectMap<Slot<Symbol<'a>>,Slot<Object<'a>>>,
+    #[no_trace]
+    pub(crate) native_key_sequence: Option<u64>,
     features: Vec<Slot<Symbol<'a>>>,
     #[no_trace]
     pub(crate) current_buffer: OwnerBufferHandle,
@@ -66,6 +70,9 @@ impl<'a> Env<'a> {
             binding_stack: Default::default(),
             binding_targets: Default::default(),
             match_data: Default::default(),
+            native_key_prefix: Default::default(),
+            keymap_functions: Default::default(),
+            native_key_sequence: None,
             features: Default::default(),
             current_buffer,
             editor_gateway,

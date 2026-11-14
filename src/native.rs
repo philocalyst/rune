@@ -84,7 +84,9 @@ pub(crate) fn run(sources: Vec<String>, native_file: Option<std::path::PathBuf>)
                         }
                     };
                     configure_native_saver(
-                        worker.with_interruptible_evaluator(evaluate_source_with_quit, owner_quit),
+                        worker
+                            .with_key_dispatcher(dispatch_native_key, owner_quit.clone())
+                            .with_interruptible_evaluator(evaluate_source_with_quit, owner_quit),
                         guarded_file_mode,
                     )
                     .run_with_outcome(|step| {
@@ -96,6 +98,9 @@ pub(crate) fn run(sources: Vec<String>, native_file: Option<std::path::PathBuf>)
                         }
                         if let Some(save) = step.save {
                             owner_reports.save(save);
+                        }
+                        if let Some(Err(error)) = step.key_outcome {
+                            owner_reports.notice(format!("Key command failed: {error}"));
                         }
                         if let Err(error) = step.edit {
                             eprintln!("native owner input: {error:?}");
@@ -308,6 +313,21 @@ fn save_selected_visited(
     })
 }
 
+fn dispatch_native_key(
+    host: &mut LispRuntimeHost<'_, '_, '_>,
+    request: &rune_gpui::editor_transport::NativeKeyRequest,
+    token: Arc<AtomicBool>,
+) -> Result<bool, String> {
+    host.dispatch_native_key_with_quit(
+        request.window_id,
+        request.buffer_id,
+        &request.key,
+        request.control,
+        request.meta,
+        request.shift,
+        token,
+    )
+}
 fn evaluate_source_with_quit(
     host: &mut LispRuntimeHost<'_, '_, '_>,
     source: &str,
@@ -704,5 +724,29 @@ mod joined_owner_tests {
             Ok(())
         })
         .unwrap();
+    }
+    #[test]
+    fn real_keymap_fifo_intercepts_printable_once_but_paste_and_ime_stay_literal() {
+        with_lisp_runtime_owner(80,24,|mut host| {
+            host.evaluate_source("(setq keymap-hits 0) (fset 'keymap-hit '(lambda () (interactive) (setq keymap-hits (+ keymap-hits 1)) (insert \"B\"))) (fset 'keymap-bad '(lambda () (interactive) (insert \"BAD\"))) (setq owner-keymap (make-sparse-keymap)) (define-key owner-keymap \"xy\" 'keymap-hit) (define-key owner-keymap [955] 'keymap-bad) (use-global-map owner-keymap)").map_err(anyhow::Error::msg)?;
+            let (publisher,_updates)=host_updates();let(sender,_replies,pending)=pending_editor_transport(16,publisher);
+            let(platform,reader)=rune_gpui::platform_context::platform_frames();
+            let bridge=EditorBridge::new(host,FixedMetrics::default(),Rect{x:0.,y:0.,width:640.,height:480.}).map_err(|e|anyhow::anyhow!("{e:?}"))?;
+            let quit=rune_gpui::evaluation_quit::EvaluationQuit::default();
+            let mut worker=pending.bind_ime_initialized(bridge,platform).map_err(|e|anyhow::anyhow!("{e:?}"))?.with_key_dispatcher(dispatch_native_key,quit).with_evaluator(evaluate_source);
+            let initial=worker.bridge().snapshot().unwrap();let v=initial.views.iter().find(|v|v.id==initial.selected_window).unwrap();let(window_id,buffer_id)=(v.id.as_u64(),v.view.buffer.as_u64());
+            sender.try_send(OwnerEvent::KeyText{window_id,buffer_id,text:"x".into()}).unwrap();
+            let step=worker.try_step().unwrap();assert!(step.key_outcome.unwrap().is_ok());assert!(!step.edit.unwrap());
+            sender.try_send(OwnerEvent::Evaluate{request_id:1,source:"(garbage-collect)".into()}).unwrap();assert!(worker.try_step().unwrap().evaluation.unwrap().outcome.is_ok());
+            sender.try_send(OwnerEvent::KeyText{window_id,buffer_id,text:"y".into()}).unwrap();assert!(worker.try_step().unwrap().key_outcome.unwrap().is_ok());
+            sender.try_send(OwnerEvent::TextInsertion{window_id,buffer_id,text:"xy".into()}).unwrap();assert!(worker.try_step().unwrap().edit.unwrap());
+            sender.try_send(OwnerEvent::KeyText{window_id,buffer_id,text:"z".into()}).unwrap();assert!(worker.try_step().unwrap().edit.unwrap());
+            let mut ime=rune_gpui::platform_state::PlatformInputState::new(reader,FixedMetrics::default()).unwrap();ime.sync();
+            ime.replace_and_mark(None,"λ",None).unwrap();let event=ime.commit(None,"λ").unwrap();assert!(matches!(&event,OwnerEvent::Composition(_)));
+            sender.try_send(event).unwrap();assert!(worker.try_step().unwrap().edit.unwrap());
+            let final_snapshot=worker.bridge().snapshot().unwrap();let buffer=final_snapshot.buffers.iter().find(|b|b.id.as_u64()==buffer_id).unwrap();assert_eq!(buffer.document.to_text(),"Bxyzλ");
+            sender.try_send(OwnerEvent::Evaluate{request_id:2,source:"(if (= keymap-hits 1) nil (error \"duplicate key invocation\"))".into()}).unwrap();assert!(worker.try_step().unwrap().evaluation.unwrap().outcome.is_ok());
+            Ok(())
+        }).unwrap();
     }
 }

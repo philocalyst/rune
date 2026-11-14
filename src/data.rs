@@ -13,7 +13,6 @@ use anyhow::{Result, anyhow};
 use rune_core::macros::list;
 use rune_macros::defun;
 
-#[defun]
 pub(crate) fn fset<'ob>(symbol: Symbol<'ob>, definition: Object) -> Result<Symbol<'ob>> {
     if definition.is_nil() {
         symbol.unbind_func();
@@ -25,13 +24,71 @@ pub(crate) fn fset<'ob>(symbol: Symbol<'ob>, definition: Object) -> Result<Symbo
     Ok(symbol)
 }
 
-#[defun]
 pub(crate) fn defalias<'ob>(
     symbol: Symbol<'ob>,
     definition: Object,
     _docstring: Option<&str>,
 ) -> Result<Symbol<'ob>> {
     fset(symbol, definition)
+}
+
+/// Only direct keymap graphs are owner-local. Ordinary functions and immutable
+/// symbol-alias edges retain the existing global publication path.
+#[defun(name = "fset")]
+fn fset_owner<'a>(
+    symbol: Symbol<'a>,
+    definition: Object<'a>,
+    env: &mut Rt<Env>,
+    cx: &'a Context,
+) -> Result<Object<'a>> {
+    anyhow::ensure!(!symbol.is_const()||definition.is_nil(), "Attempt to set a constant symbol: {symbol}");
+    if crate::keymap::direct_map(definition) {
+        // Capacity is acquired before unbinding: insert below cannot allocate,
+        // collect, call Lisp, or fail after the namespace publication.
+        env.keymap_functions.try_reserve(1)?;
+        symbol.unbind_func();
+        env.keymap_functions.insert(symbol, definition);
+    } else {
+        crate::keymap::preflight_keymap_alias(symbol, definition, env, cx)?;
+        fset(symbol, definition)?;
+        env.keymap_functions.remove(symbol);
+    }
+    crate::keymap::cancel_native_prefix(env);
+    Ok(definition)
+}
+#[defun(name = "defalias")]
+fn defalias_owner<'a>(
+    symbol: Symbol<'a>,
+    definition: Object<'a>,
+    _docstring: Option<&str>,
+    env: &mut Rt<Env>,
+    cx: &'a Context,
+) -> Result<Symbol<'a>> {
+    fset_owner(symbol, definition, env, cx)?;
+    Ok(symbol)
+}
+#[defun(name = "symbol-function")]
+pub(crate) fn symbol_function_owner<'a>(
+    symbol: Symbol,
+    env: &Rt<Env>,
+    cx: &'a Context,
+) -> Object<'a> {
+    env.keymap_functions
+        .get(symbol)
+        .map(|x| x.bind(cx))
+        .unwrap_or_else(|| symbol_function(symbol, cx))
+}
+#[defun(name = "fboundp")]
+fn fboundp_owner(symbol: Symbol, env: &Rt<Env>) -> bool {
+    env.keymap_functions.get(symbol).is_some() || fboundp(symbol)
+}
+#[defun(name = "fmakunbound")]
+fn fmakunbound_owner<'a>(symbol: Symbol<'a>, env: &mut Rt<Env>) -> Result<Symbol<'a>> {
+    anyhow::ensure!(!symbol.is_const(), "Attempt to set a constant symbol: {symbol}");
+    fmakunbound(symbol);
+    env.keymap_functions.remove(symbol);
+    crate::keymap::cancel_native_prefix(env);
+    Ok(symbol)
 }
 
 #[defun]
@@ -101,12 +158,18 @@ pub(crate) fn default_value<'ob>(
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     if symbol == sym::BUFFER_READ_ONLY {
-        return env.toplevel_value(symbol, cx).ok_or_else(|| crate::eval::EvalError::signal(sym::VOID_VARIABLE.into(), Cons::new1(symbol, cx).into(), cx).into());
+        return env.toplevel_value(symbol, cx).ok_or_else(|| {
+            crate::eval::EvalError::signal(
+                sym::VOID_VARIABLE.into(),
+                Cons::new1(symbol, cx).into(),
+                cx,
+            )
+            .into()
+        });
     }
     symbol_value(symbol, env, cx)
 }
 
-#[defun]
 pub(crate) fn symbol_function<'ob>(symbol: Symbol, cx: &'ob Context) -> Object<'ob> {
     match symbol.func(cx) {
         Some(f) => f.into(),
@@ -120,8 +183,13 @@ pub(crate) fn symbol_value<'ob>(
     env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    if symbol.is_const() { return Ok(symbol.into()); }
-    env.variable_value(symbol, cx)?.ok_or_else(|| crate::eval::EvalError::signal(sym::VOID_VARIABLE.into(), Cons::new1(symbol, cx).into(), cx).into())
+    if symbol.is_const() {
+        return Ok(symbol.into());
+    }
+    env.variable_value(symbol, cx)?.ok_or_else(|| {
+        crate::eval::EvalError::signal(sym::VOID_VARIABLE.into(), Cons::new1(symbol, cx).into(), cx)
+            .into()
+    })
 }
 
 #[defun]
@@ -134,12 +202,10 @@ pub(crate) fn null(obj: Object) -> bool {
     obj.is_nil()
 }
 
-#[defun]
 pub(crate) fn fboundp(symbol: Symbol) -> bool {
     symbol.has_func()
 }
 
-#[defun]
 pub(crate) fn fmakunbound(symbol: Symbol) -> Symbol {
     symbol.unbind_func();
     symbol
@@ -152,7 +218,10 @@ pub(crate) fn boundp(symbol: Symbol, env: &Rt<Env>, cx: &Context) -> Result<bool
 
 #[defun]
 pub(crate) fn makunbound<'ob>(symbol: Symbol<'ob>, env: &mut Rt<Env>) -> Result<Symbol<'ob>> {
-    anyhow::ensure!(symbol != sym::BUFFER_READ_ONLY, "Unbinding owner-forwarded buffer-read-only is not supported");
+    anyhow::ensure!(
+        symbol != sym::BUFFER_READ_ONLY,
+        "Unbinding owner-forwarded buffer-read-only is not supported"
+    );
     env.vars.remove(symbol);
     Ok(symbol)
 }

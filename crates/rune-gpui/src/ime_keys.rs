@@ -25,7 +25,7 @@ pub(crate) fn route(
         return ImeKey::Platform;
     }
     if meta {
-        return ImeKey::Platform;
+        return ImeKey::Unsupported;
     }
     if control || platform {
         return match (key, shift) {
@@ -50,6 +50,7 @@ pub(crate) fn route(
         "delete" => ImeKey::Command(Command::DeleteForward(1)),
         "enter" => ImeKey::Command(Command::Insert("\n".into())),
         "tab" => ImeKey::Command(Command::Insert("\t".into())),
+        key if key.starts_with('f') && key[1..].parse::<u8>().is_ok() => ImeKey::Unsupported,
         _ => ImeKey::Platform,
     }
 }
@@ -81,6 +82,6 @@ mod tests {
         assert!(matches!(route("v", true, false, false, false, false), ImeKey::Paste));
         assert!(matches!(route("v", false, true, false, true, false), ImeKey::Paste));
         assert!(matches!(route("v", true, false, false, false, true), ImeKey::Platform));
-        assert!(matches!(route("v", true, false, true, false, false), ImeKey::Platform));
+        assert!(matches!(route("v", true, false, true, false, false), ImeKey::Unsupported));
     }
 }

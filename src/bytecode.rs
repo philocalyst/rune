@@ -609,7 +609,9 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 }
                 op::SymbolFunction => {
                     let top = self.env.stack.top();
-                    top.set(data::symbol_function(top.bind_as(cx)?, cx));
+                    let symbol = top.bind_as(cx)?;
+                    let function = data::symbol_function_owner(symbol, self.env, cx);
+                    self.env.stack.top().set(function);
                 }
                 op::Set => {
                     let newlet = self.env.stack.pop(cx);

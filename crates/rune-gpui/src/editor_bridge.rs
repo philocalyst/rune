@@ -63,6 +63,14 @@ where
     ) -> Result<(), String> {
         evaluate(&mut self.host, source, token)
     }
+    pub(crate) fn dispatch_key_with(
+        &mut self,
+        dispatch: crate::editor_transport::NativeKeyDispatcher<H>,
+        request: &crate::editor_transport::NativeKeyRequest,
+        token: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<bool, String> {
+        dispatch(&mut self.host, request, token)
+    }
     pub(crate) fn save_with(
         &mut self,
         save: crate::editor_transport::VisitedSaver<H>,
