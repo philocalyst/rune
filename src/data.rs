@@ -727,7 +727,6 @@ pub(crate) fn provide<'ob>(
     feature
 }
 
-#[defun]
 pub(crate) fn car(list: List) -> Object {
     match list.untag() {
         ListType::Cons(cons) => cons.car(),
@@ -735,12 +734,44 @@ pub(crate) fn car(list: List) -> Object {
     }
 }
 
-#[defun]
 pub(crate) fn cdr(list: List) -> Object {
     match list.untag() {
         ListType::Cons(cons) => cons.cdr(),
         ListType::Nil => NIL,
     }
+}
+
+// Keep the pure typed Rust helpers above for callers that already validated a
+// List. Lisp/bytecode boundaries must retain the original operand and signal
+// GNU's listp condition, not eagerly render a generic TypeError graph.
+defsym!(CAR);
+defsym!(CDR);
+fn list_operand_error(value: Object, env: &mut Rt<Env>, cx: &Context) -> anyhow::Error {
+    env.initialize_condition_metadata(cx);
+    let data = list![sym::LISTP, value; cx];
+    crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into()
+}
+pub(crate) fn car_value<'a>(value: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Object<'a>> {
+    match value.untag() {
+        ObjectType::NIL => Ok(NIL),
+        ObjectType::Cons(cons) => Ok(cons.car()),
+        _ => Err(list_operand_error(value, env, cx)),
+    }
+}
+pub(crate) fn cdr_value<'a>(value: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Object<'a>> {
+    match value.untag() {
+        ObjectType::NIL => Ok(NIL),
+        ObjectType::Cons(cons) => Ok(cons.cdr()),
+        _ => Err(list_operand_error(value, env, cx)),
+    }
+}
+#[defun(name = "car")]
+fn car_lisp<'a>(value: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Object<'a>> {
+    car_value(value, env, cx)
+}
+#[defun(name = "cdr")]
+fn cdr_lisp<'a>(value: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Object<'a>> {
+    cdr_value(value, env, cx)
 }
 
 #[defun]
@@ -1507,3 +1538,36 @@ defsym!(CYCLIC_FUNCTION_INDIRECTION);
 defsym!(MARKER);
 
 defsym!(OBARRAY);
+
+#[cfg(test)]
+mod list_component_signal_tests {
+    use crate::interpreter::assert_lisp;
+    #[test]
+    fn list_components_preserve_nil_dotted_and_cyclic_cons_values() {
+        assert_lisp("(list (car nil) (cdr nil) (car '(a . b)) (cdr '(a . b)) (car-safe 7) (cdr-safe 7))", "(nil nil a b nil nil)");
+        assert_lisp("(let ((x (cons 7 nil))) (setcdr x x) (list (car x) (eq x (cdr x))))", "(7 t)");
+    }
+    #[test]
+    fn car_cdr_signal_listp_and_preserve_original_cyclic_operand() {
+        for name in ["car","cdr"] {
+            assert_lisp(&format!("(condition-case e ({name} 7) (wrong-type-argument (list (car e) (car (cdr e)) (car (cdr (cdr e))))))"),"(wrong-type-argument listp 7)");
+            for value in ["t", "\"text\"", "(vector 1)", "(make-char-table nil)", "(obarray-make)", "(unibyte-string 255)"] {
+                assert_lisp(&format!("(let ((x {value})) (condition-case e ({name} x) (wrong-type-argument (progn (garbage-collect) (and (eq (car (cdr e)) 'listp) (eq (car (cdr (cdr e))) x))))))"),"t");
+            }
+            assert_lisp(&format!("(let ((x (vector nil))) (aset x 0 x) (condition-case e ({name} x) (wrong-type-argument (progn (garbage-collect) (and (eq (car (cdr e)) 'listp) (eq (car (cdr (cdr e))) x))))))"),"t");
+            assert_lisp(&format!("(let* ((c (vector nil)) (f (make-byte-code 0 (unibyte-string 192 135) c 1))) (aset c 0 f) (condition-case e ({name} f) (wrong-type-argument (progn (garbage-collect) (eq (car (cdr (cdr e))) f)))))"),"t");
+        }
+    }
+    #[test]
+    fn bytecode_components_match_native_conditions_and_recover_stack() {
+        for opcode in [64,65] {
+            assert_lisp(&format!("(let ((f (make-byte-code 514 (unibyte-string 1 {opcode} 135) [] 3))) (list (condition-case e (funcall f 7 8) (wrong-type-argument (list (car e) (car (cdr e)) (car (cdr (cdr e)))))) (funcall f '(11 . 12) 0)))"),if opcode==64 {"((wrong-type-argument listp 7) 11)"} else {"((wrong-type-argument listp 7) 12)"});
+            assert_lisp(&format!("(let* ((x (vector nil)) (f (make-byte-code 0 (unibyte-string 192 {opcode} 135) (vector x) 1))) (aset x 0 x) (condition-case e (funcall f) (wrong-type-argument (progn (garbage-collect) (eq (car (cdr (cdr e))) x)))))"),"t");
+        }
+    }
+    #[test]
+    fn native_component_arity_keeps_evaluation_order() {
+        assert_lisp("(let ((seen 0)) (condition-case nil (car (progn (setq seen 1) 7) (progn (setq seen 2) 8)) (wrong-number-of-arguments nil)) seen)","0");
+        assert_lisp("(let ((seen 0)) (condition-case nil (funcall 'car (progn (setq seen 1) 7) (progn (setq seen 2) 8)) (wrong-number-of-arguments nil)) seen)","2");
+    }
+}

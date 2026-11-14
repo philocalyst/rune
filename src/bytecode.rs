@@ -553,12 +553,14 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     top.set(data::null(top.bind(cx)));
                 }
                 op::Car => {
-                    let top = self.env.stack.top();
-                    top.set(data::car(top.bind_as(cx)?));
+                    let input = self.env.stack.top().bind(cx);
+                    let value = data::car_value(input, self.env, cx)?;
+                    self.env.stack.top().set(value);
                 }
                 op::Cdr => {
-                    let top = self.env.stack.top();
-                    top.set(data::cdr(top.bind_as(cx)?));
+                    let input = self.env.stack.top().bind(cx);
+                    let value = data::cdr_value(input, self.env, cx)?;
+                    self.env.stack.top().set(value);
                 }
                 op::Cons => {
                     let cdr = self.env.stack.pop(cx);
