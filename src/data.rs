@@ -393,7 +393,22 @@ fn number_to_string(number: Number, env: &Rt<Env>, cx: &Context) -> String {
     }
 }
 
-#[defun]
+#[defun(name = "string-to-number")]
+fn string_to_number_lisp<'ob>(string: Object<'ob>, base: Option<Object>, cx: &'ob Context) -> Result<Number<'ob>> {
+    let input = match string.untag() {
+        ObjectType::String(value) => &**value,
+        ObjectType::ByteString(value) => std::str::from_utf8(&value)?,
+        other => return Err(TypeError::new(Type::String, other).into()),
+    };
+    // Preserve validation order: string kind/bytes before optional radix type.
+    let base = match base {
+        None => None,
+        Some(value) if value.is_nil() => None,
+        Some(value) => Some(i64::try_from(value)?),
+    };
+    string_to_number(input, base, cx)
+}
+
 fn string_to_number<'ob>(string: &str, base: Option<i64>, cx: &'ob Context) -> Result<Number<'ob>> {
     let base = base.unwrap_or(10);
     // GNU's string-to-number allows 2..=16, unlike the reader's #Nr syntax.
@@ -1430,5 +1445,25 @@ mod toplevel_default_tests {
         ] {
             crate::interpreter::assert_lisp(source, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod binary_numeric_cookie_tests {
+    use super::*;
+    use crate::core::gc::{Context, RootSet};
+    #[test]
+    fn unibyte_hex_cookies_use_existing_exact_parser() {
+        let roots=RootSet::default(); let cx=Context::new(&roots);
+        for token in ["0", "ff", "000abc", "ABCDEF", "ffffffffffffffffffffffff", "  ffjunk"] {
+            let input=cx.add(token.as_bytes().to_vec());
+            let actual=string_to_number_lisp(input,Some(cx.add(16_i64)),&cx).unwrap();
+            let expected=string_to_number(token,Some(16),&cx).unwrap();
+            assert_eq!(actual.val(),expected.val());
+        }
+        let invalid=cx.add(vec![b'f',0xfe]);
+        assert!(string_to_number_lisp(invalid,Some(cx.add(16_i64)),&cx).is_err());
+        let ObjectType::ByteString(bytes)=invalid.untag() else{unreachable!()};
+        assert_eq!(&**bytes,&[b'f',0xfe]);
     }
 }

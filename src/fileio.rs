@@ -17,6 +17,87 @@ use fancy_regex::Regex;
 use rune_macros::defun;
 use std::path::{Component, MAIN_SEPARATOR, Path};
 
+/// Bounded local-file search for source loaders. No callbacks or file handlers.
+#[defun]
+fn locate_file_internal(
+    filename: &str,
+    path: Object,
+    suffixes: Option<Object>,
+    predicate: OptionalFlag,
+    env: &Rt<Env>,
+    cx: &Context,
+) -> Result<Option<String>> {
+    ensure!(predicate.is_none(), "locate-file-internal custom predicates/access modes are not implemented");
+    ensure!(!filename.as_bytes().contains(&0), "Filename contains NUL");
+    ensure!(filename.len() <= 65536, "locate-file-internal filename exceeds limit");
+    let mut directories = Vec::new();
+    for entry in path.as_list()? {
+        ensure!(directories.len() < 1024, "locate-file-internal path exceeds limit");
+        let entry = entry?;
+        directories.push(match entry.untag() {
+            ObjectType::NIL => None,
+            ObjectType::String(value) => {
+                ensure!(value.len() <= 65536 && !value.as_bytes().contains(&0), "Invalid locate-file-internal directory");
+                Some(String::from(&**value))
+            },
+            _ => return Err(TypeError::new(Type::String, entry).into()),
+        });
+    }
+    if directories.is_empty() { directories.push(None); }
+    let mut endings = Vec::new();
+    for entry in suffixes.unwrap_or_default().as_list()? {
+        ensure!(endings.len() < 128, "locate-file-internal suffix list exceeds limit");
+        let entry = entry?;
+        let ObjectType::String(value) = entry.untag() else {
+            return Err(TypeError::new(Type::String, entry).into());
+        };
+        ensure!(value.len() <= 65536 && !value.as_bytes().contains(&0), "Invalid locate-file-internal suffix");
+        endings.push(String::from(&**value));
+    }
+    if endings.is_empty() { endings.push(String::new()); }
+    let directory = symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?;
+    let ObjectType::String(directory) = directory.untag() else {
+        return Err(TypeError::new(Type::String, directory).into());
+    };
+    ensure!(directory.len() <= 65536 && !directory.as_bytes().contains(&0), "Invalid default-directory");
+    let default = std::path::absolute(Path::new(&**directory))?;
+    ensure!(default.is_absolute(), "default-directory is not absolute");
+    let absolute = Path::new(filename).is_absolute();
+    let mut attempts = 0usize;
+    for directory in directories {
+        let base = match directory {
+            Some(directory) => {
+                ensure!(directory.len() <= 65536 && !directory.as_bytes().contains(&0), "Invalid locate-file-internal directory");
+                default.join(directory)
+            }
+            None => default.clone(),
+        };
+        for suffix in &endings {
+            attempts += 1;
+            ensure!(attempts <= 65536, "locate-file-internal search exceeds limit");
+            let mut name = filename.to_owned(); name.push_str(suffix);
+            let candidate = if absolute { std::path::PathBuf::from(&name) } else { base.join(&name) };
+            let candidate = std::path::absolute(candidate)?;
+            ensure!(candidate.is_absolute(), "Search candidate is not absolute");
+            // Expand lexically BEFORE checking, so the returned name is the
+            // exact name whose readability was tested (including symlink/..).
+            let mut normalized = std::path::PathBuf::new();
+            for component in candidate.components() {
+                match component {
+                    Component::CurDir => {},
+                    Component::ParentDir => { if normalized.file_name().is_some() { normalized.pop(); } },
+                    _ => normalized.push(component.as_os_str()),
+                }
+            }
+            if normalized.is_file() && std::fs::File::open(&normalized).is_ok() {
+                return Ok(Some(normalized.to_str().ok_or_else(|| anyhow::anyhow!("Search result is not UTF-8"))?.to_owned()));
+            }
+        }
+        if absolute { break; }
+    }
+    Ok(None)
+}
+
 #[defun]
 pub(crate) fn expand_file_name(
     name: &str,
@@ -988,5 +1069,55 @@ mod bounded_insert_file_tests {
         assert_eq!(env.buffer_read(cx)?.epoch, before.epoch);
         assert!(!env.editor_gateway().modified(before.handle, cx)?);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod locate_file_internal_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::{list, root, rebind};
+    #[test]
+    fn actual_lisp_search_order_suffix_order_and_default_directory() -> Result<()> {
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-locate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); std::fs::create_dir_all(dir.join("first"))?;
+        std::fs::create_dir_all(dir.join("second"))?;
+        let result = (|| -> Result<()> {
+            std::fs::write(dir.join("first/pkg.extra.el"), "first")?;
+            std::fs::write(dir.join("first/pkg.extra"), "bare")?;
+            std::fs::write(dir.join("second/pkg.extra.el"), "second")?;
+            env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.to_str().unwrap()))?;
+            let source = r#"(locate-file-internal "pkg.extra" '("first" "second") '(".el" ""))"#;
+            let form = crate::reader::read(source, cx)?.0; root!(form, cx);
+            let actual = rebind!(crate::interpreter::eval(form, None, env, cx)?, cx);
+            assert_eq!(<&str>::try_from(actual)?, dir.join("first/pkg.extra.el").to_str().unwrap());
+            assert_eq!(locate_file_internal("first/pkg.extra", NIL.into(), None, None, env, cx)?, Some(dir.join("first/pkg.extra").to_str().unwrap().to_owned()));
+            assert!(locate_file_internal("first", NIL.into(), None, None, env, cx)?.is_none());
+            assert!(locate_file_internal("missing", NIL.into(), None, None, env, cx)?.is_none());
+            #[cfg(unix)] {
+                std::fs::create_dir_all(dir.join("a"))?;
+                std::fs::create_dir_all(dir.join("b/subdir"))?;
+                std::fs::write(dir.join("b/target"), "physical-only")?;
+                std::os::unix::fs::symlink(dir.join("b/subdir"), dir.join("a/link"))?;
+                assert!(locate_file_internal("a/link/../target", NIL.into(), None, None, env, cx)?.is_none());
+                std::fs::write(dir.join("a/target"), "lexical")?;
+                assert_eq!(locate_file_internal("a/link/../target", NIL.into(), None, None, env, cx)?, Some(dir.join("a/target").to_str().unwrap().to_owned()));
+            }
+            assert!(locate_file_internal("missing", list!["x".repeat(65537); cx], None, None, env, cx).is_err());
+            assert!(locate_file_internal("pkg", list![42i64; cx], None, None, env, cx).is_err());
+            assert!(locate_file_internal("pkg", NIL.into(), Some(list![42i64; cx]), None, env, cx).is_err());
+            assert!(locate_file_internal("pkg", NIL.into(), None, Some(()), env, cx).is_err());
+            let circular = Cons::new(".", NIL, cx);
+            circular.set_cdr(circular.into())?;
+            assert!(locate_file_internal("missing", circular.into(), None, None, env, cx).is_err());
+            let mut too_many = Object::from(NIL);
+            for _ in 0..129 { too_many = Cons::new(".el", too_many, cx).into(); }
+            assert!(locate_file_internal("pkg", NIL.into(), Some(too_many), None, env, cx).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
     }
 }

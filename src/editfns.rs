@@ -95,6 +95,18 @@ fn buffer_size(
     Ok(read.document.text().len_chars())
 }
 
+/// Full current buffer text. Lisp strings do not yet represent text properties;
+/// reject that unsupported case rather than silently returning a lossy string.
+#[defun]
+fn buffer_string(env: &Rt<Env>, cx: &Context) -> Result<String> {
+    let read = env.buffer_read(cx)?;
+    for (_, id) in read.document.properties().runs() {
+        ensure!(read.document.resolve(id.0, cx)?.is_nil(),
+            "buffer-string of propertied text is not implemented");
+    }
+    Ok(read.document.text().to_string())
+}
+
 #[defun]
 fn buffer_substring_no_properties(start: i64, end: i64, env: &Rt<Env>, cx: &Context) -> Result<String> {
     let read = env.buffer_read(cx)?;
@@ -622,6 +634,49 @@ mod owner_buffer_primitives_tests {
         let mut native = g.host(cx)?;
         native.execute(rune_editor::Command::Undo)?;
         assert_eq!(buffer_substring_no_properties(1, 5, env, cx)?, "aé🙂z");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod buffer_string_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::{root, rebind};
+
+    #[test]
+    fn actual_lisp_buffer_string_returns_all_unicode_text_without_moving_point() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        crate::sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let source = "(progn (insert \"aé🙂\nsecond\") (goto-char 2) (list (buffer-string) (point)))";
+        let form = crate::reader::read(source, cx)?.0;
+        root!(form, cx);
+        let result = rebind!(crate::interpreter::eval(form, None, env, cx)?, cx);
+        assert_eq!(result.to_string(), "(\"aé🙂\nsecond\" 2)");
+        Ok(())
+    }
+
+    #[test]
+    fn buffer_string_is_current_owner_specific_and_rejects_property_loss() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        crate::sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        assert_eq!(buffer_string(env, cx)?, "");
+        let gateway = env.editor_gateway();
+        let read = env.buffer_read(cx)?;
+        gateway.splice(read.handle, read.epoch, 0..0, "abc", cx)?;
+        let read = env.buffer_read(cx)?;
+        let property = unsafe { gateway.intern_property(cx.add("retained-property"), cx) }?;
+        let prepared = gateway.prepare_properties(&read, rune_text::CharPos(0)..rune_text::CharPos(1), &property, cx)?;
+        gateway.publish_properties(prepared, cx)?;
+        assert!(buffer_string(env, cx).is_err());
+        let other = gateway.create(" *buffer-string-other*", "other", cx)?;
+        env.set_current_buffer(other, cx)?;
+        assert_eq!(buffer_string(env, cx)?, "other");
         Ok(())
     }
 }

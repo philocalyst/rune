@@ -648,7 +648,34 @@ pub(crate) fn require<'ob>(
     }
 }
 
-#[defun]
+#[defun(name = "concat")]
+fn concat_lisp<'ob>(sequences: &[Object], cx: &'ob Context) -> Result<Object<'ob>> {
+    let has_bytes = sequences.iter().any(|value| matches!(value.untag(), ObjectType::ByteString(_)));
+    if !has_bytes { return Ok(cx.add(concat(sequences)?)); }
+    // An ASCII multibyte accumulator such as mu4e's initial empty string must
+    // not reinterpret process bytes as Unicode. Mixed non-ASCII multibyte/raw
+    // strings need Emacs's non-scalar character representation, not Latin-1.
+    let mut bytes = Vec::new();
+    for &sequence in sequences {
+        match sequence.untag() {
+            ObjectType::ByteString(value) => bytes.extend_from_slice(value),
+            ObjectType::String(value) => {
+                ensure!(value.is_ascii(), "concat mixing raw bytes and non-ASCII Unicode is not implemented");
+                bytes.extend_from_slice(value.as_bytes());
+            }
+            _ => {
+                let mut text = String::new();
+                append_character_sequence(&mut text, sequence)?;
+                for character in text.chars() {
+                    ensure!(character.is_ascii(), "concat mixing raw bytes and non-ASCII character sequences is not implemented");
+                    bytes.push(character as u8);
+                }
+            }
+        }
+    }
+    Ok(cx.add(bytes))
+}
+
 pub(crate) fn concat(sequences: &[Object]) -> Result<String> {
     let mut result = String::new();
     for &sequence in sequences {
@@ -1185,7 +1212,25 @@ fn copy_sequence<'ob>(arg: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>>
     }
 }
 
-#[defun]
+#[defun(name = "substring")]
+fn substring_lisp<'ob>(string: Object, from: Option<i64>, to: Option<i64>, cx: &'ob Context) -> Result<Object<'ob>> {
+    match string.untag() {
+        ObjectType::String(string) => Ok(cx.add(substring(string, from, to)?)),
+        ObjectType::ByteString(bytes) => {
+            let normalize = |position: i64| -> Result<usize> {
+                let position = if position < 0 { bytes.len() as i128 + i128::from(position) } else { i128::from(position) };
+                ensure!(position >= 0 && position <= bytes.len() as i128, "substring args out of range");
+                Ok(position as usize)
+            };
+            let start = normalize(from.unwrap_or(0))?;
+            let end = to.map(normalize).transpose()?.unwrap_or(bytes.len());
+            ensure!(start <= end, "substring args out of range");
+            Ok(cx.add(bytes[start..end].to_vec()))
+        }
+        _ => Err(TypeError::new(Type::String, string).into()),
+    }
+}
+
 fn substring(string: &str, from: Option<i64>, to: Option<i64>) -> Result<String> {
     let char_len = string.chars().count();
     let normalize = |position: i64| -> Result<usize> {
@@ -1957,5 +2002,40 @@ mod test {
             "\"\0\0\0\0\0\0\0\0\0\0\0\"",
         );
         assert_lisp("(let ((str \"\")) (clear-string str) str)", "\"\"");
+    }
+}
+
+#[cfg(test)]
+mod binary_string_protocol_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn actual_lisp_binary_accumulator_and_cookie_slice_preserve_representation() -> Result<()> {
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        crate::sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let packet = crate::core::env::intern("binary-protocol-packet", cx);
+        env.set_var(packet, cx.add(vec![0xfe, b'3', 0xff, 0xce, 0xbb, b'!']))?;
+        let source = r#"(let* ((joined (concat "" binary-protocol-packet)) (payload (substring joined 3 -1))) (list (multibyte-string-p joined) (aref joined 0) (aref joined 2) (length joined) (multibyte-string-p payload) (aref payload 0) (aref payload 1)))"#;
+        let form = crate::reader::read(source, cx)?.0; root!(form, cx);
+        let result = rebind!(crate::interpreter::eval(form, None, env, cx)?, cx);
+        assert_eq!(result.to_string(), "(nil 254 255 6 nil 206 187)");
+        Ok(())
+    }
+
+    #[test]
+    fn concat_and_substring_keep_protocol_bytes_and_use_byte_positions() -> Result<()> {
+        let roots = RootSet::default(); let cx = Context::new(&roots);
+        let empty = cx.add(""); let packet = cx.add(vec![0xfe, b'3', 0xff, 0xce, 0xbb, b'!']);
+        let joined = concat_lisp(&[empty, packet], &cx)?;
+        let ObjectType::ByteString(bytes) = joined.untag() else { panic!("raw protocol bytes became Unicode") };
+        assert_eq!(&**bytes, &[0xfe,b'3',0xff,0xce,0xbb,b'!']);
+        let payload = substring_lisp(joined, Some(3), Some(-1), &cx)?;
+        let ObjectType::ByteString(bytes) = payload.untag() else { panic!("substring lost byte representation") };
+        assert_eq!(&**bytes, &[0xce,0xbb]);
+        assert!(substring_lisp(joined, Some(-99), None, &cx).is_err());
+        assert!(concat_lisp(&[packet, cx.add("λ")], &cx).is_err());
+        Ok(())
     }
 }

@@ -16,6 +16,7 @@ mod channel_manager;
 mod channels;
 mod character;
 mod chartab;
+mod coding;
 mod data;
 mod dired;
 mod dump;

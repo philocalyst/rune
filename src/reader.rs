@@ -548,6 +548,13 @@ fn unescape_string<'a>(string: &str, offset: usize, cx: &'a Context) -> Result<O
                     return Err(Error::InvalidEscape(pos));
                 }
                 raw.get_or_insert_with(|| new.as_bytes().to_vec()).push((base as u8) | 128);
+            } else if matches!(escaped, '0'..='7' | 'x') && (128..=255).contains(&code) {
+                // GNU octal/hex byte escapes select unibyte storage; explicit
+                // Unicode escapes (\\u/\\U) retain Unicode character semantics.
+                if !new.is_ascii() {
+                    return Err(Error::InvalidEscape(pos));
+                }
+                raw.get_or_insert_with(|| new.as_bytes().to_vec()).push(code as u8);
             } else if let Some(bytes) = &mut raw {
                 if code > 127 {
                     return Err(Error::InvalidEscape(pos));
@@ -1452,5 +1459,36 @@ mod m0_reader_regressions {
         for source in [r"?\M", r"?\H", r"?\S", r"?\A", r"?\C-", r"?\M-\"] {
             assert_eq!(read(source, &cx).unwrap_err(), Error::InvalidEscape(1), "{source}");
         }
+    }
+}
+
+#[cfg(test)]
+mod octet_escape_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use crate::core::object::ObjectType;
+    #[test]
+    fn octal_and_hex_high_byte_escapes_are_unibyte_not_unicode_scalars() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        for (source, expected) in [
+            (r#""\376""#, vec![254]),
+            (r#""\377""#, vec![255]),
+            (r#""\xfe""#, vec![254]),
+            (r#""a\376z\377""#, vec![97, 254, 122, 255]),
+            (r#""\M-x\376""#, vec![248, 254]),
+        ] {
+            let value = read(source, cx).unwrap().0;
+            let ObjectType::ByteString(bytes) = value.untag() else {
+                panic!("octet escape must produce a byte string")
+            };
+            assert_eq!(&**bytes, &expected);
+        }
+        for source in [r#""\u00fe""#, r#""\400""#] {
+            assert!(matches!(read(source, cx).unwrap().0.untag(), ObjectType::String(_)));
+        }
+        // Rune's UTF8 text model cannot represent mixed Unicode/raw-byte strings.
+        assert!(read(r#""é\376""#, cx).is_err());
+        assert!(read(r#""\376é""#, cx).is_err());
     }
 }
