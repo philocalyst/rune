@@ -255,6 +255,21 @@ impl NumberValue {
         if matches!(self, Self::Float(_)) || matches!(exponent, Self::Float(_)) {
             return Ok(Self::Float(self.to_float().powf(exponent.to_float())));
         }
+        if let (Self::Int(base), Self::Int(power)) = (&self, &exponent) {
+            if *power >= 0 {
+                let result = match *base {
+                    0 => Some(i64::from(*power == 0)),
+                    1 => Some(1),
+                    -1 => Some(if *power & 1 == 0 { 1 } else { -1 }),
+                    _ => u32::try_from(*power).ok().and_then(|power| base.checked_pow(power)),
+                };
+                if let Some(result) = result {
+                    // Every machine result is below the effective 128-bit
+                    // minimum width policy, but still needs storage normalization.
+                    return Ok(Self::Int(result).normalize());
+                }
+            }
+        }
         let exponent = exponent.into_integer()?;
         if exponent.sign() == Sign::Minus {
             return Ok(Self::Float(self.to_float().powf(bigint_float(&exponent))));
@@ -290,6 +305,28 @@ impl NumberValue {
         count: Self,
         integer_width: u64,
     ) -> Result<Self, NumericError> {
+        if let (Self::Int(value), Self::Int(distance)) = (&self, &count) {
+            if *value == 0 || *distance == 0 {
+                return Ok(Self::Int(*value).normalize());
+            }
+            if *distance < 0 {
+                let distance = distance.unsigned_abs();
+                let shifted = if distance >= 64 {
+                    if *value < 0 { -1 } else { 0 }
+                } else {
+                    *value >> distance
+                };
+                return Ok(Self::Int(shifted).normalize());
+            }
+            if *distance < 64 {
+                // Widen before shifting: primitive checked_shl checks only
+                // the count, not signed magnitude overflow.
+                let shifted = i128::from(*value) << *distance;
+                if let Ok(shifted) = i64::try_from(shifted) {
+                    return Ok(Self::Int(shifted).normalize());
+                }
+            }
+        }
         let value = self.into_integer()?;
         let count = count.into_integer()?;
         if value.is_zero() || count.is_zero() {
@@ -543,6 +580,59 @@ mod tests {
     use super::*;
     use crate::{core::gc::RootSet, interpreter::assert_lisp};
     use proptest::prelude::*;
+
+    #[test]
+    fn machine_power_boundary_and_huge_exponents_match_gnu() {
+        for base in [i64::MIN, MIN_FIXNUM, -3, -2, -1, 0, 1, 2, 3, MAX_FIXNUM, i64::MAX] {
+            let mut form = String::from("(let ((integer-width 128)) (list");
+            for power in [0, 1, 2, 3, 7, 31, 32, 55, 56, 63, 64, 127, 128, 129] {
+                form.push_str(&format!(" (condition-case nil (expt {base} {power}) (error 'caught))"));
+            }
+            form.push_str("))");
+            crate::assert_elprop!("{}", form);
+        }
+        for base in [-1, 0, 1] {
+            for power in [i64::MAX - 1, i64::MAX] {
+                let actual = NumberValue::Int(base).checked_pow(NumberValue::Int(power), 128).unwrap();
+                let expected = match base { -1 => if power & 1 == 0 { 1 } else { -1 }, 0 => 0, _ => 1 };
+                assert_eq!(actual, NumberValue::Int(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn machine_shift_boundary_matrix_matches_gnu() {
+        let values = [i64::MIN, i64::MIN + 1, MIN_FIXNUM - 1, MIN_FIXNUM,
+            -7, -1, 0, 1, 7, MAX_FIXNUM, MAX_FIXNUM + 1, i64::MAX - 1, i64::MAX];
+        let counts = [-1000, -128, -64, -63, -56, -1, 0, 1, 7, 54, 55, 56, 63, 64, 100, 128, 1000];
+        for left in values {
+            let mut form = String::from("(let ((integer-width 128)) (list");
+            for count in counts {
+                form.push_str(&format!(" (condition-case nil (ash {left} {count}) (error 'caught))"));
+            }
+            form.push_str("))");
+            crate::assert_elprop!("{}", form);
+        }
+    }
+
+    #[test]
+    fn machine_shift_extreme_counts_and_owned_values_are_safe() {
+        for value in [i64::MIN, i64::MAX, MIN_FIXNUM, MAX_FIXNUM, -1, 0, 1] {
+            for count in [i64::MIN, -64, -63, -1, 0, 1, 63, 64, i64::MAX] {
+                let actual = NumberValue::Int(value).arithmetic_shift(NumberValue::Int(count), 128);
+                if count == i64::MAX && value != 0 {
+                    assert!(matches!(actual, Err(NumericError::IntegerWidth { .. })));
+                } else {
+                    let expected = if count < 0 {
+                        if count <= -64 { BigInt::from(if value < 0 { -1 } else { 0 }) }
+                        else { BigInt::from(value) >> count.unsigned_abs() }
+                    } else if value == 0 { BigInt::from(0) }
+                    else { BigInt::from(value) << count as u64 };
+                    assert_eq!(actual.unwrap().into_integer().unwrap(), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn machine_bitwise_owned_extremes_normalize_results() {
@@ -1001,6 +1091,35 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn machine_powers_match_bigint(base in any::<i64>(), power in 0_u32..130, limit in 128_u64..257) {
+            let expected = BigInt::from(base).pow(power);
+            let actual = NumberValue::Int(base).checked_pow(NumberValue::Int(i64::from(power)), limit);
+            if expected.bits() > limit {
+                prop_assert!(matches!(actual, Err(NumericError::IntegerWidth { .. })), "expected integer-width rejection");
+            } else {
+                let actual = actual.unwrap();
+                prop_assert_eq!(matches!(actual, NumberValue::Int(_)), expected.to_i64().and_then(Fixnum::new).is_some());
+                prop_assert_eq!(actual.into_integer().unwrap(), expected);
+            }
+        }
+
+        #[test]
+        fn machine_shifts_match_bigint(
+            value in any::<i64>(), distance in -256_i64..257, limit in 128_u64..257
+        ) {
+            let actual = NumberValue::Int(value).arithmetic_shift(NumberValue::Int(distance), limit);
+            let expected = if distance < 0 { BigInt::from(value) >> distance.unsigned_abs() }
+                else { BigInt::from(value) << distance as u64 };
+            if value != 0 && distance > 0 && expected.bits() > limit {
+                prop_assert!(matches!(actual, Err(NumericError::IntegerWidth { .. })), "expected integer-width rejection");
+            } else {
+                let actual = actual.unwrap();
+                prop_assert_eq!(matches!(actual, NumberValue::Int(_)), expected.to_i64().and_then(Fixnum::new).is_some());
+                prop_assert_eq!(actual.into_integer().unwrap(), expected);
+            }
+        }
+
         #[test]
         fn machine_bitwise_matches_bigint(left in any::<i64>(), right in any::<i64>()) {
             let x = BigInt::from(left);
