@@ -450,7 +450,7 @@ fn read_character_literal_escape(
 }
 
 /// Decode the scalar-valued subset that the current Rust UTF-8 string model can
-/// represent. Modified characters in strings and raw-byte string metadata
+/// represent. General modified characters and mixed Unicode/raw-byte string metadata
 /// still need a richer string representation; never silently return NUL.
 fn read_character_escape(
     first: char,
@@ -519,19 +519,49 @@ fn read_character_escape(
 /// string.
 fn unescape_string<'a>(string: &str, offset: usize, cx: &'a Context) -> Result<Object<'a>> {
     let mut new = cx.string_with_capacity(string.len());
+    let mut raw: Option<Vec<u8>> = None;
     let mut chars = string.char_indices().peekable();
     while let Some((index, chr)) = chars.next() {
         let pos = offset + index;
         if chr != '\\' {
-            new.push(chr);
+            if let Some(bytes) = &mut raw {
+                if !chr.is_ascii() {
+                    return Err(Error::InvalidEscape(pos));
+                }
+                bytes.push(chr as u8);
+            } else {
+                new.push(chr);
+            }
             continue;
         }
         let (_, escaped) = chars.next().ok_or(Error::InvalidEscape(pos))?;
         if escaped != '\n' && escaped != ' ' {
-            new.push(read_character_escape(escaped, &mut chars, pos)?);
+            let code = if matches!(escaped, 'M' | 'C' | '^') {
+                read_character_literal_escape(escaped, &mut chars, pos)?
+            } else {
+                read_character_escape(escaped, &mut chars, pos)? as u32
+            };
+            const META: u32 = 1 << 27;
+            if code & META != 0 {
+                let base = code & !META;
+                if base > 127 || !new.is_ascii() {
+                    return Err(Error::InvalidEscape(pos));
+                }
+                raw.get_or_insert_with(|| new.as_bytes().to_vec()).push((base as u8) | 128);
+            } else if let Some(bytes) = &mut raw {
+                if code > 127 {
+                    return Err(Error::InvalidEscape(pos));
+                }
+                bytes.push(code as u8);
+            } else {
+                new.push(char::from_u32(code).ok_or(Error::InvalidEscape(pos))?);
+            }
         }
     }
-    Ok(cx.add(new))
+    Ok(match raw {
+        Some(bytes) => cx.add(bytes),
+        None => cx.add(new),
+    })
 }
 
 const fn reader_whitespace(chr: char) -> bool {
@@ -1394,7 +1424,25 @@ mod m0_reader_regressions {
         // Prefix handling is iterative, including repeated modifier chains.
         let source = "?".to_owned() + &r"\M-".repeat(10_000) + "a";
         assert_eq!(read(&source, &cx).unwrap().0, cx.add((1_i64 << 27) | 97));
-        assert_eq!(read(r#""\M-a""#, &cx).unwrap_err(), Error::InvalidEscape(1));
+        assert_eq!(read(r#""\M-a""#, &cx).unwrap().0, cx.add(vec![225_u8]));
+    }
+
+    #[test]
+    fn meta_strings_preserve_ascii_unibyte_key_sequences() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (source, expected) in [
+            (r#""\M-v""#, vec![246_u8]),
+            (r#""\M-\C-v""#, vec![150]),
+            (r#""\C-\M-v""#, vec![150]),
+            (r#""a\M-vz""#, vec![97, 246, 122]),
+            (r#""\M-\M-a\M-\n""#, vec![225, 138]),
+        ] {
+            assert_eq!(read(source, &cx).unwrap().0, cx.add(expected), "{source}");
+        }
+        for source in [r#""\M-""#, r#""\M""#, r#""\M-\""#, r#""é\M-v""#, r#""\M-vé""#] {
+            assert!(read(source, &cx).is_err(), "{source}");
+        }
     }
 
     #[test]
