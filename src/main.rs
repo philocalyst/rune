@@ -27,6 +27,7 @@ mod emacs;
 mod eval;
 mod fileio;
 mod face;
+mod frame;
 mod filelock;
 mod floatfns;
 mod fns;
