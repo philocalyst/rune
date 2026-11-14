@@ -54,6 +54,12 @@ pub(crate) fn insert(args: ArgSlice, env: &mut Rt<Env>, cx: &Context) -> Result<
         let mut encoded = [0u8; 4];
         let text = match arg.untag() {
             ObjectType::String(text) => &**text,
+            ObjectType::ByteString(bytes) => {
+                ensure!(bytes.is_ascii(), "Non-ASCII unibyte insertion into Unicode buffers is unsupported");
+                // ASCII has identical byte/scalar meaning. Do not decode arbitrary
+                // raw bytes as UTF-8 or silently turn them into Latin-1 characters.
+                std::str::from_utf8(bytes)?
+            }
             ObjectType::Int(value) => {
                 let code = u32::try_from(value)?;
                 let Some(ch) = char::from_u32(code) else {
@@ -433,6 +439,26 @@ mod test {
         env.stack.push(111);
         insert(ArgSlice::new(5), env, cx).unwrap();
         assert_eq!(env.buffer_read(cx).unwrap().document.text().to_string(), "hello");
+    }
+
+    #[test]
+    fn ascii_unibyte_insert_matches_gnu() {
+        crate::assert_elprop!(r#"(progn (erase-buffer) (insert "λ" (make-string 2 10) "🙂")
+          (list (equal (buffer-substring-no-properties 1 (point-max)) "λ\n\n🙂") (point)))"#);
+    }
+
+    #[test]
+    fn raw_unibyte_insert_rejects_without_editing_that_argument() {
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        env.stack.push(cx.add(vec![b'a', 0xff]));
+        let before = env.buffer_read(cx).unwrap();
+        assert!(insert(ArgSlice::new(1), env, cx).is_err());
+        let after = env.buffer_read(cx).unwrap();
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(after.point, before.point);
+        assert_eq!(after.document.text().to_string(), "");
     }
 
     #[test]
