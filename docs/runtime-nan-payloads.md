@@ -42,4 +42,6 @@ text quiets it. This is not an all-64-bit-pattern signaling-NaN roundtrip claim.
 NaN results from arithmetic and platform math may be canonicalized or propagated
 differently by the target/compiler; this change does not promise identical
 payload selection for every arithmetic operation. Custom `float-output-format`
-bindings remain separate and unsupported.
+bindings are supported by `number-to-string` for finite values only; general
+object printing still uses the default format. GNU nonfinite spellings bypass
+custom format policy, retaining NaN payload/sign.

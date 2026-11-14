@@ -54,9 +54,16 @@ legacy unchecked storage API, not the new numeric construction contract.
   boundaries instead of duplicate conversion rules.
 * Unary `round` and `fround` select even midpoints, matching the existing exact
   divisor-rounding path rather than Rust's away-from-zero midpoint policy.
+* `number-to-string` is a native one-argument numeric conversion using decimal
+  integers and the shared default float formatter. It creates a new Lisp string
+  and preserves numeric kind/sign/payload through default literal read-back.
+  This primitive also accepts GNU's validated `float-output-format` precision
+  policy. The policy is scoped to this conversion; recursive object-printer
+  formatting still uses the default formatter.
 * Default finite float printing follows GNU's precision search and `%g`
   notation rules, preserving exact read-back while avoiding Rust's long fixed
-  decimal spellings. Custom `float-output-format` bindings are not implemented.
+  decimal spellings. Custom `float-output-format` bindings affect only
+  `number-to-string`, not general object display.
   The reference policies are Emacs 30.1's
   [float printer](https://github.com/emacs-mirror/emacs/blob/emacs-30.1/src/print.c)
   and [gnulib dtoastr](https://github.com/emacs-mirror/emacs/blob/emacs-30.1/lib/ftoastr.c).

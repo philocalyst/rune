@@ -207,6 +207,16 @@ pub(crate) fn markerp(_: Object) -> bool {
 }
 
 #[defun]
+fn number_or_marker_p(object: Object) -> bool {
+    numberp(object) || markerp(object)
+}
+
+#[defun]
+fn integer_or_marker_p(object: Object) -> bool {
+    integerp(object) || markerp(object)
+}
+
+#[defun]
 pub(crate) fn vectorp(object: Object) -> bool {
     object.is_vec()
 }
@@ -273,6 +283,24 @@ fn bufferp(object: Object) -> bool {
 pub(crate) fn multibyte_string_p(object: Object) -> bool {
     // TODO: handle multi-line strings
     matches!(object.untag(), ObjectType::String(_))
+}
+
+defvar!(FLOAT_OUTPUT_FORMAT);
+
+/// Decimal spelling, with a scoped finite-float policy. Recursive object
+/// printers still use the default formatter until policy is threaded through.
+#[defun]
+fn number_to_string(number: Number, env: &Rt<Env>, cx: &Context) -> String {
+    if let crate::core::object::NumberType::Float(value) = number.untag() {
+        let policy = env.vars.get(sym::FLOAT_OUTPUT_FORMAT).map(|value| value.bind(cx));
+        let format = match policy.map(|value| value.untag()) {
+            Some(ObjectType::String(format)) => Some(&**format),
+            _ => None,
+        };
+        crate::core::object::float_to_string_with_format(**value, format)
+    } else {
+        number.to_string()
+    }
 }
 
 #[defun]
@@ -791,6 +819,66 @@ mod test {
     }
 
     #[test]
+    fn number_to_string_honors_scoped_float_output_format() {
+        for (source, expected) in [
+            (
+                "(let ((float-output-format \"%.2f\\0ignored\")) (number-to-string 1.23456))",
+                "\"1.23\"",
+            ),
+            ("(let ((float-output-format \"%.2f\")) (number-to-string 1.23456))", "\"1.23\""),
+            ("(let ((float-output-format \"%.0f\")) (number-to-string 2.5))", "\"2\""),
+            (
+                "(let ((float-output-format \"%.3g\")) (number-to-string 1234.0))",
+                "\"1.23e+03\"",
+            ),
+            (
+                "(let ((float-output-format \"%.16f\")) (number-to-string 1.23456))",
+                "\"1.23456\"",
+            ),
+            ("(let ((float-output-format 'bad)) (number-to-string 1.23456))", "\"1.23456\""),
+            ("(let ((float-output-format \"%.2f\")) (number-to-string 1234))", "\"1234\""),
+            (
+                "(let ((float-output-format \"%.2f\")) (number-to-string 1.0e+NaN))",
+                "\"1.0e+NaN\"",
+            ),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn number_to_string_uses_canonical_decimal_numeric_literals() {
+        for (literal, expected) in [
+            ("0", "0"),
+            ("-1", "-1"),
+            ("18446744073709551616", "18446744073709551616"),
+            ("-18446744073709551616", "-18446744073709551616"),
+            ("1.0", "1.0"),
+            ("-0.0", "-0.0"),
+            ("1e15", "1e+15"),
+            ("1e-5", "1e-05"),
+            ("1.0e+INF", "1.0e+INF"),
+            ("-1.0e+INF", "-1.0e+INF"),
+            ("1.5e+NaN", "1.0e+NaN"),
+            ("-2251799813685247.0e+NaN", "-2251799813685247.0e+NaN"),
+        ] {
+            assert_lisp(&format!("(number-to-string {literal})"), &format!("{expected:?}"));
+            assert_lisp(
+                &format!("(let ((x {literal})) (eql x (string-to-number (number-to-string x))))"),
+                "t",
+            );
+        }
+        assert_lisp("(eq (number-to-string 1) (number-to-string 1))", "nil");
+        assert_lisp("(condition-case nil (number-to-string 'bad) (error 'caught))", "caught");
+        assert_lisp("(condition-case nil (number-to-string) (error 'caught))", "caught");
+        assert_lisp("(condition-case nil (number-to-string 1 2) (error 'caught))", "caught");
+        assert_lisp(
+            "(let ((x (ash 1 200))) (let ((integer-width 128)) (= (string-to-number (number-to-string x)) x)))",
+            "t",
+        );
+    }
+
+    #[test]
     fn m0_string_to_number_rejects_invalid_radices_without_panicking() {
         let roots = crate::core::gc::RootSet::default();
         let cx = Context::new(&roots);
@@ -888,6 +976,32 @@ mod test {
             };
             assert_eq!(value.is_nan(), nan, "{source}");
             assert_eq!(value.is_sign_negative(), negative, "{source}");
+        }
+    }
+
+    #[test]
+    fn combined_numeric_marker_predicates_cover_existing_numeric_kinds() {
+        for (value, integer) in [
+            ("0", true),
+            ("-1", true),
+            ("?a", true),
+            ("18446744073709551616", true),
+            ("-18446744073709551616", true),
+            ("1.0", false),
+            ("-0.0", false),
+            ("1.0e+INF", false),
+            ("1.0e+NaN", false),
+        ] {
+            assert_lisp(&format!("(number-or-marker-p {value})"), "t");
+            assert_lisp(
+                &format!("(integer-or-marker-p {value})"),
+                if integer { "t" } else { "nil" },
+            );
+        }
+        for value in ["nil", "t", "'bad", "\"1\"", "[1]", "'(1)"] {
+            for predicate in ["number-or-marker-p", "integer-or-marker-p"] {
+                assert_lisp(&format!("({predicate} {value})"), "nil");
+            }
         }
     }
 

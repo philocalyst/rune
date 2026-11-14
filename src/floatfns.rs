@@ -370,7 +370,16 @@ fn ldexp(s: Number, e: i64) -> f64 {
 }
 
 #[defun]
-fn logb(arg: Number) -> NumberValue {
+fn logb<'ob>(arg: Number<'ob>, cx: &'ob Context) -> Object<'ob> {
+    // GNU returns nonnegative infinity and every NaN unchanged. Do not route
+    // these through owned conversion, which would lose observable identity.
+    if matches!(arg.untag(), NumberType::Float(f) if f.is_nan() || **f == f64::INFINITY) {
+        return arg.as_obj_copy();
+    }
+    cx.add(logb_value(arg))
+}
+
+fn logb_value(arg: Number) -> NumberValue {
     // GNU Flogb uses magnitude and exact integer bit widths, not a rounded
     // floating logarithm (which loses powers near large integer boundaries).
     match arg.untag() {
@@ -685,6 +694,19 @@ mod m0_logb_regressions {
     };
 
     #[test]
+    fn logb_preserves_nonfinite_operand_identity_and_payload() {
+        for literal in ["1.0e+INF", "0.0e+NaN", "1.0e+NaN", "-1.0e+NaN"] {
+            assert_lisp(
+                &format!("(let ((x {literal})) (let ((y (logb x))) (garbage-collect) (eq x y)))"),
+                "t",
+            );
+        }
+        assert_lisp("(logb -1.0e+INF)", "1.0e+INF");
+        assert_lisp("(let ((x -1.0e+INF)) (eq x (logb x)))", "nil");
+        assert_lisp("(eql (logb -1.0e+NaN) -1.0e+NaN)", "t");
+    }
+
+    #[test]
     fn logb_uses_magnitude_exact_integer_width_and_ieee_special_values() {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
@@ -697,15 +719,15 @@ mod m0_logb_regressions {
             (cx.add_as((BigInt::from(1_u8) << 4096_usize) - 1_u8), 4095),
             (cx.add_as(-((BigInt::from(1_u8) << 4096_usize) - 1_u8)), 4095),
         ] {
-            assert_eq!(logb(number), NumberValue::Int(expected));
+            assert_eq!(logb_value(number), NumberValue::Int(expected));
         }
         for number in [Number::from(0_i64), cx.add_as(0.0), cx.add_as(-0.0)] {
-            assert_eq!(logb(number), NumberValue::Float(f64::NEG_INFINITY));
+            assert_eq!(logb_value(number), NumberValue::Float(f64::NEG_INFINITY));
         }
         for infinity in [f64::INFINITY, f64::NEG_INFINITY] {
-            assert_eq!(logb(cx.add_as(infinity)), NumberValue::Float(f64::INFINITY));
+            assert_eq!(logb_value(cx.add_as(infinity)), NumberValue::Float(f64::INFINITY));
         }
-        let NumberValue::Float(nan) = logb(cx.add_as(f64::NAN)) else {
+        let NumberValue::Float(nan) = logb_value(cx.add_as(f64::NAN)) else {
             panic!("NaN exponent must remain a float");
         };
         assert!(nan.is_nan());

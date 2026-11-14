@@ -116,6 +116,49 @@ pub(crate) fn goto_char(position: i64, env: &Rt<Env>, cx: &Context) -> Result<i6
     env.editor_gateway().set_point(read.handle, index, cx)?;
     Ok(position)
 }
+/// Character count, independent of point and UTF-8 byte length.
+#[defun]
+fn buffer_size(
+    buffer: Option<crate::core::object::Gc<&crate::core::object::LispBuffer>>,
+    env: &Rt<Env>,
+    cx: &Context,
+) -> Result<usize> {
+    let read = match buffer {
+        Some(buffer) => buffer.untag().read(cx)?,
+        None => env.buffer_read(cx)?,
+    };
+    Ok(read.document.text().len_chars())
+}
+
+#[defun]
+fn buffer_substring_no_properties(start: i64, end: i64, env: &Rt<Env>, cx: &Context) -> Result<String> {
+    let read = env.buffer_read(cx)?;
+    let text = read.document.text();
+    let (start, end) = (start.min(end), start.max(end));
+    ensure!(start >= 1, "Buffer range out of bounds");
+    let start = usize::try_from(start - 1)?;
+    let end = usize::try_from(end - 1)?;
+    ensure!(end <= text.len_chars(), "Buffer range out of bounds");
+    let bytes = text.char_to_byte(rune_text::CharPos(start))?
+        ..text.char_to_byte(rune_text::CharPos(end))?;
+    let mut result = String::new();
+    for chunk in text.chunks(bytes)? {
+        result.push_str(chunk);
+    }
+    Ok(result)
+}
+
+#[defun]
+fn erase_buffer(env: &Rt<Env>, cx: &Context) -> Result<()> {
+    let read = env.buffer_read(cx)?;
+    // GNU leaves an already-empty buffer unmodified, with no undo entry.
+    if read.document.text().is_empty() {
+        return Ok(());
+    }
+    env.editor_gateway().splice(read.handle, read.epoch, 0..read.document.text().len_chars(), "", cx)?;
+    Ok(())
+}
+
 #[defun]
 pub(crate) fn point_max(env: &Rt<Env>, cx: &Context) -> Result<usize> {
     Ok(env.buffer_read(cx)?.document.text().len_chars() + 1)
@@ -139,6 +182,27 @@ fn delete_region(start: usize, end: usize, env: &Rt<Env>, cx: &Context) -> Resul
     env.editor_gateway()
         .splice(read.handle, read.epoch, start - 1..end - 1, "", cx)?;
     Ok(())
+}
+fn character_at_point(position: Option<i64>, before: bool, env: &Rt<Env>, cx: &Context) -> Result<Option<usize>> {
+    let read = env.buffer_read(cx)?;
+    let index = match position {
+        Some(position) => usize::try_from(position).ok().and_then(|p| p.checked_sub(if before { 2 } else { 1 })),
+        None => if before { read.point.checked_sub(1) } else { Some(read.point) },
+    };
+    Ok(index.and_then(|i| read.document.text().char_at(rune_text::CharPos(i))).map(|c| c as usize))
+}
+#[defun]
+fn char_after(position: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<Option<usize>> {
+    character_at_point(position, false, env, cx)
+}
+#[defun]
+fn char_before(position: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<Option<usize>> {
+    character_at_point(position, true, env, cx)
+}
+#[defun]
+fn eolp(env: &Rt<Env>, cx: &Context) -> Result<bool> {
+    let read = env.buffer_read(cx)?;
+    Ok(matches!(read.document.text().char_at(rune_text::CharPos(read.point)), None | Some('\n')))
 }
 #[defun]
 fn bolp(env: &Rt<Env>, cx: &Context) -> Result<bool> {
@@ -312,6 +376,100 @@ mod recovered_point_tests {
         assert!(bolp(env, cx)?);
         goto_char(2, env, cx)?;
         assert!(!bolp(env, cx)?);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod owner_buffer_primitives_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+    #[test]
+    fn empty_erase_preserves_revision_modified_flag_and_history() -> Result<()> {
+        use rune_editor::{Command, EditorHost};
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new(cx)?), cx);
+        let g = env.editor_gateway();
+        let before = env.buffer_read(cx)?;
+        let mut native = g.host(cx)?;
+        assert!(!native.snapshot()?.buffers[0].modified);
+        erase_buffer(env, cx)?;
+        assert_eq!(env.buffer_read(cx)?.epoch, before.epoch);
+        assert!(!native.snapshot()?.buffers[0].modified);
+        assert!(matches!(native.execute(Command::Undo), Err(rune_editor::EditorError::NoUndo)));
+        Ok(())
+    }
+    #[test]
+    fn lisp_character_queries_match_gnu_unicode_and_boundaries() {
+        crate::assert_elprop!(r#"(progn (erase-buffer) (insert "aé🙂\nz") (goto-char 3)
+          (list (char-after) (char-before) (char-after 0) (char-before 0)
+                (char-after 99) (char-before 99) (char-before 1) (char-after 6)
+                (eolp) (progn (goto-char 4) (eolp))
+                (progn (goto-char 6) (list (char-after) (char-before) (eolp)))))"#);
+    }
+    #[test]
+    fn persistent_owner_lisp_copy_erase_and_native_history_share_storage() -> Result<()> {
+        use rune_editor::{Command, Document, EditorHost};
+        crate::editor_document::with_lisp_runtime_owner(80, 24, |mut host| {
+            host.evaluate_source("(insert \"aé🙂z\") (setq owner-copy (buffer-substring-no-properties 2 4)) (if (= (buffer-size) 4) nil (error \"wrong scalar size\"))")
+                .map_err(anyhow::Error::msg)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "aé🙂z");
+            host.evaluate_source("(erase-buffer)").map_err(anyhow::Error::msg)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "");
+            host.execute(Command::Undo)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "aé🙂z");
+            host.execute(Command::Redo)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "");
+            host.evaluate_source("(insert owner-copy) (garbage-collect)").map_err(anyhow::Error::msg)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "é🙂");
+            Ok(())
+        })
+    }
+    #[test]
+    fn lisp_buffer_primitives_match_gnu_unicode_and_noncurrent_size() {
+        crate::assert_elprop!(r#"(save-current-buffer
+          (let ((b (get-buffer-create "owner-primitive-oracle")))
+            (set-buffer b) (erase-buffer) (insert "aé🙂z")
+            (list (buffer-size b) (buffer-substring-no-properties 4 2)
+                  (buffer-substring-no-properties 5 5)
+                  (progn (erase-buffer) (list (buffer-size) (point))))))"#);
+        crate::assert_elprop!(r#"(save-current-buffer
+          (let ((a (get-buffer-create "owner-size-a"))
+                (b (get-buffer-create "owner-size-b")))
+            (set-buffer a) (erase-buffer) (insert "é🙂")
+            (set-buffer b) (erase-buffer) (insert "x")
+            (list (buffer-size a) (buffer-size b) (buffer-size))))"#);
+    }
+    #[test]
+    fn lisp_substring_errors_do_not_mutate_text_or_point() {
+        crate::assert_elprop!(r#"(progn (erase-buffer) (insert "aé🙂z") (goto-char 3)
+          (list (condition-case nil (buffer-substring-no-properties -1 2) (error t))
+                (condition-case nil (buffer-substring-no-properties 1 6) (error t))
+                (buffer-size) (point) (buffer-substring-no-properties 1 5)))"#);
+    }
+    #[test]
+    fn unicode_substrings_validate_before_edit_and_erase_uses_same_owner() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new(cx)?), cx);
+        let g = env.editor_gateway();
+        let read = env.buffer_read(cx)?;
+        g.splice(read.handle, read.epoch, 0..0, "aé🙂z", cx)?;
+        assert_eq!(buffer_size(None, env, cx)?, 4);
+        assert_eq!(buffer_substring_no_properties(4, 2, env, cx)?, "é🙂");
+        assert_eq!(buffer_substring_no_properties(5, 5, env, cx)?, "");
+        assert!(buffer_substring_no_properties(0, 2, env, cx).is_err());
+        assert!(buffer_substring_no_properties(1, 6, env, cx).is_err());
+        assert_eq!(buffer_size(None, env, cx)?, 4);
+        erase_buffer(env, cx)?;
+        assert_eq!(buffer_size(None, env, cx)?, 0);
+        assert_eq!(point(env, cx)?, 1);
+        use rune_editor::EditorHost;
+        let mut native = g.host(cx)?;
+        native.execute(rune_editor::Command::Undo)?;
+        assert_eq!(buffer_substring_no_properties(1, 5, env, cx)?, "aé🙂z");
         Ok(())
     }
 }

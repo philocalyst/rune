@@ -93,6 +93,79 @@ pub(crate) fn fmt_float(value: f64, f: &mut std::fmt::Formatter) -> std::fmt::Re
     }
 }
 
+#[derive(Clone, Copy)]
+struct FloatOutputSpec {
+    kind: u8,
+    precision: usize,
+    explicit_precision: bool,
+}
+
+fn float_output_spec(format: &str) -> Option<FloatOutputSpec> {
+    // GNU's format validator reads the string as a C string.
+    let format = format.split('\0').next()?;
+    let suffix = format.strip_prefix("%.")?;
+    let (&kind, digits) = suffix.as_bytes().split_last()?;
+    if !matches!(kind, b'e' | b'f' | b'g') {
+        return None;
+    }
+    let mut precision = 0;
+    for &digit in digits {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        precision = precision * 10 + usize::from(digit - b'0');
+        if precision > f64::DIGITS as usize {
+            return None;
+        }
+    }
+    let explicit_precision = !digits.is_empty();
+    if explicit_precision && precision == 0 && kind != b'f' {
+        return None;
+    }
+    Some(FloatOutputSpec { kind, precision, explicit_precision })
+}
+
+/// Scoped policy boundary for number-to-string. No user string is passed as a
+/// Rust/C format program: only validated kind and precision select operations.
+pub(crate) fn float_to_string_with_format(value: f64, format: Option<&str>) -> String {
+    struct Output(f64, Option<FloatOutputSpec>);
+    impl Display for Output {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            let Self(value, spec) = self;
+            let Some(spec) = spec.filter(|_| value.is_finite()) else {
+                return fmt_float(*value, f);
+            };
+            let precision = spec.precision;
+            match spec.kind {
+                b'f' => {
+                    write!(f, "{value:.precision$}")?;
+                    // %.0f deliberately omits the decimal point; %.f does not.
+                    if precision == 0 && !spec.explicit_precision {
+                        f.write_str(".0")?;
+                    }
+                    Ok(())
+                }
+                b'e' => {
+                    let scientific = format!("{value:.precision$e}");
+                    if let Some((coefficient, exponent)) = scientific.split_once('e') {
+                        if let Ok(exponent) = exponent.parse::<i32>() {
+                            return write!(f, "{coefficient}e{exponent:+03}");
+                        }
+                    }
+                    f.write_str(&scientific)
+                }
+                b'g' => {
+                    let precision = precision.max(1);
+                    let scientific = format!("{value:.decimals$e}", decimals = precision - 1);
+                    fmt_general_float(&scientific, precision, f)
+                }
+                _ => fmt_float(*value, f),
+            }
+        }
+    }
+    Output(value, format.and_then(float_output_spec)).to_string()
+}
+
 /// Match GNU's default dtoastr policy, not a user float-output-format override.
 /// Normal doubles start at DBL_DIG significant digits; subnormals start at one.
 /// Increase precision until decimal parsing preserves the original IEEE bits.
@@ -128,7 +201,7 @@ fn fmt_general_float(
     let digits: String = coefficient.chars().filter(char::is_ascii_digit).collect();
     let digits = digits.trim_end_matches('0');
     if digits.is_empty() {
-        return f.write_str(scientific);
+        return write!(f, "{sign}0.0");
     }
     // C %g uses scientific notation below 1e-4, or when its rounded decimal
     // exponent reaches the selected precision. Its exponent has a sign and at
@@ -182,6 +255,31 @@ mod tests {
             (-1.5, "-1.5"),
         ] {
             assert_eq!(LispFloat::new(value, false).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn finite_output_policy_matches_gnu_precision_notation_and_fallback_rules() {
+        for (policy, value, expected) in [
+            ("%.2f", 1.23456, "1.23"),
+            ("%.0f", 2.5, "2"),
+            ("%.0f", -2.5, "-2"),
+            ("%.f", 2.5, "2.0"),
+            ("%.2e", 1234.0, "1.23e+03"),
+            ("%.e", 1.23456, "1e+00"),
+            ("%.3g", 1234.0, "1.23e+03"),
+            ("%.3g", 1.0, "1.0"),
+            ("%.g", -0.0, "-0.0"),
+            ("%.0g", 1.23456, "1.23456"),
+            ("%.16f", 1.23456, "1.23456"),
+            ("%f", 1.23456, "1.23456"),
+            ("%.03g", 0.000012345, "1.23e-05"),
+            ("%.2f\0ignored", 1.23456, "1.23"),
+            ("%.2f", f64::INFINITY, "1.0e+INF"),
+            ("%.2f", nan_from_decimal_prefix("1"), "1.0e+NaN"),
+            ("%.😃f", 1.23456, "1.23456"),
+        ] {
+            assert_eq!(float_to_string_with_format(value, Some(policy)), expected);
         }
     }
 

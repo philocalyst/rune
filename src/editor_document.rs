@@ -1616,3 +1616,132 @@ mod case_coordinate_tests {
         }
     }
 }
+
+/// Scoped persistent interpreter owner. Env is rooted before this wrapper is
+/// constructed, and neither rooted Env nor Context can escape its factory.
+pub(crate) struct LispRuntimeHost<'a, 'roots, 'env> {
+    owner: MutableGatewayEditorHost<'a, 'roots>,
+    env: &'a mut crate::core::gc::Rt<crate::core::env::Env<'env>>,
+}
+impl LispRuntimeHost<'_, '_, '_> {
+    /// Native command entry binds evaluator current-buffer to the selected UI
+    /// view ONCE. Nested set-buffer/save-current-buffer remain evaluator-local.
+    /// Partial Lisp effects on signal are retained; never replay this callback.
+    pub(crate) fn evaluate_source(&mut self, source: &str) -> Result<(), String> {
+        use rune_editor::EditorHost;
+        let snapshot = self.owner.snapshot().map_err(|e| e.to_string())?;
+        let selected = snapshot
+            .views
+            .iter()
+            .find(|v| v.id == snapshot.selected_window)
+            .ok_or_else(|| "Missing selected editor view".to_owned())?
+            .view
+            .buffer;
+        drop(snapshot); // Do not pin every document/lease throughout evaluation.
+        let handle = self
+            .owner
+            .gateway
+            .inner
+            .try_borrow()
+            .map_err(|e| e.to_string())?
+            .buffer_handle(selected, self.owner.cx)
+            .map_err(|e| e.to_string())?;
+        self.env.set_current_buffer(handle, self.owner.cx).map_err(|e| e.to_string())?;
+        crate::lread::load_internal(source, self.owner.cx, self.env)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+impl rune_editor::EditorHost for LispRuntimeHost<'_, '_, '_> {
+    type Doc = RuntimeDocument;
+    fn snapshot(&self) -> rune_editor::Result<rune_editor::SessionSnapshot<RuntimeDocument>> {
+        use rune_editor::EditorHost;
+        self.owner.snapshot()
+    }
+    fn execute(
+        &mut self,
+        c: rune_editor::Command,
+    ) -> rune_editor::Result<rune_editor::CommandOutcome> {
+        use rune_editor::EditorHost;
+        self.owner.execute(c)
+    }
+    fn dispatch_key(&mut self, k: rune_editor::Key) -> rune_editor::Result<rune_editor::Dispatch> {
+        use rune_editor::EditorHost;
+        self.owner.dispatch_key(k)
+    }
+    fn cancel_prefix(&mut self) -> rune_editor::Result<()> {
+        use rune_editor::EditorHost;
+        self.owner.cancel_prefix()
+    }
+    fn place_pointer(
+        &mut self,
+        w: rune_editor::WindowId,
+        b: rune_editor::BufferId,
+        e: u64,
+        p: usize,
+    ) -> rune_editor::Result<rune_editor::CommandOutcome> {
+        use rune_editor::EditorHost;
+        self.owner.place_pointer(w, b, e, p)
+    }
+    fn commit_replacement(
+        &mut self,
+        w: rune_editor::WindowId,
+        b: rune_editor::BufferId,
+        e: u64,
+        r: Range<usize>,
+        t: String,
+    ) -> rune_editor::Result<rune_editor::CommandOutcome> {
+        use rune_editor::EditorHost;
+        self.owner.commit_replacement(w, b, e, r, t)
+    }
+}
+pub(crate) fn with_lisp_runtime_owner<R>(
+    width: u32,
+    height: u32,
+    run: impl for<'a, 'roots, 'env> FnOnce(LispRuntimeHost<'a, 'roots, 'env>) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    use crate::core::env::{Env, intern, sym};
+    use rune_core::macros::root;
+    use rune_editor::EditorHost;
+    let roots = crate::core::gc::RootSet::default();
+    let mut cx = Context::new(&roots);
+    root!(env, init(Env::new(&cx)?), cx);
+    sym::init_symbols();
+    crate::core::env::init_variables(&cx, env);
+    crate::data::defalias(intern("not", &cx), sym::NULL.into(), None)?;
+    let gateway = cx.editor_gateway()?;
+    let mut host =
+        LispRuntimeHost { owner: MutableGatewayEditorHost { gateway, cx: &mut cx }, env };
+    host.execute(rune_editor::Command::Resize { width, height })?;
+    run(host)
+}
+#[cfg(test)]
+mod persistent_lisp_owner_tests {
+    use super::*;
+    use rune_editor::{Command, Document, EditorHost};
+    #[test]
+    fn persistent_lisp_environment_and_native_undo_share_one_session() {
+        with_lisp_runtime_owner(80,24,|mut host|{
+            host.evaluate_source("(setq owner-counter 40)").map_err(anyhow::Error::msg)?;
+            host.evaluate_source("(setq owner-counter (+ owner-counter 2)) (if (= owner-counter 42) (insert \"λ🙂\") (error \"lost env\"))").map_err(anyhow::Error::msg)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(),"λ🙂");host.execute(Command::Undo)?;assert_eq!(host.snapshot()?.buffers[0].document.to_text(),"");host.execute(Command::Redo)?;assert_eq!(host.snapshot()?.buffers[0].document.to_text(),"λ🙂");
+            assert!(host.evaluate_source("(insert \"x\") (error \"signal after edit\")").is_err());assert_eq!(host.snapshot()?.buffers[0].document.to_text(),"λ🙂x");Ok(())
+        }).unwrap();
+    }
+}
+#[cfg(test)]
+mod lisp_native_entry_sync_tests {
+    use super::*;
+    use rune_editor::{Document, EditorHost};
+    #[test]
+    fn native_entry_sync_is_once_per_request_and_nested_set_buffer_stays_local() {
+        with_lisp_runtime_owner(80,24,|mut host|{
+            let before=host.snapshot()?;let selected=before.selected_window;let visible=before.views.iter().find(|v|v.id==selected).unwrap().view.buffer;
+            host.evaluate_source("(setq owner-bg (get-buffer-create \"owner-background\")) (set-buffer owner-bg) (insert \"hidden\")").map_err(anyhow::Error::msg)?;
+            let after=host.snapshot()?;assert_eq!(after.selected_window,selected);assert_eq!(after.views.iter().find(|v|v.id==selected).unwrap().view.buffer,visible);
+            assert_eq!(after.buffers.iter().find(|b|b.id==visible).unwrap().document.to_text(),"");assert_eq!(after.buffers.iter().find(|b|b.name=="owner-background").unwrap().document.to_text(),"hidden");
+            host.evaluate_source("(insert \"visible\") (save-current-buffer (set-buffer owner-bg) (insert \"!\")) (insert \".\")").map_err(anyhow::Error::msg)?;
+            let after=host.snapshot()?;assert_eq!(after.buffers.iter().find(|b|b.id==visible).unwrap().document.to_text(),"visible.");assert_eq!(after.buffers.iter().find(|b|b.name=="owner-background").unwrap().document.to_text(),"hidden!");Ok(())
+        }).unwrap();
+    }
+}
