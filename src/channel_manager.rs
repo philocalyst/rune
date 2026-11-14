@@ -11,7 +11,7 @@ use crate::core::{
         __HeapRoot, Block, Context, DeferredEndpointFinalizers, Slot, ThreadSafeRootSet,
         collect_garbage_raw,
     },
-    object::{CloneIn, Object},
+    object::{CloneIn, EndpointResidence, Object},
 };
 use std::sync::OnceLock;
 #[cfg(test)]
@@ -19,13 +19,25 @@ use std::sync::atomic::AtomicBool;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        Arc, Condvar, Mutex, RwLock,
+        Arc, Condvar, Mutex, RwLock, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 /// Unique identifier for a channel
 pub(crate) type ChannelId = u64;
+
+/// Opaque native allocation identity. Numeric channel IDs are not arena roles.
+#[derive(Clone)]
+pub(crate) struct ChannelManagerIdentity(Arc<()>);
+impl ChannelManagerIdentity {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 /// GC state for the channel manager, all guarded by a single Mutex to prevent deadlocks
 struct GcState {
@@ -38,11 +50,11 @@ struct GcState {
 }
 
 impl GcState {
-    fn new(roots_static: &'static ThreadSafeRootSet) -> Self {
+    fn new(roots_static: &'static ThreadSafeRootSet, identity: ChannelManagerIdentity) -> Self {
         Self {
             // SAFETY: ChannelManager exclusively owns this arena under its
             // gc_state mutex and deep-copies every incoming/outgoing value.
-            block: unsafe { Block::new_local_unchecked() },
+            block: unsafe { Block::new_channel_manager_unchecked(identity) },
             roots_static,
             next_limit: Context::MIN_GC_BYTES,
         }
@@ -107,6 +119,9 @@ impl ChannelState {
 
 /// The channel manager state
 pub(crate) struct ChannelManager {
+    identity: ChannelManagerIdentity,
+    // Native only: no Object/Context values or callbacks under this mutex.
+    endpoint_residences: Mutex<Vec<Weak<EndpointResidence>>>,
     /// GC state (block, roots, and next_limit) all guarded by a single Mutex
     /// We also leak a static reference to the RootSet for HeapRoot creation
     gc_state: Mutex<GcState>,
@@ -136,8 +151,11 @@ impl ChannelManager {
         let roots_static: &'static ThreadSafeRootSet =
             Box::leak(Box::new(ThreadSafeRootSet::default()));
 
+        let identity = ChannelManagerIdentity::new();
         Self {
-            gc_state: Mutex::new(GcState::new(roots_static)),
+            gc_state: Mutex::new(GcState::new(roots_static, identity.clone())),
+            identity,
+            endpoint_residences: Mutex::new(Vec::new()),
             gc_access: RwLock::new(()),
             channels: RwLock::new(HashMap::new()),
             next_channel_id: AtomicU64::new(1),
@@ -148,6 +166,39 @@ impl ChannelManager {
             #[cfg(test)]
             finalizer_lock_violation: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn identity(&self) -> &ChannelManagerIdentity {
+        &self.identity
+    }
+    pub(crate) fn register_endpoint_residence(&self, residence: Weak<EndpointResidence>) {
+        let Some(root) = residence.upgrade() else { return };
+        assert!(root.manager_identity().same(&self.identity), "foreign endpoint residence");
+        self.endpoint_residences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(residence);
+        // Root's possible last native drop occurs after registry guard release.
+    }
+    /// SAFETY: pointer must identify the residence currently being finally
+    /// destroyed. Removing membership while a live residence exists would make
+    /// a future conditional collector omit an external root.
+    pub(crate) unsafe fn unregister_endpoint_residence(&self, pointer: *const EndpointResidence) {
+        self.endpoint_residences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|root| root.as_ptr() != pointer);
+    }
+    /// Retention-only native roots. Keep snapshots until AFTER collector/data
+    /// guards: last drop can invoke native family close/cleanup. This is not
+    /// yet consumed by the production collector; queue roots remain unconditional.
+    pub(crate) fn snapshot_endpoint_residences(&self) -> Vec<Arc<EndpointResidence>> {
+        self.endpoint_residences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
     }
 
     /// Create a new channel and return its ID
@@ -590,5 +641,27 @@ mod char_table_finalization_tests {
         manager.close_sender(channel);
         manager.close_receiver(channel);
         manager.cleanup_channel(channel);
+    }
+}
+
+#[cfg(test)]
+mod residence_registry_tests {
+    use super::*;
+    use crate::core::object::make_channel_pair_for_test;
+    #[test]
+    fn foreign_manager_residence_rejects_before_registry_mutation() {
+        let owner = ChannelManager::isolated_for_test();
+        let foreign = ChannelManager::isolated_for_test();
+        let (_, sender, receiver) = make_channel_pair_for_test(owner.clone(), 1);
+        let residence = owner.snapshot_endpoint_residences().pop().unwrap();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            foreign.register_endpoint_residence(Arc::downgrade(&residence));
+        }));
+        assert!(rejected.is_err());
+        assert!(foreign.snapshot_endpoint_residences().is_empty());
+        sender.close();
+        receiver.close();
+        drop(residence);
+        assert!(owner.snapshot_endpoint_residences().is_empty());
     }
 }

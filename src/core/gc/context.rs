@@ -45,6 +45,9 @@ pub(in crate::core) enum DropStackElem {
 /// A block of allocations. This type should be owned by [Context] and not used
 /// directly.
 pub(crate) struct Block<const CONST: bool> {
+    // Assigned only by the audited fresh manager-arena constructor. Ordinary
+    // owner/global arenas are external relative to every channel manager.
+    channel_manager: Option<crate::channel_manager::ChannelManagerIdentity>,
     pub(in crate::core) objects: bumpalo::Bump,
     // Allocations that will be dropped when the objects are moved. At that time
     // the allocation will get copied into the GC heap. This let's us avoid an
@@ -157,6 +160,17 @@ impl Block<false> {
         Self::empty()
     }
 
+    /// SAFETY: all new_local_unchecked ownership/synchronization obligations
+    /// apply. The arena must be owned by exactly this manager identity; every
+    /// endpoint copy into it must remain protected through root registration.
+    pub(crate) unsafe fn new_channel_manager_unchecked(
+        identity: crate::channel_manager::ChannelManagerIdentity,
+    ) -> Self {
+        let mut block = unsafe { Self::new_local_unchecked() };
+        block.channel_manager = Some(identity);
+        block
+    }
+
     pub(crate) fn assert_unique() {
         SINGLETON_CHECK.with(|x| {
             assert!(!x.get(), "There was already and active context when this context was created");
@@ -170,6 +184,7 @@ impl<const CONST: bool> Block<CONST> {
     // singleton and let borrowed objects be rooted in the wrong heap.
     fn empty() -> Self {
         Self {
+            channel_manager: None,
             objects: bumpalo::Bump::new(),
             drop_stack: RefCell::default(),
             lisp_hashtables: RefCell::default(),
@@ -178,6 +193,13 @@ impl<const CONST: bool> Block<CONST> {
             lisp_receivers: RefCell::default(),
             uninterned_symbol_map: UninternedSymbolMap::default(),
         }
+    }
+
+    pub(in crate::core) fn is_channel_transit(
+        &self,
+        identity: &crate::channel_manager::ChannelManagerIdentity,
+    ) -> bool {
+        !CONST && self.channel_manager.as_ref().is_some_and(|owner| owner.same(identity))
     }
 
     #[cfg(test)]

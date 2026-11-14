@@ -76,13 +76,58 @@ impl Drop for EndpointLease {
         self.manager.cleanup_channel(self.channel_id);
     }
 }
-fn copy_lease(state: &Mutex<Option<Arc<EndpointLease>>>) -> Option<Arc<EndpointLease>> {
+/// One external residence may be shared by owner aliases/operation snapshots.
+/// Native family pinning delays last-family callbacks until residence snapshots
+/// are dropped. No Lisp Object or Context crosses this registry boundary.
+pub(crate) struct EndpointResidence {
+    family: Arc<EndpointLease>,
+}
+impl EndpointResidence {
+    pub(crate) fn manager_identity(&self) -> &channel_manager::ChannelManagerIdentity {
+        self.family.manager.identity()
+    }
+    pub(crate) fn channel_id(&self) -> ChannelId {
+        self.family.channel_id
+    }
+}
+impl Drop for EndpointResidence {
+    fn drop(&mut self) {
+        // Registry guard is released before automatic family field destruction.
+        // SAFETY: Arc invokes Drop only after its last strong residence owner;
+        // weak upgrades can no longer expose a live residence at this point.
+        unsafe { self.family.manager.unregister_endpoint_residence(self as *const Self) };
+    }
+}
+#[derive(Clone)]
+struct LeaseSnapshot {
+    family: Arc<EndpointLease>,
+    external: Option<Arc<EndpointResidence>>,
+}
+impl LeaseSnapshot {
+    fn external(family: Arc<EndpointLease>) -> Self {
+        let residence = Arc::new(EndpointResidence { family: family.clone() });
+        family.manager.register_endpoint_residence(Arc::downgrade(&residence));
+        Self { family, external: Some(residence) }
+    }
+    fn for_block<const C: bool>(&mut self, block: &Block<C>) {
+        if block.is_channel_transit(self.family.manager.identity()) {
+            // Caller holds target-manager access through copy AND flight-root
+            // registration. Role metadata alone is not a rooting capability.
+            self.external = None;
+        } else if self.external.is_none() {
+            // Foreign-manager arenas are external relative to this target.
+            self.external = Self::external(self.family.clone()).external;
+        }
+    }
+}
+fn copy_lease(state: &Mutex<Option<LeaseSnapshot>>) -> Option<LeaseSnapshot> {
+    // Family+residence are extracted atomically; a concurrent source close
+    // cannot create an unregistered temporary clone/operation gap.
     state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
-fn close_lease(state: &Mutex<Option<Arc<EndpointLease>>>) {
-    // No manager callback may run while this wrapper mutex is held.
+fn close_lease(state: &Mutex<Option<LeaseSnapshot>>) {
     let lease = { state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() };
-    drop(lease);
+    drop(lease); // Never close family/unregister under the wrapper active mutex.
 }
 
 /// The sending half of a channel.
@@ -93,7 +138,7 @@ derive_GcMoveable!(ChannelSender);
 pub(in crate::core) struct ChannelSenderInner {
     pub(in crate::core) channel_id: ChannelId,
     pub(in crate::core) manager: Arc<channel_manager::ChannelManager>,
-    active: Mutex<Option<Arc<EndpointLease>>>,
+    active: Mutex<Option<LeaseSnapshot>>,
 }
 
 impl ChannelSender {
@@ -104,7 +149,11 @@ impl ChannelSender {
     ) -> Self {
         let lease = EndpointLease::new(channel_id, manager.clone(), EndpointKind::Sender);
         Self(GcHeap::new(
-            ChannelSenderInner { channel_id, manager, active: Mutex::new(Some(lease)) },
+            ChannelSenderInner {
+                channel_id,
+                manager,
+                active: Mutex::new(Some(LeaseSnapshot::external(lease))),
+            },
             constant,
         ))
     }
@@ -166,7 +215,7 @@ derive_GcMoveable!(ChannelReceiver);
 pub(in crate::core) struct ChannelReceiverInner {
     pub(in crate::core) channel_id: ChannelId,
     pub(in crate::core) manager: Arc<channel_manager::ChannelManager>,
-    active: Mutex<Option<Arc<EndpointLease>>>,
+    active: Mutex<Option<LeaseSnapshot>>,
 }
 
 impl ChannelReceiver {
@@ -177,7 +226,11 @@ impl ChannelReceiver {
     ) -> Self {
         let lease = EndpointLease::new(channel_id, manager.clone(), EndpointKind::Receiver);
         Self(GcHeap::new(
-            ChannelReceiverInner { channel_id, manager, active: Mutex::new(Some(lease)) },
+            ChannelReceiverInner {
+                channel_id,
+                manager,
+                active: Mutex::new(Some(LeaseSnapshot::external(lease))),
+            },
             constant,
         ))
     }
@@ -287,6 +340,14 @@ impl<'new> CloneIn<'new, &'new Self> for ChannelReceiver {
 }
 
 impl ChannelSender {
+    pub(in crate::core) fn residence_for_block<const C: bool>(mut self, block: &Block<C>) -> Self {
+        if let Some(active) =
+            self.0.active.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            active.for_block(block);
+        }
+        self
+    }
     fn copy_owned(&self, constant: bool) -> Self {
         Self(GcHeap::new(
             ChannelSenderInner {
@@ -308,6 +369,14 @@ impl ChannelSender {
     }
 }
 impl ChannelReceiver {
+    pub(in crate::core) fn residence_for_block<const C: bool>(mut self, block: &Block<C>) -> Self {
+        if let Some(active) =
+            self.0.active.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            active.for_block(block);
+        }
+        self
+    }
     fn copy_owned(&self, constant: bool) -> Self {
         Self(GcHeap::new(
             ChannelReceiverInner {
@@ -982,5 +1051,205 @@ mod lifecycle_tests {
         assert_eq!(manager.counts_for_test(id), Some((0, 1)));
         receiver.close();
         assert_eq!(manager.counts_for_test(id), None);
+    }
+}
+
+#[cfg(test)]
+mod residence_instrumentation_tests {
+    use super::*;
+    use crate::core::{env::INTERNED_SYMBOLS, gc::RootSet};
+    use rune_core::macros::root;
+    fn roots(manager: &channel_manager::ChannelManager) -> usize {
+        manager.snapshot_endpoint_residences().len()
+    }
+    #[test]
+    fn owner_aliases_share_embedded_residence_across_owner_gc() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots_set = RootSet::default();
+        let cx = &mut Context::new(&roots_set);
+        let sender = sender.into_obj(&cx.block);
+        root!(sender, cx);
+        let alias = sender.bind(cx).clone_in(&cx.block);
+        root!(alias, cx);
+        assert_eq!(roots(&manager), 2);
+        sender.bind(cx).close();
+        receiver.close();
+        for _ in 0..10 {
+            cx.garbage_collect(true);
+            assert_eq!(roots(&manager), 1);
+        }
+        alias.bind(cx).close();
+        assert_eq!(roots(&manager), 0);
+        cx.garbage_collect(true);
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+    #[test]
+    fn same_manager_transit_copy_has_no_external_residence_after_source_close() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots_set = RootSet::default();
+        let cx = &mut Context::new(&roots_set);
+        let sender = sender.into_obj(&cx.block);
+        root!(sender, cx);
+        sender.bind(cx).send(cx.add(sender.bind(cx))).unwrap();
+        sender.bind(cx).close();
+        receiver.close();
+        assert_eq!(roots(&manager), 0, "transit wrapper must not retain external group");
+        manager.collect_for_test();
+        cx.garbage_collect(true);
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+    #[test]
+    fn receive_into_owner_arena_mints_external_residence() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots_set = RootSet::default();
+        let cx = &mut Context::new(&roots_set);
+        let sender = sender.into_obj(&cx.block);
+        root!(sender, cx);
+        sender.bind(cx).send(cx.add(sender.bind(cx))).unwrap();
+        sender.bind(cx).close();
+        assert_eq!(roots(&manager), 1); // Native receiver only; source is transit.
+        let received = receiver.recv(cx).unwrap();
+        root!(received, cx);
+        assert_eq!(roots(&manager), 2);
+        manager.collect_for_test();
+        cx.garbage_collect(true);
+        let sender: Gc<&ChannelSender> = received.bind(cx).try_into().unwrap();
+        sender.send(cx.add(17)).unwrap();
+        assert_eq!(receiver.recv(cx).unwrap(), 17);
+        sender.close();
+        receiver.close();
+        manager.collect_for_test();
+        assert_eq!(roots(&manager), 0);
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+    #[test]
+    fn foreign_manager_storage_is_external_to_endpoint_target() {
+        let target = channel_manager::ChannelManager::isolated_for_test();
+        let carrier = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(target.clone(), 1);
+        let (carrier_id, send, recv) = make_channel_pair_for_test(carrier.clone(), 1);
+        let roots_set = RootSet::default();
+        let cx = &mut Context::new(&roots_set);
+        let sender = sender.into_obj(&cx.block);
+        root!(sender, cx);
+        send.send(cx.add(sender.bind(cx))).unwrap();
+        sender.bind(cx).close();
+        receiver.close();
+        cx.garbage_collect(true);
+        assert_eq!(roots(&target), 1, "foreign transit is not target-manager transit");
+        carrier.collect_for_test();
+        let copied = recv.recv(cx).unwrap();
+        root!(copied, cx);
+        carrier.collect_for_test();
+        cx.garbage_collect(true);
+        assert_eq!(roots(&target), 1);
+        let copied: Gc<&ChannelSender> = copied.bind(cx).try_into().unwrap();
+        copied.close();
+        assert_eq!(roots(&target), 0);
+        assert_eq!(target.counts_for_test(id), None);
+        send.close();
+        recv.close();
+        assert_eq!(carrier.counts_for_test(carrier_id), None);
+    }
+    #[test]
+    fn global_wrapper_retains_registration_without_lisp_tracing_until_close() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots_set = RootSet::default();
+        let cx = &mut Context::new(&roots_set);
+        let symbols = INTERNED_SYMBOLS.lock().unwrap();
+        let global = sender.clone_in(symbols.global_block());
+        sender.close();
+        receiver.close();
+        for _ in 0..5 {
+            cx.garbage_collect(true);
+            assert_eq!(roots(&manager), 1);
+        }
+        global.close();
+        assert_eq!(roots(&manager), 0);
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+    #[test]
+    fn copied_native_snapshot_pins_residence_across_concurrent_source_close() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let state = &sender.0.active;
+        let ready = std::sync::Barrier::new(2);
+        let release = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let copied = copy_lease(state).unwrap();
+                ready.wait();
+                release.wait();
+                drop(copied);
+            });
+            ready.wait();
+            close_lease(state);
+            receiver.close();
+            assert_eq!(roots(&manager), 1);
+            assert_eq!(manager.counts_for_test(id), Some((1, 0)));
+            release.wait();
+            worker.join().unwrap();
+        });
+        assert_eq!(roots(&manager), 0);
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+}
+
+#[cfg(test)]
+mod residence_alias_finalization_tests {
+    use super::*;
+    use crate::core::{cons::Cons, env::INTERNED_SYMBOLS, gc::RootSet, object::ObjectType};
+    use rune_core::macros::root;
+    #[test]
+    fn lisp_container_aliases_keep_registration_until_owner_wrapper_finalization() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        {
+            let sender = sender.into_obj(&cx.block);
+            let vector = cx.add(vec![Object::from(sender)]);
+            root!(vector, cx);
+            let pair = Cons::new(Object::from(sender), vector.bind(cx), cx);
+            root!(pair, cx);
+            receiver.close();
+            for _ in 0..10 {
+                cx.garbage_collect(true);
+                assert_eq!(manager.snapshot_endpoint_residences().len(), 1);
+                let pair = pair.bind(cx);
+                let ObjectType::Vec(vector) = pair.cdr().untag() else { panic!("vector expected") };
+                assert!(pair.car().ptr_eq(vector[0].get()));
+            }
+        }
+        cx.garbage_collect(true);
+        assert!(manager.snapshot_endpoint_residences().is_empty());
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+    #[test]
+    fn global_registration_outlives_allocating_context_without_root_adoption() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let symbols = INTERNED_SYMBOLS.lock().unwrap();
+        let global = {
+            let roots = RootSet::default();
+            let _cx = Context::new(&roots);
+            let (_, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+            let global = sender.clone_in(symbols.global_block());
+            sender.close();
+            receiver.close();
+            global
+        };
+        assert_eq!(manager.snapshot_endpoint_residences().len(), 1);
+        {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            cx.garbage_collect(true);
+        }
+        assert_eq!(manager.snapshot_endpoint_residences().len(), 1);
+        global.close();
+        assert!(manager.snapshot_endpoint_residences().is_empty());
     }
 }
