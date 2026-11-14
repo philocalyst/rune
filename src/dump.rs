@@ -716,7 +716,7 @@ pub(crate) fn load_dump(path: &Path, env: &mut Rt<Env>, cx: &mut Context) -> Res
             DumpedObject::HashTable(entries) => {
                 if let ObjectType::HashTable(ht) = table[id].untag() {
                     for (k_id, v_id) in entries {
-                        ht.insert(table[*k_id as usize], table[*v_id as usize]);
+                        ht.insert(table[*k_id as usize], table[*v_id as usize]).map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -745,6 +745,7 @@ pub(crate) fn load_dump(path: &Path, env: &mut Rt<Env>, cx: &mut Context) -> Res
     // We go through INTERNED_SYMBOLS.set_func which clones the function
     // into the global block and marks it immutable.
     {
+        let mut deferred = crate::core::gc::DeferredEndpointFinalizers::default();
         let map = INTERNED_SYMBOLS.lock().unwrap();
         for sym_entry in &dump.symbols {
             if let Some(func_id) = sym_entry.func_id {
@@ -759,7 +760,7 @@ pub(crate) fn load_dump(path: &Path, env: &mut Rt<Env>, cx: &mut Context) -> Res
                     let func: crate::core::object::Function =
                         unsafe { crate::core::object::Gc::from_raw(func_obj.into_raw()) };
                     // set_func clones into the global block and marks immutable
-                    map.set_func(sym, func).map_err(|e| e.to_string())?;
+                    map.set_func(sym, func, &mut deferred).map_err(|e| e.to_string())?;
                 }
             }
         }

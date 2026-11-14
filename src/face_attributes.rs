@@ -147,7 +147,7 @@ fn internal_make_lisp_face<'a>(
         let vector = fresh_vector(cx);
         let id = env.face_next_id;
         let entry = Cons::new(id as i64, vector, cx);
-        global_table(env, cx)?.insert(face.into(), entry.into());
+        global_table(env, cx)?.insert(face.into(), entry.into())?;
         env.set_prop(face, sym::FACE, (id as i64).into());
         env.face_next_id = next_id.unwrap();
         vector
@@ -157,7 +157,7 @@ fn internal_make_lisp_face<'a>(
             value
         } else {
             let value = fresh_vector(cx);
-            frame_table(frame, env, cx)?.insert(face.into(), value);
+            frame_table(frame, env, cx)?.insert(face.into(), value)?;
             value
         }
     } else {

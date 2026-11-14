@@ -73,21 +73,23 @@ impl PartialEq for CharTableInner<'_> {
 }
 
 impl<'new> CloneIn<'new, &'new Self> for CharTable {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<&'new Self>> {
         // Release source locks before recursively cloning. The source borrow
         // excludes local collection; globally published tables are immutable.
         let source_parent = lock(&self.0.parent).as_ref().map(|parent| **parent);
         let source_data: Vec<_> =
             lock(&self.0.data).iter().map(|(&key, value)| (key, **value)).collect();
-        let parent_clone = source_parent.map(|parent| Slot::new(parent.clone_in(bk).untag()));
+        let parent_clone = source_parent
+            .map(|parent| Ok::<_, anyhow::Error>(Slot::new(parent.clone_in(bk)?.untag())))
+            .transpose()?;
         let parent = Mutex::new(parent_clone);
         let mut data = HashMap::default();
         for (key, value) in source_data {
-            data.insert(key, Slot::new(value.clone_in(bk)));
+            data.insert(key, Slot::new(value.clone_in(bk)?));
         }
         let data = Mutex::new(data);
-        let init = Slot::new(self.0.init.clone_in(bk));
-        CharTableInner { parent, data, init }.into_obj(bk)
+        let init = Slot::new(self.0.init.clone_in(bk)?);
+        Ok(CharTableInner { parent, data, init }.into_obj(bk))
     }
 }
 
@@ -263,7 +265,7 @@ mod ownership_tests {
             let definition = Cons::new(table, NIL, &cx);
             let function: Function = cx.add(definition).try_into().unwrap();
             let symbol = intern(name, &cx);
-            INTERNED_SYMBOLS.lock().unwrap().set_func(symbol, function).unwrap();
+            crate::data::fset(symbol, function.into()).unwrap();
             // Global function constants must not retain the source local table.
             table.untag().set(42, cx.add("changed-local")).unwrap();
         }

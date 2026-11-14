@@ -3,8 +3,8 @@ use super::Trace;
 use crate::core::object::GcString;
 use crate::core::object::WeakBufferPropertyRoot;
 use crate::core::object::{
-    ChannelReceiver, ChannelSender, CharTable, FrameRegistry, LispFrame, LispHashTable,
-    LispProcess, ProcessRegistry,
+    ByteFn, ChannelReceiver, ChannelSender, CharTable, FrameRegistry, LispBigInt, LispFrame,
+    LispHashTable, LispProcess, ProcessRegistry,
 };
 use crate::core::object::{Gc, IntoObject, Object, UninternedSymbolMap, WithLifetime};
 use bumpalo::collections::Vec as GcVec;
@@ -61,6 +61,9 @@ pub(crate) struct Block<const CONST: bool> {
     // Assigned only by the audited fresh manager-arena constructor. Ordinary
     // owner/global arenas are external relative to every channel manager.
     channel_manager: Option<crate::channel_manager::ChannelManagerIdentity>,
+    copy_allocations: RefCell<Option<Vec<CopyAllocation>>>,
+    #[cfg(test)]
+    copy_failure_after: Cell<Option<usize>>,
     pub(in crate::core) objects: bumpalo::Bump,
     // Allocations that will be dropped when the objects are moved. At that time
     // the allocation will get copied into the GC heap. This let's us avoid an
@@ -92,6 +95,88 @@ pub(crate) struct DeferredEndpointFinalizers {
     receivers: Vec<ChannelReceiver>,
     processes: Vec<LispProcess>,
     frames: Vec<LispFrame>,
+    copy_tables: Vec<LispHashTable>,
+    copy_chartables: Vec<CharTable>,
+    copy_integers: Vec<LispBigInt>,
+    copy_bytefns: Vec<ByteFn>,
+    copy_storage: Vec<DropStackElem>,
+}
+/// Owning native resources allocated during an unpublished graph copy. These
+/// are not roots and may only be consumed before any collection of the arena.
+pub(in crate::core) enum CopyAllocation {
+    Sender(*const ChannelSender),
+    Receiver(*const ChannelReceiver),
+    Process(*const LispProcess),
+    Frame(*const LispFrame),
+    Table(*const LispHashTable),
+    CharTable(*const CharTable),
+    Integer(*const LispBigInt),
+    ByteFn(*const ByteFn),
+}
+#[cfg(test)]
+struct CopyFailureScope<'a, const C: bool> {
+    block: &'a Block<C>,
+    previous: Option<usize>,
+}
+#[cfg(test)]
+impl<const C: bool> Drop for CopyFailureScope<'_, C> {
+    fn drop(&mut self) {
+        self.block.copy_failure_after.set(self.previous);
+    }
+}
+pub(crate) struct CopyTransaction<'a, const C: bool> {
+    block: &'a Block<C>,
+    deferred: &'a mut DeferredEndpointFinalizers,
+    lengths: [usize; 7],
+    committed: bool,
+}
+impl<const C: bool> CopyTransaction<'_, C> {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl<const C: bool> Drop for CopyTransaction<'_, C> {
+    fn drop(&mut self) {
+        let allocations = self
+            .block
+            .copy_allocations
+            .borrow_mut()
+            .take()
+            .expect("active copy transaction");
+        if self.committed {
+            return;
+        }
+        self.block.lisp_senders.borrow_mut().truncate(self.lengths[0]);
+        self.block.lisp_receivers.borrow_mut().truncate(self.lengths[1]);
+        self.block.lisp_processes.borrow_mut().truncate(self.lengths[2]);
+        self.block.lisp_frames.borrow_mut().truncate(self.lengths[3]);
+        self.block.lisp_hashtables.borrow_mut().truncate(self.lengths[4]);
+        self.block.lisp_chartables.borrow_mut().truncate(self.lengths[5]);
+        self.deferred
+            .copy_storage
+            .extend(self.block.drop_stack.borrow_mut().drain(self.lengths[6]..));
+        // SAFETY: each recorded pointer is a distinct newly allocated owning
+        // wrapper in this exclusive transaction, never published or collected.
+        // Remove its finalizer registration before transferring ownership.
+        for allocation in allocations {
+            unsafe {
+                match allocation {
+                    CopyAllocation::Sender(p) => self.deferred.senders.push(std::ptr::read(p)),
+                    CopyAllocation::Receiver(p) => self.deferred.receivers.push(std::ptr::read(p)),
+                    CopyAllocation::Process(p) => self.deferred.processes.push(std::ptr::read(p)),
+                    CopyAllocation::Frame(p) => self.deferred.frames.push(std::ptr::read(p)),
+                    CopyAllocation::Table(p) => self.deferred.copy_tables.push(std::ptr::read(p)),
+                    CopyAllocation::CharTable(p) => {
+                        self.deferred.copy_chartables.push(std::ptr::read(p))
+                    }
+                    CopyAllocation::Integer(p) => {
+                        self.deferred.copy_integers.push(std::ptr::read(p))
+                    }
+                    CopyAllocation::ByteFn(p) => self.deferred.copy_bytefns.push(std::ptr::read(p)),
+                }
+            }
+        }
+    }
 }
 fn collect_endpoint_finalizers(block: &Block<false>, deferred: &mut DeferredEndpointFinalizers) {
     block.lisp_senders.borrow_mut().retain_mut(|pointer| {
@@ -226,6 +311,9 @@ impl<const CONST: bool> Block<CONST> {
     fn empty() -> Self {
         Self {
             channel_manager: None,
+            copy_allocations: RefCell::new(None),
+            #[cfg(test)]
+            copy_failure_after: Cell::new(None),
             objects: bumpalo::Bump::new(),
             drop_stack: RefCell::default(),
             lisp_hashtables: RefCell::default(),
@@ -252,6 +340,62 @@ impl<const CONST: bool> Block<CONST> {
     #[cfg(test)]
     pub(crate) fn tracked_endpoint_allocations(&self) -> (usize, usize) {
         (self.lisp_senders.borrow().len(), self.lisp_receivers.borrow().len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scoped_copy_failure(&self, successful_nodes: usize) -> impl Drop + '_ {
+        let previous = self.copy_failure_after.replace(Some(successful_nodes));
+        CopyFailureScope { block: self, previous }
+    }
+    #[cfg(test)]
+    pub(crate) fn fail_copy_after(&self, successful_nodes: usize) {
+        self.copy_failure_after.set(Some(successful_nodes));
+    }
+    #[cfg(test)]
+    pub(crate) fn clear_copy_failure(&self) {
+        self.copy_failure_after.set(None);
+    }
+    #[cfg(test)]
+    pub(crate) fn check_copy_failure(&self) -> anyhow::Result<()> {
+        if let Some(remaining) = self.copy_failure_after.get() {
+            anyhow::ensure!(remaining != 0, "injected graph-copy failure");
+            self.copy_failure_after.set(Some(remaining - 1));
+        }
+        Ok(())
+    }
+
+    /// Begin an unpublished graph-copy transaction.
+    ///
+    /// SAFETY: Caller excludes collection and concurrent target allocation;
+    /// records only newly allocated owning wrappers, publishes no copied value
+    /// before success, and commits immediately after infallible publication.
+    /// Declare deferred before all manager/global locks, so native destructors
+    /// run only after those guards are released. No nested transaction is allowed.
+    pub(crate) unsafe fn copy_transaction<'a>(
+        &'a self,
+        deferred: &'a mut DeferredEndpointFinalizers,
+    ) -> CopyTransaction<'a, CONST> {
+        let lengths = [
+            self.lisp_senders.borrow().len(),
+            self.lisp_receivers.borrow().len(),
+            self.lisp_processes.borrow().len(),
+            self.lisp_frames.borrow().len(),
+            self.lisp_hashtables.borrow().len(),
+            self.lisp_chartables.borrow().len(),
+            self.drop_stack.borrow().len(),
+        ];
+        let mut active = self.copy_allocations.borrow_mut();
+        assert!(active.is_none(), "nested native copy transaction");
+        *active = Some(Vec::new());
+        CopyTransaction { block: self, deferred, lengths, committed: false }
+    }
+    /// SAFETY: when a transaction is active, this must be a distinct newly
+    /// allocated owning wrapper in this block, never published or registered
+    /// twice. It must not be an existing same-arena identity alias.
+    pub(in crate::core) unsafe fn record_copy_allocation(&self, allocation: CopyAllocation) {
+        if let Some(active) = self.copy_allocations.borrow_mut().as_mut() {
+            active.push(allocation);
+        }
     }
 
     /// Scope the uninterned-symbol alias cache to one complete graph copy.

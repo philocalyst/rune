@@ -42,8 +42,8 @@ impl PartialEq for LispFloat {
 impl Eq for LispFloat {}
 
 impl<'new> CloneIn<'new, &'new LispFloat> for LispFloat {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> super::Gc<&'new Self> {
-        (**self).into_obj(bk)
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<super::Gc<&'new Self>> {
+        Ok((**self).into_obj(bk))
     }
 }
 

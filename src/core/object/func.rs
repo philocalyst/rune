@@ -109,11 +109,11 @@ impl ByteFnPrototype {
 }
 
 impl<'new> CloneIn<'new, &'new Self> for ByteFn {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> super::Gc<&'new Self> {
-        let constants = self.constants.clone_in(bk);
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<super::Gc<&'new Self>> {
+        let constants = self.constants.clone_in(bk)?;
         let byte_fn =
             unsafe { ByteFn::make(&self.op_codes, constants.untag(), self.args, self.depth) };
-        byte_fn.into_obj(bk)
+        Ok(byte_fn.into_obj(bk))
     }
 }
 
@@ -233,7 +233,10 @@ mod test {
     use super::*;
 
     fn check_arg_spec(spec: i64) {
-        assert_eq!(spec, i64::try_from(FnArgs::from_arg_spec(spec).unwrap().into_arg_spec()).unwrap());
+        assert_eq!(
+            spec,
+            i64::try_from(FnArgs::from_arg_spec(spec).unwrap().into_arg_spec()).unwrap()
+        );
     }
 
     #[test]

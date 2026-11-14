@@ -52,8 +52,8 @@ impl Trace for FrameInner {
     fn trace(&self, _: &mut GcState) {}
 }
 impl<'new> CloneIn<'new, &'new Self> for LispFrame {
-    fn clone_in<const C: bool>(&self, block: &'new Block<C>) -> Gc<&'new Self> {
-        Self(GcHeap::new(FrameInner { identity: self.0.identity.clone() }, C)).into_obj(block)
+    fn clone_in<const C: bool>(&self, block: &'new Block<C>) -> anyhow::Result<Gc<&'new Self>> {
+        Ok(Self(GcHeap::new(FrameInner { identity: self.0.identity.clone() }, C)).into_obj(block))
     }
 }
 impl PartialEq for LispFrame {

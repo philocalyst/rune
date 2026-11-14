@@ -169,7 +169,7 @@ mod tests {
         vector.untag().try_mut().unwrap()[0].set(vector.into());
         assert!(validate_function_clone(vector.into()).is_err());
         let table = crate::core::object::HashTable::default().into_obj(&cx.block);
-        table.untag().insert(Object::from(0), table.into());
+        table.untag().insert(Object::from(0), table.into()).unwrap();
         assert!(table.untag().clone_children_snapshot(1).is_err());
         assert_eq!(table.untag().clone_children_snapshot(2).unwrap().len(), 2);
         assert!(validate_function_clone(table.into()).is_err());

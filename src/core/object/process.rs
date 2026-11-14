@@ -66,8 +66,8 @@ impl Trace for ProcessInner {
     fn trace(&self, _: &mut GcState) {}
 }
 impl<'new> CloneIn<'new, &'new Self> for LispProcess {
-    fn clone_in<const C: bool>(&self, block: &'new Block<C>) -> Gc<&'new Self> {
-        Self(GcHeap::new(ProcessInner { data: self.0.data.clone() }, C)).into_obj(block)
+    fn clone_in<const C: bool>(&self, block: &'new Block<C>) -> anyhow::Result<Gc<&'new Self>> {
+        Ok(Self(GcHeap::new(ProcessInner { data: self.0.data.clone() }, C)).into_obj(block))
     }
 }
 impl PartialEq for LispProcess {

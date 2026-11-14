@@ -100,7 +100,25 @@ impl LispHashTable {
         self.0.with(|x| x.get_index_of(&key))
     }
 
-    pub(crate) fn insert(&self, key: Object, value: Object) {
+    pub(crate) fn insert(&self, key: Object, value: Object) -> anyhow::Result<()> {
+        self.insert_inner(key, value, None)
+    }
+    #[cfg(test)]
+    pub(crate) fn insert_with_copy_failure(
+        &self,
+        key: Object,
+        value: Object,
+        after: usize,
+    ) -> anyhow::Result<()> {
+        self.insert_inner(key, value, Some(after))
+    }
+    fn insert_inner(
+        &self,
+        key: Object,
+        value: Object,
+        _copy_failure_after: Option<usize>,
+    ) -> anyhow::Result<()> {
+        let mut deferred = crate::core::gc::DeferredEndpointFinalizers::default();
         match &self.0.0 {
             HashTableType::Local(table) => {
                 let key = unsafe { key.with_lifetime() };
@@ -110,16 +128,24 @@ impl LispHashTable {
             HashTableType::Global(table) => {
                 let map = INTERNED_SYMBOLS.lock().unwrap();
                 let block = map.global_block();
+                #[cfg(test)]
+                let _failure_scope =
+                    _copy_failure_after.map(|after| block.scoped_copy_failure(after));
                 // Keys and values share one copy session, preserving aliases
                 // inside this insertion without retaining stale external IDs.
+                // SAFETY: target copy is exclusive and unpublished until commit; deferred outlives locks.
+                let transaction = unsafe { block.copy_transaction(&mut deferred) };
                 let _clone_session = block.clone_session();
                 // Need to clone these objects in the global block since this
                 // hashtable is globally shared
-                let key = unsafe { key.clone_in(block).with_lifetime() };
-                let value = unsafe { value.clone_in(block).with_lifetime() };
-                table.lock().unwrap().inner.insert(key, value)
+                let key = unsafe { key.clone_in(block)?.with_lifetime() };
+                let value = unsafe { value.clone_in(block)?.with_lifetime() };
+                let previous = table.lock().unwrap().inner.insert(key, value);
+                transaction.commit();
+                previous
             }
         };
+        Ok(())
     }
 
     pub(crate) fn shift_remove(&self, key: Object) {
@@ -191,16 +217,17 @@ impl PartialEq for HashTableCore<'_> {
 }
 
 impl<'new> CloneIn<'new, &'new Self> for LispHashTable {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<&'new Self>> {
         let mut table = HashTable::default();
-        self.0.with(|x| {
+        self.0.with(|x| -> anyhow::Result<()> {
             for (key, value) in x {
-                let new_key = key.clone_in(bk);
-                let new_value = value.clone_in(bk);
+                let new_key = key.clone_in(bk)?;
+                let new_value = value.clone_in(bk)?;
                 table.insert(new_key, new_value);
             }
-        });
-        table.into_obj(bk)
+            Ok(())
+        })?;
+        Ok(table.into_obj(bk))
     }
 }
 

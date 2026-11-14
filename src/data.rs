@@ -18,8 +18,9 @@ pub(crate) fn fset<'ob>(symbol: Symbol<'ob>, definition: Object) -> Result<Symbo
         symbol.unbind_func();
     } else {
         let func = definition.try_into()?;
+        let mut deferred = crate::core::gc::DeferredEndpointFinalizers::default();
         let map = INTERNED_SYMBOLS.lock().unwrap();
-        map.set_func(symbol, func)?;
+        map.set_func(symbol, func, &mut deferred)?;
     }
     Ok(symbol)
 }
@@ -1359,6 +1360,7 @@ defsym!(CHANNEL_CLOSED);
 defsym!(CHANNEL_FULL);
 defsym!(CHANNEL_EMPTY);
 defsym!(CHANNEL_TIMEOUT);
+defsym!(CHANNEL_COPY_FAILED);
 defsym!(THREAD_ERRORED);
 
 #[cfg(test)]

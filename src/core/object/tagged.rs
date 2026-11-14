@@ -400,6 +400,9 @@ impl IntoObject for ByteFnPrototype {
 
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         let ptr = block.objects.alloc(ByteFn::new(self, C));
+        unsafe {
+            block.record_copy_allocation(crate::core::gc::CopyAllocation::ByteFn(ptr));
+        }
         unsafe { Self::Out::tag_ptr(ptr) }
     }
 }
@@ -517,6 +520,9 @@ impl IntoObject for HashTable<'_> {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         unsafe {
             let ptr = block.objects.alloc(LispHashTable::new(self, C));
+            unsafe {
+                block.record_copy_allocation(crate::core::gc::CopyAllocation::Table(ptr));
+            }
             block.lisp_hashtables.borrow_mut().push(ptr);
             <&LispHashTable>::tag_ptr(ptr)
         }
@@ -529,6 +535,9 @@ impl IntoObject for CharTableInner<'_> {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         unsafe {
             let ptr = block.objects.alloc(CharTable::new(self, C));
+            unsafe {
+                block.record_copy_allocation(crate::core::gc::CopyAllocation::CharTable(ptr));
+            }
             if !C {
                 block.lisp_chartables.borrow_mut().push(ptr);
             }
@@ -543,6 +552,9 @@ impl IntoObject for BigInt {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> super::Gc<Self::Out<'_>> {
         unsafe {
             let ptr = block.objects.alloc(LispBigInt::new(self, C));
+            unsafe {
+                block.record_copy_allocation(crate::core::gc::CopyAllocation::Integer(ptr));
+            }
             // block.lisp_integers.borrow_mut().push(ptr);
             <&LispBigInt>::tag_ptr(ptr)
         }
@@ -555,6 +567,9 @@ impl IntoObject for ChannelSender {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         let ChannelSender(heap) = self.residence_for_block(block);
         let ptr = block.objects.alloc(ChannelSender(heap.for_block::<C>()));
+        unsafe {
+            block.record_copy_allocation(crate::core::gc::CopyAllocation::Sender(ptr));
+        }
         if !C {
             block.lisp_senders.borrow_mut().push(ptr);
         }
@@ -568,6 +583,9 @@ impl IntoObject for ChannelReceiver {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         let ChannelReceiver(heap) = self.residence_for_block(block);
         let ptr = block.objects.alloc(ChannelReceiver(heap.for_block::<C>()));
+        unsafe {
+            block.record_copy_allocation(crate::core::gc::CopyAllocation::Receiver(ptr));
+        }
         if !C {
             block.lisp_receivers.borrow_mut().push(ptr);
         }
@@ -580,6 +598,9 @@ impl IntoObject for LispProcess {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         let LispProcess(heap) = self;
         let ptr = block.objects.alloc(LispProcess(heap.for_block::<C>()));
+        unsafe {
+            block.record_copy_allocation(crate::core::gc::CopyAllocation::Process(ptr));
+        }
         if !C {
             block.lisp_processes.borrow_mut().push(ptr);
         }
@@ -592,6 +613,9 @@ impl IntoObject for LispFrame {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         let LispFrame(heap) = self;
         let ptr = block.objects.alloc(LispFrame(heap.for_block::<C>()));
+        unsafe {
+            block.record_copy_allocation(crate::core::gc::CopyAllocation::Frame(ptr));
+        }
         if !C {
             block.lisp_frames.borrow_mut().push(ptr);
         }
@@ -1633,7 +1657,7 @@ pub(crate) trait CloneIn<'new, T>
 where
     T: 'new,
 {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<T>;
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<T>>;
 }
 
 impl<'new, T, U, E> CloneIn<'new, U> for Gc<T>
@@ -1642,29 +1666,31 @@ where
     T: WithLifetime<'new, Out = U>,
     Gc<U>: TryFrom<Object<'new>, Error = E> + 'new,
 {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<U> {
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<U>> {
+        #[cfg(test)]
+        bk.check_copy_failure()?;
         let obj = match self.as_obj().untag() {
             ObjectType::Int(x) => x.into(),
-            ObjectType::Cons(x) => x.clone_in(bk).into(),
-            ObjectType::String(x) => x.clone_in(bk).into(),
-            ObjectType::ByteString(x) => x.clone_in(bk).into(),
-            ObjectType::Symbol(x) => x.clone_in(bk).into(),
-            ObjectType::ByteFn(x) => x.clone_in(bk).into(),
+            ObjectType::Cons(x) => x.clone_in(bk)?.into(),
+            ObjectType::String(x) => x.clone_in(bk)?.into(),
+            ObjectType::ByteString(x) => x.clone_in(bk)?.into(),
+            ObjectType::Symbol(x) => x.clone_in(bk)?.into(),
+            ObjectType::ByteFn(x) => x.clone_in(bk)?.into(),
             ObjectType::SubrFn(x) => x.into(),
-            ObjectType::Float(x) => x.clone_in(bk).into(),
-            ObjectType::Vec(x) => x.clone_in(bk).into(),
-            ObjectType::Record(x) => x.clone_in(bk).into(),
-            ObjectType::HashTable(x) => x.clone_in(bk).into(),
-            ObjectType::Buffer(x) => x.clone_in(bk).into(),
-            ObjectType::CharTable(x) => x.clone_in(bk).into(),
-            ObjectType::BigInt(x) => x.clone_in(bk).into(),
-            ObjectType::ChannelSender(x) => x.clone_in(bk).into(),
-            ObjectType::ChannelReceiver(x) => x.clone_in(bk).into(),
-            ObjectType::Process(x) => x.clone_in(bk).into(),
-            ObjectType::Frame(x) => x.clone_in(bk).into(),
+            ObjectType::Float(x) => x.clone_in(bk)?.into(),
+            ObjectType::Vec(x) => x.clone_in(bk)?.into(),
+            ObjectType::Record(x) => x.clone_in(bk)?.into(),
+            ObjectType::HashTable(x) => x.clone_in(bk)?.into(),
+            ObjectType::Buffer(x) => x.clone_in(bk)?.into(),
+            ObjectType::CharTable(x) => x.clone_in(bk)?.into(),
+            ObjectType::BigInt(x) => x.clone_in(bk)?.into(),
+            ObjectType::ChannelSender(x) => x.clone_in(bk)?.into(),
+            ObjectType::ChannelReceiver(x) => x.clone_in(bk)?.into(),
+            ObjectType::Process(x) => x.clone_in(bk)?.into(),
+            ObjectType::Frame(x) => x.clone_in(bk)?.into(),
         };
         let Ok(x) = Gc::<U>::try_from(obj) else { unreachable!() };
-        x
+        Ok(x)
     }
 }
 

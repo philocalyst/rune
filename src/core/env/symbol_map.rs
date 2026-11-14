@@ -61,15 +61,26 @@ impl SymbolMap {
         self.map.intern(name, &self.block, cx)
     }
 
-    pub(crate) fn set_func(&self, symbol: Symbol, func: Function) -> Result<()> {
+    pub(crate) fn set_func(
+        &self,
+        symbol: Symbol,
+        func: Function,
+        deferred: &mut crate::core::gc::DeferredEndpointFinalizers,
+    ) -> Result<()> {
         // INTERNED_SYMBOLS is held by callers throughout validation and copy;
         // this excludes global hash-table insertion changing the source graph.
         crate::core::object::validate_function_clone(func.into())?;
+        // SAFETY: target copy is exclusive and unpublished until commit; deferred outlives locks.
+        let transaction = unsafe { self.block.copy_transaction(deferred) };
         let _clone_session = self.block.clone_session();
-        let new_func = func.clone_in(&self.block);
+        let new_func = func.clone_in(&self.block)?;
         // SAFETY: The object is marked read-only, we have cloned in the map's
         // context, and it is const, so calling this function is safe.
-        unsafe { symbol.set_func(new_func) }
+        unsafe {
+            symbol.set_func(new_func)?;
+        }
+        transaction.commit();
+        Ok(())
     }
 
     pub(crate) fn global_block(&self) -> &Block<true> {

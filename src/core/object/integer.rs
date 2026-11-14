@@ -11,9 +11,9 @@ pub(crate) struct LispBigInt(GcHeap<BigInt>);
 derive_GcMoveable!(LispBigInt);
 
 impl<'new> CloneIn<'new, &'new Self> for LispBigInt {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> super::Gc<&'new Self> {
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<super::Gc<&'new Self>> {
         let big_int = self.0.clone();
-        big_int.into_obj(bk)
+        Ok(big_int.into_obj(bk))
     }
 }
 

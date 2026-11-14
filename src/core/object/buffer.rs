@@ -60,8 +60,8 @@ impl LispBuffer {
     pub(in crate::core) fn clone_in<'new, const C: bool>(
         &self,
         _: &'new Block<C>,
-    ) -> Gc<&'new Self> {
-        unsafe { self.with_lifetime().tag() }
+    ) -> anyhow::Result<Gc<&'new Self>> {
+        Ok(unsafe { self.with_lifetime().tag() })
     }
 }
 impl fmt::Display for LispBuffer {

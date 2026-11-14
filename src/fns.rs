@@ -1132,9 +1132,9 @@ pub(crate) fn puthash<'ob>(
     key: Object<'ob>,
     value: Object<'ob>,
     table: &'ob LispHashTable,
-) -> Object<'ob> {
-    table.insert(key, value);
-    value
+) -> Result<Object<'ob>> {
+    table.insert(key, value)?;
+    Ok(value)
 }
 
 #[defun]

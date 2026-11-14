@@ -38,30 +38,51 @@ use rune_macros::defun;
 use std::thread;
 
 #[defun]
-fn go<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
+fn go<'ob>(obj: Object, cx: &'ob Context) -> anyhow::Result<Object<'ob>> {
     go_internal(obj, cx)
 }
 
-fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
+fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> anyhow::Result<Object<'ob>> {
     // Create a rendezvous channel (capacity 1) for the result
     let (sender, receiver) = make_channel_pair(1);
 
     let (init_sender, init_receiver) = make_channel_pair(1);
-    init_sender.send(obj).expect("channel is immediately used after creation");
+    init_sender
+        .send(obj)
+        .map_err(|_| anyhow::anyhow!("Unable to copy go expression into worker channel"))?;
     init_sender.close();
 
     // Spawn thread to evaluate expression
-    thread::spawn(move || {
+    thread::Builder::new().spawn(move || {
         // A worker owns the ordinary singleton Context on its fresh thread.
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, init(Env::new(cx).expect("fresh worker editor initialization")), cx);
+        let fresh_env = match Env::new(cx) {
+            Ok(env) => env,
+            Err(_) => {
+                let failure =
+                    Cons::new(sym::THREAD_ERRORED, cx.add("worker initialization failed"), cx);
+                let _ = sender.send(failure.into());
+                sender.close();
+                return;
+            }
+        };
+        root!(env, init(fresh_env), cx);
         // Each worker has its own variable bindings, including the same built-in
         // defaults as the main interpreter. Root them before evaluation can GC.
         crate::core::env::init_variables(cx, env);
 
         // Reconstruct the object from raw
-        let obj = init_receiver.recv(cx).expect("go_internal parent thread waited on the send operation in this channel before spawning the thread");
+        let obj = match init_receiver.recv(cx) {
+            Ok(object) => object,
+            Err(_) => {
+                let failure =
+                    Cons::new(sym::THREAD_ERRORED, cx.add("worker graph transfer failed"), cx);
+                let _ = sender.send(failure.into());
+                sender.close();
+                return;
+            }
+        };
         init_receiver.close();
         root!(obj, cx);
 
@@ -79,13 +100,17 @@ fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
         // The result is already in the thread's context (block),
         // and will be double-copied: once into channel's buffer_block,
         // then once into receiver's context when received
-        let _ = sender.send(result);
+        if sender.send(result).is_err() {
+            let failure =
+                Cons::new(sym::THREAD_ERRORED, cx.add("worker result transfer failed"), cx);
+            let _ = sender.send(failure.into());
+        }
         sender.close();
         cx.garbage_collect(true);
-    });
+    })?;
 
     // Return the receiver to the caller
-    receiver.into_obj(&cx.block).into()
+    Ok(receiver.into_obj(&cx.block).into())
 }
 
 #[cfg(test)]
@@ -104,7 +129,7 @@ mod tests {
             (sym::LEXICAL_BINDING, cx.add(true)),
             (sym::PRINT_LENGTH, cx.add(false)),
         ] {
-            let receiver_obj = go_internal(variable.into(), cx);
+            let receiver_obj = go_internal(variable.into(), cx).unwrap();
             let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
             assert_eq!(receiver.recv(cx).unwrap(), expected, "default for {variable}");
         }
@@ -114,7 +139,7 @@ mod tests {
     fn roadmap_m0_go_initializes_allocated_builtin_defaults() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        let receiver_obj = go_internal(sym::LOAD_PATH.into(), cx);
+        let receiver_obj = go_internal(sym::LOAD_PATH.into(), cx).unwrap();
         let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
         let result = receiver.recv(cx).unwrap();
         let ObjectType::Cons(path) = result.untag() else {
@@ -128,19 +153,19 @@ mod tests {
     fn roadmap_m0_go_defaults_are_local_to_child_env() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, init(Env::new(cx).expect("fresh worker editor initialization")), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         crate::core::env::init_variables(cx, env);
         env.set_var(sym::FILL_COLUMN, cx.add(91)).unwrap();
 
         // A worker's assignment must not change either the parent or the next
         // worker's defaults. SETQ/PROGN are special forms, not global subr setup.
         let form = crate::reader::read("(progn (setq fill-column 23) fill-column)", cx).unwrap().0;
-        let receiver_obj = go_internal(form, cx);
+        let receiver_obj = go_internal(form, cx).unwrap();
         let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
         assert_eq!(receiver.recv(cx).unwrap(), cx.add(23));
         assert_eq!(env.vars.get(sym::FILL_COLUMN).unwrap().bind(cx), cx.add(91));
 
-        let receiver_obj = go_internal(sym::FILL_COLUMN.into(), cx);
+        let receiver_obj = go_internal(sym::FILL_COLUMN.into(), cx).unwrap();
         let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
         assert_eq!(receiver.recv(cx).unwrap(), cx.add(70));
     }
@@ -150,7 +175,7 @@ mod tests {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         let missing = crate::core::env::intern("roadmap-m0-unbound-worker-variable", cx);
-        let receiver_obj = go_internal(missing.into(), cx);
+        let receiver_obj = go_internal(missing.into(), cx).unwrap();
         let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
         let result = receiver.recv(cx).unwrap();
         let ObjectType::Cons(error) = result.untag() else {
@@ -165,7 +190,7 @@ mod tests {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         let obj = cx.add("test string");
-        let receiver_obj = go_internal(obj, cx);
+        let receiver_obj = go_internal(obj, cx).unwrap();
 
         // Verify it returns a ChannelReceiver
         assert!(matches!(receiver_obj.untag(), ObjectType::ChannelReceiver(_)));
@@ -182,9 +207,9 @@ mod tests {
         let cx = &mut Context::new(roots);
 
         let receivers = [
-            go_internal(crate::reader::read("(if nil 1 2 3)", cx).unwrap().0, cx),
-            go_internal(crate::reader::read("(progn (defvar foo 1) foo)", cx).unwrap().0, cx),
-            go_internal(crate::reader::read("(progn (defvar foo 1) (makunbound 'foo) (let ((fn #'(lambda () (defvar foo 3))) (foo 7)) (funcall fn)) foo)", cx).unwrap().0, cx),
+            go_internal(crate::reader::read("(if nil 1 2 3)", cx).unwrap().0, cx).unwrap(),
+            go_internal(crate::reader::read("(progn (defvar foo 1) foo)", cx).unwrap().0, cx).unwrap(),
+            go_internal(crate::reader::read("(progn (defvar foo 1) (makunbound 'foo) (let ((fn #'(lambda () (defvar foo 3))) (foo 7)) (funcall fn)) foo)", cx).unwrap().0, cx).unwrap(),
         ];
 
         for recv_obj in receivers {
@@ -200,7 +225,7 @@ mod tests {
         println!("hello main thread");
         let cx = &mut Context::new(roots);
         let obj = crate::reader::read("(message \"hello from thread\")", cx).unwrap().0;
-        let receiver_obj = go_internal(obj, cx);
+        let receiver_obj = go_internal(obj, cx).unwrap();
 
         let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
         let result = receiver.recv(cx);
@@ -214,7 +239,7 @@ mod tests {
 
         // This expression should error (undefined function)
         let obj = crate::reader::read("(undefined-function-xyz)", cx).unwrap().0;
-        let receiver_obj = go_internal(obj, cx);
+        let receiver_obj = go_internal(obj, cx).unwrap();
 
         let receiver: Gc<&ChannelReceiver> = receiver_obj.try_into().unwrap();
         let result = receiver.recv(cx).unwrap();
@@ -239,7 +264,7 @@ mod tests {
         let cx = &mut Context::new(roots);
 
         // Spawn thread but discard receiver immediately
-        let _receiver = go_internal(cx.add("discarded"), cx);
+        let _receiver = go_internal(cx.add("discarded"), cx).unwrap();
         let _ = _receiver;
 
         cx.garbage_collect(true);

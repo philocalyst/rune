@@ -237,14 +237,27 @@ impl ChannelManager {
             || data.receiver_closed
     }
     /// Copy without ChannelData locks; a payload may reference its own carrier.
-    fn copy_for_queue(&self, object: Object) -> __HeapRoot<Slot<Object<'static>>> {
+    #[cfg(test)]
+    pub(crate) fn fail_queue_copy_after(&self, successful_nodes: usize) {
+        self.gc_state.lock().unwrap().block.fail_copy_after(successful_nodes);
+    }
+    #[cfg(test)]
+    pub(crate) fn clear_queue_copy_failure(&self) {
+        self.gc_state.lock().unwrap().block.clear_copy_failure();
+    }
+    fn copy_for_queue(&self, object: Object) -> anyhow::Result<__HeapRoot<Slot<Object<'static>>>> {
+        let mut deferred = crate::core::gc::DeferredEndpointFinalizers::default();
         let _access = self.gc_access.read().unwrap();
         let state = self.gc_state.lock().unwrap();
+        // SAFETY: target copy is exclusive and unpublished until commit; deferred outlives locks.
+        let transaction = unsafe { state.block.copy_transaction(&mut deferred) };
         let _session = state.block.clone_session();
-        let copied = object.clone_in(&state.block);
+        let copied = object.clone_in(&state.block)?;
         // SAFETY: register the manager-owned graph before releasing gc_access.
         let copied = unsafe { std::mem::transmute::<Object<'_>, Object<'static>>(copied) };
-        __HeapRoot::new(Slot::new(copied), state.roots_static)
+        let root = __HeapRoot::new(Slot::new(copied), state.roots_static);
+        transaction.commit();
+        Ok(root)
     }
     fn reject_prepared(&self, prepared: __HeapRoot<Slot<Object<'static>>>) {
         drop(prepared);
@@ -263,7 +276,7 @@ impl ChannelManager {
                 return Err(SendError::Full);
             }
         }
-        let prepared = self.copy_for_queue(object);
+        let prepared = self.copy_for_queue(object).map_err(|_| SendError::CopyFailed)?;
         let mut data = state.data.lock().unwrap();
         let rejected = if Self::send_closed(&data) {
             Some(SendError::Closed)
@@ -293,7 +306,7 @@ impl ChannelManager {
                 return Err(SendError::Closed);
             }
         }
-        let prepared = self.copy_for_queue(object);
+        let prepared = self.copy_for_queue(object).map_err(|_| SendError::CopyFailed)?;
         let mut data = state.data.lock().unwrap();
         // Optimistic preparation: revalidate capacity and retain a HeapRoot,
         // not a gc_access guard, while blocked. Collection must keep progressing.
@@ -314,21 +327,28 @@ impl ChannelManager {
         &self,
         rooted: __HeapRoot<Slot<Object<'static>>>,
         target: &'ob Block<false>,
-    ) -> Object<'ob> {
+    ) -> Result<Object<'ob>, RecvError> {
+        let mut deferred = crate::core::gc::DeferredEndpointFinalizers::default();
         let result = {
             let _access = self.gc_access.read().unwrap();
             // SAFETY: root stays alive and access excludes transit collection
             // throughout the target graph copy. No data lock is held.
             let object = unsafe { rooted.get_inner() };
+            // SAFETY: target copy is exclusive and unpublished until commit; deferred outlives locks.
+            let transaction = unsafe { target.copy_transaction(&mut deferred) };
             let _session = target.clone_session();
-            object.clone_in(target)
+            let result = object.clone_in(target);
+            if result.is_ok() {
+                transaction.commit();
+            }
+            result
         };
         drop(rooted);
         if self.recv_count.fetch_add(1, Ordering::SeqCst) + 1 >= self.gc_threshold {
             self.recv_count.store(0, Ordering::SeqCst);
             self.collect_garbage();
         }
-        result
+        result.map_err(|_| RecvError::CopyFailed)
     }
     pub(crate) fn try_recv<'ob>(
         &self,
@@ -347,7 +367,7 @@ impl ChannelManager {
         };
         drop(data);
         state.not_full.notify_one();
-        Ok(self.receive_prepared(rooted, target))
+        self.receive_prepared(rooted, target)
     }
     pub(crate) fn recv<'ob>(
         &self,
@@ -372,7 +392,7 @@ impl ChannelManager {
         let rooted = data.queue.pop_front().expect("nonempty queue");
         drop(data);
         state.not_full.notify_one();
-        Ok(self.receive_prepared(rooted, target))
+        self.receive_prepared(rooted, target)
     }
 
     /// Close the sender side of a channel
@@ -504,6 +524,8 @@ pub(crate) fn get_manager() -> Arc<ChannelManager> {
 /// Error type for send operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendError {
+    /// Payload could not be copied; channel state is not misreported as closed.
+    CopyFailed,
     /// Receiver has been dropped
     Closed,
     /// Channel is full (only for try_send)
@@ -515,6 +537,8 @@ pub(crate) enum SendError {
 /// Error type for receive operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecvError {
+    /// Dequeued payload could not be copied into the destination owner.
+    CopyFailed,
     /// All senders have been dropped
     Closed,
     /// Channel is empty (only for try_recv)

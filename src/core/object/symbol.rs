@@ -179,30 +179,32 @@ impl<'new> Symbol<'_> {
     pub(in crate::core) fn clone_in<const C: bool>(
         self,
         bk: &'new crate::core::gc::Block<C>,
-    ) -> Gc<Symbol<'new>> {
-        if let SymbolName::Uninterned(name) = &self.0.name {
-            match bk.uninterned_symbol_map.get(self) {
-                Some(new) => new.tag(),
-                None => {
-                    let sym = Symbol::new_uninterned(name.get(), bk);
-                    if let Some(old_func) = self.get().get() {
-                        // Function cells always refer to read-only global
-                        // storage. Cloning into a local block would violate
-                        // func(cx)'s lifetime extension and leave an untraced
-                        // moving pointer in this atomic cell. Share the stable
-                        // global function instead, including for local clones.
-                        unsafe {
-                            sym.set_func(old_func).unwrap();
+    ) -> anyhow::Result<Gc<Symbol<'new>>> {
+        Ok({
+            if let SymbolName::Uninterned(name) = &self.0.name {
+                match bk.uninterned_symbol_map.get(self) {
+                    Some(new) => new.tag(),
+                    None => {
+                        let sym = Symbol::new_uninterned(name.get(), bk);
+                        if let Some(old_func) = self.get().get() {
+                            // Function cells always refer to read-only global
+                            // storage. Cloning into a local block would violate
+                            // func(cx)'s lifetime extension and leave an untraced
+                            // moving pointer in this atomic cell. Share the stable
+                            // global function instead, including for local clones.
+                            unsafe {
+                                sym.set_func(old_func).unwrap();
+                            }
                         }
+                        let new = sym.into_obj(bk);
+                        bk.uninterned_symbol_map.insert(self, new.untag());
+                        new
                     }
-                    let new = sym.into_obj(bk);
-                    bk.uninterned_symbol_map.insert(self, new.untag());
-                    new
                 }
+            } else {
+                unsafe { self.with_lifetime().tag() }
             }
-        } else {
-            unsafe { self.with_lifetime().tag() }
-        }
+        })
     }
 }
 
@@ -458,9 +460,9 @@ mod function_domain_tests {
         root!(env, init(Env::new(cx).unwrap()), cx);
         let source = Symbol::new_uninterned("local-function-symbol", &cx.block);
         let lambda = list![sym::LAMBDA, NIL, 7; cx];
-        let function = lambda.try_into().unwrap();
-        INTERNED_SYMBOLS.lock().unwrap().set_func(source, function).unwrap();
-        let cloned = source.clone_in(&cx.block);
+        let function: Function = lambda.try_into().unwrap();
+        crate::data::fset(source, function.into()).unwrap();
+        let cloned = source.clone_in(&cx.block).unwrap();
         root!(cloned, cx);
         for _ in 0..10 {
             cx.garbage_collect(true);
@@ -489,7 +491,7 @@ mod clone_session_tests {
         for _ in 0..10 {
             let copy = {
                 let _session = cx.block.clone_session();
-                graph.bind(cx).clone_in(&cx.block)
+                graph.bind(cx).clone_in(&cx.block).unwrap()
             };
             let ObjectType::Vec(values) = copy.untag() else { panic!("vector expected") };
             assert!(values[0].get().ptr_eq(values[1].get()));
@@ -505,7 +507,7 @@ mod clone_session_tests {
         let source = Symbol::new_uninterned("copy-unwind", &cx.block);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _session = cx.block.clone_session();
-            let _copy = source.clone_in(&cx.block);
+            let _copy = source.clone_in(&cx.block).unwrap();
             assert!(!cx.block.uninterned_symbol_map.map.borrow().is_empty());
             panic!("abort copy");
         }));

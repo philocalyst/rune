@@ -115,8 +115,8 @@ impl Cons {
 }
 
 impl<'new> CloneIn<'new, &'new Cons> for Cons {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Cons> {
-        Cons::new(self.car().clone_in(bk), self.cdr().clone_in(bk), bk).into_obj(bk)
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<&'new Cons>> {
+        Ok(Cons::new(self.car().clone_in(bk)?, self.cdr().clone_in(bk)?, bk).into_obj(bk))
     }
 }
 

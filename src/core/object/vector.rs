@@ -75,10 +75,12 @@ impl LispVec {
 }
 
 impl<'new> CloneIn<'new, &'new Self> for LispVec {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<&'new Self>> {
         let mut vec = GcVec::with_capacity_in(self.len(), &bk.objects);
-        vec.extend(self.iter().map(|x| x.get().clone_in(bk)));
-        vec.into_obj(bk)
+        for value in self.iter() {
+            vec.push(value.get().clone_in(bk)?);
+        }
+        Ok(vec.into_obj(bk))
     }
 }
 
@@ -159,10 +161,12 @@ impl Deref for Record {
 }
 
 impl<'new> CloneIn<'new, &'new Self> for Record {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<&'new Self>> {
         let mut vec = GcVec::with_capacity_in(self.len(), &bk.objects);
-        vec.extend(self.iter().map(|x| x.get().clone_in(bk)));
-        RecordBuilder(vec).into_obj(bk)
+        for value in self.iter() {
+            vec.push(value.get().clone_in(bk)?);
+        }
+        Ok(RecordBuilder(vec).into_obj(bk))
     }
 }
 

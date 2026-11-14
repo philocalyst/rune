@@ -23,6 +23,7 @@ use std::{
 impl From<SendError> for Symbol<'static> {
     fn from(err: SendError) -> Self {
         match err {
+            SendError::CopyFailed => sym::CHANNEL_COPY_FAILED,
             SendError::Closed => sym::CHANNEL_CLOSED,
             SendError::Full => sym::CHANNEL_FULL,
             SendError::Timeout => sym::CHANNEL_TIMEOUT,
@@ -33,6 +34,7 @@ impl From<SendError> for Symbol<'static> {
 impl From<RecvError> for Symbol<'static> {
     fn from(err: RecvError) -> Self {
         match err {
+            RecvError::CopyFailed => sym::CHANNEL_COPY_FAILED,
             RecvError::Closed => sym::CHANNEL_CLOSED,
             RecvError::Empty => sym::CHANNEL_EMPTY,
             RecvError::Timeout => sym::CHANNEL_TIMEOUT,
@@ -327,15 +329,17 @@ impl Trace for ChannelReceiverInner {
 
 // CloneIn implementations for cross-context copying
 impl<'new> CloneIn<'new, &'new Self> for ChannelSender {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
-        // The endpoint must live in the target arena, not in this stack frame.
-        self.copy_owned(C).into_obj(bk)
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<&'new Self>> {
+        Ok(
+            // The endpoint must live in the target arena, not in this stack frame.
+            self.copy_owned(C).into_obj(bk),
+        )
     }
 }
 
 impl<'new> CloneIn<'new, &'new Self> for ChannelReceiver {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
-        self.copy_owned(C).into_obj(bk)
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<&'new Self>> {
+        Ok(self.copy_owned(C).into_obj(bk))
     }
 }
 
@@ -767,8 +771,8 @@ mod endpoint_ownership_tests {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         let (sender, receiver) = make_channel_pair(1);
-        let copied_sender = sender.clone_in(&cx.block);
-        let copied_receiver = receiver.clone_in(&cx.block);
+        let copied_sender = sender.clone_in(&cx.block).unwrap();
+        let copied_receiver = receiver.clone_in(&cx.block).unwrap();
         assert_in_target_arena(copied_sender, &cx.block, size_of::<ChannelSender>());
         assert_in_target_arena(copied_receiver, &cx.block, size_of::<ChannelReceiver>());
         root!(copied_sender, cx);
@@ -858,7 +862,7 @@ mod lifecycle_tests {
         let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        let alias = sender.clone_in(&cx.block);
+        let alias = sender.clone_in(&cx.block).unwrap();
         root!(alias, cx);
         assert_eq!(manager.counts_for_test(id), Some((1, 1)));
         sender.close();
@@ -870,7 +874,7 @@ mod lifecycle_tests {
         alias.bind(cx).close();
         alias.bind(cx).close();
         assert_eq!(manager.counts_for_test(id), Some((0, 1)));
-        let closed = alias.bind(cx).clone_in(&cx.block);
+        let closed = alias.bind(cx).clone_in(&cx.block).unwrap();
         assert_eq!(closed.try_send(cx.add(8)), Err(SendError::Closed));
         assert_eq!(manager.counts_for_test(id), Some((0, 1)));
         receiver.close();
@@ -885,7 +889,7 @@ mod lifecycle_tests {
         let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        let alias = receiver.clone_in(&cx.block);
+        let alias = receiver.clone_in(&cx.block).unwrap();
         root!(alias, cx);
         receiver.close();
         receiver.close();
@@ -893,7 +897,7 @@ mod lifecycle_tests {
         sender.send(cx.add(9)).unwrap();
         assert_eq!(alias.bind(cx).recv(cx).unwrap(), 9);
         alias.bind(cx).close();
-        let closed = alias.bind(cx).clone_in(&cx.block);
+        let closed = alias.bind(cx).clone_in(&cx.block).unwrap();
         assert_eq!(closed.try_recv(cx), Err(RecvError::Closed));
         assert_eq!(manager.counts_for_test(id), Some((1, 0)));
         sender.close();
@@ -1070,7 +1074,7 @@ mod residence_instrumentation_tests {
         let cx = &mut Context::new(&roots_set);
         let sender = sender.into_obj(&cx.block);
         root!(sender, cx);
-        let alias = sender.bind(cx).clone_in(&cx.block);
+        let alias = sender.bind(cx).clone_in(&cx.block).unwrap();
         root!(alias, cx);
         assert_eq!(roots(&manager), 2);
         sender.bind(cx).close();
@@ -1161,7 +1165,7 @@ mod residence_instrumentation_tests {
         let roots_set = RootSet::default();
         let cx = &mut Context::new(&roots_set);
         let symbols = INTERNED_SYMBOLS.lock().unwrap();
-        let global = sender.clone_in(symbols.global_block());
+        let global = sender.clone_in(symbols.global_block()).unwrap();
         sender.close();
         receiver.close();
         for _ in 0..5 {
@@ -1237,7 +1241,7 @@ mod residence_alias_finalization_tests {
             let roots = RootSet::default();
             let _cx = Context::new(&roots);
             let (_, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
-            let global = sender.clone_in(symbols.global_block());
+            let global = sender.clone_in(symbols.global_block()).unwrap();
             sender.close();
             receiver.close();
             global

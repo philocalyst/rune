@@ -126,8 +126,8 @@ impl LispString {
 }
 
 impl<'new> CloneIn<'new, &'new Self> for LispString {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> super::Gc<&'new Self> {
-        GcString::from_str_in(self.inner(), &bk.objects).into_obj(bk)
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<super::Gc<&'new Self>> {
+        Ok(GcString::from_str_in(self.inner(), &bk.objects).into_obj(bk))
     }
 }
 
@@ -206,9 +206,11 @@ impl ByteString {
 }
 
 impl<'new> CloneIn<'new, &'new Self> for ByteString {
-    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> super::Gc<&'new Self> {
-        // TODO: Allocate in the non-gc heap here
-        (**self).to_vec().into_obj(bk)
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<super::Gc<&'new Self>> {
+        Ok(
+            // TODO: Allocate in the non-gc heap here
+            (**self).to_vec().into_obj(bk),
+        )
     }
 }
 
