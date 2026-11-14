@@ -223,6 +223,17 @@ fn line_end_position(count: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<
     line_position(count, true, env, cx)
 }
 
+#[defun]
+fn beginning_of_line(count: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<()> {
+    let position = line_position(count, false, env, cx)?;
+    env.editor_gateway().set_point(env.current_buffer_handle(), position - 1, cx)
+}
+#[defun]
+fn end_of_line(count: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<()> {
+    let position = line_position(count, true, env, cx)?;
+    env.editor_gateway().set_point(env.current_buffer_handle(), position - 1, cx)
+}
+
 /// Unicode buffer byte coordinates are one-based UTF-8 offsets.
 #[defun]
 fn position_bytes(position: i64, env: &Rt<Env>, cx: &Context) -> Result<Option<usize>> {
@@ -476,6 +487,16 @@ mod owner_buffer_primitives_tests {
                   (list (bobp) (eobp) (following-char) (preceding-char) (point))
                   (progn (goto-char 2) (list (following-char) (preceding-char) (point)))
                   (progn (goto-char 4) (list (bobp) (eobp) (bolp) (eolp) (following-char) (preceding-char) (point))))))"#);
+    }
+    #[test]
+    fn line_movement_matches_gnu_unicode_offsets_and_clamping() {
+        crate::assert_elprop!(r#"(progn (erase-buffer) (insert "aé\n🙂x\nef") (goto-char 5)
+          (list (beginning-of-line) (point) (end-of-line) (point)
+                (beginning-of-line 0) (point) (end-of-line 2) (point)
+                (end-of-line -99) (point) (beginning-of-line 99) (point)
+                (equal (buffer-substring-no-properties 1 (point-max)) "aé\n🙂x\nef")))"#);
+        crate::assert_elprop!(r#"(progn (erase-buffer)
+          (list (beginning-of-line) (point) (end-of-line 99) (point)))"#);
     }
     #[test]
     fn indexed_line_boundaries_match_gnu_unicode_empty_and_offsets() {

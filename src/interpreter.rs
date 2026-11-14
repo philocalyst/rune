@@ -77,7 +77,8 @@ impl Interpreter<'_, '_> {
                 sym::PROG1 => self.eval_progx(forms, 1, cx),
                 sym::PROG2 => self.eval_progx(forms, 2, cx),
                 sym::SETQ => self.setq(forms, cx),
-                sym::DEFVAR | sym::DEFCONST => self.defvar(forms, cx),
+                sym::DEFVAR => self.defvar(forms, cx),
+                sym::DEFCONST => self.defconst(forms, cx),
                 sym::FUNCTION => self.eval_function(forms, cx),
                 sym::INTERACTIVE => Ok(NIL), // TODO: implement
                 sym::CATCH => self.catch(forms, cx),
@@ -125,6 +126,32 @@ impl Interpreter<'_, '_> {
         // pop this tag from the catch stack
         self.env.catch_stack.pop();
         result
+    }
+
+    fn defconst<'ob>(&mut self, obj: &Rto<Object>, cx: &'ob mut Context) -> EvalResult<'ob> {
+        rooted_iter!(forms, obj, cx);
+        let Some(name) = forms.next()? else {
+            bail_err!(LispError::arg_cnt(sym::DEFCONST, 2, 0, cx))
+        };
+        let name: Symbol = name.bind(cx).try_into()?;
+        root!(name, cx);
+        let Some(initializer) = forms.next()? else {
+            bail_err!(LispError::arg_cnt(sym::DEFCONST, 2, 1, cx))
+        };
+        root!(initializer, cx);
+        // Documentation is unevaluated. Validate the complete argument shape
+        // before running the initializer, including an improper trailing list.
+        forms.next()?;
+        if forms.next()?.is_some() {
+            bail_err!("Too many arguments");
+        }
+        let value = rebind!(self.eval_form(initializer, cx)?);
+        let name = name.bind(cx);
+        self.env.set_var(name, value)?;
+        name.make_special();
+        // DEFCONST declares special storage, not an immutable value/function
+        // cell: later SETQ, rebinding and redefinition remain permitted.
+        Ok(name.into())
     }
 
     fn defvar<'ob>(&mut self, obj: &Rto<Object>, cx: &'ob mut Context) -> EvalResult<'ob> {
@@ -976,6 +1003,34 @@ mod test {
         let obj = crate::reader::read(test_str, cx).unwrap().0;
         root!(obj, cx);
         assert!(eval(obj, None, env, cx).is_err());
+    }
+
+    #[test]
+    fn defconst_reinitializes_value_without_freezing_function_cell() {
+        for (source, expected) in [
+            ("(defconst vm-dc-result 3)", "vm-dc-result"),
+            (
+                "(progn (fset 'vm-dc-function (function (lambda () 8))) (defconst vm-dc-function 2) (list vm-dc-function (vm-dc-function)))",
+                "(2 8)",
+            ),
+            (
+                "(progn (defconst vm-dc-reset 1) (setq vm-dc-reset 2) (defconst vm-dc-reset 3) vm-dc-reset)",
+                "3",
+            ),
+            (
+                "(progn (defconst vm-dc-dynamic 1) (list (let ((vm-dc-dynamic 2)) (defconst vm-dc-dynamic 3) vm-dc-dynamic) vm-dc-dynamic))",
+                "(3 1)",
+            ),
+            ("(progn (defconst vm-dc-mutable 1) (setq vm-dc-mutable 4) vm-dc-mutable)", "4"),
+            ("(progn (defconst vm-dc-doc 1 (error \"unevaluated\")) vm-dc-doc)", "1"),
+            (
+                "(progn (setq vm-dc-side 0) (condition-case nil (defconst vm-dc-extra (setq vm-dc-side 1) \"doc\" extra) (error nil)) vm-dc-side)",
+                "0",
+            ),
+            ("(condition-case nil (defconst vm-dc-missing) (error 'caught))", "caught"),
+        ] {
+            assert_lisp(source, expected);
+        }
     }
 
     #[test]
