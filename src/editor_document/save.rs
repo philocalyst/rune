@@ -39,8 +39,11 @@ pub(crate) struct WrittenSave {
     path: PathBuf,
     committed_metadata: fs::Metadata,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SaveKind { Saved, Unchanged }
 #[derive(Debug)]
 pub(crate) struct SaveOutcome {
+    pub(crate) kind: SaveKind,
     pub(crate) path: PathBuf,
     pub(crate) bytes: usize,
 }
@@ -113,7 +116,7 @@ impl RuntimeEditorGateway {
             written.pending.file_revision,
             association,
         )?;
-        Ok(SaveOutcome { path: written.path, bytes: written.pending.bytes })
+        Ok(SaveOutcome { kind: SaveKind::Saved, path: written.path, bytes: written.pending.bytes })
     }
 }
 impl PendingSave {
@@ -673,7 +676,7 @@ impl super::LispRuntimeHost<'_, '_, '_> {
         {
             // Clean existing visited files are not rewritten. bytes=0 means
             // no bytes were written; a missing target is recreated below.
-            return Ok(SaveOutcome { path: path.to_owned(), bytes: 0 });
+            return Ok(SaveOutcome { kind: SaveKind::Unchanged, path: path.to_owned(), bytes: 0 });
         }
         let pending = gateway
             .prepare_visited_save(handle, read.epoch, max_bytes, self.owner.cx)
@@ -751,5 +754,51 @@ mod absolute_save_path_tests {
         if let Ok(path) = absolute_path(Path::new(r"C:rune-save-target")) {
             assert!(path.is_absolute());
         }
+    }
+}
+
+#[cfg(test)]
+mod save_kind_tests {
+    use super::*;
+    #[test]
+    fn zero_byte_write_is_saved_not_unchanged() {
+        super::super::with_lisp_runtime_owner(80, 24, |mut host| {
+            use rune_editor::EditorHost;
+            let snapshot = host.snapshot()?;
+            let selected = snapshot
+                .views
+                .iter()
+                .find(|v| v.id == snapshot.selected_window)
+                .unwrap()
+                .view
+                .buffer;
+            let gateway = host.owner.gateway.clone();
+            let h = gateway.inner.borrow().buffer_handle(selected, host.owner.cx)?;
+            let dir = std::env::temp_dir().join(format!(
+                "rune-save-kind-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&dir)?;
+            let path = dir.join("file");
+            let cleanup = TempPath(Some(path.clone()));
+            gateway.set_file_association(h, 0, Some(&path), host.owner.cx)?;
+            gateway.set_modified(h, true, host.owner.cx)?;
+            let saved = host.save_selected_visited(64).unwrap();
+            assert_eq!(saved.kind, SaveKind::Saved);
+            assert_eq!(saved.bytes, 0);
+            assert!(fs::read(&path)?.is_empty());
+            let unchanged = host.save_selected_visited(64).unwrap();
+            assert_eq!(unchanged.kind, SaveKind::Unchanged);
+            assert_eq!(unchanged.bytes, 0);
+            fs::remove_file(&path)?;
+            let recreated = host.save_selected_visited(64).unwrap();
+            assert_eq!(recreated.kind, SaveKind::Saved);
+            assert_eq!(recreated.bytes, 0);
+            drop(cleanup);
+            fs::remove_dir(dir)?;
+            Ok(())
+        })
+        .unwrap();
     }
 }

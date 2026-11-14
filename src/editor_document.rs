@@ -1842,4 +1842,4 @@ mod persistent_lisp_quit_adapter_tests {
 }
 
 mod save;
-pub(crate) use save::{PendingSave, SaveMode, SaveOutcome, WrittenSave};
+pub(crate) use save::{PendingSave, SaveKind, SaveMode, SaveOutcome, WrittenSave};

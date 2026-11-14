@@ -1570,4 +1570,20 @@ mod file_association_tests {
         assert!(s.modified(b).unwrap());
         assert_eq!(s.snapshot().sequence, before);
     }
+    #[test]
+    fn trusted_open_sequence_exhaustion_or_name_collision_publishes_nothing() {
+        let mut s=Session::new(StringDocument::empty(),80,24).unwrap();
+        let before=s.snapshot();
+        s.state.sequence=u64::MAX;
+        assert_eq!(s.create_visited_buffer("new",StringDocument::from("disk"),Arc::from(Path::new("/native/new"))),Err(EditorError::IdExhausted));
+        assert!(s.get_buffer("new").is_none());
+        assert_eq!(s.snapshot().buffers.len(),before.buffers.len());
+        s.state.sequence=before.sequence;
+        let old=s.current_buffer();
+        let name=s.snapshot().buffers.iter().find(|b|b.id==old).unwrap().name.clone();
+        assert_eq!(s.create_visited_buffer(&name,StringDocument::from("disk"),Arc::from(Path::new("/native/new"))),Err(EditorError::NameInUse));
+        assert_eq!(s.snapshot().sequence,before.sequence);
+        assert!(s.file_name(old).unwrap().is_none());
+    }
+
 }

@@ -2,6 +2,8 @@
 //! Not wired into native/Lisp Save yet. Detection is NOT atomic overwrite CAS.
 #[path = "trusted_open.rs"]
 mod trusted_open;
+#[path="trusted_host.rs"]
+mod trusted_host;
 use super::disk_witness::DiskWitness;
 use super::*;
 static NEXT_BASELINE: AtomicU64 = AtomicU64::new(1);
@@ -136,7 +138,7 @@ impl RuntimeEditorGateway {
                 witness,
             },
         );
-        Ok(SaveOutcome { path: receipt.written.path, bytes: receipt.written.pending.bytes })
+        Ok(SaveOutcome { kind: SaveKind::Saved, path: receipt.written.path, bytes: receipt.written.pending.bytes })
     }
 }
 impl GuardedSave {
