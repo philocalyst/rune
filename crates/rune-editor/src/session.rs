@@ -9,6 +9,16 @@ use std::{
     sync::Arc,
 };
 
+/// Read-only native lifetime witness. It retains no buffer, text or GC value.
+/// Only the owning Session can close it; a killed identity is never reused.
+#[derive(Clone, Debug)]
+pub struct BufferLiveness(Arc<std::sync::atomic::AtomicBool>);
+impl BufferLiveness {
+    fn new() -> Self { Self(Arc::new(std::sync::atomic::AtomicBool::new(true))) }
+    pub fn is_live(&self) -> bool { self.0.load(std::sync::atomic::Ordering::Acquire) }
+    fn close(&self) { self.0.store(false, std::sync::atomic::Ordering::Release); }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Insert(String),
@@ -180,6 +190,7 @@ impl<D: Document> Drop for History<D> {
 }
 #[derive(Clone)]
 struct Buffer<D: Document> {
+    liveness: BufferLiveness,
     name: String,
     document: D,
     saved_point: usize,
@@ -258,11 +269,17 @@ pub struct Session<D: Document> {
     last_macro: Vec<Command>,
     playing_macro: bool,
 }
+impl<D: Document> Drop for Session<D> {
+    fn drop(&mut self) {
+        for buffer in self.state.buffers.values() { buffer.liveness.close(); }
+    }
+}
 impl<D: Document> Session<D> {
     pub fn new(document: D, width: u32, height: u32) -> Result<Self> {
         let id = BufferId(crate::allocate_id()?);
         let windows = WindowTree::new(id, width, height)?;
         let buffer = Buffer {
+            liveness: BufferLiveness::new(),
             name: "*scratch*".into(),
             document,
             saved_point: 0,
@@ -400,6 +417,75 @@ impl<D: Document> Session<D> {
             read_only: b.read_only,
         })
     }
+    pub fn buffer_liveness(&self, id: BufferId) -> Result<BufferLiveness> {
+        Ok(self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.liveness.clone())
+    }
+    /// Derive both markers before publishing either. Native IDs consumed by a
+    /// failed derivation remain retired; text/history/point/epochs are unchanged.
+    pub fn register_marker_pair(&mut self, buffer: BufferId,
+        start: usize, start_bias: Bias, end: usize, end_bias: Bias,
+    ) -> Result<(crate::MarkerId, crate::MarkerId)> where D: crate::MarkerDocument {
+        let document = self.document(buffer)?;
+        if start > document.len_chars() || end > document.len_chars() {
+            return Err(EditorError::InvalidPosition);
+        }
+        let first = crate::MarkerId(crate::allocate_id()?);
+        let second = crate::MarkerId(crate::allocate_id()?);
+        if document.marker_position(first.as_u64()).is_some() || document.marker_position(second.as_u64()).is_some() {
+            return Err(EditorError::InvalidRange);
+        }
+        let next = document.set_live_marker(first.as_u64(), start, start_bias)
+            .and_then(|doc| doc.set_live_marker(second.as_u64(), end, end_bias))
+            .map_err(|e| EditorError::Backend(e.to_string()))?;
+        self.state.buffers.get_mut(&buffer).ok_or(EditorError::InvalidBuffer)?.document = next;
+        Ok((first, second))
+    }
+    pub fn move_marker_pair(&mut self, buffer: BufferId,
+        pair: (crate::MarkerId, crate::MarkerId), start: usize, start_bias: Bias,
+        end: usize, end_bias: Bias,
+    ) -> Result<()> where D: crate::MarkerDocument {
+        self.transfer_marker_pair(buffer, buffer, pair, start, start_bias, end, end_bias).map(|_| ())
+    }
+    pub fn transfer_marker_pair(&mut self, source: BufferId, target: BufferId,
+        pair: (crate::MarkerId, crate::MarkerId), start: usize, start_bias: Bias,
+        end: usize, end_bias: Bias,
+    ) -> Result<BufferLiveness> where D: crate::MarkerDocument {
+        let old = self.document(source)?;
+        if pair.0 == pair.1 || old.marker_position(pair.0.as_u64()).is_none()
+            || old.marker_position(pair.1.as_u64()).is_none() {
+            return Err(EditorError::InvalidRange);
+        }
+        let target_doc = self.document(target)?;
+        if start > target_doc.len_chars() || end > target_doc.len_chars() {
+            return Err(EditorError::InvalidPosition);
+        }
+        // A different live buffer may not already own these globally unique IDs.
+        if source != target && (target_doc.marker_position(pair.0.as_u64()).is_some()
+            || target_doc.marker_position(pair.1.as_u64()).is_some()) {
+            return Err(EditorError::InvalidRange);
+        }
+        let next = target_doc.set_live_marker(pair.0.as_u64(), start, start_bias)
+            .and_then(|doc| doc.set_live_marker(pair.1.as_u64(), end, end_bias))
+            .map_err(|e| EditorError::Backend(e.to_string()))?;
+        let old_next = if source != target {
+            Some(old.remove_live_marker(pair.0.as_u64()).remove_live_marker(pair.1.as_u64()))
+        } else { None };
+        if let Some(old_next) = old_next {
+            self.state.buffers.get_mut(&source).expect("validated source").document = old_next;
+        }
+        let target = self.state.buffers.get_mut(&target).expect("validated target");
+        target.document = next;
+        Ok(target.liveness.clone())
+    }
+    /// Idempotent pair removal is safe for detached/partially retired overlays.
+    pub fn remove_marker_pair(&mut self, buffer: BufferId,
+        pair: (crate::MarkerId, crate::MarkerId),
+    ) -> Result<()> where D: crate::MarkerDocument {
+        let next = self.document(buffer)?.remove_live_marker(pair.0.as_u64())
+            .remove_live_marker(pair.1.as_u64());
+        self.state.buffers.get_mut(&buffer).expect("validated buffer").document = next;
+        Ok(())
+    }
     pub fn register_marker(
         &mut self,
         buffer: BufferId,
@@ -455,6 +541,7 @@ impl<D: Document> Session<D> {
         self.state.buffers.insert(
             id,
             Buffer {
+                liveness: BufferLiveness::new(),
                 name: name.into(),
                 document,
                 saved_point: 0,
@@ -1449,6 +1536,11 @@ impl<D: Document> Session<D> {
         };
         match result {
             Ok(changed_buffers) => {
+                // No irreversible token transition before the checked command
+                // commits. Failed/panicking kills restore the still-live state.
+                for (id, buffer) in &backup.buffers {
+                    if !self.state.buffers.contains_key(id) { buffer.liveness.close(); }
+                }
                 self.state.sequence = next_sequence;
                 self.state.last_command = Some(kind);
                 self.state.last_error = None;
@@ -1789,5 +1881,21 @@ mod file_association_tests {
         );
         assert_eq!(s.snapshot().sequence, before.sequence);
         assert!(s.file_name(old).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod overlay_liveness_commit_tests {
+    use super::*;
+    #[test]
+    fn sequence_exhaustion_does_not_retire_a_live_buffer() {
+        let mut session = Session::new(crate::StringDocument::from("text"),80,24).unwrap();
+        let buffer=session.current_buffer();let token=session.buffer_liveness(buffer).unwrap();
+        session.state.sequence=u64::MAX;
+        assert_eq!(session.execute(Command::KillBuffer{buffer,force:true}),Err(EditorError::IdExhausted));
+        assert!(token.is_live());assert!(session.buffer_live(buffer));
+        session.state.sequence=0;
+        session.execute(Command::KillBuffer{buffer,force:true}).unwrap();
+        assert!(!token.is_live());
     }
 }

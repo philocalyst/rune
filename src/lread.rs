@@ -120,44 +120,77 @@ fn eager_expand<'ob, 'rt>(
 }
 
 fn file_in_path(file: &str, path: &str) -> Option<PathBuf> {
-    let path = Path::new(path).join(file);
-    // GNU openp appends suffixes to the whole name; with_extension would
-    // incorrectly turn package.extra into package.el. This source-only loader
-    // tries .el before the unsuffixed name; compiled/module suffixes remain open.
+    file_in_path_options(file, path, false, false)
+}
+fn file_in_path_options(
+    file: &str,
+    directory: &str,
+    no_suffix: bool,
+    must_suffix: bool,
+) -> Option<PathBuf> {
+    let path = Path::new(directory).join(file);
+    if no_suffix {
+        return path.is_file().then_some(path);
+    }
     let mut source_name = path.as_os_str().to_os_string();
     source_name.push(".el");
     let source = PathBuf::from(source_name);
-    if source.is_file() { Some(source) } else { path.is_file().then_some(path) }
-}
-
-fn find_file_in_load_path(file: &str, cx: &Context, env: &Rt<Env>) -> Result<PathBuf> {
-    let load_path = env.vars.get(sym::LOAD_PATH).context("`load-path' is unbound")?;
-    let load_path = load_path.bind(cx);
-    // GNU openp also searches the default directory for an empty load-path.
-    if Path::new(file).is_absolute() || load_path.is_nil() {
-        return file_in_path(file, "")
-            .ok_or_else(|| anyhow!("Unable to find file `{file}' in load-path"));
+    if source.is_file() {
+        return Some(source);
     }
-    let paths = load_path.as_list().context("`load-path' was not a list")?;
-    for path in paths {
-        let found = match path?.untag() {
-            ObjectType::String(path) => file_in_path(file, path),
-            // A nil entry denotes the default directory. Rune currently uses
-            // the process directory, pending buffer default-directory support.
-            ObjectType::NIL => file_in_path(file, ""),
-            x => {
-                return Err(TypeError::new(Type::String, x))
-                    .context("Found non-string/non-nil in `load-path'");
-            }
+    // GNU ignores MUST-SUFFIX for explicit directory names. NOSUFFIX above
+    // also takes precedence, as qualified by direct GNU load probes.
+    let directory_name = Path::new(file).parent().is_some_and(|p| !p.as_os_str().is_empty());
+    let recognized = [".el", ".elc", ".so", ".dll", ".dylib"]
+        .iter()
+        .any(|suffix| file.ends_with(suffix));
+    if must_suffix && !directory_name && !recognized {
+        return None;
+    }
+    path.is_file().then_some(path)
+}
+fn search_load_path(
+    file: &str,
+    cx: &Context,
+    env: &Rt<Env>,
+    no_suffix: bool,
+    must_suffix: bool,
+) -> Result<Option<PathBuf>> {
+    if Path::new(file).is_absolute() {
+        return Ok(file_in_path_options(file, "", no_suffix, must_suffix));
+    }
+    let load_path = env.vars.get(sym::LOAD_PATH).context("`load-path' is unbound")?.bind(cx);
+    if load_path.is_nil() {
+        return Ok(file_in_path_options(file, "", no_suffix, must_suffix));
+    }
+    // GNU ignores non-string entries and non-list/improper tails. Keep the
+    // spine walk bounded instead of recursively printing a malformed value.
+    let mut tail = load_path;
+    let mut seen = std::collections::HashSet::new();
+    while let ObjectType::Cons(pair) = tail.untag() {
+        ensure!(seen.len() < 100_000, "load-path exceeds traversal budget");
+        seen.try_reserve(1)?;
+        if !seen.insert(tail.into_raw().addr()) {
+            break;
+        }
+        let found = match pair.car().untag() {
+            ObjectType::String(path) => file_in_path_options(file, path, no_suffix, must_suffix),
+            ObjectType::NIL => file_in_path_options(file, "", no_suffix, must_suffix),
+            _ => None,
         };
-        if let Some(found) = found {
+        if found.is_some() {
             return Ok(found);
         }
+        tail = pair.cdr();
     }
-    Err(anyhow!("Unable to find file `{file}' in load-path"))
+    Ok(None)
+}
+fn find_file_in_load_path(file: &str, cx: &Context, env: &Rt<Env>) -> Result<PathBuf> {
+    search_load_path(file, cx, env, false, false)?
+        .ok_or_else(|| anyhow!("Unable to find file `{file}' in load-path"))
 }
 
-#[defun]
+/// Native Rust callers keep their existing three-argument load semantics.
 pub(crate) fn load(
     file: &Rto<Gc<&LispString>>,
     noerror: OptionalFlag,
@@ -165,13 +198,45 @@ pub(crate) fn load(
     cx: &mut Context,
     env: &mut Rt<Env>,
 ) -> Result<bool> {
+    load_with_options(file, noerror, nomessage, false, false, cx, env)
+}
+
+#[defun(name = "load")]
+fn load_lisp(
+    file: &Rto<Gc<&LispString>>,
+    noerror: OptionalFlag,
+    nomessage: OptionalFlag,
+    nosuffix: OptionalFlag,
+    must_suffix: OptionalFlag,
+    cx: &mut Context,
+    env: &mut Rt<Env>,
+) -> Result<bool> {
+    load_with_options(file, noerror, nomessage, nosuffix.is_some(), must_suffix.is_some(), cx, env)
+}
+fn load_with_options(
+    file: &Rto<Gc<&LispString>>,
+    noerror: OptionalFlag,
+    nomessage: OptionalFlag,
+    no_suffix: bool,
+    must_suffix: bool,
+    cx: &mut Context,
+    env: &mut Rt<Env>,
+) -> Result<bool> {
     let noerror = noerror.is_some();
     let nomessage = nomessage.is_some();
     let file: &str = file.untag(cx);
-    let final_file = match find_file_in_load_path(file, cx, env) {
-        Ok(path) => path,
-        Err(error) => return if noerror { Ok(false) } else { Err(error) },
+    let final_file = match search_load_path(file, cx, env, no_suffix, must_suffix)? {
+        Some(path) => path,
+        None if noerror => return Ok(false),
+        None => bail!("Unable to find file `{file}' in load-path"),
     };
+    ensure!(
+        !matches!(
+            final_file.extension().and_then(|x| x.to_str()),
+            Some("elc" | "eln" | "so" | "dll" | "dylib")
+        ),
+        "Compiled Lisp and native module loading are not implemented"
+    );
 
     let filename = String::from(file);
     if !nomessage {
@@ -187,14 +252,12 @@ pub(crate) fn load(
         None => NIL,
     };
     root!(prev_load_file, cx);
-    let result = match fs::read_to_string(&final_file)
-        .with_context(|| format!("Couldn't open file {:?}", final_file.as_os_str()))
-    {
+    let result = match fs::read_to_string(&final_file) {
         Ok(content) => load_internal(&content, cx, env),
-        Err(e) => match noerror {
-            true => Ok(false),
-            false => Err(e),
-        },
+        Err(error) if noerror && error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("Couldn't open file {:?}", final_file.as_os_str()))
+        }
     };
 
     if !nomessage && result.is_ok() {
@@ -417,6 +480,106 @@ mod test {
         root!(obj, cx);
         let val = interpreter::eval(obj, None, env, cx).unwrap();
         assert_eq!(val, 4.5);
+    }
+    #[test]
+    fn source_load_flags_match_gnu_suffix_order_and_precedence() {
+        let fixture = LoadFixture::new();
+        fs::write(fixture.0.join("a"), "(setq rune-load-marker 1)").unwrap();
+        fs::write(fixture.0.join("b.el"), "(setq rune-load-marker 2)").unwrap();
+        fs::write(fixture.0.join("b.el.el"), "(setq rune-load-marker 3)").unwrap();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let path = list!(fixture.0.to_str().unwrap(); cx);
+        env.vars.insert(sym::LOAD_PATH, path);
+        for (file, no_suffix, must_suffix, expected) in [
+            ("a", false, false, 1),
+            ("a", true, false, 1),
+            ("a", false, true, 0),
+            ("a", true, true, 1),
+            ("b.el", false, false, 3),
+            ("b.el", true, false, 2),
+            ("b.el", false, true, 3),
+            ("b.el", true, true, 2),
+            ("b", false, true, 2),
+            ("b", true, true, 0),
+        ] {
+            env.vars
+                .insert(crate::core::env::intern("rune-load-marker", cx), Object::from(0));
+            let file = cx.add(file);
+            let file: Gc<&LispString> = file.try_into().unwrap();
+            root!(file, cx);
+            let loaded = load_lisp(
+                file,
+                Some(()),
+                Some(()),
+                no_suffix.then_some(()),
+                must_suffix.then_some(()),
+                cx,
+                env,
+            )
+            .unwrap();
+            assert_eq!(loaded, expected != 0);
+            assert_eq!(
+                env.vars.get(crate::core::env::intern("rune-load-marker", cx)).unwrap().bind(cx),
+                Object::from(expected)
+            );
+        }
+        let absolute = fixture.0.join("a");
+        let file = cx.add(absolute.to_str().unwrap());
+        let file: Gc<&LispString> = file.try_into().unwrap();
+        root!(file, cx);
+        assert!(load_lisp(file, None, Some(()), None, Some(()), cx, env).unwrap());
+        let source = crate::reader::read("(func-arity 'load)", cx).unwrap().0;
+        root!(source, cx);
+        assert_eq!(
+            format!("{}", crate::interpreter::eval(source, None, env, cx).unwrap()),
+            "(1 . 5)"
+        );
+    }
+    #[test]
+    fn load_noerror_does_not_hide_execution_encoding_errors_but_ignores_bad_path_entries() {
+        let fixture = LoadFixture::new();
+        fs::write(fixture.0.join("bad.el"), "(error \"actual load error\")").unwrap();
+        fs::write(fixture.0.join("invalid.el"), [255]).unwrap();
+        fs::write(fixture.0.join("compiled.elc"), "nil").unwrap();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        env.vars.insert(sym::LOAD_PATH, list!(fixture.0.to_str().unwrap();cx));
+        for name in ["bad", "invalid", "compiled.elc"] {
+            let file = cx.add(name);
+            let file: Gc<&LispString> = file.try_into().unwrap();
+            root!(file, cx);
+            assert!(load_lisp(file, Some(()), Some(()), None, None, cx, env).is_err());
+        }
+        let file = cx.add("rune-load-no-such-file-for-path-errors");
+        let file: Gc<&LispString> = file.try_into().unwrap();
+        root!(file, cx);
+        root!(paths, new(Vec<Slot<Object>>), cx);
+        paths.push(Object::from(17));
+        paths.push(list!(17;cx));
+        paths.push(list!(TRUE;cx));
+        paths.push(Object::from(Cons::new("/tmp", 17, cx)));
+        let cycle = Cons::new(17, NIL, cx);
+        cycle.set_cdr(cycle.into()).unwrap();
+        paths.push(Object::from(cycle));
+        for index in 0..paths.len() {
+            env.vars.insert(sym::LOAD_PATH, paths[index].bind(cx));
+            assert!(!load_lisp(file, Some(()), Some(()), None, None, cx, env).unwrap());
+            let error = load_lisp(file, None, Some(()), None, None, cx, env).unwrap_err();
+            assert!(error.to_string().contains("Unable to find file"));
+        }
+        // A bad entry does not stop searching later valid directories.
+        env.vars.insert(sym::LOAD_PATH, list!(17, fixture.0.to_str().unwrap();cx));
+        let file = cx.add("bad");
+        let file: Gc<&LispString> = file.try_into().unwrap();
+        root!(file, cx);
+        assert!(load_lisp(file, Some(()), Some(()), None, None, cx, env).is_err());
     }
 }
 

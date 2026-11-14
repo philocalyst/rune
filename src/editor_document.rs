@@ -2184,3 +2184,85 @@ mod owner_process_poll_adapter_tests {
         .unwrap();
     }
 }
+
+impl RuntimeEditorGateway {
+    /// Native-only witness. This is not Context/domain authorization.
+    pub(crate) fn buffer_liveness(&self, handle: OwnerBufferHandle, cx: &Context)
+        -> anyhow::Result<rune_editor::BufferLiveness> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.buffer_liveness(id)?)
+    }
+    pub(crate) fn register_marker_pair(&self, handle: OwnerBufferHandle,
+        start: usize, start_bias: Bias, end: usize, end_bias: Bias, cx: &Context,
+    ) -> anyhow::Result<(rune_editor::MarkerId, rune_editor::MarkerId)> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.register_marker_pair(id, start, start_bias, end, end_bias)?)
+    }
+    pub(crate) fn marker_pair_positions(&self, handle: OwnerBufferHandle,
+        pair: (rune_editor::MarkerId, rune_editor::MarkerId), cx: &Context,
+    ) -> anyhow::Result<Option<(usize, usize)>> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        let id = owner.validate_handle(handle, cx)?;
+        let first = owner.session.marker_position(id, pair.0)?;
+        let second = owner.session.marker_position(id, pair.1)?;
+        Ok(first.zip(second))
+    }
+    pub(crate) fn move_marker_pair(&self, handle: OwnerBufferHandle,
+        pair: (rune_editor::MarkerId, rune_editor::MarkerId), start: usize,
+        start_bias: Bias, end: usize, end_bias: Bias, cx: &Context,
+    ) -> anyhow::Result<()> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.move_marker_pair(id, pair, start, start_bias, end, end_bias)?)
+    }
+    pub(crate) fn transfer_marker_pair(&self, source: OwnerBufferHandle, target: OwnerBufferHandle,
+        pair: (rune_editor::MarkerId, rune_editor::MarkerId), start: usize,
+        start_bias: Bias, end: usize, end_bias: Bias, cx: &Context,
+    ) -> anyhow::Result<rune_editor::BufferLiveness> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let source = owner.validate_handle(source, cx)?;
+        let target = owner.validate_handle(target, cx)?;
+        Ok(owner.session.transfer_marker_pair(source, target, pair, start, start_bias, end, end_bias)?)
+    }
+    pub(crate) fn remove_marker_pair(&self, handle: OwnerBufferHandle,
+        pair: (rune_editor::MarkerId, rune_editor::MarkerId), cx: &Context,
+    ) -> anyhow::Result<()> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.remove_marker_pair(id, pair)?)
+    }
+}
+
+#[cfg(test)]
+mod overlay_pair_gateway_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn pairs_authenticate_both_buffers_and_do_not_retarget_evaluator_or_views() {
+        let roots=RootSet::default();let cx=Context::new(&roots);
+        let g=RuntimeEditorGateway::new(&cx,80,24).unwrap();let other=RuntimeEditorGateway::new(&cx,80,24).unwrap();
+        let source=g.create("overlay source","λ🙂abc",&cx).unwrap();let target=g.create("overlay target","xy",&cx).unwrap();
+        let foreign=other.create("foreign","foreign",&cx).unwrap();
+        let read=g.read(source,&cx).unwrap();let token=g.buffer_liveness(source,&cx).unwrap();
+        let pair=g.register_marker_pair(source,1,Bias::Left,3,Bias::Right,&cx).unwrap();
+        assert_eq!(g.read(source,&cx).unwrap().epoch,read.epoch);
+        assert!(g.transfer_marker_pair(source,foreign,pair,0,Bias::Left,1,Bias::Right,&cx).is_err());
+        assert_eq!(g.marker_pair_positions(source,pair,&cx).unwrap(),Some((1,3)));
+        assert!(g.move_marker_pair(source,pair,0,Bias::Left,99,Bias::Right,&cx).is_err());
+        let target_live=g.transfer_marker_pair(source,target,pair,0,Bias::Right,2,Bias::Left,&cx).unwrap();
+        assert!(target_live.is_live());assert_eq!(g.marker_pair_positions(source,pair,&cx).unwrap(),None);
+        assert_eq!(g.marker_pair_positions(target,pair,&cx).unwrap(),Some((0,2)));
+        assert_eq!(g.read(source,&cx).unwrap().epoch,read.epoch);
+        g.remove_marker_pair(target,pair,&cx).unwrap();g.remove_marker_pair(target,pair,&cx).unwrap();
+        assert_eq!(g.marker_pair_positions(target,pair,&cx).unwrap(),None);
+        g.kill(source,true,&cx).unwrap();assert!(!token.is_live());assert!(target_live.is_live());
+    }
+}
