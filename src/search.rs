@@ -34,10 +34,10 @@ fn string_match_value<'ob>(
             string_match(pattern, text, start, inhibit_modify, env, cx)
         }
         (ObjectType::ByteString(pattern), ObjectType::ByteString(text)) => {
-            byte_string_match(&pattern, &text, start, env, cx)
+            byte_string_match(&pattern, &text, start, inhibit_modify, env, cx)
         }
         (ObjectType::String(pattern), ObjectType::ByteString(text)) if pattern.is_ascii() => {
-            byte_string_match(pattern.as_bytes(), &text, start, env, cx)
+            byte_string_match(pattern.as_bytes(), &text, start, inhibit_modify, env, cx)
         }
         _ => bail!(
             "string-match requires two text strings or a byte string with a byte/ASCII pattern"
@@ -48,6 +48,7 @@ fn byte_string_match<'ob>(
     pattern: &[u8],
     text: &[u8],
     start: Option<i64>,
+    inhibit_modify: OptionalFlag,
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
@@ -82,7 +83,9 @@ fn byte_string_match<'ob>(
             }
         }
         let result = positions.first().copied().unwrap_or(NIL);
-        env.match_data.set(crate::fns::slice_into_list(&positions, None, cx));
+        if inhibit_modify.is_none() {
+            env.match_data.set(crate::fns::slice_into_list(&positions, None, cx));
+        }
         Ok(result)
     } else {
         Ok(NIL)
@@ -93,11 +96,10 @@ fn string_match<'ob>(
     regexp: &str,
     string: &str,
     start: Option<i64>,
-    _inhibit_modify: OptionalFlag,
+    inhibit_modify: OptionalFlag,
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    // TODO: implement inhibit-modify
     let re = RegexBuilder::new(&lisp_regex_to_rust(regexp))
         .case_insensitive(case_fold(env, cx)?)
         .build()?;
@@ -120,7 +122,9 @@ fn string_match<'ob>(
             }
         }
         let result = all.first().copied().unwrap_or(NIL);
-        env.match_data.set(crate::fns::slice_into_list(&all, None, cx));
+        if inhibit_modify.is_none() {
+            env.match_data.set(crate::fns::slice_into_list(&all, None, cx));
+        }
         Ok(result)
     } else {
         Ok(NIL)
@@ -454,6 +458,36 @@ mod test {
     use super::*;
 
     #[test]
+    fn inhibit_modify_preserves_captures_like_gnu_for_text_and_bytes() {
+        for (pattern,text) in [(r#""\\(λ\\)""#, r#""🙂λ""#), (r#""\\(a\\)""#, r#""ba""#), (r#""\\(\377\\)""#, r#""x\377""#), (r#""z""#,r#""abc""#)] {
+            for flag in ["nil","t","7"] {
+                crate::assert_elprop!("(let ((case-fold-search nil)) (set-match-data '(7 8 9 10)) (let ((old (match-data))) (list (string-match {} {} nil {}) (equal old (match-data)) (match-data))))",pattern,text,flag);
+            }
+        }
+        // Real capture data must remain available after a predicate-style call.
+        crate::assert_elprop!(r#"(let ((case-fold-search nil)) (string-match "\\(a\\)" "ba") (string-match "z" "zz" nil t) (list (match-beginning 0) (match-end 0) (match-beginning 1) (match-end 1)))"#);
+    }
+
+    #[test]
+    fn inhibited_match_keeps_owner_root_and_survives_collection() {
+        let roots=&RootSet::default();let cx=&mut Context::new(roots);
+        root!(env,init(Env::new(cx).unwrap()),cx);
+        crate::core::env::init_variables(cx,env);
+        let original=crate::fns::slice_into_list(&[7.into(),8.into(),9.into(),10.into()],None,cx);
+        env.match_data.set(original);
+        string_match("λ","🙂λ",None,Some(()),env,cx).unwrap();
+        assert!(env.match_data.bind(cx).ptr_eq(original));
+        byte_string_match(b"a",b"ba",None,Some(()),env,cx).unwrap();
+        assert!(env.match_data.bind(cx).ptr_eq(original));
+        assert!(byte_string_match(b"[",b"ba",None,Some(()),env,cx).is_err());
+        assert!(env.match_data.bind(cx).ptr_eq(original));
+        // No native snapshot is restored: the original Env Slot remains the
+        // live root throughout. Do not use the pre-move local original again.
+        cx.garbage_collect(true);
+        assert_eq!(env.match_data.bind(cx).to_string(),"(7 8 9 10)");
+    }
+
+    #[test]
     fn lisp_regex() {
         assert_eq!(lisp_regex_to_rust("foo"), "foo");
         assert_eq!(lisp_regex_to_rust("a|b"), "a\\|b");
@@ -624,13 +658,13 @@ mod raw_byte_tests {
         let cx = &Context::new(&roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
         crate::core::env::init_variables(cx, env);
-        assert_eq!(byte_string_match(b".", &[255], None, env, cx).unwrap(), Object::from(0));
+        assert_eq!(byte_string_match(b".", &[255], None, None, env, cx).unwrap(), Object::from(0));
         assert_eq!(
-            byte_string_match(&[0], &[255, 0, 254], None, env, cx).unwrap(),
+            byte_string_match(&[0], &[255, 0, 254], None, None, env, cx).unwrap(),
             Object::from(1)
         );
-        assert_eq!(byte_string_match(b"^x", b"ax", Some(1), env, cx).unwrap(), NIL);
-        assert!(byte_string_match(b"x", b"x", Some(2), env, cx).is_err());
+        assert_eq!(byte_string_match(b"^x", b"ax", Some(1), None, env, cx).unwrap(), NIL);
+        assert!(byte_string_match(b"x", b"x", Some(2), None, env, cx).is_err());
     }
 }
 
@@ -661,11 +695,11 @@ mod case_fold_scope_tests {
         sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
         crate::core::env::init_variables(cx, env);
-        assert_eq!(byte_string_match(b"a", b"A", None, env, cx).unwrap(), Object::from(0));
-        assert_eq!(byte_string_match(&[201], &[233], None, env, cx).unwrap(), NIL);
+        assert_eq!(byte_string_match(b"a", b"A", None, None, env, cx).unwrap(), Object::from(0));
+        assert_eq!(byte_string_match(&[201], &[233], None, None, env, cx).unwrap(), NIL);
         env.set_var_context(sym::CASE_FOLD_SEARCH, NIL, cx).unwrap();
-        assert_eq!(byte_string_match(b"a", b"A", None, env, cx).unwrap(), NIL);
-        assert_eq!(byte_string_match(b"A", b"A", None, env, cx).unwrap(), Object::from(0));
+        assert_eq!(byte_string_match(b"a", b"A", None, None, env, cx).unwrap(), NIL);
+        assert_eq!(byte_string_match(b"A", b"A", None, None, env, cx).unwrap(), Object::from(0));
     }
 }
 
