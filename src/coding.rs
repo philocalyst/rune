@@ -8,7 +8,11 @@ use crate::core::{
 };
 use anyhow::Result;
 use rune_macros::defun;
+use rune_core::macros::list;
 defvar!(LAST_CODING_SYSTEM_USED);
+// GNU30 coding.c's native seed is NIL; original mule-cmds locale setup may
+// subsequently select a concrete coding system. Do not invent UTF8 negotiation.
+defvar!(LOCALE_CODING_SYSTEM);
 
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +41,7 @@ impl std::fmt::Display for CodingError {
 impl std::error::Error for CodingError {}
 #[derive(Clone, Copy)]
 enum Coding {
+    Identity,
     Utf8,
     Unix,
     Dos,
@@ -45,6 +50,7 @@ enum Coding {
     Ascii,
 }
 fn select(value: Object) -> Result<Coding> {
+    if value.is_nil() { return Ok(Coding::Identity); }
     let ObjectType::Symbol(symbol) = value.untag() else {
         return Err(TypeError::new(Type::Symbol, value.untag()).into());
     };
@@ -101,6 +107,20 @@ fn decoded(bytes: &[u8], coding: Coding) -> Result<(String, &'static str)> {
 fn remember(env: &mut Rt<Env>, name: &str, cx: &Context) -> Result<()> {
     env.set_var_context(intern("last-coding-system-used", cx), intern(name, cx).into(), cx)
 }
+fn nil_coding_copy<'ob>(string: Object<'ob>, nocopy: Option<Object>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    if !matches!(string.untag(), ObjectType::String(_) | ObjectType::ByteString(_)) {
+        env.initialize_condition_metadata(cx);
+        let data = rune_core::macros::list!(crate::sym::STRINGP, string; cx);
+        return Err(crate::eval::EvalError::signal(crate::sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into());
+    }
+    if input_bytes(string)?.len() > MAX_BYTES { return Err(CodingError::SizeLimit.into()); }
+    remember(env, "no-conversion", cx)?;
+    if nocopy.is_some_and(|v| !v.is_nil()) { return Ok(string); }
+    // Validated same-owner String, no callback/GC under shared cx; the existing
+    // string-copy helper copies plist spines and retains property-value identity.
+    crate::fns::copy_sequence(string, cx)
+}
+
 #[defun]
 fn decode_coding_string<'ob>(
     string: Object<'ob>,
@@ -114,6 +134,7 @@ fn decode_coding_string<'ob>(
     if buffer.is_some_and(|value| !value.is_nil()) {
         return Err(CodingError::DestinationUnsupported.into());
     }
+    if matches!(coding, Coding::Identity) { return nil_coding_copy(string,nocopy,env,cx); }
     let bytes = input_bytes(string)?;
     if bytes.len() > MAX_BYTES {
         return Err(CodingError::SizeLimit.into());
@@ -154,6 +175,7 @@ fn encode_coding_string<'ob>(
     if buffer.is_some_and(|value| !value.is_nil()) {
         return Err(CodingError::DestinationUnsupported.into());
     }
+    if matches!(coding, Coding::Identity) { return nil_coding_copy(string,nocopy,env,cx); }
     let bytes = input_bytes(string)?;
     if bytes.len() > MAX_BYTES {
         return Err(CodingError::SizeLimit.into());
@@ -243,5 +265,44 @@ mod tests {
             (condition-case nil (decode-coding-string "x" 'utf-8 nil t) (error 'caught)))"#,
             "(caught caught caught)",
         );
+    }
+}
+
+#[cfg(test)]
+mod locale_nil_tests {
+    #[test]
+    fn nil_coding_preserves_kind_properties_and_copy_identity_like_gnu() {
+        for function in ["encode-coding-string","decode-coding-string"] {
+            for nocopy in ["nil","t"] {
+                crate::assert_elprop!("(let* ((value (list 42)) (s (propertize \"é\" 'face value)) (v ({} s nil {}))) (list (eq s v) (equal s v) (multibyte-string-p v) (eq (get-text-property 0 'face v) value) last-coding-system-used))",function,nocopy);
+                crate::assert_elprop!(r#"(let* ((s (substring "\377" 0)) (v ({} s nil {}))) (list (eq s v) (equal s v) (multibyte-string-p v) (aref v 0) last-coding-system-used))"#,function,nocopy);
+            }
+        }
+        crate::assert_elprop!(r#"(let ((v(vector nil))) (aset v 0 v) (condition-case e (encode-coding-string v nil) (wrong-type-argument (list (car e) (car(cdr e)) (eq v(car(cdr(cdr e))))))))"#);
+    }
+    #[test]
+    fn empty_nil_coding_reuses_each_storage_kind_like_gnu() {
+        for function in ["encode-coding-string","decode-coding-string"] {
+            for nocopy in ["nil","t"] {
+                for source in [r#""""#, "(make-string 0 0)", "(make-string 0 0 t)"] {
+                    crate::assert_elprop!("(let* ((s {}) (v ({} s nil {}))) (list (eq s v) (eq (multibyte-string-p s) (multibyte-string-p v)) last-coding-system-used))",source,function,nocopy);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_locale_seed_is_nil_and_later_variable_bindings_are_real() {
+        use crate::core::{env::{Env,sym},gc::{Context,RootSet}};
+        use rune_core::macros::root;
+        let roots=RootSet::default();let cx=&mut Context::new(&roots);
+        root!(env,init(Env::new_isolated(cx).unwrap()),cx);
+        crate::core::env::init_variables(cx,env);
+        assert!(crate::data::symbol_value(sym::LOCALE_CODING_SYSTEM,env,cx).unwrap().is_nil());
+        let utf8=crate::core::env::intern("utf-8-unix",cx).into();
+        env.varbind(sym::LOCALE_CODING_SYSTEM,utf8,cx).unwrap();
+        assert!(crate::data::symbol_value(sym::LOCALE_CODING_SYSTEM,env,cx).unwrap().ptr_eq(utf8));
+        cx.garbage_collect(true);
+        assert_eq!(crate::data::symbol_value(sym::LOCALE_CODING_SYSTEM,env,cx).unwrap().to_string(),"utf-8-unix");
     }
 }

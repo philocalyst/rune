@@ -1345,7 +1345,7 @@ fn maphash(
 }
 
 #[defun]
-fn copy_sequence<'ob>(arg: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
+pub(crate) fn copy_sequence<'ob>(arg: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
     match arg.untag() {
         ObjectType::Vec(x) => Ok(cx.add(x.to_vec())),
         ObjectType::Record(record) => {
