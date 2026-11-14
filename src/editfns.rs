@@ -6,7 +6,7 @@ use crate::core::{
 };
 use anyhow::{Result, bail, ensure};
 use rune_macros::defun;
-use std::{fmt::Write as _, io::Write};
+use std::io::Write;
 
 #[defun]
 fn message(format_string: &str, args: &[Object]) -> Result<String> {
@@ -19,47 +19,12 @@ fn message(format_string: &str, args: &[Object]) -> Result<String> {
 defvar!(MESSAGE_NAME);
 defvar!(MESSAGE_TYPE, "new message");
 
+#[path = "format.rs"]
+mod format_impl;
+
 #[defun]
 fn format(string: &str, objects: &[Object]) -> Result<String> {
-    let mut result = String::new();
-    let mut arguments = objects.iter();
-    let mut remaining = string;
-
-    let mut escaped = false;
-    let mut is_format_char = |c: char| {
-        if escaped {
-            escaped = false;
-            false
-        } else if c == '\\' {
-            escaped = true;
-            false
-        } else {
-            c == '%'
-        }
-    };
-    while let Some(start) = remaining.find(&mut is_format_char) {
-        result += &remaining[..start];
-        let Some(specifier) = remaining.as_bytes().get(start + 1) else {
-            bail!("Format string ends in middle of format specifier")
-        };
-        // "%%" inserts a single "%" in the output
-        if *specifier == b'%' {
-            result.push('%');
-        } else {
-            // TODO: currently handles all format types the same. Need to check the modifier characters.
-            let Some(val) = arguments.next() else {
-                bail!("Not enough arguments for format string")
-            };
-            match val.untag() {
-                ObjectType::String(string) => write!(result, "{string}")?,
-                obj => write!(result, "{obj}")?,
-            }
-        }
-        remaining = &remaining[start + 2..];
-    }
-    result += remaining;
-    ensure!(arguments.next().is_none(), "Too many arguments for format string");
-    Ok(result)
+    format_impl::format(string, objects)
 }
 
 #[defun]
@@ -436,7 +401,7 @@ mod test {
         assert_eq!(&format("%s", &[sym]).unwrap(), "function");
 
         assert!(&format("%s", &[]).is_err());
-        assert!(&format("%s", &[1.into(), 2.into()]).is_err());
+        assert_eq!(&format("%s", &[1.into(), 2.into()]).unwrap(), "1");
 
         assert!(format("`%s' %s%s%s", &[0.into(), 1.into(), 2.into(), 3.into()]).is_ok());
     }
