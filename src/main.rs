@@ -70,7 +70,7 @@ fn main() -> Result<(), ()> {
 
     let roots = &RootSet::default();
     let cx = &mut Context::new(roots);
-    root!(env, new(Env), cx);
+    root!(env, init(Env::new(cx).map_err(|error| eprintln!("Cannot initialize editor: {error}"))?), cx);
 
     sym::init_symbols();
     crate::core::env::init_variables(cx, env);
@@ -298,7 +298,7 @@ mod stdin_tests {
             let roots = &RootSet::default();
             let cx = &mut Context::new(roots);
             sym::init_symbols();
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             repl_with_input(input(text), env, cx);
         }
     }
@@ -309,7 +309,7 @@ mod stdin_tests {
             let roots = &RootSet::default();
             let cx = &mut Context::new(roots);
             sym::init_symbols();
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             assert_eq!(eval_stdin_with_input(input(text), cx, env), Ok(()));
         }
     }
@@ -319,7 +319,7 @@ mod stdin_tests {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         assert_eq!(
             eval_stdin_with_input(
                 input("(setq eof-test-value 1) (setq eof-test-value 2)"),
@@ -338,7 +338,7 @@ mod stdin_tests {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         assert_eq!(eval_stdin_with_input(input("("), cx, env), Err(()));
     }
 }
@@ -374,7 +374,7 @@ mod command_line_load_tests {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         // A nonempty unrelated path must not intercept explicit CLI files.
         env.vars.insert(
             sym::LOAD_PATH,

@@ -6,7 +6,7 @@ use crate::core::{gc::Rt, object::Object};
 use crate::fns::StringOrChar;
 use crate::{Context, Env};
 use rune_macros::defun;
-use text_buffer::Buffer as TextBuffer;
+use rune_text::{BytePos, CharPos, Rope};
 
 #[defun]
 fn capitalize<'ob>(string_or_char: StringOrChar<'ob>, cx: &'ob Context<'ob>) -> Object<'ob> {
@@ -56,13 +56,24 @@ fn capitalize_word(offset: i64, env: &mut Rt<Env>, cx: &Context) -> Result<()> {
 }
 
 fn casify_word(offset: i64, env: &mut Rt<Env>, cx: &Context, mode: CaseMode) -> Result<()> {
-    let buffer = env.current_buffer.get_mut();
-    let text = &buffer.text;
-    let range = if offset >= 0 { find_forward_word(text) } else { find_backward_word(text) };
-    let (start, end) = (range.start, range.end);
-    let (a, b) = text.slice(range);
-    let replacement = casify_string(&(a.to_owned() + b), mode);
-    buffer.replace_text(start, end, &replacement, cx)
+    let read = env.buffer_read(cx)?;
+    let text = read.document.text();
+    let range = if offset >= 0 {
+        find_forward_word(text, read.point)?
+    } else {
+        find_backward_word(text, read.point)?
+    };
+    let selected = text.slice(CharPos(range.start)..CharPos(range.end))?;
+    let source: String = selected.chars_from(CharPos(0))?.collect();
+    let replacement = casify_string(&source, mode);
+    env.editor_gateway().replace_preserving_properties(
+        read.handle,
+        read.epoch,
+        range,
+        &replacement,
+        cx,
+    )?;
+    Ok(())
 }
 
 fn casify_string(s: &str, mode: CaseMode) -> String {
@@ -119,33 +130,29 @@ where
     }
 }
 
-fn find_forward_word(buf: &TextBuffer) -> Range<usize> {
-    let cursor = buf.cursor().chars();
-    let (s1, s2) = buf.slice(cursor..);
+fn find_forward_word(buf: &Rope, cursor: usize) -> Result<Range<usize>> {
     let end = cursor
-        + s1.chars()
-            .chain(s2.chars())
+        + buf
+            .chars_from(CharPos(cursor))?
             .enumerate()
             .skip_while(|(_, c)| !c.is_alphanumeric())
             .find(|(_, c)| c.is_whitespace())
             .map(|(idx, _)| idx)
             .unwrap_or_else(|| buf.len_chars() - cursor);
-    cursor..end
+    Ok(cursor..end)
 }
-
-fn find_backward_word(buf: &TextBuffer) -> Range<usize> {
-    let cursor = buf.cursor().chars();
-    let (s1, s2) = buf.slice(..cursor);
+fn find_backward_word(buf: &Rope, cursor: usize) -> Result<Range<usize>> {
+    let chunks = buf.chunks(BytePos(0)..buf.char_to_byte(CharPos(cursor))?)?;
     let start = cursor
-        - s1.chars()
-            .chain(s2.chars())
+        - chunks
             .rev()
+            .flat_map(|s| s.chars().rev())
             .enumerate()
             .skip_while(|(_, c)| !c.is_alphanumeric())
             .find(|(_, c)| c.is_whitespace())
             .map(|(idx, _)| idx)
             .unwrap_or(0);
-    start..cursor
+    Ok(start..cursor)
 }
 
 #[cfg(test)]
@@ -244,124 +251,120 @@ mod tests {
         assert_eq!(upcase_initials('X'.into(), cx), 'X');
     }
 
-    #[cfg(not(miri))] // Uses SIMD
     mod upcase_word {
-        use crate::core::gc::Context;
-        use crate::core::gc::RootSet;
-        use rune_core::macros::root;
-
         use super::*;
-
+        use rune_core::macros::root;
+        use rune_editor::Document;
+        fn setup(env: &mut Rt<Env>, text: &str, point: usize, cx: &Context) {
+            let read = env.buffer_read(cx).unwrap();
+            let g = env.editor_gateway();
+            g.splice(read.handle, read.epoch, 0..read.document.text().len_chars(), text, cx)
+                .unwrap();
+            g.set_point(read.handle, point, cx).unwrap();
+        }
+        #[test]
+        fn forward_and_inside_unicode_words() {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+            setup(env, "αβγ word", 0, cx);
+            upcase_word(1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "ΑΒΓ word");
+            setup(env, "DOWNCASE WORD", 2, cx);
+            downcase_word(1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "DOwncase WORD");
+            setup(env, "αΒΓ wORD", 0, cx);
+            capitalize_word(1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "Αβγ wORD");
+            setup(env, "ΑΒΓ woRd", 0, cx);
+            downcase_word(1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "αβγ woRd");
+            setup(env, "upcase word", 2, cx);
+            upcase_word(1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "upCASE word");
+            setup(env, "capitalize word", 2, cx);
+            capitalize_word(1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "caPitalize word");
+        }
+        #[test]
+        fn backward_and_inside_unicode_words() {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+            setup(env, "upcase αβγword ", 15, cx);
+            upcase_word(-1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "upcase ΑΒΓWORD ");
+            setup(env, "downcase WORD", 11, cx);
+            downcase_word(-1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "downcase woRD");
+            setup(env, "capitalize word", 13, cx);
+            capitalize_word(-1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "capitalize Word");
+            setup(env, "upcase word", 9, cx);
+            upcase_word(-1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "upcase WOrd");
+            setup(env, "dOwNcAsE αΒΓWord ", 17, cx);
+            downcase_word(-1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "dOwNcAsE αβγword ");
+            setup(env, "cAPITALIZE αΒΓWORD ", 19, cx);
+            capitalize_word(-1, env, cx).unwrap();
+            assert_eq!(env.buffer_read(cx).unwrap().document.to_text(), "cAPITALIZE Αβγword ");
+        }
         #[test]
         fn expanding_case_updates_following_properties() {
             let roots = &RootSet::default();
             let cx = &mut Context::new(roots);
-            root!(env, new(Env), cx);
-            let buffer = env.current_buffer.get_mut();
-            buffer.insert(cx.add("ß tail"), cx).unwrap();
-            buffer.textprops.lock(cx).unwrap().set_properties(3, 7, cx.add(42));
-            buffer.text.set_cursor(0);
+            root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+            setup(env, "ß tail", 0, cx);
+            let read = env.buffer_read(cx).unwrap();
+            let g = env.editor_gateway();
+            // SAFETY: integer immediate has no foreign reachable heap payload.
+            let style = unsafe { g.intern_property(cx.add(42), cx) }.unwrap();
+            let prepared = g.prepare_properties(&read, CharPos(2)..CharPos(6), &style, cx).unwrap();
+            g.publish_properties(prepared, cx).unwrap();
             upcase_word(1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "SS tail");
-            let properties = env.current_buffer.get().textprops.lock(cx).unwrap();
-            assert!(properties.find(3).is_none());
-            assert!(properties.find(4).is_some());
+            let read = env.buffer_read(cx).unwrap();
+            assert_eq!(read.document.to_text(), "SS tail");
+            assert_eq!(read.document.properties().at(CharPos(2)), Some(rune_text::PropSetId(0)));
+            assert_eq!(
+                read.document.properties().at(CharPos(3)),
+                Some(rune_text::PropSetId(style.id()))
+            );
         }
-
         #[test]
-        fn forward() {
+        fn same_width_case_keeps_position_properties() {
             let roots = &RootSet::default();
             let cx = &mut Context::new(roots);
-            root!(env, new(Env), cx);
-
-            // αβγ word
-            // ^-----
-            env.current_buffer.get_mut().text.insert("αβγ word");
-            env.current_buffer.get_mut().text.set_cursor(0);
+            root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+            setup(env, "αβ word", 0, cx);
+            let read = env.buffer_read(cx).unwrap();
+            let g = env.editor_gateway();
+            // SAFETY: integer immediates carry no heap graph.
+            let first = unsafe { g.intern_property(cx.add(1), cx) }.unwrap();
+            let second = unsafe { g.intern_property(cx.add(2), cx) }.unwrap();
+            let prepared = g
+                .prepare_property_runs(
+                    &read,
+                    [
+                        (CharPos(0)..CharPos(1), first.clone()),
+                        (CharPos(1)..CharPos(2), second.clone()),
+                    ],
+                    cx,
+                )
+                .unwrap();
+            g.publish_properties(prepared, cx).unwrap();
+            let epoch = env.buffer_read(cx).unwrap().epoch;
             upcase_word(1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "ΑΒΓ word");
-            env.current_buffer.get_mut().text = text_buffer::Buffer::default();
-            env.current_buffer.get_mut().text.insert("ΑΒΓ woRd");
-            env.current_buffer.get_mut().text.set_cursor(0);
-            downcase_word(1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "αβγ woRd");
-            env.current_buffer.get_mut().text = text_buffer::Buffer::default();
-            env.current_buffer.get_mut().text.insert("αΒΓ wORD");
-            env.current_buffer.get_mut().text.set_cursor(0);
-            capitalize_word(1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "Αβγ wORD");
-        }
-
-        #[test]
-        fn backward() {
-            let roots = &RootSet::default();
-            let cx = &mut Context::new(roots);
-            root!(env, new(Env), cx);
-
-            // upcase αβγword
-            //        -------^
-            env.current_buffer.get_mut().text.insert("upcase αβγword ");
-            env.current_buffer.get_mut().text.set_cursor(15);
-            upcase_word(-1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "upcase ΑΒΓWORD ");
-            env.current_buffer.get_mut().text = text_buffer::Buffer::default();
-            env.current_buffer.get_mut().text.insert("dOwNcAsE αΒΓWord ");
-            env.current_buffer.get_mut().text.set_cursor(17);
-            downcase_word(-1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "dOwNcAsE αβγword ");
-            env.current_buffer.get_mut().text = text_buffer::Buffer::default();
-            env.current_buffer.get_mut().text.insert("cAPITALIZE αΒΓWORD ");
-            env.current_buffer.get_mut().text.set_cursor(19);
-            capitalize_word(-1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "cAPITALIZE Αβγword ");
-        }
-
-        #[test]
-        fn forward_cursor_inside_of_word() {
-            let roots = &RootSet::default();
-            let cx = &mut Context::new(roots);
-            root!(env, new(Env), cx);
-
-            // upcase word
-            //  ^----
-            env.current_buffer.get_mut().text.insert("upcase word");
-            env.current_buffer.get_mut().text.set_cursor(2);
-            upcase_word(1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "upCASE word");
-            env.current_buffer.get_mut().text = text_buffer::Buffer::default();
-            env.current_buffer.get_mut().text.insert("DOWNCASE WORD");
-            env.current_buffer.get_mut().text.set_cursor(2);
-            downcase_word(1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "DOwncase WORD");
-            env.current_buffer.get_mut().text = text_buffer::Buffer::default();
-            env.current_buffer.get_mut().text.insert("capitalize word");
-            env.current_buffer.get_mut().text.set_cursor(2);
-            capitalize_word(1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "caPitalize word");
-        }
-
-        #[test]
-        fn backward_cursor_inside_of_word() {
-            let roots = &RootSet::default();
-            let cx = &mut Context::new(roots);
-            root!(env, new(Env), cx);
-
-            // upcase word
-            //        --^
-            env.current_buffer.get_mut().text.insert("upcase word");
-            env.current_buffer.get_mut().text.set_cursor(9);
-            upcase_word(-1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "upcase WOrd");
-            env.current_buffer.get_mut().text = text_buffer::Buffer::default();
-            env.current_buffer.get_mut().text.insert("downcase WORD");
-            env.current_buffer.get_mut().text.set_cursor(11);
-            downcase_word(-1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "downcase woRD");
-            env.current_buffer.get_mut().text = text_buffer::Buffer::default();
-            env.current_buffer.get_mut().text.insert("capitalize word");
-            env.current_buffer.get_mut().text.set_cursor(13);
-            capitalize_word(-1, env, cx).unwrap();
-            assert_eq!(env.current_buffer.get().text, "capitalize Word");
+            let after = env.buffer_read(cx).unwrap();
+            assert_eq!(after.epoch, epoch + 1);
+            assert_eq!(
+                after.document.properties().at(CharPos(0)),
+                Some(rune_text::PropSetId(first.id()))
+            );
+            assert_eq!(
+                after.document.properties().at(CharPos(1)),
+                Some(rune_text::PropSetId(second.id()))
+            );
         }
     }
 }

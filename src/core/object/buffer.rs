@@ -1,470 +1,99 @@
-use super::{BufferProperties, Gc, Object, ObjectType, TagType, WithLifetime};
+//! Stable global buffer identities. All mutable text/properties/markers live in
+//! the Context-owned editor Session, never in this shell or an Env cache.
+use super::{Gc, TagType, WithLifetime};
 use crate::{
     core::{
-        error::{Type, TypeError},
+        env::INTERNED_SYMBOLS,
         gc::{Block, Context, GcHeap, GcState, Trace},
     },
     derive_GcMoveable,
+    editor_document::{BufferRead, OwnerBufferHandle},
 };
-use anyhow::{Result, bail};
-use rune_macros::Trace;
-use rune_text::{Bias, CharPos, EditDelta, MarkerId, PositionTree};
+use anyhow::Result;
+use rune_core::hashmap::HashMap;
 use std::{
-    fmt::Display,
-    ops::{Deref, DerefMut},
-    sync::{Mutex, MutexGuard, TryLockError},
+    fmt,
+    sync::{LazyLock, Mutex},
 };
-use text_buffer::Buffer as TextBuffer;
-
-/// A Handle to an open buffer. Only one thread can hold this at a time.
-#[derive(Debug)]
-pub(crate) struct OpenBuffer<'a> {
-    data: MutexGuard<'a, Option<BufferData>>,
-    back_ref: &'a LispBuffer,
-}
-
-impl Trace for OpenBuffer<'_> {
-    fn trace(&self, state: &mut GcState) {
-        // Globally stable text storage; Lisp metadata roots are owned by the
-        // Context registry, not this lock (including killed cached guards).
-        let _ = state;
-    }
-}
-
-impl OpenBuffer<'_> {
-    /// Inspect liveness through this already-held text guard, without locking
-    /// the buffer again. A cached guard can remain after kill().
-    pub(crate) fn is_live(&self) -> bool {
-        self.data.is_some()
-    }
-
-    /// Temporary markers contain no Lisp values. IDs are per-buffer and never reused.
-    pub(crate) fn save_excursion_marker(&mut self) -> Result<MarkerId> {
-        let data = self.get_mut();
-        let id = MarkerId(data.next_marker_id);
-        let next = data
-            .next_marker_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("buffer marker ID exhausted"))?;
-        let positions = if data.markers.marker_count() == 0 {
-            PositionTree::new(data.text.len_chars())
-        } else {
-            anyhow::ensure!(
-                data.markers.len_chars() == data.text.len_chars(),
-                "untracked text edit with live markers"
-            );
-            data.markers.clone()
-        };
-        let markers = positions.insert(id, CharPos(data.text.cursor().chars()), Bias::Left)?;
-        data.markers = markers;
-        data.next_marker_id = next;
-        Ok(id)
-    }
-    /// Prepare before any physical edit; publish after text/properties succeed.
-    pub(crate) fn prepare_marker_edit(
-        &self,
-        start: usize,
-        end: usize,
-        inserted: usize,
-    ) -> Result<PositionTree> {
-        let data = self.get();
-        let positions = if data.markers.marker_count() == 0 {
-            PositionTree::new(data.text.len_chars())
-        } else {
-            anyhow::ensure!(
-                data.markers.len_chars() == data.text.len_chars(),
-                "untracked text edit with live markers"
-            );
-            data.markers.clone()
-        };
-        Ok(positions.edit(&EditDelta::new(CharPos(start)..CharPos(end), inserted)?)?)
-    }
-    /// Equal-width case substitutions preserve interior boundaries. Expanded
-    /// casification still has coarse replacement mapping, not full GNU policy.
-    pub(crate) fn prepare_marker_substitution(
-        &self,
-        start: usize,
-        end: usize,
-        inserted: usize,
-    ) -> Result<PositionTree> {
-        anyhow::ensure!(
-            start <= end && end <= self.get().text.len_chars(),
-            "Invalid replacement range"
-        );
-        if inserted == end - start {
-            self.prepare_marker_edit(start, start, 0)
-        } else {
-            self.prepare_marker_edit(start, end, inserted)
-        }
-    }
-    /// Use an existing guard, do not relock or resurrect a killed saved buffer.
-    pub(crate) fn restore_excursion_marker(&mut self, id: MarkerId) -> bool {
-        if !self.is_live() {
-            return false;
-        }
-        let data = self.get_mut();
-        let Some((position, _)) = data.markers.get(id) else { return false };
-        data.markers = data.markers.remove(id);
-        data.text.set_cursor(position.0);
-        true
-    }
-
-    pub(crate) fn get(&self) -> &BufferData {
-        // buffer can never be none because we check it as part of `lock`.
-        self.data.as_ref().unwrap()
-    }
-
-    pub(crate) fn get_mut(&mut self) -> &mut BufferData {
-        // buffer can never be none because we check it as part of `lock`.
-        self.data.as_mut().unwrap()
-    }
-
-    // TODO: we shouldn't leave it empty
-    pub(crate) fn kill(&mut self) -> bool {
-        let killed = self.data.is_some();
-        *self.data = None;
-        killed
-    }
-
-    pub(crate) fn lisp_buffer<'ob>(&self, cx: &'ob Context) -> &'ob LispBuffer {
-        cx.bind(self.back_ref)
-    }
-
-    pub(crate) fn insert(&mut self, arg: Object, cx: &Context) -> Result<()> {
-        let metadata = self.get().textprops.clone();
-        let mut properties = metadata.lock(cx)?;
-        let position = self.get().text.cursor().chars() + 1;
-        let old_len = self.get().text.len_chars();
-        let markers = match arg.untag() {
-            ObjectType::Int(i) => {
-                let Ok(u_32) = i.try_into() else { bail!("{i} is an invalid char") };
-                let Some(chr) = char::from_u32(u_32) else { bail!("{i} is an Invalid char") };
-                let markers = self.prepare_marker_edit(position - 1, position - 1, 1)?;
-                self.get_mut().text.insert_char(chr);
-                markers
-            }
-            ObjectType::String(s) => {
-                let markers =
-                    self.prepare_marker_edit(position - 1, position - 1, s.chars().count())?;
-                self.get_mut().text.insert(s);
-                markers
-            }
-            x => bail!(TypeError::new(Type::String, x)),
-        };
-        let chars = self.get().text.len_chars() - old_len;
-        properties.insert_text(position, chars);
-        self.get_mut().markers = markers;
-        Ok(())
-    }
-
-    pub(crate) fn slice_with_gap(&self, beg: usize, end: usize) -> Result<(&str, &str)> {
-        let beg = self.in_range(beg)?;
-        let end = self.in_range(end)?;
-        Ok(self.get().text.slice(beg..end))
-    }
-
-    pub(crate) fn delete(&mut self, beg: usize, end: usize, cx: &Context) -> Result<()> {
-        let metadata = self.get().textprops.clone();
-        let mut properties = metadata.lock(cx)?;
-        let beg = self.in_range(beg)?;
-        let end = self.in_range(end)?;
-        let (beg, end) = (beg.min(end), beg.max(end));
-        let markers = self.prepare_marker_edit(beg, end, 0)?;
-        self.get_mut().text.delete_range(beg, end);
-        properties.delete_text(beg + 1, end + 1);
-        self.get_mut().markers = markers;
-        Ok(())
-    }
-
-    /// Replace a character range while holding the heap-domain metadata guard.
-    /// No mutation occurs if the metadata owner is foreign or has ended.
-    pub(crate) fn replace_text(
-        &mut self,
-        start: usize,
-        end: usize,
-        replacement: &str,
-        cx: &Context,
-    ) -> Result<()> {
-        let metadata = self.get().textprops.clone();
-        let mut properties = metadata.lock(cx)?;
-        if start > end || end > self.get().text.len_chars() {
-            bail!("Invalid replacement range");
-        }
-        let chars = replacement.chars().count();
-        let markers = self.prepare_marker_substitution(start, end, chars)?;
-        self.get_mut().text.delete_range(start, end);
-        self.get_mut().text.set_cursor(start);
-        self.get_mut().text.insert(replacement);
-        // A same-width substitution preserves the properties of every position.
-        // Expansions use the same coordinate semantics as deletion + insertion.
-        if chars != end - start {
-            properties.delete_text(start + 1, end + 1);
-            properties.insert_text(start + 1, chars);
-        }
-        self.get_mut().markers = markers;
-        Ok(())
-    }
-
-    fn in_range(&self, pos: usize) -> Result<usize> {
-        if pos == 0 || pos > self.get().text.len_chars() + 1 {
-            bail!("Position {pos} out of range in {}", self.get().name);
-        }
-        Ok(pos - 1)
-    }
-}
-
-impl<'new> WithLifetime<'new> for OpenBuffer<'_> {
-    type Out = OpenBuffer<'new>;
-
-    unsafe fn with_lifetime(self) -> Self::Out {
-        std::mem::transmute(self)
-    }
-}
-
-impl PartialEq<str> for OpenBuffer<'_> {
-    fn eq(&self, other: &str) -> bool {
-        self.get().text == other
-    }
-}
-
-impl Deref for OpenBuffer<'_> {
-    type Target = BufferData;
-
-    fn deref(&self) -> &Self::Target {
-        self.get()
-    }
-}
-
-impl DerefMut for OpenBuffer<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.get_mut()
-    }
-}
-
-/// The actual data of the buffer. Buffer local variables will be stored here
-/// eventually.
-#[derive(Debug)]
-pub(crate) struct BufferData {
-    pub(crate) name: String,
-    pub(crate) text: TextBuffer,
-    pub(crate) textprops: BufferProperties,
-    pub(crate) markers: PositionTree,
-    next_marker_id: u64,
-}
-
-#[derive(Debug)]
-struct LispBufferInner {
-    text_buffer: Mutex<Option<BufferData>>,
-}
-
-/// A lisp handle to a buffer. This is a just a reference type and does not give
-/// access to the contents until it is locked and a `OpenBuffer` is returned.
-#[derive(PartialEq, Eq, Trace)]
-pub(crate) struct LispBuffer(GcHeap<LispBufferInner>);
-
-// SAFETY: LispBuffer is allocated only in the global nonmoving block. Text is
-// mutex protected, and all moving property slots use Context ownership guards.
+pub(crate) type OpenBuffer = BufferRead;
+pub(crate) type BufferData = BufferRead;
+static SHELLS: LazyLock<Mutex<HashMap<OwnerBufferHandle, &'static LispBuffer>>> =
+    LazyLock::new(|| Mutex::new(HashMap::default()));
+pub(crate) struct LispBuffer(GcHeap<OwnerBufferHandle>);
+// SAFETY: all shells are constant global allocations and contain only native
+// checked IDs. No Context/Rc, moving Lisp value, text root, or owner borrow.
 unsafe impl Sync for LispBuffer {}
-
-derive_GcMoveable!(LispBuffer);
-
-impl LispBuffer {
-    pub(crate) fn create(name: String, block: &Block<true>) -> &LispBuffer {
-        let buffer = unsafe { Self::new(name, block) };
-        block.objects.alloc(buffer)
-    }
-
-    pub(crate) unsafe fn new(name: String, _: &Block<true>) -> LispBuffer {
-        let textprops = BufferProperties::new();
-        let new = LispBufferInner {
-            text_buffer: Mutex::new(Some(BufferData {
-                name,
-                text: TextBuffer::new(),
-                textprops,
-                markers: PositionTree::new(0),
-                next_marker_id: 1,
-            })),
-        };
-        Self(GcHeap::new(new, true))
-    }
-
-    pub(crate) fn lock(&self) -> Result<OpenBuffer<'_>> {
-        let guard = self.0.text_buffer.lock().unwrap();
-        if guard.is_none() {
-            bail!("selecting deleted buffer");
-        }
-        Ok(OpenBuffer { data: guard, back_ref: self })
-    }
+impl Trace for LispBuffer {
+    fn trace(&self, _: &mut GcState) {}
 }
-
-impl PartialEq for LispBufferInner {
+impl PartialEq for LispBuffer {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self, other)
+        self.handle() == other.handle()
     }
 }
-
-impl PartialEq<OpenBuffer<'_>> for LispBuffer {
-    fn eq(&self, other: &OpenBuffer) -> bool {
-        other.back_ref == self
+impl Eq for LispBuffer {}
+derive_GcMoveable!(LispBuffer);
+impl LispBuffer {
+    pub(crate) fn create(handle: OwnerBufferHandle, block: &Block<true>) -> &Self {
+        block.objects.alloc(Self(GcHeap::new(handle, true)))
     }
-}
-
-impl PartialEq<LispBuffer> for OpenBuffer<'_> {
-    fn eq(&self, other: &LispBuffer) -> bool {
-        self.back_ref == other
+    pub(crate) fn handle(&self) -> OwnerBufferHandle {
+        *self.0
     }
-}
-
-impl Eq for LispBufferInner {}
-
-impl Display for LispBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        // Diagnostics may format a property referring to a buffer whose text
-        // guard is already held by this operation. Never reenter that mutex.
-        let data = match self.0.text_buffer.try_lock() {
-            Ok(data) => data,
-            Err(TryLockError::WouldBlock) => return f.write_str("#<locked buffer>"),
-            Err(TryLockError::Poisoned(_)) => return f.write_str("#<poisoned buffer>"),
-        };
-        let name = match data.as_ref() {
-            Some(buf) => &buf.name,
-            None => "deleted buffer",
-        };
-        write!(f, "#<{name}>")
+    pub(crate) fn for_handle<'ob>(
+        handle: OwnerBufferHandle,
+        cx: &'ob Context,
+    ) -> Result<&'ob Self> {
+        cx.editor_gateway()?.read(handle, cx)?;
+        let mut shells = SHELLS.lock().unwrap();
+        let shell = *shells.entry(handle).or_insert_with(|| {
+            let symbols = INTERNED_SYMBOLS.lock().unwrap();
+            // Global block shells never move or contain heap-local data.
+            let shell = symbols.create_buffer(handle);
+            unsafe { &*(shell as *const Self) }
+        });
+        Ok(cx.bind(shell))
     }
-}
-
-impl std::fmt::Debug for LispBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        Display::fmt(self, f)
+    pub(crate) fn read(&self, cx: &Context) -> Result<BufferRead> {
+        cx.editor_gateway()?.read(self.handle(), cx)
     }
-}
-
-impl Trace for LispBufferInner {
-    fn trace(&self, _: &mut GcState) {
-        // The globally allocated handle and text contain no moving Lisp values.
-        // Metadata is traced by Context's registry. In particular, never acquire
-        // the text mutex here: a rooted cached OpenBuffer may already hold it.
-    }
-}
-
-impl<'new> LispBuffer {
-    pub(in crate::core) fn clone_in<const C: bool>(
+    pub(in crate::core) fn clone_in<'new, const C: bool>(
         &self,
         _: &'new Block<C>,
-    ) -> Gc<&'new LispBuffer> {
+    ) -> Gc<&'new Self> {
         unsafe { self.with_lifetime().tag() }
     }
 }
-
-#[cfg(test)]
-mod roadmap_m0_buffer_property_regressions {
-    use super::*;
-    use crate::RootSet;
-
-    #[test]
-    fn diagnostics_do_not_reenter_held_text_mutex() -> Result<()> {
-        let roots = RootSet::default();
-        let cx = Context::new(&roots);
-        let name = format!("diagnostic-lock-{}", cx.domain_id());
-        let object = crate::buffer::get_buffer_create(cx.add(name), None, &cx)?;
-        let handle = object.buffer().unwrap();
-        let _buffer = handle.lock()?;
-        assert_eq!(format!("{handle:?}"), "#<locked buffer>");
-        Ok(())
+impl fmt::Display for LispBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "#<buffer {:?}>", self.handle())
     }
-
-    #[test]
-    fn replacement_inserts_at_range_start_not_unrelated_cursor() -> Result<()> {
-        let roots = RootSet::default();
-        let cx = Context::new(&roots);
-        let name = format!("replacement-cursor-{}", cx.domain_id());
-        let object = crate::buffer::get_buffer_create(cx.add(name), None, &cx)?;
-        let mut buffer = object.buffer().unwrap().lock()?;
-        buffer.insert(cx.add("abcdef"), &cx)?;
-        buffer.text.set_cursor(6);
-        buffer.replace_text(1, 3, "XY", &cx)?;
-        assert_eq!(buffer.text, "aXYdef");
-        buffer.text.set_cursor(0);
-        buffer.replace_text(3, 5, "!", &cx)?;
-        assert_eq!(buffer.text, "aXY!f");
-        Ok(())
-    }
-
-    #[test]
-    fn roadmap_m0_buffer_edits_use_character_property_positions() -> Result<()> {
-        let roots = RootSet::default();
-        let cx = Context::new(&roots);
-        let object = crate::buffer::get_buffer_create(cx.add("roadmap-m0-properties"), None, &cx)?;
-        let buffer = object.buffer().unwrap();
-        let mut buffer = buffer.lock()?;
-        buffer.insert(cx.add("aé🙂z"), &cx)?;
-        // Lisp character positions are one-based, regardless of UTF-8 width.
-        buffer.textprops.lock(&cx).unwrap().set_properties(2, 4, cx.add(7));
-        buffer.text.set_cursor(0);
-        buffer.insert(cx.add("λ"), &cx)?;
-        assert!(buffer.textprops.lock(&cx).unwrap().find(2).is_none());
-        assert_eq!(
-            buffer.textprops.lock(&cx).unwrap().find(3).map(|node| *node.val),
-            Some(cx.add(7))
-        );
-        // Reversed endpoints are accepted and normalized before editing.
-        buffer.delete(4, 2, &cx)?;
-        assert_eq!(
-            buffer.textprops.lock(&cx).unwrap().find(2).map(|node| *node.val),
-            Some(cx.add(7))
-        );
-        assert!(buffer.textprops.lock(&cx).unwrap().find(3).is_none());
-        Ok(())
+}
+impl fmt::Debug for LispBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 
 #[cfg(test)]
-mod excursion_marker_tests {
+mod owner_shell_tests {
     use super::*;
-    use crate::RootSet;
+    use crate::core::gc::RootSet;
+
     #[test]
-    fn marker_transactions_translate_validate_and_unregister() -> Result<()> {
+    fn stable_shell_identity_tracks_owner_name_and_rejects_killed_handle() -> Result<()> {
         let roots = RootSet::default();
-        let cx = Context::new(&roots);
-        let object =
-            crate::buffer::get_buffer_create(cx.add("recovery-marker-transaction"), None, &cx)?;
-        let mut buffer = object.buffer().unwrap().lock()?;
-        buffer.insert(cx.add("aé🙂z"), &cx)?;
-        buffer.text.set_cursor(2);
-        let saved = buffer.save_excursion_marker()?;
-        buffer.text.set_cursor(0);
-        buffer.insert(cx.add("λ"), &cx)?;
-        assert!(buffer.restore_excursion_marker(saved));
-        assert_eq!(buffer.text.cursor().chars(), 3);
-        assert_eq!(buffer.markers.marker_count(), 0);
-        let saved = buffer.save_excursion_marker()?;
-        assert!(buffer.insert(cx.add(-1_i64), &cx).is_err());
-        assert!(buffer.delete(0, 3, &cx).is_err());
-        assert!(buffer.delete(1, 99, &cx).is_err());
-        assert_eq!(buffer.markers.get(saved).unwrap().0, CharPos(3));
-        buffer.delete(1, 3, &cx)?;
-        assert!(buffer.restore_excursion_marker(saved));
-        assert_eq!(buffer.text.cursor().chars(), 1);
-        buffer.next_marker_id = u64::MAX;
-        assert!(buffer.save_excursion_marker().is_err());
-        assert_eq!(buffer.markers.marker_count(), 0);
-        Ok(())
-    }
-    #[test]
-    fn substitution_and_kill_preserve_liveness_contract() -> Result<()> {
-        let roots = RootSet::default();
-        let cx = Context::new(&roots);
-        let object =
-            crate::buffer::get_buffer_create(cx.add("recovery-marker-substitution"), None, &cx)?;
-        let mut buffer = object.buffer().unwrap().lock()?;
-        buffer.insert(cx.add("abcd"), &cx)?;
-        buffer.text.set_cursor(2);
-        let marker = buffer.save_excursion_marker()?;
-        buffer.replace_text(0, 4, "ABCD", &cx)?;
-        assert_eq!(buffer.markers.get(marker).unwrap().0, CharPos(2));
-        assert!(buffer.kill());
-        assert!(!buffer.restore_excursion_marker(marker));
+        let cx = &Context::new(&roots);
+        let gateway = cx.editor_gateway()?;
+        let handle = gateway.create("shell-exact-name", "λ🙂", cx)?;
+        let shell = LispBuffer::for_handle(handle, cx)?;
+        assert!(std::ptr::eq(shell, LispBuffer::for_handle(handle, cx)?));
+        gateway.rename(handle, "renamed-shell", false, cx)?;
+        assert_eq!(shell.read(cx)?.name, "renamed-shell");
+        assert_eq!(shell.read(cx)?.document.text().to_string(), "λ🙂");
+        gateway.kill(handle, true, cx)?;
+        assert!(shell.read(cx).is_err());
+        assert!(LispBuffer::for_handle(handle, cx).is_err());
         Ok(())
     }
 }

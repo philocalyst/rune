@@ -750,7 +750,7 @@ mod exit_diagnostic_tests {
         .unwrap();
         root!(function, cx);
         constants.bind(cx).untag().try_mut().unwrap()[0].set(function.bind(cx).into());
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let mut frame = CallFrame::new(env);
         frame.push_arg(Object::from(function.bind(cx)));
         frame.finalize_arguments().unwrap();
@@ -772,7 +772,7 @@ mod exit_diagnostic_tests {
     fn argument_and_text_diagnostics_are_bounded_and_escape_control_characters() {
         let roots = RootSet::default();
         let cx = &Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let mut frame = CallFrame::new(env);
         let text = "界\n".repeat(1000);
         for _ in 0..100 {
@@ -803,7 +803,7 @@ mod checked_argument_tests {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let list = crate::fns::slice_into_list(&vec![NIL; usize::from(u16::MAX) + 1], None, cx);
         root!(list, cx);
         let function: Function = crate::core::env::intern("list", cx).into();
@@ -827,7 +827,7 @@ mod checked_argument_tests {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let list =
             crate::fns::slice_into_list(&vec![Object::from(0); usize::from(u16::MAX)], None, cx);
         root!(list, cx);
@@ -845,7 +845,7 @@ mod checked_argument_tests {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let function: Function = crate::core::env::intern("list", cx).into();
         root!(function, cx);
         let improper = Cons::new(Object::from(7), Object::from(9), cx);
@@ -865,7 +865,7 @@ mod checked_argument_tests {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let function: Function = crate::core::env::intern("list", cx).into();
         root!(function, cx);
         {

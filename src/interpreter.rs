@@ -566,7 +566,7 @@ impl Interpreter<'_, '_> {
             let next = varbind_count
                 .checked_add(1)
                 .ok_or_else(|| error!("Too many dynamic let bindings"))?;
-            self.env.varbind(var, val, cx);
+            self.env.varbind(var, val, cx)?;
             *varbind_count = next;
         } else {
             self.vars.push(Cons::new(var, val, cx));
@@ -625,12 +625,11 @@ impl Interpreter<'_, '_> {
     }
 
     fn save_excursion<'ob>(&mut self, form: &Rto<Object>, cx: &'ob mut Context) -> EvalResult<'ob> {
-        let buffer = self.env.current_buffer.try_get()?.lisp_buffer(cx);
-        root!(buffer, cx);
-        let marker = self.env.current_buffer.try_get_mut()?.save_excursion_marker()?;
-        // Capture errors/throws as well. Restoration performs no Lisp/GC work.
+        // The token contains owner-local native handle/marker IDs, not a heap
+        // reference or a long-lived editor borrow across arbitrary Lisp code.
+        let token = self.env.save_excursion(cx)?;
         let result = rebind!(self.eval_progn(form, cx));
-        self.env.restore_excursion_marker(buffer.bind(cx), marker);
+        self.env.restore_excursion(token, cx);
         result
     }
 
@@ -639,10 +638,11 @@ impl Interpreter<'_, '_> {
         form: &Rto<Object>,
         cx: &'ob mut Context,
     ) -> EvalResult<'ob> {
-        let buffer = self.env.current_buffer.get().lisp_buffer(cx);
-        root!(buffer, cx);
+        let buffer = self.env.current_buffer_handle();
         let result = rebind!(self.eval_progn(form, cx));
-        self.env.set_buffer(buffer.bind(cx));
+        // Killing the saved buffer is allowed. Do not replace a pending body
+        // error/throw with a failed attempt to restore that expired handle.
+        let _ = self.env.set_current_buffer(buffer, cx);
         result
     }
 
@@ -864,7 +864,7 @@ pub(crate) fn assert_lisp(compare: &str, expect: &str) {
     let roots = &crate::core::gc::RootSet::default();
     let cx = &mut Context::new(roots);
     sym::init_symbols();
-    root!(env, new(Env), cx);
+    root!(env, init(Env::new(cx).unwrap()), cx);
     println!("Test String: {compare}");
     let compare = {
         let obj = crate::reader::read(compare, cx).unwrap().0;
@@ -887,7 +887,7 @@ mod test {
         T: IntoObject,
     {
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
         println!("Test String: {test_str}");
         let obj = crate::reader::read(test_str, cx).unwrap().0;
         root!(obj, cx);
@@ -933,7 +933,7 @@ mod test {
         ] {
             check_interpreter(source, expected, cx)
         }
-        check_error("(progn (kill-buffer) (save-excursion 1))", cx);
+        check_interpreter("(progn (kill-buffer) (save-excursion 1))", 1, cx);
     }
     #[test]
     fn recovered_save_excursion_gc_cleanup() {
@@ -945,13 +945,13 @@ mod test {
             let roots = RootSet::default();
             let cx = &mut Context::new(&roots);
             sym::init_symbols();
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let form = crate::reader::read(source, cx).unwrap().0;
             root!(form, cx);
             assert_eq!(eval(form, None, env, cx).unwrap(), Object::from(4_i64));
-            assert_eq!(env.current_buffer.get().markers.marker_count(), 0);
+            assert_eq!(env.buffer_read(cx).unwrap().document.marker_count(), 0);
             cx.garbage_collect(true);
-            assert_eq!(env.current_buffer.get().markers.marker_count(), 0)
+            assert_eq!(env.buffer_read(cx).unwrap().document.marker_count(), 0)
         }
     }
     #[test]
@@ -971,11 +971,75 @@ mod test {
     }
 
     fn check_error(test_str: &str, cx: &mut Context) {
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         println!("Test String: {test_str}");
         let obj = crate::reader::read(test_str, cx).unwrap().0;
         root!(obj, cx);
         assert!(eval(obj, None, env, cx).is_err());
+    }
+
+    #[test]
+    fn dynamic_integer_width_guards_preserve_existing_lexical_bindings() {
+        for (source, expected) in [
+            ("(condition-case nil (let ((integer-width nil)) 1) (error 'caught))", "caught"),
+            ("(condition-case nil (let ((integer-width 1.0)) 1) (error 'caught))", "caught"),
+            (
+                "(condition-case nil (let ((integer-width 9223372036854775808)) 1) (error 'caught))",
+                "caught",
+            ),
+            (
+                "(condition-case nil (let ((integer-width -9223372036854775809)) 1) (error 'caught))",
+                "caught",
+            ),
+            (
+                "(let ((integer-width 128)) (condition-case nil (setq integer-width nil) (error nil)) integer-width)",
+                "128",
+            ),
+            (
+                "(let ((integer-width 128)) (condition-case nil (set 'integer-width 1.0) (error nil)) integer-width)",
+                "128",
+            ),
+            (
+                "(let ((integer-width 128)) (condition-case nil (let* ((integer-width 129) (integer-width nil)) 1) (error nil)) integer-width)",
+                "128",
+            ),
+            (
+                "(let ((integer-width 128)) (condition-case nil (let ((integer-width nil)) 1) (error nil)) integer-width)",
+                "128",
+            ),
+            (
+                "(let ((seen 0)) (condition-case nil (let ((integer-width nil) (x (setq seen 1))) 1) (error nil)) seen)",
+                "1",
+            ),
+            (
+                "(let ((seen 0)) (condition-case nil (let* ((integer-width nil) (x (setq seen 1))) 1) (error nil)) seen)",
+                "0",
+            ),
+            (
+                "(let ((integer-width -9223372036854775808)) integer-width)",
+                "-9223372036854775808",
+            ),
+            (
+                "(let ((integer-width 9223372036854775807)) integer-width)",
+                "9223372036854775807",
+            ),
+            ("(let ((integer-width 128)) (setq integer-width 129) integer-width)", "129"),
+            // Preserve existing lexical closure/handler behavior. These match
+            // GNU eval with lexical=t, not its distinct dynamic eval mode.
+            ("(funcall (function (lambda (integer-width) integer-width)) nil)", "nil"),
+            (
+                "(funcall (function (lambda (integer-width) (setq integer-width nil) integer-width)) 128)",
+                "nil",
+            ),
+            ("(funcall (function (lambda (&optional integer-width) integer-width)))", "nil"),
+            ("(funcall (function (lambda (&rest integer-width) integer-width)) 128)", "(128)"),
+            (
+                "(condition-case integer-width (if) (error (setq integer-width nil) integer-width))",
+                "nil",
+            ),
+        ] {
+            assert_lisp(source, expected);
+        }
     }
 
     #[test]
@@ -1051,7 +1115,7 @@ mod test {
     fn m0_let_dynamic_count_overflow_is_checked_before_binding() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         root!(vars, new(Vec<Slot<&Cons>>), cx);
         let variable = intern("m0-let-binding-count", cx);
         variable.make_special();
@@ -1307,7 +1371,7 @@ mod test {
             let roots = &RootSet::default();
             let cx = &mut Context::new(roots);
             sym::init_symbols();
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let form = crate::reader::read(source, cx).unwrap().0;
             root!(form, cx);
             let result = eval(form, None, env, cx);

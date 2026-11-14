@@ -449,7 +449,7 @@ mod function_domain_tests {
     fn cloned_uninterned_function_remains_global_across_collection() {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let source = Symbol::new_uninterned("local-function-symbol", &cx.block);
         let lambda = list![sym::LAMBDA, NIL, 7; cx];
         let function = lambda.try_into().unwrap();

@@ -616,7 +616,7 @@ mod m0_nonfinite_rounding_regressions {
             let roots = RootSet::default();
             let cx = Context::new(&roots);
             let context = &cx;
-            rune_core::macros::root!(env, new(Env), context);
+            rune_core::macros::root!(env, init(Env::new(context).unwrap()), context);
             for operation in [floor, ceiling, round, truncate] {
                 for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
                     let value = cx.add_as(value);

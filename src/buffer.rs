@@ -1,7 +1,7 @@
-//! Buffer operations.
+//! Buffer metadata and identities resolve through the Context-owned Session.
 use crate::{
     core::{
-        env::{Env, INTERNED_SYMBOLS},
+        env::Env,
         error::{Type, TypeError},
         gc::{Context, Rt},
         object::{Gc, LispBuffer, NIL, Object, ObjectType, OptionalFlag},
@@ -9,218 +9,160 @@ use crate::{
     fns::slice_into_list,
 };
 use anyhow::{Result, bail};
-use rune_core::hashmap::HashMap;
 use rune_macros::defun;
-use std::sync::LazyLock;
-use std::sync::Mutex;
-
-type BufferMap = HashMap<String, &'static LispBuffer>;
-// static hashmap containing all the buffers
-pub(crate) static BUFFERS: LazyLock<Mutex<BufferMap>> = LazyLock::new(Mutex::default);
-
-/// Return the existing stable buffer handle without acquiring its text mutex.
 #[defun]
-fn current_buffer<'ob>(env: &Rt<Env>, cx: &'ob Context) -> Object<'ob> {
-    cx.add(cx.bind(env.current_buffer.buf_ref))
+fn current_buffer<'ob>(env: &Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    Ok(cx.add(LispBuffer::for_handle(env.current_buffer_handle(), cx)?))
 }
-
+fn resolve_buffer<'ob>(value: Object, cx: &'ob Context) -> Result<&'ob LispBuffer> {
+    match value.untag() {
+        ObjectType::Buffer(buffer) => {
+            buffer.read(cx)?;
+            Ok(cx.bind(buffer))
+        }
+        ObjectType::String(name) => {
+            let gateway = cx.editor_gateway()?;
+            let Some(handle) = gateway.lookup(name, cx)? else { bail!("No buffer named {name}") };
+            LispBuffer::for_handle(handle, cx)
+        }
+        other => Err(TypeError::new(Type::BufferOrName, other).into()),
+    }
+}
 #[defun]
 pub(crate) fn set_buffer<'ob>(
-    buffer_or_name: Object<'ob>,
+    value: Object,
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    let buffer = resolve_buffer(buffer_or_name, cx)?;
-    env.set_buffer(buffer);
+    let buffer = resolve_buffer(value, cx)?;
+    env.set_buffer(buffer, cx)?;
     Ok(cx.add(buffer))
 }
-
-fn resolve_buffer<'ob>(buffer_or_name: Object, cx: &'ob Context) -> Result<&'ob LispBuffer> {
-    match buffer_or_name.untag() {
-        ObjectType::Buffer(b) => Ok(b),
-        ObjectType::String(name) => {
-            let buffer_list = BUFFERS.lock().unwrap();
-            let Some(buffer) = buffer_list.get(name.as_ref()) else {
-                bail!("No buffer named {}", name);
-            };
-            Ok(cx.bind(*buffer))
-        }
-        x => Err(TypeError::new(Type::String, x).into()),
-    }
-}
-
 #[defun]
 fn set_buffer_modified_p(flag: Object) -> Object {
-    // TODO: implement
     flag
 }
-
 #[defun]
-fn buffer_live_p(buffer: Object, env: &Rt<Env>) -> bool {
-    match buffer.untag() {
-        ObjectType::Buffer(b) => env.with_buffer(b, |_| {}).is_ok(),
-        _ => false,
-    }
+fn buffer_live_p(value: Object, cx: &Context) -> bool {
+    value.buffer().is_some_and(|buffer| buffer.read(cx).is_ok())
 }
-
 #[defun]
-fn buffer_name(buffer: Option<Gc<&LispBuffer>>, env: &Rt<Env>) -> Result<String> {
+fn buffer_name(
+    buffer: Option<Gc<&LispBuffer>>,
+    env: &Rt<Env>,
+    cx: &Context,
+) -> Result<Option<String>> {
     match buffer {
-        Some(buffer) => env.with_buffer(buffer.untag(), |b| b.name.to_string()),
-        None => Ok(env.current_buffer.get().name.to_string()),
-    }
-}
-
-#[defun]
-fn rename_buffer(newname: &str, unique: OptionalFlag, env: &mut Rt<Env>) -> Result<String> {
-    let buf = env.current_buffer.get_mut();
-    if buf.name == newname {
-        return Ok(newname.to_string());
-    }
-    let mut buffer_list = BUFFERS.lock().unwrap();
-    let mut replace_buffer = |buffer_list: &mut HashMap<_, _>, newname: &str| {
-        let buffer = buffer_list.remove(&buf.name).unwrap();
-        buffer_list.insert(newname.into(), buffer);
-        buf.name = newname.to_string();
-    };
-    if buffer_list.contains_key(newname) {
-        // there is already a buffer with newname
-        if unique.is_none() {
-            bail!("rename-buffer failed: Buffer name {newname} is in use");
+        Some(buffer) => {
+            let gateway = cx.editor_gateway()?;
+            if !gateway.list(cx)?.contains(&buffer.untag().handle()) {
+                return Ok(None);
+            }
+            Ok(Some(buffer.untag().read(cx)?.name))
         }
-        let newname = unique_buffer_name(newname, None, &buffer_list);
-        replace_buffer(&mut buffer_list, &newname);
-        Ok(newname)
-    } else {
-        replace_buffer(&mut buffer_list, newname);
-        Ok(newname.to_string())
+        None => Ok(Some(env.buffer_read(cx)?.name)),
     }
 }
-
+#[defun]
+fn rename_buffer(name: &str, unique: OptionalFlag, env: &Rt<Env>, cx: &Context) -> Result<String> {
+    env.editor_gateway()
+        .rename(env.current_buffer_handle(), name, unique.is_some(), cx)
+}
 #[defun]
 pub(crate) fn get_buffer_create<'ob>(
-    buffer_or_name: Object<'ob>,
-    _inhibit_buffer_hooks: Option<Object>,
+    value: Object<'ob>,
+    _inhibit: Option<Object>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    match buffer_or_name.untag() {
+    match value.untag() {
         ObjectType::String(name) => {
-            let mut buffer_list = BUFFERS.lock().unwrap();
-            match buffer_list.get(name.as_ref()) {
-                Some(b) => Ok(cx.add(*b)),
-                None => {
-                    // If not already in the global buffer list, create a new
-                    // buffer and add it
-                    let buffer: &'static _ = {
-                        let global = INTERNED_SYMBOLS.lock().unwrap();
-                        let buffer = global.create_buffer(name);
-                        // SAFETY: This can be 'static because it is stored in the
-                        // global block. Eventually it will be garbage collected
-                        unsafe { &*(buffer as *const LispBuffer) }
-                    };
-                    buffer_list.insert(name.to_string(), buffer);
-                    let buf = cx.add(buffer);
-                    Ok(buf)
-                }
-            }
+            let gateway = cx.editor_gateway()?;
+            let handle = match gateway.lookup(name, cx)? {
+                Some(handle) => handle,
+                None => gateway.create(name, "", cx)?,
+            };
+            Ok(cx.add(LispBuffer::for_handle(handle, cx)?))
         }
-        ObjectType::Buffer(_) => Ok(buffer_or_name),
+        ObjectType::Buffer(_) => Ok(value),
         other => Err(TypeError::new(Type::BufferOrName, other).into()),
     }
 }
-
 #[defun]
-pub(crate) fn get_buffer<'ob>(
-    buffer_or_name: Object<'ob>,
-    cx: &'ob Context,
-) -> Result<Object<'ob>> {
-    match buffer_or_name.untag() {
+pub(crate) fn get_buffer<'ob>(value: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
+    match value.untag() {
         ObjectType::String(name) => {
-            let buffer_list = BUFFERS.lock().unwrap();
-            match buffer_list.get(name.as_ref()) {
-                Some(b) => Ok(cx.add(*b)),
+            let gateway = cx.editor_gateway()?;
+            match gateway.lookup(name, cx)? {
+                Some(handle) => Ok(cx.add(LispBuffer::for_handle(handle, cx)?)),
                 None => Ok(NIL),
             }
         }
-        ObjectType::Buffer(_) => Ok(buffer_or_name),
+        ObjectType::Buffer(_) => Ok(value),
         other => Err(TypeError::new(Type::BufferOrName, other).into()),
     }
 }
-
-/// Return a string that is the name of no existing buffer based on NAME.
-///
-/// If there is no live buffer named NAME, then return NAME.
-/// Otherwise modify name by appending \<NUMBER\>, incrementing NUMBER
-/// (starting at 2) until an unused name is found, and then return that name.
-/// Optional second argument IGNORE specifies a name that is okay to use (if
-/// it is in the sequence to be tried) even if a buffer with that name exists.
-///
-/// If NAME begins with a space (i.e., a buffer that is not normally
-/// visible to users), then if buffer NAME already exists a random number
-/// is first appended to NAME, to speed up finding a non-existent buffer.
 #[defun]
-pub(crate) fn generate_new_buffer_name(name: &str, ignore: Option<&str>) -> String {
-    unique_buffer_name(name, ignore, &BUFFERS.lock().unwrap())
-}
-
-fn unique_buffer_name(name: &str, ignore: Option<&str>, buffer_list: &BufferMap) -> String {
-    let valid_name =
-        |name: &str| ignore.is_some_and(|x| x == name) || !buffer_list.contains_key(name);
-
-    let mut new_name = name.to_string();
-    let mut number = 2;
-
-    // check if the name exists
-    while !valid_name(&new_name) {
-        if name.starts_with(' ') {
-            // use rand to find uniq names faster
-            let rand = rand::random::<u32>();
-            new_name = format!("{name}-{rand}");
-        } else {
-            new_name = format!("{name}<{number}>");
-            number += 1;
+pub(crate) fn generate_new_buffer_name(
+    name: &str,
+    ignore: Option<&str>,
+    cx: &Context,
+) -> Result<String> {
+    let gateway = cx.editor_gateway()?;
+    let mut names = std::collections::HashSet::new();
+    for handle in gateway.list(cx)? {
+        names.insert(gateway.read(handle, cx)?.name);
+    }
+    let valid = |candidate: &str| ignore == Some(candidate) || !names.contains(candidate);
+    if valid(name) {
+        return Ok(name.to_owned());
+    }
+    if name.starts_with(' ') {
+        loop {
+            let candidate = format!("{name}-{}", rand::random::<u32>());
+            if valid(&candidate) {
+                return Ok(candidate);
+            }
         }
     }
-    new_name
+    for index in 2usize.. {
+        let candidate = format!("{name}<{index}>");
+        if valid(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!("Buffer name identifiers exhausted")
 }
-
 #[defun]
-fn kill_buffer(buffer_or_name: Option<Object>, cx: &Context, env: &mut Rt<Env>) -> bool {
-    match buffer_or_name {
-        Some(buffer) => match resolve_buffer(buffer, cx) {
-            Ok(b) => env.with_buffer_mut(b, |b| b.kill()).unwrap_or(false),
-            Err(_) => false,
+fn kill_buffer(value: Option<Object>, cx: &Context, env: &mut Rt<Env>) -> bool {
+    let handle = match value {
+        Some(value) => match resolve_buffer(value, cx) {
+            Ok(buffer) => buffer.handle(),
+            Err(_) => return false,
         },
-        None => {
-            let killed = env.current_buffer.get_mut().kill();
-            // todo, we need to select a new buffer
-            env.current_buffer.release();
-            killed
-        }
+        None => env.current_buffer_handle(),
+    };
+    let Ok(fallback) = env.editor_gateway().kill(handle, true, cx) else { return false };
+    if env.current_buffer_handle() == handle {
+        let _ = env.set_current_buffer(fallback, cx);
     }
+    true
 }
-
 #[defun]
 fn buffer_base_buffer(_buffer: OptionalFlag) -> bool {
-    // TODO: implement indirect buffers
     false
 }
-
 #[defun]
 fn get_file_buffer(_filename: &str) -> bool {
-    // TODO: implement file buffers
     false
 }
-
 #[defun]
-fn buffer_list<'ob>(_frame: OptionalFlag, cx: &'ob Context) -> Object<'ob> {
-    // TODO: implement frame parameter
-    // TODO: remove this temp vector
-    let mut buffer_list: Vec<Object> = Vec::new();
-    for buffer in BUFFERS.lock().unwrap().values() {
-        buffer_list.push(cx.add(*buffer));
+fn buffer_list<'ob>(_frame: OptionalFlag, cx: &'ob Context) -> Result<Object<'ob>> {
+    let gateway = cx.editor_gateway()?;
+    let mut buffers = Vec::new();
+    for handle in gateway.list(cx)? {
+        buffers.push(cx.add(LispBuffer::for_handle(handle, cx)?));
     }
-    slice_into_list(&buffer_list, None, cx)
+    Ok(slice_into_list(&buffers, None, cx))
 }
 
 // TODO: buffer local
@@ -246,25 +188,25 @@ mod test {
         let cx = &mut Context::new(roots);
 
         let name = "gen_buffer_test";
-        let new_name = generate_new_buffer_name(name, None);
+        let new_name = generate_new_buffer_name(name, None, cx).unwrap();
         assert_eq!(new_name, "gen_buffer_test");
 
         get_buffer_create(cx.add(name), Some(NIL), cx).unwrap();
-        let new_name = generate_new_buffer_name(name, None);
+        let new_name = generate_new_buffer_name(name, None, cx).unwrap();
         assert_eq!(new_name, "gen_buffer_test<2>");
 
         get_buffer_create(cx.add("gen_buffer_test<2>"), Some(NIL), cx).unwrap();
-        let new_name = generate_new_buffer_name(name, None);
+        let new_name = generate_new_buffer_name(name, None, cx).unwrap();
         assert_eq!(new_name, "gen_buffer_test<3>");
 
-        let new_name = generate_new_buffer_name(name, Some("gen_buffer_test<2>"));
+        let new_name = generate_new_buffer_name(name, Some("gen_buffer_test<2>"), cx).unwrap();
         assert_eq!(new_name, "gen_buffer_test<2>");
 
-        let new_name = generate_new_buffer_name(" gen_buffer_test", None);
+        let new_name = generate_new_buffer_name(" gen_buffer_test", None, cx).unwrap();
         assert_eq!(new_name, " gen_buffer_test");
 
         get_buffer_create(cx.add(" gen_buffer_test"), Some(NIL), cx).unwrap();
-        let new_name = generate_new_buffer_name(" gen_buffer_test", None);
+        let new_name = generate_new_buffer_name(" gen_buffer_test", None, cx).unwrap();
         assert!(new_name.starts_with(" gen_buffer_test-"));
     }
 

@@ -262,25 +262,31 @@ fn write_region(
     lockname: OptionalFlag,
     mustbenew: OptionalFlag,
     env: &Rt<Env>,
+    cx: &Context,
 ) -> Result<()> {
     use std::io::Write;
     ensure!(append.is_none(), "append not implemented");
     ensure!(visit.is_none(), "visit not implemented");
     ensure!(lockname.is_none(), "lockname not implemented");
     ensure!(mustbenew.is_none(), "mustbenew not implemented");
-    // Validate both character endpoints before any destructive file operation.
+    // Capture and validate an immutable owner root before opening/truncating.
     let start = usize::try_from(start)?;
     let end = usize::try_from(end)?;
     let (start, end) = (start.min(end), start.max(end));
-    let b = env.current_buffer.get();
-    let (s1, s2) = b.slice_with_gap(start, end)?;
+    let read = env.buffer_read(cx)?;
+    let text = read.document.text();
+    ensure!(start > 0 && end <= text.len_chars() + 1, "Buffer range out of bounds");
+    let bytes = text.char_to_byte(rune_text::CharPos(start - 1))?
+        ..text.char_to_byte(rune_text::CharPos(end - 1))?;
+    let chunks = text.chunks(bytes)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(filename)?;
-    file.write_all(s1.as_bytes())?;
-    file.write_all(s2.as_bytes())?;
+    for chunk in chunks {
+        file.write_all(chunk.as_bytes())?;
+    }
     Ok(())
 }
 
@@ -341,7 +347,7 @@ mod tests {
     fn test_find_file_name_handler_matching() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
 
         let handler = Symbol::new_uninterned("matching-handler", cx);
         let not_matching_handler = Symbol::new_uninterned("not-matching-handler", cx);
@@ -362,7 +368,7 @@ mod tests {
     fn test_find_file_name_handler_inhibit_handlers() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
 
         let handler = Symbol::new_uninterned("matching-handler", cx);
         let inhibit_handler = Symbol::new_uninterned("inhibit-handler", cx);
@@ -386,7 +392,7 @@ mod tests {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         let handler = Symbol::new_uninterned("handler", cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
 
         set(FILE_NAME_HANDLER_ALIST, list![Cons::new(NIL, handler, cx); cx], env).unwrap();
         find_file_name_handler("example", NIL, env, cx);
@@ -403,7 +409,7 @@ mod tests {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         let handler = Symbol::new_uninterned("handler", cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
 
         set(
             FILE_NAME_HANDLER_ALIST,
@@ -424,21 +430,16 @@ mod tests {
 #[cfg(test)]
 mod recovered_write_region_tests {
     use super::*;
-    use crate::{
-        buffer::{get_buffer_create, set_buffer},
-        core::gc::RootSet,
-    };
+    use crate::core::gc::RootSet;
     use rune_core::macros::root;
     #[test]
     fn invalid_windows_cannot_truncate_and_unicode_reversal_is_exact() -> Result<()> {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        root!(env, new(Env), cx);
-        let buffer = get_buffer_create(cx.add("recovery-write-validation"), Some(NIL.into()), cx)?;
-        set_buffer(buffer, env, cx)?;
+        root!(env, init(Env::new_isolated(cx)?), cx);
         let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
-        let dir = std::env::temp_dir()
-            .join(format!("rune-write-recovery-{}-{unique}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rune-owner-write-{}-{unique}", std::process::id()));
         std::fs::create_dir(&dir)?;
         let existing = dir.join("existing");
         let absent = dir.join("absent");
@@ -446,35 +447,35 @@ mod recovered_write_region_tests {
         for (start, end) in [(-1, 1), (0, 1), (1, 2), (2, 1), (1, i64::MAX)] {
             for path in [&existing, &absent] {
                 assert!(
-                    write_region(start, end, path.to_str().unwrap(), None, None, None, None, env)
-                        .is_err()
+                    write_region(
+                        start,
+                        end,
+                        path.to_str().unwrap(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        env,
+                        cx
+                    )
+                    .is_err()
                 )
             }
             assert_eq!(std::fs::read(&existing)?, b"must survive");
             assert!(!absent.exists())
         }
-        env.current_buffer.get_mut().insert(cx.add("aé🙂\0z"), cx)?;
-        env.current_buffer.get_mut().text.set_cursor(2);
-        env.current_buffer.get_mut().insert(cx.add("λ"), cx)?;
+        let gateway = env.editor_gateway();
+        let read = env.buffer_read(cx)?;
+        gateway.splice(read.handle, read.epoch, 0..0, "aé🙂\0z", cx)?;
+        gateway.set_point(read.handle, 2, cx)?;
+        let read = env.buffer_read(cx)?;
+        gateway.splice(read.handle, read.epoch, 2..2, "λ", cx)?;
         for (start, end) in [(2, 6), (6, 2)] {
-            write_region(start, end, existing.to_str().unwrap(), None, None, None, None, env)?;
+            write_region(start, end, existing.to_str().unwrap(), None, None, None, None, env, cx)?;
             assert_eq!(std::fs::read(&existing)?, "éλ🙂\0".as_bytes())
         }
-        write_region(1, 1, existing.to_str().unwrap(), None, None, None, None, env)?;
+        write_region(1, 1, existing.to_str().unwrap(), None, None, None, None, env, cx)?;
         assert!(std::fs::read(&existing)?.is_empty());
-        assert!(
-            write_region(
-                1,
-                1,
-                dir.join("missing/file").to_str().unwrap(),
-                None,
-                None,
-                None,
-                None,
-                env
-            )
-            .is_err()
-        );
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

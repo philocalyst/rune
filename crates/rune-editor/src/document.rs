@@ -17,6 +17,15 @@ pub trait Document: Clone {
     fn empty() -> Self;
     fn len_chars(&self) -> usize;
     fn replace(&self, range: Range<usize>, text: &str) -> Result<Self, Self::Error>;
+    /// Case conversion policy: preserve properties for same-width substitution.
+    /// Marker/history transformation is still an ordinary text splice.
+    fn replace_preserving_properties(
+        &self,
+        range: Range<usize>,
+        text: &str,
+    ) -> Result<Self, Self::Error> {
+        self.replace(range, text)
+    }
     fn visit_chars(&self, start: usize, max: usize, visitor: &mut dyn FnMut(usize, char) -> bool);
 
     /// Explicit materialization for diagnostics/files, not the rendering path.

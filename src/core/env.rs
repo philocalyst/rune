@@ -1,8 +1,10 @@
-use super::gc::{Context, GcState, ObjectMap, RootedDeref, Rt, Rto, Slot, Trace};
-use super::object::{LispBuffer, Object, OpenBuffer, Symbol, WithLifetime};
+use super::gc::{Context, ObjectMap, Rt, Rto, Slot, Trace};
+use super::object::{LispBuffer, Number, Object, Symbol, WithLifetime};
+use crate::editor_document::{
+    BufferRead, MarkerCleanupGuard, OwnerBufferHandle, RuntimeEditorGateway,
+};
 use anyhow::{Result, anyhow};
 use rune_macros::Trace;
-use std::cell::OnceCell;
 use std::sync::{LazyLock, Mutex};
 
 mod stack;
@@ -24,7 +26,7 @@ unsafe impl Send for InternedFeatures {}
 static INTERNED_FEATURES: LazyLock<Mutex<InternedFeatures>> = LazyLock::new(Mutex::default);
 
 type PropertyMap<'a> = ObjectMap<Slot<Symbol<'a>>, Vec<(Slot<Symbol<'a>>, Slot<Object<'a>>)>>;
-#[derive(Debug, Default, Trace)]
+#[derive(Debug, Trace)]
 pub(crate) struct Env<'a> {
     pub(crate) vars: ObjectMap<Slot<Symbol<'a>>, Slot<Object<'a>>>,
     pub(crate) props: PropertyMap<'a>,
@@ -32,107 +34,52 @@ pub(crate) struct Env<'a> {
     binding_stack: Vec<(Slot<Symbol<'a>>, Option<Slot<Object<'a>>>)>,
     pub(crate) match_data: Slot<Object<'a>>,
     features: Vec<Slot<Symbol<'a>>>,
-    pub(crate) current_buffer: CurrentBuffer<'a>,
+    #[no_trace]
+    pub(crate) current_buffer: OwnerBufferHandle,
+    #[no_trace]
+    editor_gateway: RuntimeEditorGateway,
     pub(crate) stack: LispStack<'a>,
 }
 
-#[derive(Debug)]
-pub(crate) struct CurrentBuffer<'a> {
-    buffer: OnceCell<OpenBuffer<'a>>,
-    pub(crate) buf_ref: &'a LispBuffer,
+/// Opaque live registration plus a native-only panic cleanup intent. It never
+/// borrows Context, so evaluation/collection can run while the token exists.
+pub(crate) struct ExcursionToken {
+    buffer: OwnerBufferHandle,
+    marker: rune_editor::MarkerId,
+    cleanup: MarkerCleanupGuard,
 }
-
-// CurrentBuffer contains a globally stable buffer handle and an optional
-// guard, not directly borrowed GC pointers. Its property slots are owned by
-// the Context registry, so rooting needs no transformed field representation.
-impl RootedDeref for CurrentBuffer<'_> {
-    type Target = Self;
-
-    fn rooted_deref(rooted: &Rt<Self>) -> &Self {
-        // Rt is repr(transparent); keep the lifetime parameter unchanged.
-        unsafe { &*(rooted as *const Rt<Self>).cast::<Self>() }
+impl<'a> Env<'a> {
+    pub(crate) fn new(cx: &Context) -> Result<Self> {
+        let editor_gateway = cx.editor_gateway()?;
+        let current_buffer = editor_gateway.scratch(cx)?;
+        Ok(Self {
+            vars: Default::default(),
+            props: Default::default(),
+            catch_stack: Default::default(),
+            binding_stack: Default::default(),
+            match_data: Default::default(),
+            features: Default::default(),
+            current_buffer,
+            editor_gateway,
+            stack: Default::default(),
+        })
     }
-
-    fn rooted_derefmut(rooted: &mut Rt<Self>) -> &mut Self {
-        unsafe { &mut *(rooted as *mut Rt<Self>).cast::<Self>() }
-    }
-}
-
-impl PartialEq<LispBuffer> for Rt<CurrentBuffer<'_>> {
-    fn eq(&self, other: &LispBuffer) -> bool {
-        CurrentBuffer::eq(self, other)
-    }
-}
-
-impl Trace for CurrentBuffer<'_> {
-    fn trace(&self, _: &mut GcState) {
-        // Globally stable text handle; Lisp metadata is traced by Context's
-        // owner-domain registry even when this buffer is not current.
-    }
-}
-
-impl Default for CurrentBuffer<'_> {
-    fn default() -> Self {
-        let name = crate::buffer::generate_new_buffer_name("*scratch*", None);
-        let buffer = {
-            // // need to drop global to avoid deadlocks
-            let global = INTERNED_SYMBOLS.lock().unwrap();
-            unsafe { global.create_buffer(&name).with_lifetime() }
-        };
-        crate::buffer::BUFFERS.lock().unwrap().insert(name, buffer);
-        Self { buffer: Default::default(), buf_ref: buffer }
-    }
-}
-
-impl<'a> CurrentBuffer<'a> {
-    fn lock(&self) -> OpenBuffer<'a> {
-        unsafe { self.buf_ref.lock().unwrap().with_lifetime() }
-    }
-
-    /// Fallible cached access for unwind/marker restoration. In particular,
-    /// selecting a killed saved buffer must not panic or re-lock a held guard.
-    pub(crate) fn try_get(&self) -> Result<&OpenBuffer<'a>> {
-        if self.buffer.get().is_none() {
-            let locked = unsafe { self.buf_ref.lock()?.with_lifetime() };
-            let _ = self.buffer.set(locked);
-        }
-        let buffer = self.buffer.get().unwrap();
-        anyhow::ensure!(buffer.is_live(), "selecting deleted buffer");
-        Ok(buffer)
-    }
-
-    pub(crate) fn try_get_mut(&mut self) -> Result<&mut OpenBuffer<'a>> {
-        self.try_get()?;
-        Ok(self.buffer.get_mut().unwrap())
-    }
-
-    pub(crate) fn get(&self) -> &OpenBuffer<'a> {
-        self.buffer.get_or_init(|| self.lock())
-    }
-
-    pub(crate) fn get_mut(&mut self) -> &mut OpenBuffer<'a> {
-        // there is no get_or_init_mut
-        if self.buffer.get().is_none() {
-            let locked = self.lock();
-            let _ = self.buffer.set(locked);
-        }
-        self.buffer.get_mut().unwrap()
-    }
-
-    pub(crate) fn set(&mut self, buffer: &LispBuffer) {
-        let buffer = unsafe { buffer.with_lifetime() };
-        self.buf_ref = buffer;
-        self.release();
-    }
-
-    pub(crate) fn release(&mut self) {
-        self.buffer.take();
-    }
-}
-
-impl PartialEq<LispBuffer> for CurrentBuffer<'_> {
-    fn eq(&self, other: &LispBuffer) -> bool {
-        self.buf_ref == other
+    /// Tests asking for isolation choose a fresh buffer explicitly while still
+    /// sharing the Context's single owner. Production new binds owner scratch.
+    #[cfg(test)]
+    pub(crate) fn new_isolated(cx: &Context) -> Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_add(1),
+            )
+            .expect("test buffer IDs exhausted");
+        let mut env = Self::new(cx)?;
+        env.current_buffer =
+            env.editor_gateway.create(&format!(" *isolated-eval-{id}*"), "", cx)?;
+        Ok(env)
     }
 }
 
@@ -157,7 +104,15 @@ impl<'a> RootedEnv<'a> {
         }
     }
 
+    pub(crate) fn validate_variable_value(var: Symbol, value: Object) -> Result<()> {
+        if var == crate::sym::INTEGER_WIDTH {
+            Number::try_from(value)?.integer_width()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_var(&mut self, sym: Symbol, value: Object) -> Result<()> {
+        Self::validate_variable_value(sym, value)?;
         if sym.is_const() {
             Err(anyhow!("Attempt to set a constant symbol: {sym}"))
         } else {
@@ -178,10 +133,12 @@ impl<'a> RootedEnv<'a> {
         }
     }
 
-    pub(crate) fn varbind(&mut self, var: Symbol, value: Object, cx: &Context) {
+    pub(crate) fn varbind(&mut self, var: Symbol, value: Object, cx: &Context) -> Result<()> {
+        Self::validate_variable_value(var, value)?;
         let prev_value = self.vars.get(var).map(|x| x.bind(cx));
         self.binding_stack.push((var, prev_value));
         self.vars.insert(var, value);
+        Ok(())
     }
 
     /// Save a dynamic-binding boundary for bytecode frames and handlers.
@@ -222,121 +179,121 @@ impl<'a> RootedEnv<'a> {
         // we will bind it to the new value
         for binding in &mut *self.binding_stack {
             if binding.0 == var && binding.1.is_none() {
+                Self::validate_variable_value(var, value)?;
                 binding.1.set(Some(value));
             }
         }
         Ok(())
     }
 
-    pub(crate) fn set_buffer(&mut self, buffer: &LispBuffer) {
-        if buffer == self.current_buffer.buf_ref {
-            return;
-        }
-        CurrentBuffer::set(&mut self.current_buffer, buffer);
+    pub(crate) fn editor_gateway(&self) -> RuntimeEditorGateway {
+        self.editor_gateway.clone()
     }
-
-    /// Restore through a cached current guard or lock a noncurrent buffer once.
-    /// Native-only: never evaluate Lisp or allocate on the moving heap here.
-    pub(crate) fn restore_excursion_marker(
+    pub(crate) fn current_buffer_handle(&self) -> OwnerBufferHandle {
+        self.current_buffer
+    }
+    pub(crate) fn buffer_read(&self, cx: &Context) -> Result<BufferRead> {
+        self.editor_gateway.read(self.current_buffer, cx)
+    }
+    pub(crate) fn set_current_buffer(
         &mut self,
-        saved: &LispBuffer,
-        marker: rune_text::MarkerId,
-    ) -> bool {
-        if saved == self.current_buffer.buf_ref {
-            return self
-                .current_buffer
-                .try_get_mut()
-                .is_ok_and(|buffer| buffer.restore_excursion_marker(marker));
-        }
-        let restored = match saved.lock() {
-            Ok(mut buffer) => buffer.restore_excursion_marker(marker),
-            Err(_) => false,
-        };
-        if restored {
-            self.set_buffer(saved)
-        }
-        restored
+        handle: OwnerBufferHandle,
+        cx: &Context,
+    ) -> Result<()> {
+        self.editor_gateway.read(handle, cx)?;
+        self.current_buffer = handle;
+        Ok(())
     }
-
+    pub(crate) fn set_buffer(&mut self, buffer: &LispBuffer, cx: &Context) -> Result<()> {
+        self.set_current_buffer(buffer.handle(), cx)
+    }
+    pub(crate) fn save_excursion(&self, cx: &Context) -> Result<ExcursionToken> {
+        let read = self.buffer_read(cx)?;
+        let (marker, cleanup) = self.editor_gateway.register_temporary_marker(
+            self.current_buffer,
+            read.point,
+            rune_editor::Bias::Left,
+            cx,
+        )?;
+        Ok(ExcursionToken { buffer: self.current_buffer, marker, cleanup })
+    }
+    /// Restore CURRENT live marker state, not an old immutable marker root.
+    /// The guard's Drop queues unregister if any failure interrupts cleanup.
+    pub(crate) fn restore_excursion(&mut self, token: ExcursionToken, cx: &Context) -> bool {
+        let Ok(Some(point)) = self.editor_gateway.marker_position(token.buffer, token.marker, cx)
+        else {
+            return false;
+        };
+        if self.editor_gateway.remove_marker(token.buffer, token.marker, cx).is_err() {
+            return false;
+        }
+        if self.editor_gateway.set_point(token.buffer, point, cx).is_err() {
+            return false;
+        }
+        self.current_buffer = token.buffer;
+        token.cleanup.disarm();
+        true
+    }
     pub(crate) fn with_buffer<T>(
         &self,
         buffer: &LispBuffer,
-        mut func: impl FnMut(&OpenBuffer) -> T,
+        cx: &Context,
+        func: impl FnOnce(&BufferRead) -> T,
     ) -> Result<T> {
-        if self.current_buffer == *buffer {
-            Ok(func(self.current_buffer.get()))
-        } else {
-            let buffer = buffer.lock()?;
-            Ok(func(&buffer))
-        }
-    }
-
-    pub(crate) fn with_buffer_mut<T>(
-        &mut self,
-        buffer: &LispBuffer,
-        mut func: impl FnMut(&mut OpenBuffer) -> T,
-    ) -> Result<T> {
-        if self.current_buffer == *buffer {
-            Ok(func(self.current_buffer.get_mut()))
-        } else {
-            let mut buffer = buffer.lock()?;
-            Ok(func(&mut buffer))
-        }
+        let read = self.editor_gateway.read(buffer.handle(), cx)?;
+        Ok(func(&read))
     }
 }
 
 #[cfg(test)]
-mod current_buffer_gc_tests {
+mod owner_env_tests {
     use super::*;
-    use crate::core::{cons::Cons, gc::RootSet, object::NIL};
+    use crate::core::gc::RootSet;
     use rune_core::macros::root;
-
     #[test]
-    fn m0_current_buffer_properties_survive_gc_with_cached_and_released_guard() {
-        for release in [false, true] {
-            let roots = RootSet::default();
-            let cx = &mut Context::new(&roots);
-            root!(env, new(Env), cx);
-            env.current_buffer.get_mut().insert(cx.add("x"), &cx).unwrap();
-            let key = cx.add(intern("m0-buffer-gc-property", cx));
-            // The stored list/string have no root except the current buffer.
-            let plist =
-                Cons::new(key, Cons::new(cx.add("survives-current-buffer-gc"), NIL, cx), cx);
-            env.current_buffer.get_mut().textprops.lock(&cx).unwrap().set_properties(
-                1,
-                2,
-                plist.into(),
-            );
-            if release {
-                env.current_buffer.release();
-            }
-            for _ in 0..3 {
-                cx.garbage_collect(true);
-                let properties =
-                    *env.current_buffer.get().textprops.lock(&cx).unwrap().find(1).unwrap().val;
-                let value = crate::intervals::textget(
-                    properties,
-                    cx.add(intern("m0-buffer-gc-property", cx)),
-                )
-                .unwrap();
-                assert_eq!(value, cx.add("survives-current-buffer-gc"));
-                if release {
-                    env.current_buffer.release();
-                }
-            }
-            // Context teardown retires metadata even while its global handle survives.
-        }
-    }
-
-    #[test]
-    fn m0_current_buffer_gc_tolerates_killed_guard() {
+    fn independent_env_bindings_share_exact_owner_without_accidental_buffer_aliases() -> Result<()>
+    {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        root!(env, new(Env), cx);
-        env.current_buffer.get_mut().kill();
+        root!(first, init(Env::new(cx)?), cx);
+        root!(second, init(Env::new(cx)?), cx);
+        assert_eq!(first.current_buffer_handle(), second.current_buffer_handle());
+        let gateway = first.editor_gateway();
+        let a = gateway.create("env-a", "λ", cx)?;
+        let b = gateway.create("env-b", "🙂", cx)?;
+        first.set_current_buffer(a, cx)?;
+        second.set_current_buffer(b, cx)?;
+        let read = first.buffer_read(cx)?;
+        gateway.splice(a, read.epoch, 1..1, "x", cx)?;
+        assert_eq!(first.buffer_read(cx)?.document.text().to_string(), "λx");
+        assert_eq!(second.buffer_read(cx)?.document.text().to_string(), "🙂");
+        assert_eq!(second.current_buffer_handle(), b);
+        root!(isolated, init(Env::new_isolated(cx)?), cx);
+        assert_ne!(isolated.current_buffer_handle(), a);
+        assert_ne!(isolated.current_buffer_handle(), b);
         cx.garbage_collect(true);
-        env.current_buffer.release();
-        cx.garbage_collect(true);
+        assert_eq!(first.buffer_read(cx)?.document.text().to_string(), "λx");
+        Ok(())
+    }
+    #[test]
+    fn excursion_cleanup_guard_queues_only_abandoned_native_registration() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let gateway = env.editor_gateway();
+        let handle = env.current_buffer_handle();
+        let keep = gateway.register_marker(handle, 0, rune_editor::Bias::Left, cx)?;
+        let mut abandoned = None;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let token = env.save_excursion(cx).unwrap();
+            abandoned = Some(token.marker);
+            let _guard = token;
+            panic!("test unwind");
+        }));
+        assert!(panic.is_err());
+        assert_eq!(gateway.marker_position(handle, abandoned.unwrap(), cx)?, None);
+        assert_eq!(gateway.marker_position(handle, keep, cx)?, Some(0));
+        Ok(())
     }
 }
 
@@ -352,7 +309,7 @@ mod feature_ownership_tests {
         std::thread::spawn(move || {
             let roots = RootSet::default();
             let cx = &mut Context::new(&roots);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let feature = intern(name, cx);
             env.provide_feature(feature, cx);
             assert!(env.features.is_empty());
@@ -361,7 +318,7 @@ mod feature_ownership_tests {
         .unwrap();
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         assert!(env.has_feature(intern(name, cx), cx));
     }
 
@@ -369,7 +326,7 @@ mod feature_ownership_tests {
     fn uninterned_features_are_rooted_and_keep_identity() {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         {
             let first = Symbol::new_uninterned("local-feature", &cx.block);
             let second = Symbol::new_uninterned("local-feature", &cx.block);

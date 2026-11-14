@@ -84,59 +84,71 @@ fn char_to_string(chr: char) -> String {
 
 #[defun]
 pub(crate) fn insert(args: ArgSlice, env: &mut Rt<Env>, cx: &Context) -> Result<()> {
-    let env = &mut **env; // Deref into rooted type so we can split the borrow
-    let buffer = env.current_buffer.get_mut();
     let args = Rt::bind_slice(env.stack.arg_slice(args), cx);
     for arg in args {
-        buffer.insert(*arg, cx)?;
+        let mut encoded = [0u8; 4];
+        let text = match arg.untag() {
+            ObjectType::String(text) => &**text,
+            ObjectType::Int(value) => {
+                let code = u32::try_from(value)?;
+                let Some(ch) = char::from_u32(code) else {
+                    bail!("Invalid Unicode character {value}")
+                };
+                ch.encode_utf8(&mut encoded)
+            }
+            other => {
+                bail!(crate::core::error::TypeError::new(crate::core::error::Type::String, other))
+            }
+        };
+        let read = env.buffer_read(cx)?;
+        env.editor_gateway()
+            .splice(read.handle, read.epoch, read.point..read.point, text, cx)?;
     }
     Ok(())
 }
-
-// TODO: this should not throw and error. Buffer will always be present.
 #[defun]
-pub(crate) fn goto_char(position: i64, env: &mut Rt<Env>) -> Result<i64> {
-    let buffer = env.current_buffer.get_mut();
-    let index = usize::try_from(position.max(1)).unwrap_or(usize::MAX);
-    buffer.text.set_cursor(index.saturating_sub(1));
+pub(crate) fn goto_char(position: i64, env: &Rt<Env>, cx: &Context) -> Result<i64> {
+    let read = env.buffer_read(cx)?;
+    let index = usize::try_from(position.max(1))
+        .unwrap_or(usize::MAX)
+        .saturating_sub(1)
+        .min(read.document.text().len_chars());
+    env.editor_gateway().set_point(read.handle, index, cx)?;
     Ok(position)
 }
-
-// TODO: this should not throw and error. Buffer will always be present.
 #[defun]
-pub(crate) fn point_max(env: &mut Rt<Env>) -> Result<usize> {
-    let buffer = env.current_buffer.get_mut();
-    // TODO: Handle narrowing
-    Ok(buffer.text.len_chars() + 1)
+pub(crate) fn point_max(env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    Ok(env.buffer_read(cx)?.document.text().len_chars() + 1)
 }
-
 #[defun]
 pub(crate) fn point_min() -> usize {
-    // TODO: Handle narrowing
     1
 }
-
 #[defun]
-pub(crate) fn point_marker(env: &mut Rt<Env>) -> usize {
-    // TODO: Implement marker objects
-    env.current_buffer.get_mut().text.cursor().chars() + 1
+pub(crate) fn point_marker(env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    point(env, cx)
 }
-
 #[defun]
-fn delete_region(start: usize, end: usize, env: &mut Rt<Env>, cx: &Context) -> Result<()> {
-    env.current_buffer.get_mut().delete(start, end, cx)
+fn delete_region(start: usize, end: usize, env: &Rt<Env>, cx: &Context) -> Result<()> {
+    let read = env.buffer_read(cx)?;
+    let (start, end) = (start.min(end), start.max(end));
+    ensure!(
+        start > 0 && end <= read.document.text().len_chars() + 1,
+        "Buffer range out of bounds"
+    );
+    env.editor_gateway()
+        .splice(read.handle, read.epoch, start - 1..end - 1, "", cx)?;
+    Ok(())
 }
-
 #[defun]
-fn bolp(env: &Rt<Env>) -> bool {
-    let buf = env.current_buffer.get();
-    let chars = buf.text.cursor().chars();
-    chars == 0 || buf.text.char_at(chars - 1).unwrap() == '\n'
+fn bolp(env: &Rt<Env>, cx: &Context) -> Result<bool> {
+    let read = env.buffer_read(cx)?;
+    Ok(read.point == 0
+        || read.document.text().char_at(rune_text::CharPos(read.point - 1)) == Some('\n'))
 }
-
 #[defun]
-fn point(env: &Rt<Env>) -> usize {
-    env.current_buffer.get().text.cursor().chars() + 1
+fn point(env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    Ok(env.buffer_read(cx)?.point + 1)
 }
 
 #[defun]
@@ -245,7 +257,7 @@ mod test {
     fn test_insert() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let buffer = get_buffer_create(cx.add("test_insert"), Some(NIL), cx).unwrap();
         set_buffer(buffer, env, cx).unwrap();
         cx.garbage_collect(true);
@@ -255,14 +267,14 @@ mod test {
         env.stack.push(108);
         env.stack.push(111);
         insert(ArgSlice::new(5), env, cx).unwrap();
-        assert_eq!(env.current_buffer.get(), "hello");
+        assert_eq!(env.buffer_read(cx).unwrap().document.text().to_string(), "hello");
     }
 
     #[test]
     fn test_delete_region() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let buffer = get_buffer_create(cx.add("test_delete_region"), Some(NIL), cx).unwrap();
         set_buffer(buffer, env, cx).unwrap();
         cx.garbage_collect(true);
@@ -270,41 +282,36 @@ mod test {
         env.stack.push(cx.add(" world"));
         insert(ArgSlice::new(2), env, cx).unwrap();
 
-        assert_eq!(env.current_buffer.get(), "hello world");
+        assert_eq!(env.buffer_read(cx).unwrap().document.text().to_string(), "hello world");
         delete_region(2, 4, env, cx).unwrap();
-        assert_eq!(env.current_buffer.get(), "hlo world");
+        assert_eq!(env.buffer_read(cx).unwrap().document.text().to_string(), "hlo world");
     }
 }
 
 #[cfg(test)]
 mod recovered_point_tests {
     use super::*;
-    use crate::{
-        buffer::{get_buffer_create, set_buffer},
-        core::gc::RootSet,
-        sym::NIL,
-    };
+    use crate::core::gc::RootSet;
     use rune_core::macros::root;
     #[test]
     fn signed_one_based_points_are_character_offsets() -> Result<()> {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        root!(env, new(Env), cx);
-        let buffer = get_buffer_create(cx.add("recovery-point-boundary"), Some(NIL.into()), cx)?;
-        set_buffer(buffer, env, cx)?;
-        assert_eq!(point(env), 1);
-        env.current_buffer.get_mut().insert(cx.add("aé🙂z"), cx)?;
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        assert_eq!(point(env, cx)?, 1);
+        let read = env.buffer_read(cx)?;
+        env.editor_gateway().splice(read.handle, read.epoch, 0..0, "aé🙂z", cx)?;
         for (requested, expected) in
             [(-10, 1), (0, 1), (1, 1), (2, 2), (3, 3), (5, 5), (99, 5), (i64::MAX, 5)]
         {
-            assert_eq!(goto_char(requested, env)?, requested);
-            assert_eq!(point(env), expected);
-            assert_eq!(point_marker(env), expected)
+            assert_eq!(goto_char(requested, env, cx)?, requested);
+            assert_eq!(point(env, cx)?, expected);
+            assert_eq!(point_marker(env, cx)?, expected)
         }
-        goto_char(1, env)?;
-        assert!(bolp(env));
-        goto_char(2, env)?;
-        assert!(!bolp(env));
+        goto_char(1, env, cx)?;
+        assert!(bolp(env, cx)?);
+        goto_char(2, env, cx)?;
+        assert!(!bolp(env, cx)?);
         Ok(())
     }
 }

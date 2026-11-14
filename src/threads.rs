@@ -55,7 +55,7 @@ fn go_internal<'ob>(obj: Object, cx: &'ob Context) -> Object<'ob> {
         // A worker owns the ordinary singleton Context on its fresh thread.
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).expect("fresh worker editor initialization")), cx);
         // Each worker has its own variable bindings, including the same built-in
         // defaults as the main interpreter. Root them before evaluation can GC.
         crate::core::env::init_variables(cx, env);
@@ -128,7 +128,7 @@ mod tests {
     fn roadmap_m0_go_defaults_are_local_to_child_env() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).expect("fresh worker editor initialization")), cx);
         crate::core::env::init_variables(cx, env);
         env.set_var(sym::FILL_COLUMN, cx.add(91)).unwrap();
 

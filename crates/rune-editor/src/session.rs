@@ -138,6 +138,7 @@ struct HistoryEntry<D: Document> {
     after: D,
     splice: Splice,
     metadata: bool,
+    coordinate_stable: bool,
     before_markers: Option<D::MarkerUndo>,
     after_markers: Option<D::MarkerUndo>,
     before_version: u64,
@@ -526,9 +527,15 @@ impl<D: Document> Session<D> {
     }
     fn edit(&mut self, range: Range<usize>, text: &str) -> Result<BufferId> {
         let id = self.state.windows.view(self.selected_window())?.buffer;
-        self.edit_buffer(id, range, text)
+        self.edit_buffer(id, range, text, false)
     }
-    fn edit_buffer(&mut self, id: BufferId, range: Range<usize>, text: &str) -> Result<BufferId> {
+    fn edit_buffer(
+        &mut self,
+        id: BufferId,
+        range: Range<usize>,
+        text: &str,
+        preserve: bool,
+    ) -> Result<BufferId> {
         let buffer = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
         if buffer.read_only {
             return Err(EditorError::ReadOnly);
@@ -540,7 +547,8 @@ impl<D: Document> Session<D> {
             buffer.publication_epoch.checked_add(1).ok_or(EditorError::IdExhausted)?;
         let inserted = text.chars().count();
         let splice = Splice { start: range.start, end: range.end, inserted };
-        let records = if range.start < range.end {
+        let coordinate_stable = preserve && inserted == range.end - range.start;
+        let records = if !coordinate_stable && range.start < range.end {
             Some(
                 buffer
                     .document
@@ -550,10 +558,12 @@ impl<D: Document> Session<D> {
         } else {
             None
         };
-        let document = buffer
-            .document
-            .replace(range, text)
-            .map_err(|error| EditorError::Backend(error.to_string()))?;
+        let document = if preserve {
+            buffer.document.replace_preserving_properties(range, text)
+        } else {
+            buffer.document.replace(range, text)
+        }
+        .map_err(|error| EditorError::Backend(error.to_string()))?;
         let length = document.len_chars();
         let version = buffer.next_version;
         let next = version.checked_add(1).ok_or(EditorError::IdExhausted)?;
@@ -562,12 +572,15 @@ impl<D: Document> Session<D> {
             after: document.clone(),
             splice,
             metadata: false,
+            coordinate_stable,
             before_markers: records,
             after_markers: None,
             before_version: buffer.version,
             after_version: version,
         };
-        self.map_views(id, splice, length)?;
+        if !coordinate_stable {
+            self.map_views(id, splice, length)?;
+        }
         let buffer = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
         if !buffer.name.starts_with(' ') {
             buffer.undo = Some(Arc::new(History { entry, next: buffer.undo.clone() }));
@@ -617,7 +630,7 @@ impl<D: Document> Session<D> {
         };
         let reinserted =
             if redo { entry.after_markers.clone() } else { entry.before_markers.clone() };
-        let removed = if !entry.metadata && splice.start < splice.end {
+        let removed = if !entry.metadata && !entry.coordinate_stable && splice.start < splice.end {
             Some(
                 buffer
                     .document
@@ -627,7 +640,7 @@ impl<D: Document> Session<D> {
         } else {
             None
         };
-        if !entry.metadata {
+        if !entry.metadata && !entry.coordinate_stable {
             if redo {
                 entry.before_markers = removed;
             } else {
@@ -638,12 +651,12 @@ impl<D: Document> Session<D> {
             .document
             .restore_history(
                 &document,
-                if entry.metadata { None } else { Some(splice) },
+                if entry.metadata || entry.coordinate_stable { None } else { Some(splice) },
                 reinserted.as_ref(),
             )
             .map_err(|e| EditorError::Backend(e.to_string()))?;
         let length = document.len_chars();
-        if !entry.metadata {
+        if !entry.metadata && !entry.coordinate_stable {
             self.map_views(id, splice, length)?;
         }
         let metadata = entry.metadata;
@@ -963,6 +976,7 @@ impl<D: Document> Session<D> {
                 after: document.clone(),
                 splice: Splice { start: 0, end: 0, inserted: 0 },
                 metadata: true,
+                coordinate_stable: true,
                 before_markers: None,
                 after_markers: None,
                 before_version: b.version,
@@ -1019,6 +1033,25 @@ impl<D: Document> Session<D> {
         range: Range<usize>,
         text: &str,
     ) -> Result<CommandOutcome> {
+        self.replace_buffer_policy(id, expected_epoch, range, text, false)
+    }
+    pub fn replace_buffer_preserving_properties(
+        &mut self,
+        id: BufferId,
+        expected_epoch: u64,
+        range: Range<usize>,
+        text: &str,
+    ) -> Result<CommandOutcome> {
+        self.replace_buffer_policy(id, expected_epoch, range, text, true)
+    }
+    fn replace_buffer_policy(
+        &mut self,
+        id: BufferId,
+        expected_epoch: u64,
+        range: Range<usize>,
+        text: &str,
+        preserve: bool,
+    ) -> Result<CommandOutcome> {
         if self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.publication_epoch
             != expected_epoch
         {
@@ -1026,7 +1059,7 @@ impl<D: Document> Session<D> {
         }
         let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
         let backup = self.state.clone();
-        let result = catch_unwind(AssertUnwindSafe(|| self.edit_buffer(id, range, text)));
+        let result = catch_unwind(AssertUnwindSafe(|| self.edit_buffer(id, range, text, preserve)));
         match result {
             Ok(Ok(id)) => {
                 self.state.sequence = sequence;

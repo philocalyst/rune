@@ -427,7 +427,7 @@ mod checked_argument_tests {
     fn checked_arguments_boundary_finalization_is_atomic() {
         let roots = RootSet::default();
         let cx = &Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let mut frame = CallFrame::new(env);
         for _ in 0..u16::MAX {
             frame.push_arg(NIL);
@@ -444,7 +444,7 @@ mod checked_argument_tests {
     fn checked_arguments_frame_entry_rejects_overflow_and_caller_prefix_access() {
         let roots = RootSet::default();
         let cx = &Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         for _ in 0..=u16::MAX {
             env.stack.push(NIL);
         }

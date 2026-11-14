@@ -73,8 +73,11 @@ impl SymbolMap {
         &self.block
     }
 
-    pub(crate) fn create_buffer(&self, name: &str) -> &LispBuffer {
-        LispBuffer::create(name.to_owned(), &self.block)
+    pub(crate) fn create_buffer(
+        &self,
+        handle: crate::editor_document::OwnerBufferHandle,
+    ) -> &LispBuffer {
+        LispBuffer::create(handle, &self.block)
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<Symbol<'_>> {
@@ -178,7 +181,7 @@ mod test {
     fn test_init_variables() {
         let roots = &RootSet::default();
         let cx = &Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         init_variables(cx, env);
     }
 }

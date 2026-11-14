@@ -63,6 +63,25 @@ impl Document for RopeDocument {
         )?;
         Ok(Self { snapshot, insertion_properties: self.insertion_properties })
     }
+    fn replace_preserving_properties(
+        &self,
+        range: Range<usize>,
+        text: &str,
+    ) -> Result<Self, Self::Error> {
+        let mut next = self.replace(range.clone(), text)?;
+        if range.end - range.start == text.chars().count() {
+            for (run, id) in self.snapshot.properties().runs() {
+                let start = run.start.0.max(range.start);
+                let end = run.end.0.min(range.end);
+                if start < end {
+                    next.snapshot =
+                        next.snapshot.set_properties(CharPos(start)..CharPos(end), id)?;
+                }
+            }
+            next.snapshot = self.snapshot.restore_content(&next.snapshot, None)?;
+        }
+        Ok(next)
+    }
     fn visit_chars(&self, start: usize, max: usize, visitor: &mut dyn FnMut(usize, char) -> bool) {
         if let Ok(chars) = self.snapshot.chars_from(CharPos(start)) {
             for (offset, ch) in chars.take(max).enumerate() {

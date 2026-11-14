@@ -4,7 +4,7 @@ use crate::{
         env::Env,
         error::{Type, TypeError},
         gc::{Context, Rt, Slot},
-        object::{NIL, Object, ObjectType, TRUE, WithLifetime},
+        object::{NIL, Object, ObjectType, TRUE},
     },
     fns::eq,
     intervals::textget,
@@ -12,8 +12,6 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use rune_core::macros::list;
 use rune_macros::defun;
-
-use crate::core::object::BufferData;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,45 +84,242 @@ fn merge_properties<'ob>(
     Ok((obj_i, changed))
 }
 
-/// Helper function to safely modify buffer data.
-///
-/// Takes an object (buffer or nil) and environment, and applies the given function
-/// to the buffer's data. Handles both current buffer and other buffers safely.
-///
-/// # Arguments
-/// * `object` - The buffer object to modify (or nil for current buffer)
-/// * `env` - The environment containing buffer state
-/// * `func` - Function to apply to the buffer's data
-///
-/// # Returns
-/// Result containing the return value from func or an error
-fn modify_buffer_data<'ob, T>(
-    object: Object<'ob>,
-    env: &'ob mut Rt<Env>,
-    func: impl FnOnce(&mut BufferData) -> Result<T>,
-) -> Result<T> {
-    if object.is_nil() {
-        let data = env.current_buffer.get_mut();
-        func(data)
-    } else {
-        let current_buf = env.current_buffer.buf_ref;
-        if let Some(b) = object.buffer() {
-            if b == current_buf {
-                let data = env.current_buffer.get_mut();
-                func(data)
-            } else {
-                let mut open_buf = b.lock()?;
-                func(open_buf.get_mut())
+// Captured, owner-local property view. This is never stored in a buffer or sent
+// to workers. The immutable document lease roots old values; &Context excludes
+// collection throughout the native-only scan/merge and prepared publication.
+struct PropertyView<'ob> {
+    text: PropertyLength,
+    textprops: PropertyScratch<'ob>,
+}
+struct PropertyLength(usize);
+impl PropertyLength {
+    fn len_chars(&self) -> usize {
+        self.0
+    }
+}
+#[derive(Clone)]
+struct PropertyNode<'ob> {
+    key: std::ops::Range<usize>,
+    val: Slot<Object<'ob>>,
+}
+struct PropertyIndex<'ob> {
+    nodes: Vec<PropertyNode<'ob>>,
+}
+impl<'ob> PropertyIndex<'ob> {
+    fn find_intersect_min(&self, range: std::ops::Range<usize>) -> Option<PropertyNode<'ob>> {
+        self.nodes
+            .iter()
+            .find(|n| n.key.start < range.end && range.start < n.key.end)
+            .cloned()
+    }
+    fn find_intersect_max(&self, range: std::ops::Range<usize>) -> Option<PropertyNode<'ob>> {
+        self.nodes
+            .iter()
+            .rev()
+            .find(|n| n.key.start < range.end && range.start < n.key.end)
+            .cloned()
+    }
+}
+struct PropertyScratch<'ob> {
+    tree: PropertyIndex<'ob>,
+    updates: Vec<(std::ops::Range<usize>, Object<'ob>)>,
+}
+impl<'ob> PropertyScratch<'ob> {
+    fn find(&self, position: usize) -> Option<PropertyNode<'ob>> {
+        self.tree.nodes.iter().find(|n| n.key.contains(&position)).cloned()
+    }
+    fn iter(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> std::vec::IntoIter<(std::ops::Range<usize>, Object<'ob>)> {
+        let mut segments = Vec::new();
+        let mut cursor = start;
+        if start >= end {
+            return segments.into_iter();
+        }
+        for node in &self.tree.nodes {
+            let a = node.key.start.max(start);
+            let b = node.key.end.min(end);
+            if a >= b {
+                continue;
             }
-        } else {
-            Err(anyhow!(TypeError::new(Type::BufferOrString, object.untag())))
+            if cursor < a {
+                segments.push((cursor..a, NIL));
+            }
+            segments.push((a..b, *node.val));
+            cursor = b;
+        }
+        if cursor < end {
+            segments.push((cursor..end, NIL));
+        }
+        segments.into_iter()
+    }
+    fn iter_reverse(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> std::vec::IntoIter<(std::ops::Range<usize>, Object<'ob>)> {
+        let mut segments: Vec<_> = self.iter(start, end).collect();
+        segments.reverse();
+        segments.into_iter()
+    }
+    fn set_properties(&mut self, start: usize, end: usize, properties: Object<'ob>) {
+        if start < end {
+            self.updates.push((start..end, properties));
         }
     }
+    fn insert(
+        &mut self,
+        start: usize,
+        end: usize,
+        properties: Slot<Object<'ob>>,
+        cx: &'ob Context,
+    ) -> Result<()> {
+        let mut updates = Vec::new();
+        for (range, old) in self.iter(start, end) {
+            let (new, _) = merge_properties(*properties, old, cx)?;
+            if !property_plists_eq(old, new)? {
+                updates.push((range, new));
+            }
+        }
+        self.updates.extend(updates);
+        Ok(())
+    }
+    fn delete(
+        &mut self,
+        start: usize,
+        end: usize,
+        keys: Object<'ob>,
+        cx: &'ob Context,
+    ) -> Result<bool> {
+        let keys = keys.as_list()?.collect::<std::result::Result<Vec<_>, _>>()?;
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        let mut updates = Vec::new();
+        for (range, old) in self.iter(start, end) {
+            let mut iter = old.as_list()?;
+            let mut pairs = Vec::new();
+            let mut changed = false;
+            while let Some(key) = iter.next() {
+                let key = key?;
+                let value = iter.next().ok_or_else(|| anyhow!("Odd length property list"))??;
+                if keys.iter().any(|k| eq(*k, key)) {
+                    changed = true;
+                } else {
+                    pairs.push((key, value));
+                }
+            }
+            if changed {
+                let mut new = NIL;
+                for (key, value) in pairs.into_iter().rev() {
+                    new = Cons::new(key, Cons::new(value, new, cx), cx).into();
+                }
+                updates.push((range, new));
+            }
+        }
+        let changed = !updates.is_empty();
+        self.updates.extend(updates);
+        Ok(changed)
+    }
+}
+fn property_plists_eq(a: Object<'_>, b: Object<'_>) -> Result<bool> {
+    if eq(a, b) {
+        return Ok(true);
+    }
+    fn pairs(value: Object<'_>) -> Result<Vec<(Object<'_>, Object<'_>)>> {
+        let mut iter = value.as_list()?;
+        let mut result = Vec::new();
+        while let Some(key) = iter.next() {
+            let key = key?;
+            let value = iter.next().ok_or_else(|| anyhow!("Odd length property list"))??;
+            if !result.iter().any(|(k, _)| eq(*k, key)) {
+                result.push((key, value));
+            }
+        }
+        Ok(result)
+    }
+    let a = pairs(a)?;
+    let b = pairs(b)?;
+    Ok(
+        a.len() == b.len()
+            && a.iter().all(|(k, v)| b.iter().any(|(l, w)| eq(*k, *l) && eq(*v, *w))),
+    )
+}
+fn modify_buffer_data<'ob, T>(
+    object: Object<'ob>,
+    env: &mut Rt<Env>,
+    cx: &'ob Context,
+    func: impl FnOnce(&mut PropertyView<'ob>) -> Result<T>,
+) -> Result<T> {
+    let gateway = env.editor_gateway();
+    let handle = if object.is_nil() {
+        env.current_buffer_handle()
+    } else {
+        object
+            .buffer()
+            .ok_or_else(|| anyhow!(TypeError::new(Type::BufferOrString, object.untag())))?
+            .handle()
+    };
+    let read = gateway.read(handle, cx)?;
+    let mut nodes: Vec<PropertyNode<'ob>> = Vec::new();
+    // Native sparse run view only, never text flattening or an IntervalTree.
+    // Materialization currently costs O(property runs); values remain rooted
+    // by read.document, and this view cannot outlive its shared Context borrow.
+    for (range, id) in read.document.properties().runs() {
+        let value = read.document.resolve(id.0, cx)?;
+        if value.is_nil() {
+            continue;
+        }
+        let range = (range.start.0 + 1)..(range.end.0 + 1);
+        if let Some(last) = nodes.last_mut() {
+            if last.key.end == range.start && property_plists_eq(*last.val, value).unwrap_or(false)
+            {
+                last.key.end = range.end;
+                continue;
+            }
+        }
+        nodes.push(PropertyNode { key: range, val: Slot::new(value) });
+    }
+    let mut view = PropertyView {
+        text: PropertyLength(read.document.text().len_chars()),
+        textprops: PropertyScratch { tree: PropertyIndex { nodes }, updates: Vec::new() },
+    };
+    let result = func(&mut view)?;
+    if !view.textprops.updates.is_empty() {
+        let mut updates = Vec::new();
+        for (range, value) in &view.textprops.updates {
+            // Skip no-effective-change assignments without publishing history.
+            if view
+                .textprops
+                .iter(range.start, range.end)
+                .all(|(_, old)| property_plists_eq(old, *value).unwrap_or(false))
+            {
+                continue;
+            }
+            // SAFETY: values are resolved from this owner-checked immutable
+            // document, evaluator inputs, or freshly built same-Context plist
+            // spines. This is the evaluator's trusted reachable-graph boundary,
+            // not a runtime proof of arbitrary Object provenance. No GC/callback
+            // occurs under the shared Context borrow or gateway allocator call.
+            let property = unsafe { gateway.intern_property(*value, cx) }?;
+            updates.push((
+                rune_text::CharPos(range.start - 1)..rune_text::CharPos(range.end - 1),
+                property,
+            ));
+        }
+        if !updates.is_empty() {
+            let prepared = gateway.prepare_property_runs(&read, updates, cx)?;
+            gateway.publish_properties(prepared, cx)?;
+        }
+    }
+    Ok(result)
 }
 
 /// GNU validate_interval_range treats empty mutation ranges as no-ops before
 /// checking bounds; nonempty buffer ranges use one-based character positions.
-fn validate_property_mutation_range(data: &BufferData, start: usize, end: usize) -> Result<bool> {
+fn validate_property_mutation_range(data: &PropertyView, start: usize, end: usize) -> Result<bool> {
     if start == end {
         return Ok(false);
     }
@@ -159,7 +354,7 @@ pub fn text_properties_at<'ob>(
     if matches!(object.untag(), ObjectType::String(_)) {
         bail!("String text properties are not supported yet");
     }
-    modify_buffer_data(object, env, |data| {
+    modify_buffer_data(object, env, cx, |data| {
         let point_max = data.text.len_chars() + 1;
         if position == 0 || position > point_max {
             bail!("Buffer position {position} is out of range 1..={point_max}");
@@ -169,11 +364,11 @@ pub fn text_properties_at<'ob>(
         if position == point_max {
             return Ok(NIL);
         }
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         let properties = tree.find(position).map(|node| *node.val).unwrap_or(NIL);
         // The returned Lisp object belongs to the GC context, not to the
         // temporary buffer mutex guard used to look it up.
-        Ok(unsafe { properties.with_lifetime() })
+        Ok(properties)
     })
 }
 
@@ -247,7 +442,7 @@ pub fn next_char_property_change<'ob>(
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    let point_max = env.current_buffer.get().text.len_chars() + 1;
+    let point_max = env.buffer_read(cx)?.document.text().len_chars() + 1;
     if position == 0 || position > point_max {
         bail!("Buffer position {position} is out of range 1..={point_max}");
     }
@@ -268,7 +463,7 @@ pub fn previous_char_property_change<'ob>(
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    let point_max = env.current_buffer.get().text.len_chars() + 1;
+    let point_max = env.buffer_read(cx)?.document.text().len_chars() + 1;
     if position == 0 || position > point_max {
         bail!("Buffer position {position} is out of range 1..={point_max}");
     }
@@ -290,7 +485,7 @@ pub fn next_single_char_property_change<'ob>(
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    let point_max = character_property_scan_point_max(position, object, env)?;
+    let point_max = character_property_scan_point_max(position, object, env, cx)?;
     let point_max = i64::try_from(point_max)?;
     let limit = limit.unwrap_or(point_max).min(point_max);
     if limit <= i64::try_from(position)? {
@@ -310,7 +505,7 @@ pub fn previous_single_char_property_change<'ob>(
     env: &'ob mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    character_property_scan_point_max(position, object, env)?;
+    character_property_scan_point_max(position, object, env, cx)?;
     let limit = limit.unwrap_or(1).max(1);
     if limit >= i64::try_from(position)? {
         return Ok(property_scan_limit_object(limit, cx));
@@ -322,8 +517,9 @@ fn character_property_scan_point_max(
     position: usize,
     object: Option<Object<'_>>,
     env: &mut Rt<Env>,
+    cx: &Context,
 ) -> Result<usize> {
-    modify_buffer_data(object.unwrap_or(NIL), env, |data| {
+    modify_buffer_data(object.unwrap_or(NIL), env, cx, |data| {
         let point_max = data.text.len_chars() + 1;
         if position == 0 || position > point_max {
             bail!("Buffer position {position} is out of range 1..={point_max}");
@@ -352,11 +548,11 @@ pub fn add_text_properties<'ob>(
     }
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
-    modify_buffer_data(object, env, |data| {
+    modify_buffer_data(object, env, cx, |data| {
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(false);
         }
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         let mut changed = false;
         // Normalize duplicate keys for uncovered gaps, where insertion stores
         // the incoming plist directly. GNU applies later assignments last.
@@ -394,11 +590,11 @@ pub fn put_text_property<'ob>(
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
     let prop = list!(property, value; cx);
-    modify_buffer_data(object, env, |data| {
+    modify_buffer_data(object, env, cx, |data| {
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(());
         }
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         tree.insert(start, end, Slot::new(prop), cx)
     })
 }
@@ -427,13 +623,13 @@ pub fn next_property_change<'ob>(
     let next_interval = limit.is_some_and(|limit| eq(limit, TRUE));
     let limit: Option<usize> =
         if next_interval { None } else { limit.map(TryInto::try_into).transpose()? };
-    modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
+    modify_buffer_data(object, env, cx, |data| -> Result<Object<'ob>> {
         let point_max = data.text.len_chars() + 1;
         if next_interval {
             if position == 0 || position > point_max {
                 bail!("Buffer position {position} is out of range 1..={point_max}");
             }
-            let mut tree = data.textprops.lock(cx)?;
+            let tree = &mut data.textprops;
             let next = tree.tree.find_intersect_min(position..point_max);
             let boundary = match next {
                 Some(node) if node.key.start > position => node.key.start,
@@ -443,7 +639,7 @@ pub fn next_property_change<'ob>(
             return Ok(cx.add(boundary));
         }
         let end = limit.unwrap_or(point_max);
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         let prop = tree.tree.find_intersect_min(position..end);
 
         match prop {
@@ -493,10 +689,10 @@ pub fn next_single_property_change<'ob>(
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     let object = object.unwrap_or(NIL);
-    modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
+    modify_buffer_data(object, env, cx, |data| -> Result<Object<'ob>> {
         let point_max = data.text.len_chars() + 1;
         let end = limit.unwrap_or(point_max);
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         let iter = tree.iter(position, end);
 
         let mut val = None;
@@ -538,11 +734,11 @@ pub fn previous_property_change<'ob>(
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     let object = object.unwrap_or(NIL);
-    modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
+    modify_buffer_data(object, env, cx, |data| -> Result<Object<'ob>> {
         let point_min = 1;
         let start = limit.unwrap_or(point_min);
         let end = position;
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         let prop = tree.tree.find_intersect_max(start..end);
 
         match prop {
@@ -596,10 +792,10 @@ pub fn previous_single_property_change<'ob>(
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     let object = object.unwrap_or(NIL);
-    modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
+    modify_buffer_data(object, env, cx, |data| -> Result<Object<'ob>> {
         let point_min = 1;
         let start = limit.unwrap_or(point_min);
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         let iter = tree.iter_reverse(start, position);
 
         let mut val = None;
@@ -665,12 +861,12 @@ pub fn set_text_properties<'ob>(
 ) -> Result<()> {
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
-    modify_buffer_data(object, env, |data| -> Result<()> {
+    modify_buffer_data(object, env, cx, |data| -> Result<()> {
         let properties = copy_text_property_plist(properties, cx)?;
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(());
         }
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         tree.set_properties(start, end, properties);
         Ok(())
     })
@@ -697,11 +893,11 @@ pub fn remove_text_properties<'ob>(
 ) -> Result<bool> {
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
-    modify_buffer_data(object, env, |data| -> Result<bool> {
+    modify_buffer_data(object, env, cx, |data| -> Result<bool> {
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(false);
         }
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         // GNU textprop.c traverses candidate keys without validate_plist:
         // non-lists are no-ops, and a final key need not have a value.
         if !properties.is_nil() && properties.cons().is_none() {
@@ -740,11 +936,11 @@ pub fn remove_list_of_text_properties<'ob>(
 ) -> Result<bool> {
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
-    modify_buffer_data(object, env, |data| -> Result<bool> {
+    modify_buffer_data(object, env, cx, |data| -> Result<bool> {
         if !validate_property_mutation_range(data, start, end)? {
             return Ok(false);
         }
-        let mut tree = data.textprops.lock(cx)?;
+        let tree = &mut data.textprops;
         tree.delete(start, end, list_of_properties, cx)
     })
 }
@@ -767,8 +963,8 @@ pub fn text_property_any<'ob>(
 ) -> Result<Object<'ob>> {
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
-    modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
-        let mut tree = data.textprops.lock(cx)?;
+    modify_buffer_data(object, env, cx, |data| -> Result<Object<'ob>> {
+        let tree = &mut data.textprops;
         let iter = tree.iter(start, end);
         for (interval, props) in iter {
             let val = textget(props, property)?;
@@ -798,8 +994,8 @@ pub fn text_property_not_all<'ob>(
 ) -> Result<Object<'ob>> {
     let object = object.unwrap_or(NIL);
     let (start, end) = (start.min(end), start.max(end));
-    modify_buffer_data(object, env, |data| -> Result<Object<'ob>> {
-        let mut tree = data.textprops.lock(cx)?;
+    modify_buffer_data(object, env, cx, |data| -> Result<Object<'ob>> {
+        let tree = &mut data.textprops;
         let iter = tree.iter(start, end);
         for (interval, props) in iter {
             let val = textget(props, property)?;
@@ -814,7 +1010,7 @@ pub fn text_property_not_all<'ob>(
 #[cfg(test)]
 mod tests {
     use crate::{
-        buffer::{BUFFERS, get_buffer_create},
+        buffer::get_buffer_create,
         core::{
             env::intern,
             gc::{Context, RootSet},
@@ -825,6 +1021,20 @@ mod tests {
 
     use super::*;
 
+    fn insert_fixture(buffer: Object<'_>, text: &str, cx: &Context) -> Result<()> {
+        let gateway = cx.editor_gateway()?;
+        let handle = buffer.buffer().unwrap().handle();
+        let read = gateway.read(handle, cx)?;
+        gateway.splice(handle, read.epoch, 0..0, text, cx)?;
+        Ok(())
+    }
+    fn insert_current_fixture(env: &Rt<Env>, text: &str, cx: &Context) -> Result<()> {
+        let gateway = env.editor_gateway();
+        let handle = env.current_buffer_handle();
+        let read = gateway.read(handle, cx)?;
+        gateway.splice(handle, read.epoch, 0..0, text, cx)?;
+        Ok(())
+    }
     #[test]
     fn roadmap_m0_add_properties_does_not_change_shared_list() {
         let roots = RootSet::default();
@@ -845,9 +1055,9 @@ mod tests {
     fn roadmap_m0_property_noops_and_restore_coalesce() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-property-noops"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdefg"), &cx)?;
+        insert_fixture(buf, "abcdefg", &cx)?;
         let key: Object = intern("roadmap-face", &cx).into();
         let missing: Object = intern("roadmap-missing", &cx).into();
         let value = cx.add("bold");
@@ -888,16 +1098,10 @@ mod tests {
         let roots = &RootSet::default();
         let mut context = Context::new(roots);
         let cx = &mut context;
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
 
         let buf = get_buffer_create(cx.add("test_next_property_change"), None, cx)?;
-        if let Some(b) = buf.buffer() {
-            b.lock()
-                .unwrap()
-                .get_mut()
-                .text
-                .insert("lorem ipsum quia dolor sit amet, consectetur, adipisci velit.");
-        }
+        insert_fixture(buf, "lorem ipsum quia dolor sit amet, consectetur, adipisci velit.", &cx)?;
 
         let a = intern(":a", cx);
         let a = cx.add(a);
@@ -931,7 +1135,6 @@ mod tests {
         let change = next_property_change(20, Some(buf), None, env, cx)?;
         assert!(change.is_nil()); // No changes after last property
 
-        BUFFERS.lock().unwrap().clear();
         Ok(())
     }
 
@@ -941,16 +1144,10 @@ mod tests {
         let roots = &RootSet::default();
         let mut context = Context::new(roots);
         let cx = &mut context;
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
 
         let buf = get_buffer_create(cx.add("test_next_single_property_change"), None, cx)?;
-        if let ObjectType::Buffer(b) = buf.untag() {
-            b.lock()
-                .unwrap()
-                .get_mut()
-                .text
-                .insert("lorem ipsum quia dolor sit amet, consectetur, adipisci velit.");
-        }
+        insert_fixture(buf, "lorem ipsum quia dolor sit amet, consectetur, adipisci velit.", &cx)?;
 
         let a = intern(":a", cx);
         let a = cx.add(a);
@@ -994,7 +1191,6 @@ mod tests {
         let change = next_single_property_change(10, b, Some(buf), None, env, cx)?;
         assert_eq!(change, cx.add(15)); // Change at end of b range
 
-        BUFFERS.lock().unwrap().clear();
         Ok(())
     }
 
@@ -1002,9 +1198,9 @@ mod tests {
     fn roadmap_m0_remove_candidates_match_gnu_traversal() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-remove-candidates"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcde"), &cx)?;
+        insert_fixture(buf, "abcde", &cx)?;
         let a: Object = intern("roadmap-remove-a", &cx).into();
         let b: Object = intern("roadmap-remove-b", &cx).into();
         put_text_property(1, 5, a, cx.add(1), Some(buf), env, &cx)?;
@@ -1027,9 +1223,9 @@ mod tests {
     fn roadmap_m0_previous_single_change_reports_shared_boundary() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-previous-single"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdefghij"), &cx)?;
+        insert_fixture(buf, "abcdefghij", &cx)?;
         let key: Object = intern("roadmap-previous-key", &cx).into();
         let other: Object = intern("roadmap-previous-other", &cx).into();
         let value = cx.add("value");
@@ -1052,9 +1248,9 @@ mod tests {
     fn roadmap_m0_reversed_property_mutations_normalize_ranges() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-reversed-properties"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
+        insert_fixture(buf, "abcdef", &cx)?;
         let a: Object = intern("roadmap-reversed-a", &cx).into();
         let b: Object = intern("roadmap-reversed-b", &cx).into();
         put_text_property(6, 2, a, cx.add(1), Some(buf), env, &cx)?;
@@ -1087,9 +1283,9 @@ mod tests {
     fn roadmap_m0_property_search_predicates_and_identity() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-property-search"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
+        insert_fixture(buf, "abcdef", &cx)?;
         let key: Object = intern("roadmap-search-key", &cx).into();
         let value = cx.add("same");
         put_text_property(2, 5, key, value, Some(buf), env, &cx)?;
@@ -1112,9 +1308,9 @@ mod tests {
     fn roadmap_m0_property_removal_reports_actual_changes() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-removal-results"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
+        insert_fixture(buf, "abcdef", &cx)?;
         let key: Object = intern("roadmap-removal-result-key", &cx).into();
         let missing: Object = intern("roadmap-removal-result-missing", &cx).into();
         put_text_property(1, 6, key, NIL, Some(buf), env, &cx)?;
@@ -1163,10 +1359,10 @@ mod tests {
     fn roadmap_m0_optional_property_object_keeps_explicit_buffer_isolated() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
-        env.current_buffer.get_mut().insert(cx.add("abc"), &cx)?;
+        root!(env, init(Env::new_isolated(&cx)?), cx);
+        insert_current_fixture(env, "abc", &cx)?;
         let other = get_buffer_create(cx.add("roadmap-optional-other"), None, &cx)?;
-        other.buffer().unwrap().lock()?.insert(cx.add("abc"), &cx)?;
+        insert_fixture(other, "abc", &cx)?;
         let key: Object = intern("roadmap-optional-key", &cx).into();
         put_text_property(1, 3, key, cx.add(1), None, env, &cx)?;
         set_text_properties(1, 3, list![key, 2; &cx], Some(other), env, &cx)?;
@@ -1207,9 +1403,9 @@ mod tests {
     fn roadmap_m0_property_mutations_validate_character_ranges_atomically() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-mutation-bounds"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"), &cx)?;
+        insert_fixture(buf, "é🙂", &cx)?;
         let key: Object = intern("roadmap-mutation-bounds-key", &cx).into();
         put_text_property(1, 3, key, cx.add(7), Some(buf), env, &cx)?;
         for (start, end) in [(0, 2), (1, 4), (4, 1), (1, usize::MAX)] {
@@ -1250,9 +1446,9 @@ mod tests {
     fn roadmap_m0_set_properties_copies_plist_spine_and_validates() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-set-plist-copy"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abc"), &cx)?;
+        insert_fixture(buf, "abc", &cx)?;
         let key: Object = intern("roadmap-set-plist-key", &cx).into();
         let value = cx.add("shared-value");
         let original = list![key, value; &cx];
@@ -1286,9 +1482,9 @@ mod tests {
     fn roadmap_m0_add_text_properties_merges_and_reports_eq_changes() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-add-properties"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
+        insert_fixture(buf, "abcdef", &cx)?;
         let a: Object = intern("roadmap-add-a", &cx).into();
         let b: Object = intern("roadmap-add-b", &cx).into();
         let value = cx.add("same");
@@ -1320,9 +1516,9 @@ mod tests {
     fn roadmap_m0_add_text_properties_applies_duplicate_keys_sequentially() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-add-duplicate-keys"), None, &cx)?;
-        buf.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
+        insert_fixture(buf, "abcdef", &cx)?;
         let key: Object = intern("roadmap-add-duplicate", &cx).into();
         // Initially uncovered text must end up with the last assignment.
         assert!(add_text_properties(2, 5, list![key, 1, key, 2; &cx], Some(buf), env, &cx)?);
@@ -1396,10 +1592,10 @@ mod tests {
     fn roadmap_m0_optional_property_queries_preserve_explicit_object() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
-        env.current_buffer.get_mut().insert(cx.add("abcdef"), &cx)?;
+        root!(env, init(Env::new_isolated(&cx)?), cx);
+        insert_current_fixture(env, "abcdef", &cx)?;
         let other = get_buffer_create(cx.add("roadmap-query-other-buffer"), None, &cx)?;
-        other.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
+        insert_fixture(other, "abcdef", &cx)?;
         let key: Object = intern("roadmap-query-object-key", &cx).into();
         put_text_property(1, 3, key, cx.add(7), None, env, &cx)?;
         put_text_property(2, 5, key, cx.add(9), Some(other), env, &cx)?;
@@ -1426,10 +1622,10 @@ mod tests {
     fn roadmap_m0_next_property_change_true_limit_returns_interval_boundary() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-true-limit"), None, &cx)?;
         assert_eq!(next_property_change(1, Some(buf), Some(TRUE), env, &cx)?, 1);
-        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂abcd"), &cx)?;
+        insert_fixture(buf, "é🙂abcd", &cx)?;
         let key: Object = intern("roadmap-true-limit-key", &cx).into();
         // Unpropertized text still returns the endpoint with t, not nil.
         assert_eq!(next_property_change(1, Some(buf), Some(TRUE), env, &cx)?, 7);
@@ -1464,8 +1660,8 @@ mod tests {
     fn roadmap_m0_character_property_text_fallback_preserves_identity() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
-        env.current_buffer.get_mut().insert(cx.add("é🙂"), &cx)?;
+        root!(env, init(Env::new_isolated(&cx)?), cx);
+        insert_current_fixture(env, "é🙂", &cx)?;
         let key: Object = intern("roadmap-char-property-key", &cx).into();
         let value = cx.add("identity");
         put_text_property(1, 3, key, value, None, env, &cx)?;
@@ -1478,7 +1674,7 @@ mod tests {
         assert!(get_char_property(0, key, None, env, &cx).is_err());
         assert!(get_char_property_and_overlay(4, key, None, env, &cx).is_err());
         let other = get_buffer_create(cx.add("roadmap-char-property-other"), None, &cx)?;
-        other.buffer().unwrap().lock()?.insert(cx.add("x"), &cx)?;
+        insert_fixture(other, "x", &cx)?;
         assert!(get_char_property(1, key, Some(other), env, &cx)?.is_nil());
         assert_eq!(
             get_char_property_and_overlay(1, key, Some(other), env, &cx)?.to_string(),
@@ -1501,10 +1697,10 @@ mod tests {
     fn roadmap_m0_character_property_scans_return_endpoints_and_limits() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         assert_eq!(next_char_property_change(1, None, env, &cx)?, 1);
         assert_eq!(previous_char_property_change(1, None, env, &cx)?, 1);
-        env.current_buffer.get_mut().insert(cx.add("é🙂abcd"), &cx)?;
+        insert_current_fixture(env, "é🙂abcd", &cx)?;
         let key: Object = intern("roadmap-char-scan-key", &cx).into();
         put_text_property(2, 5, key, cx.add(1), None, env, &cx)?;
         for (position, expected) in [(1, 2), (2, 5), (5, 7), (7, 7)] {
@@ -1552,10 +1748,10 @@ mod tests {
     fn roadmap_m0_single_character_property_scans_ignore_other_keys() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         assert_eq!(next_single_char_property_change(1, cx.add(1), None, None, env, &cx)?, 1);
         assert_eq!(previous_single_char_property_change(1, cx.add(1), None, None, env, &cx)?, 1);
-        env.current_buffer.get_mut().insert(cx.add("é🙂abcd"), &cx)?;
+        insert_current_fixture(env, "é🙂abcd", &cx)?;
         let key: Object = intern("roadmap-single-char-key", &cx).into();
         let other_key: Object = intern("roadmap-single-char-other", &cx).into();
         let value = cx.add("same");
@@ -1581,7 +1777,7 @@ mod tests {
         assert_eq!(previous_single_char_property_change(2, key, None, Some(-1), env, &cx)?, 1);
         assert_eq!(previous_single_char_property_change(7, key, None, Some(6), env, &cx)?, 6);
         let other = get_buffer_create(cx.add("roadmap-single-char-buffer"), None, &cx)?;
-        other.buffer().unwrap().lock()?.insert(cx.add("abcdef"), &cx)?;
+        insert_fixture(other, "abcdef", &cx)?;
         put_text_property(3, 6, key, cx.add(1), Some(other), env, &cx)?;
         assert_eq!(next_single_char_property_change(1, key, Some(other), None, env, &cx)?, 3);
         assert_eq!(previous_single_char_property_change(7, key, Some(other), None, env, &cx)?, 6);
@@ -1603,12 +1799,10 @@ mod tests {
         let roots = &RootSet::default();
         let mut context = Context::new(roots);
         let cx = &mut context;
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
 
         let buf = get_buffer_create(cx.add("test_remove_text_properties"), None, cx)?;
-        if let ObjectType::Buffer(b) = buf.untag() {
-            b.lock().unwrap().get_mut().text.insert("test text");
-        }
+        insert_fixture(buf, "test text", &cx)?;
 
         let a = intern(":a", cx);
         let a = cx.add(a);
@@ -1634,22 +1828,22 @@ mod tests {
         // Try removing non-existent property
         remove_text_properties(1, 10, list![a, NIL; cx], Some(buf), env, cx)?;
 
-        BUFFERS.lock().unwrap().clear();
         Ok(())
     }
 
     #[test]
-    fn roadmap_m0_property_reads_reuse_current_buffer_guard() -> Result<()> {
+    fn roadmap_m0_property_reads_share_owner_snapshot_identity() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
-        let current = cx.add(env.current_buffer.buf_ref);
-        env.current_buffer.get_mut().insert(cx.add("abc"), &cx)?;
+        root!(env, init(Env::new_isolated(&cx)?), cx);
+        let current =
+            cx.add(crate::core::object::LispBuffer::for_handle(env.current_buffer_handle(), &cx)?);
+        insert_current_fixture(env, "abc", &cx)?;
         let key: Object = intern("roadmap-current-property", &cx).into();
         let value = cx.add("identity");
         put_text_property(1, 3, key, value, None, env, &cx)?;
-        // Env already owns this buffer's guard. Explicit current-buffer reads
-        // must use it rather than trying to lock the same mutex again.
+        // Implicit and explicit reads resolve the same authoritative owner root;
+        // neither acquires a legacy text mutex or keeps an owner borrow.
         let implicit = text_properties_at(1, None, env, &cx)?;
         root!(implicit, cx);
         let explicit = text_properties_at(1, Some(current), env, &cx)?;
@@ -1658,7 +1852,7 @@ mod tests {
         assert!(text_properties_at(4, Some(current), env, &cx)?.is_nil());
 
         let deleted = get_buffer_create(cx.add("roadmap-deleted-property"), None, &cx)?;
-        deleted.buffer().unwrap().lock()?.kill();
+        env.editor_gateway().kill(deleted.buffer().unwrap().handle(), true, &cx)?;
         assert!(text_properties_at(1, Some(deleted), env, &cx).is_err());
         assert!(text_properties_at(1, Some(cx.add(123)), env, &cx).is_err());
         assert!(text_properties_at(0, Some(cx.add("string")), env, &cx).is_err());
@@ -1669,14 +1863,14 @@ mod tests {
     fn roadmap_m0_property_reads_validate_character_positions() -> Result<()> {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
         let buf = get_buffer_create(cx.add("roadmap-property-read-bounds"), None, &cx)?;
         let key: Object = intern("roadmap-read-bounds-key", &cx).into();
         // An empty buffer has one legal position, but no character there.
         assert!(text_properties_at(1, Some(buf), env, &cx)?.is_nil());
         assert!(text_properties_at(0, Some(buf), env, &cx).is_err());
         assert!(text_properties_at(2, Some(buf), env, &cx).is_err());
-        buf.buffer().unwrap().lock()?.insert(cx.add("é🙂"), &cx)?;
+        insert_fixture(buf, "é🙂", &cx)?;
         put_text_property(1, 3, key, cx.add(7), Some(buf), env, &cx)?;
         assert_eq!(get_text_property(2, key, Some(buf), env, &cx)?, 7);
         assert!(text_properties_at(3, Some(buf), env, &cx)?.is_nil());
@@ -1684,7 +1878,7 @@ mod tests {
         // Character counts, not UTF-8 bytes, determine the legal endpoint.
         assert!(get_text_property(4, key, Some(buf), env, &cx).is_err());
         assert!(get_text_property(0, key, Some(buf), env, &cx).is_err());
-        env.set_buffer(buf.buffer().unwrap());
+        env.set_buffer(buf.buffer().unwrap(), &cx)?;
         assert_eq!(get_text_property(2, key, None, env, &cx)?, 7);
         assert!(text_properties_at(0, None, env, &cx).is_err());
         assert!(text_properties_at(3, None, env, &cx)?.is_nil());
@@ -1696,7 +1890,7 @@ mod tests {
         let roots = &RootSet::default();
         let mut context = Context::new(roots);
         let cx = &mut context;
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new_isolated(&cx)?), cx);
 
         let buf = get_buffer_create(cx.add("test_text_properties_at"), None, cx)?;
         let n = text_properties_at(1, Some(buf), env, &cx)?;
@@ -1704,13 +1898,55 @@ mod tests {
 
         let a = intern(":a", cx);
         let a = cx.add(a);
-        buf.buffer().unwrap().lock()?.insert(cx.add("x"), &cx)?;
+        insert_fixture(buf, "x", &cx)?;
         put_text_property(1, 2, a, cx.add(3), Some(buf), env, cx)?;
         let n = text_properties_at(1, Some(buf), env, &cx)?;
         let val = plist_get(n, a)?;
         assert!(eq(val, cx.add(3)));
 
-        BUFFERS.lock().unwrap().clear();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod owner_property_transaction_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+    use rune_editor::{Command, EditorHost};
+    #[test]
+    fn property_batch_is_one_cas_and_redo_history_roots_new_values() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, init(Env::new(cx)?), cx);
+        let gateway = env.editor_gateway();
+        let handle = gateway.scratch(cx)?;
+        let before = gateway.read(handle, cx)?;
+        gateway.splice(handle, before.epoch, 0..0, "aé🙂", cx)?;
+        let first = crate::core::env::intern("owner-property-first", cx);
+        root!(first, cx);
+        let second = crate::core::env::intern("owner-property-second", cx);
+        root!(second, cx);
+        put_text_property(1, 2, first.bind(cx).into(), Object::from(7), None, env, cx)?;
+        let epoch = gateway.read(handle, cx)?.epoch;
+        let properties = list![second.bind(cx),cx.add("moving-value");cx];
+        assert!(add_text_properties(1, 4, properties, None, env, cx)?);
+        assert_eq!(gateway.read(handle, cx)?.epoch, epoch + 1);
+        // Failed preflight does not publish a partial range or history entry.
+        let epoch = gateway.read(handle, cx)?.epoch;
+        assert!(add_text_properties(1, 4, list![second.bind(cx);cx], None, env, cx).is_err());
+        assert_eq!(gateway.read(handle, cx)?.epoch, epoch);
+        gateway.host(cx)?.execute(Command::Undo)?;
+        cx.garbage_collect(true);
+        assert!(get_text_property(2, second.bind(cx).into(), None, env, cx)?.is_nil());
+        gateway.host(cx)?.execute(Command::Redo)?;
+        for _ in 0..5 {
+            cx.garbage_collect(true);
+            assert_eq!(
+                get_text_property(3, second.bind(cx).into(), None, env, cx)?,
+                "moving-value"
+            );
+        }
         Ok(())
     }
 }

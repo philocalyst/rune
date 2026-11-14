@@ -168,8 +168,9 @@ impl<'ob> RootedVM<'_, '_, '_> {
         // Validate the constant before consuming a stack value.
         let symbol: Symbol = self.get_const(idx as usize, cx)?.try_into()?;
         self.require_stack(1)?;
-        let value = self.env.stack.pop(cx);
-        self.env.varbind(symbol, value, cx);
+        let value = self.env.stack[0].bind(cx);
+        self.env.varbind(symbol, value, cx)?;
+        self.env.stack.pop(cx);
         Ok(())
     }
 
@@ -1192,13 +1193,40 @@ mod test {
         expect: &Rto<Object>,
         cx: &mut Context,
     ) {
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let frame = &mut CallFrame::new(env);
         frame.push_arg_slice(Rt::bind_slice(args, cx));
         frame.finalize_arguments().unwrap();
         let val = rebind!(call(bytecode, frame.arg_count(), "test", frame, cx).unwrap());
         let expect = expect.bind(cx);
         assert_eq!(val, expect);
+    }
+
+    #[test]
+    fn invalid_forwarded_varbind_preserves_operand_and_binding_depth() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        make_bytecode!(
+            bytecode,
+            0,
+            [O::Constant0, O::VarBind1, O::Return],
+            [NIL, sym::INTEGER_WIDTH],
+            cx
+        );
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        env.set_var(sym::INTEGER_WIDTH, Object::from(128)).unwrap();
+        for _ in 0..3 {
+            let initial = env.binding_depth();
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments().unwrap();
+            assert!(call(bytecode, 0, "invalid-forwarded-bind", &mut frame, cx).is_err());
+            assert_eq!(frame.binding_depth(), initial);
+            assert_eq!(frame.vars.get(sym::INTEGER_WIDTH).unwrap().bind(cx), Object::from(128));
+            assert_eq!(frame.stack.frame_len(), 1);
+            assert!(frame.stack[0].bind(cx).is_nil());
+        }
     }
 
     #[test]
@@ -1223,7 +1251,7 @@ mod test {
         )
         .unwrap();
         root!(bytecode, cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         env.catch_stack.push(Object::from(29));
         for _ in 0..3 {
             let mut frame = CallFrame::new(env);
@@ -1277,7 +1305,7 @@ mod test {
             )
             .unwrap();
             root!(bytecode, cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             env.catch_stack.push(Object::from(29));
             let mut frame = CallFrame::new(env);
             frame.finalize_arguments().unwrap();
@@ -1338,7 +1366,7 @@ mod test {
             [17],
             cx
         );
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         for _ in 0..3 {
             let mut frame = CallFrame::new(env);
             frame.finalize_arguments().unwrap();
@@ -1388,9 +1416,9 @@ mod test {
             [17, inner_obj.bind(cx), variable],
             cx
         );
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let variable = crate::core::env::intern("pushcatch-nested-variable", cx);
-        env.varbind(variable, Object::from(3), cx);
+        env.varbind(variable, Object::from(3), cx).unwrap();
         let initial = env.binding_depth();
         for _ in 0..3 {
             let mut frame = CallFrame::new(env);
@@ -1414,7 +1442,7 @@ mod test {
                 .unwrap()
                 .0;
         root!(form, cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let closure = crate::interpreter::eval(form, None, env, cx).unwrap();
         root!(closure, cx);
         make_bytecode!(
@@ -1449,7 +1477,7 @@ mod test {
         sym::init_symbols();
         let form = crate::reader::read("(function (lambda () (unwind-protect (throw 17 7) (catch 19 (throw 19 2)) (garbage-collect))))", cx).unwrap().0;
         root!(form, cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let closure = crate::interpreter::eval(form, None, env, cx).unwrap();
         root!(closure, cx);
         make_bytecode!(
@@ -1487,7 +1515,7 @@ mod test {
         let cx = &mut Context::new(roots);
         sym::init_symbols();
         make_bytecode!(bytecode, 0, [O::Constant0, O::PushCatch, 2, 0, O::Return], [17], cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let mut frame = CallFrame::new(env);
         frame.finalize_arguments().unwrap();
         assert!(call(bytecode, 0, "bad-catch-target", &mut frame, cx).is_err());
@@ -1519,10 +1547,10 @@ mod test {
                 [big.clone(), rhs],
                 cx
             );
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             env.set_var(sym::INTEGER_WIDTH, cx.add(128_i64)).unwrap();
             let frame = &mut CallFrame::new(env);
-            frame.finalize_arguments();
+            frame.finalize_arguments().unwrap();
             let error = call(bytecode, 0, "arithmetic-width", frame, cx).unwrap_err();
             assert!(error.to_string().contains("integer width"), "{opcode:?}: {error}");
         }
@@ -1551,7 +1579,7 @@ mod test {
             let cx = &mut Context::new(roots);
             sym::init_symbols();
             make_bytecode!(bytecode, 0, [opcode, 0, 0], [sym::FILL_COLUMN], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             env.stack.push(Object::from(99_i64));
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
@@ -1569,7 +1597,7 @@ mod test {
         let cx = &mut Context::new(roots);
         sym::init_symbols();
         make_bytecode!(missing_argument, 0, [O::Constant0, O::Call1], [sym::IDENTITY], cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         {
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
@@ -1606,7 +1634,7 @@ mod test {
             let cx = &mut Context::new(roots);
             sym::init_symbols();
             make_bytecode!(bytecode, 0, [opcode, operand, 0], [], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             // A caller value is present, but inaccessible to the empty callee.
             env.stack.push(Object::from(99_i64));
             let frame = &mut CallFrame::new(env);
@@ -1653,7 +1681,7 @@ mod test {
             sym::init_symbols();
             let function = depth_fixture(depth, cx);
             root!(function, cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             env.stack.push(Object::from(99));
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
@@ -1706,7 +1734,7 @@ mod test {
             let cx = &mut Context::new(roots);
             sym::init_symbols();
             make_bytecode!(bytecode, spec, [O::Constant0, O::Return], [7], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             let argc = if spec & 0x80 != 0 { 10 } else { 0 };
             for _ in 0..argc {
@@ -1729,7 +1757,7 @@ mod test {
             sym::init_symbols();
             // Ten required arguments already fill make_bytecode!'s depth10.
             make_bytecode!(bytecode, 2570, [opcode, 0], [], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.push_arg_slice(&[Object::from(1_i64); 10]);
             frame.finalize_arguments().unwrap();
@@ -1766,7 +1794,7 @@ mod test {
             [1, 2],
             cx
         );
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let frame = &mut CallFrame::new(env);
         frame.finalize_arguments().unwrap();
         let result = call(set_and_ref, 0, "valid-stack-operations", frame, cx).unwrap();
@@ -1797,7 +1825,7 @@ mod test {
             let function =
                 crate::alloc::make_byte_code(0, codes, constants, 10, None, None, &[], cx).unwrap();
             root!(function, cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             assert!(call(function, 0, "truncated-bytecode", frame, cx).is_err());
@@ -1865,7 +1893,7 @@ mod test {
             let cx = &mut Context::new(&roots);
             sym::init_symbols();
             make_bytecode!(function, 0, [opcode], [], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             let error = call(function, 0, "empty-operands", frame, cx).unwrap_err();
@@ -1888,7 +1916,7 @@ mod test {
             let function =
                 crate::alloc::make_byte_code(0, codes, constants, 10, None, None, &[], cx).unwrap();
             root!(function, cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             assert!(
@@ -1922,7 +1950,7 @@ mod test {
         check_bytecode!(floating, [], 2.75, cx);
         for opcode in [O::Quo, O::Rem] {
             make_bytecode!(zero, 0, [O::Constant0, O::Constant1, opcode, O::Return], [1, 0], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             assert!(
@@ -2011,7 +2039,7 @@ mod test {
             sym::init_symbols();
             // Operand bytes are present, but no constants or stack values are.
             make_bytecode!(bytecode, 0, [opcode, 0xff, 0xff], [], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             let error = call(bytecode, 0, "invalid-constant", frame, cx).unwrap_err();
@@ -2028,7 +2056,7 @@ mod test {
             sym::init_symbols();
             // An invalid symbol must signal before VarSet/VarBind pop an empty stack.
             make_bytecode!(bytecode, 0, [opcode, O::Return], [7], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             let error = call(bytecode, 0, "nonsymbol-constant", frame, cx).unwrap_err();
@@ -2050,7 +2078,7 @@ mod test {
             // A complete one-byte stream exercises decoding only. Truncated
             // operands and stack validation are separate, still-open issues.
             make_bytecode!(bytecode, 0, [byte], [], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             let error = call(bytecode, 0, "invalid-opcode", frame, cx).unwrap_err();
@@ -2075,8 +2103,8 @@ mod test {
                 [variable, 7],
                 cx
             );
-            root!(env, new(Env), cx);
-            env.varbind(variable, Object::from(3), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
+            env.varbind(variable, Object::from(3), cx).unwrap();
             let initial = env.binding_depth();
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
@@ -2119,8 +2147,8 @@ mod test {
             [condition, variable, 7],
             cx
         );
-        root!(env, new(Env), cx);
-        env.varbind(variable, Object::from(3), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        env.varbind(variable, Object::from(3), cx).unwrap();
         let initial = env.binding_depth();
         let frame = &mut CallFrame::new(env);
         frame.finalize_arguments().unwrap();
@@ -2164,8 +2192,8 @@ mod test {
             [condition, inner.bind(cx), variable],
             cx
         );
-        root!(env, new(Env), cx);
-        env.varbind(variable, Object::from(3), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        env.varbind(variable, Object::from(3), cx).unwrap();
         let initial = env.binding_depth();
         let frame = &mut CallFrame::new(env);
         frame.finalize_arguments().unwrap();
@@ -2182,8 +2210,8 @@ mod test {
         sym::init_symbols();
         let variable = crate::core::env::intern("vm-unbind-floor", cx);
         make_bytecode!(bytecode, 0, [O::Unbind1], [], cx);
-        root!(env, new(Env), cx);
-        env.varbind(variable, Object::from(3), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        env.varbind(variable, Object::from(3), cx).unwrap();
         let initial = env.binding_depth();
         let frame = &mut CallFrame::new(env);
         frame.finalize_arguments().unwrap();
@@ -2206,7 +2234,7 @@ mod test {
         let cx = &mut Context::new(roots);
         sym::init_symbols();
         make_bytecode!(bytecode, 0, [O::Unbind1], [], cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let frame = &mut CallFrame::new(env);
         frame.finalize_arguments().unwrap();
         let error = call(bytecode, 0, "binding-underflow", frame, cx).unwrap_err();
@@ -2243,8 +2271,8 @@ mod test {
             [condition, closure.bind(cx), variable, 7],
             cx
         );
-        root!(env, new(Env), cx);
-        env.varbind(variable, Object::from(3), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        env.varbind(variable, Object::from(3), cx).unwrap();
         env.catch_stack.push(Object::from(17));
         let initial = env.binding_depth();
         let frame = &mut CallFrame::new(env);
@@ -2504,7 +2532,7 @@ mod test {
         root!(middle_target, cx);
         make_bytecode!(outer, 0, [O::Constant0, O::Call0, O::Return], [middle_target.bind(cx)], cx);
         make_bytecode!(good, 0, [O::Constant0, O::Return], [7], cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         for _ in 0..4 {
             {
                 let frame = &mut CallFrame::new(env);
@@ -2640,7 +2668,7 @@ mod test {
             // InsertN (u8): malformed encoding is a decoder error, not an
             // unsupported-operation signal, and is tested separately.
             make_bytecode!(bytecode, 0, [opcode, 0, 0, O::Return], [], cx);
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             let error = call(bytecode, 0, "unsupported-opcode", frame, cx).unwrap_err();
@@ -2803,7 +2831,7 @@ mod test {
                 [1, table, 9],
                 cx
             );
-            root!(env, new(Env), cx);
+            root!(env, init(Env::new(cx).unwrap()), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             let before = frame.stack.len();
@@ -2816,7 +2844,7 @@ mod test {
         let mut table = HashTable::default();
         table.insert(1.into(), cx.add("not-an-index"));
         make_bytecode!(bad_target, 0, [O::Constant0, O::Constant1, O::Switch], [1, table], cx);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         {
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();

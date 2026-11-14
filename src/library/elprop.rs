@@ -58,7 +58,7 @@ macro_rules! assert_elprop {
         let roots = &$crate::core::gc::RootSet::default();
         let cx = &mut $crate::core::gc::Context::new(roots);
         $crate::core::env::sym::init_symbols();
-        rune_core::macros::root!(env, init($crate::core::env::Env::default()), cx);
+        rune_core::macros::root!(env, init($crate::core::env::Env::new_isolated(cx).unwrap()), cx);
         let rune_result = {
             let obj = $crate::reader::read(&lisp_form, cx).unwrap().0;
             rune_core::macros::root!(obj, cx);

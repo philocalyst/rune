@@ -19,6 +19,10 @@ pub(crate) struct RuntimeDocument {
     binding: Option<Binding>,
 }
 impl RuntimeDocument {
+    #[cfg(test)]
+    pub(crate) fn marker_count(&self) -> usize {
+        self.snapshot.positions().marker_count()
+    }
     pub(crate) fn text(&self) -> &Rope {
         self.snapshot.text()
     }
@@ -135,6 +139,36 @@ impl Document for RuntimeDocument {
             })
             .transpose()?;
         Ok(Self { snapshot, lineage: Arc::new(()), binding })
+    }
+    fn replace_preserving_properties(
+        &self,
+        range: Range<usize>,
+        text: &str,
+    ) -> anyhow::Result<Self> {
+        let mut next = self.replace(range.clone(), text)?;
+        if range.end - range.start == text.chars().count() {
+            for (run, id) in self.snapshot.properties().runs() {
+                let start = run.start.0.max(range.start);
+                let end = run.end.0.min(range.end);
+                if start < end {
+                    next.snapshot =
+                        next.snapshot.set_properties(CharPos(start)..CharPos(end), id)?;
+                }
+            }
+            // In-place-width substitution preserves the CURRENT live marker
+            // registry, unlike a deletion+insertion coordinate transformation.
+            next.snapshot = self.snapshot.restore_content(&next.snapshot, None)?;
+            if let Some(binding) = &self.binding {
+                next.binding = Some(Binding {
+                    lease: binding.lease.retain_for_snapshot(
+                        next.snapshot.properties().runs().map(|(_, id)| id.0),
+                        &binding.insertion,
+                    )?,
+                    insertion: binding.insertion.clone(),
+                });
+            }
+        }
+        Ok(next)
     }
     fn visit_chars(&self, start: usize, max: usize, visitor: &mut dyn FnMut(usize, char) -> bool) {
         if let Ok(chars) = self.snapshot.chars_from(CharPos(start)) {
@@ -1443,5 +1477,142 @@ impl std::fmt::Debug for MarkerCleanupGuard {
         f.debug_struct("MarkerCleanupGuard")
             .field("armed", &self.record.is_some())
             .finish_non_exhaustive()
+    }
+}
+#[cfg(test)]
+mod gateway_property_identity_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn late_foreign_property_handle_rejects_entire_batch_even_equal_numeric_ids() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let first = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let second = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = first.create("owned", "ab", &cx).unwrap();
+        let read = first.read(h, &cx).unwrap();
+        // SAFETY: both scalar payloads belong to this Context; their distinct
+        // registry provenance must still reject mixing equal numeric IDs.
+        let local = unsafe { first.intern_property(cx.add("local"), &cx) }.unwrap();
+        let foreign = unsafe { second.intern_property(cx.add("foreign"), &cx) }.unwrap();
+        assert_eq!(local.id(), foreign.id());
+        assert!(
+            first
+                .prepare_property_runs(
+                    &read,
+                    [(CharPos(0)..CharPos(1), local), (CharPos(1)..CharPos(2), foreign)],
+                    &cx
+                )
+                .is_err()
+        );
+        let unchanged = first.read(h, &cx).unwrap();
+        assert_eq!(unchanged.epoch, read.epoch);
+        assert_eq!(unchanged.document.properties().at(CharPos(0)), Some(PropSetId(0)));
+        assert_eq!(unchanged.document.properties().at(CharPos(1)), Some(PropSetId(0)));
+    }
+}
+impl RuntimeEditorGateway {
+    pub(crate) fn replace_preserving_properties(
+        &self,
+        handle: OwnerBufferHandle,
+        epoch: u64,
+        range: Range<usize>,
+        text: &str,
+        cx: &Context,
+    ) -> anyhow::Result<rune_editor::CommandOutcome> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.replace_buffer_preserving_properties(id, epoch, range, text)?)
+    }
+}
+#[cfg(test)]
+mod case_property_transaction_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_editor::{Command, EditorHost};
+    #[test]
+    fn same_width_case_replacement_keeps_each_property_and_is_one_undo() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let g = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = g.create("case", "aβ tail", &cx).unwrap();
+        let before = g.read(h, &cx).unwrap();
+        // SAFETY: fresh scalar values in this Context.
+        let a = unsafe { g.intern_property(cx.add("first"), &cx) }.unwrap();
+        let b = unsafe { g.intern_property(cx.add("second"), &cx) }.unwrap();
+        let prepared = g
+            .prepare_property_runs(
+                &before,
+                [(CharPos(0)..CharPos(1), a.clone()), (CharPos(1)..CharPos(2), b.clone())],
+                &cx,
+            )
+            .unwrap();
+        g.publish_properties(prepared, &cx).unwrap();
+        let before = g.read(h, &cx).unwrap();
+        g.replace_preserving_properties(h, before.epoch, 0..2, "AΒ", &cx).unwrap();
+        let after = g.read(h, &cx).unwrap();
+        assert_eq!(after.epoch, before.epoch + 1);
+        assert_eq!(after.document.to_text(), "AΒ tail");
+        assert_eq!(after.document.properties().at(CharPos(0)), Some(PropSetId(a.id())));
+        assert_eq!(after.document.properties().at(CharPos(1)), Some(PropSetId(b.id())));
+        assert!(g.replace_preserving_properties(h, before.epoch, 0..2, "bad", &cx).is_err());
+        let mut host = g.host(&cx).unwrap();
+        host.execute(Command::SwitchBuffer(h.buffer)).unwrap();
+        host.execute(Command::Undo).unwrap();
+        assert_eq!(g.read(h, &cx).unwrap().document.to_text(), "aβ tail");
+        host.execute(Command::Redo).unwrap();
+        assert_eq!(g.read(h, &cx).unwrap().document.to_text(), "AΒ tail");
+    }
+    #[test]
+    fn expanding_case_replacement_shifts_following_properties_in_one_edit() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let g = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = g.create("expand", "ß tail", &cx).unwrap();
+        let before = g.read(h, &cx).unwrap();
+        // SAFETY: fresh scalar value in this Context.
+        let style = unsafe { g.intern_property(cx.add("following"), &cx) }.unwrap();
+        let prepared = g.prepare_properties(&before, CharPos(2)..CharPos(6), &style, &cx).unwrap();
+        g.publish_properties(prepared, &cx).unwrap();
+        let before = g.read(h, &cx).unwrap();
+        g.replace_preserving_properties(h, before.epoch, 0..1, "SS", &cx).unwrap();
+        let after = g.read(h, &cx).unwrap();
+        assert_eq!(after.document.to_text(), "SS tail");
+        assert_eq!(after.document.properties().at(CharPos(2)), Some(PropSetId(0)));
+        assert_eq!(after.document.properties().at(CharPos(3)), Some(PropSetId(style.id())));
+    }
+}
+#[cfg(test)]
+mod case_coordinate_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_editor::{Command, EditorHost};
+    #[test]
+    fn same_width_case_and_history_preserve_current_live_markers() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let g = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = g.create("case-markers", "abc tail", &cx).unwrap();
+        let old = g.register_marker(h, 1, Bias::Left, &cx).unwrap();
+        let removed = g.register_marker(h, 2, Bias::Right, &cx).unwrap();
+        let read = g.read(h, &cx).unwrap();
+        g.replace_preserving_properties(h, read.epoch, 0..3, "ABC", &cx).unwrap();
+        assert_eq!(g.marker_position(h, old, &cx).unwrap(), Some(1));
+        g.remove_marker(h, removed, &cx).unwrap();
+        let fresh = g.register_marker(h, 2, Bias::Left, &cx).unwrap();
+        let mut native = g.host(&cx).unwrap();
+        native.execute(Command::SwitchBuffer(h.buffer)).unwrap();
+        for _ in 0..3 {
+            native.execute(Command::Undo).unwrap();
+            assert_eq!(g.read(h, &cx).unwrap().document.to_text(), "abc tail");
+            assert_eq!(g.marker_position(h, fresh, &cx).unwrap(), Some(2));
+            assert_eq!(g.marker_position(h, old, &cx).unwrap(), Some(1));
+            assert_eq!(g.marker_position(h, removed, &cx).unwrap(), None);
+            native.execute(Command::Redo).unwrap();
+            assert_eq!(g.read(h, &cx).unwrap().document.to_text(), "ABC tail");
+            assert_eq!(g.marker_position(h, fresh, &cx).unwrap(), Some(2));
+            assert_eq!(g.marker_position(h, removed, &cx).unwrap(), None);
+        }
     }
 }

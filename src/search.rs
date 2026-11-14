@@ -230,7 +230,7 @@ mod test {
     fn character_offsets_and_bounds() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let position: usize =
             string_match("b", "éab", Some(1), None, env, cx).unwrap().try_into().unwrap();
         assert_eq!(position, 2);
@@ -248,7 +248,7 @@ mod test {
     fn unmatched_groups_keep_capture_indices() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         string_match("\\(a\\)?\\(b\\)", "éb", None, None, env, cx).unwrap();
         assert_eq!(match_beginning(1, env, cx).unwrap(), NIL);
         let beginning: usize = match_beginning(2, env, cx).unwrap().try_into().unwrap();
@@ -264,7 +264,7 @@ mod test {
     fn start_keeps_anchor_and_lookbehind_context() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         assert_eq!(string_match("^b", "ab", Some(1), None, env, cx).unwrap(), NIL);
         let pos: usize = string_match("\\(?<=é\\)b", "éb", Some(1), None, env, cx)
             .unwrap()
@@ -277,7 +277,7 @@ mod test {
     fn translation_skips_nil_and_preflights_errors() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         string_match("\\(a\\)?b", "éb", None, None, env, cx).unwrap();
         match_data__translate(2, env, cx).unwrap();
         let pos: usize = match_beginning(0, env, cx).unwrap().try_into().unwrap();
@@ -294,7 +294,7 @@ mod test {
     fn invalid_replacement_bounds_signal() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         for (beg, end) in [(2usize, 1usize), (0, 10)] {
             env.match_data
                 .set(crate::fns::slice_into_list(&[beg.into(), end.into()], None, cx));
@@ -306,7 +306,7 @@ mod test {
     fn test_replace_match() {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let string = "foo bar baz";
         let newtext = "quux";
         string_match("bar", string, None, None, env, cx).unwrap();

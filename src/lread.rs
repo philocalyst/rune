@@ -362,7 +362,7 @@ mod test {
         let roots = RootSet::default();
         let cx = &Context::new(&roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         let path = crate::core::env::intern("load-path", cx);
         let directories = list!(fixture.0.join("first").to_str().unwrap(), fixture.0.join("second").to_str().unwrap(); cx);
         env.vars.insert(path, directories);
@@ -395,7 +395,7 @@ mod test {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         load_internal("#!/usr/bin/env rune\n(setq shebang-loaded-value 41)\n#! ignored\n(setq shebang-loaded-value (+ shebang-loaded-value 1))", cx, env).unwrap();
         let form = reader::read("shebang-loaded-value", cx).unwrap().0;
         root!(form, cx);
@@ -408,7 +408,7 @@ mod test {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         load_internal("(setq foo 1) (setq bar 2) (setq baz 1.5)", cx, env).unwrap();
 
         let obj = reader::read("(+ foo bar baz)", cx).unwrap().0;

@@ -687,7 +687,7 @@ mod test {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
-        root!(env, new(Env), cx);
+        root!(env, init(Env::new(cx).unwrap()), cx);
         // Unlike assert_lisp's deliberately empty environment, exercise the
         // generated variable initializers used by production startup.
         crate::core::env::init_variables(cx, env);

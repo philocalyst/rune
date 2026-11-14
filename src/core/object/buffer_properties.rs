@@ -179,8 +179,10 @@ mod ownership_tests {
     fn noncurrent_and_explicit_buffer_properties_survive_repeated_collection() {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        root!(env, new(Env), cx);
-        let first = cx.add(env.current_buffer.buf_ref);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        let first = cx.add(
+            crate::core::object::LispBuffer::for_handle(env.current_buffer_handle(), cx).unwrap(),
+        );
         root!(first, cx);
         let other = crate::buffer::get_buffer_create(
             cx.add(format!("owner-domain-other-{}", cx.domain_id())),
@@ -189,15 +191,11 @@ mod ownership_tests {
         )
         .unwrap();
         root!(other, cx);
-        env.current_buffer.get_mut().insert(cx.add("abc"), &cx).unwrap();
-        other
-            .bind(cx)
-            .buffer()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .insert(cx.add("abc"), &cx)
-            .unwrap();
+        let gateway = env.editor_gateway();
+        for handle in [env.current_buffer_handle(), other.bind(cx).buffer().unwrap().handle()] {
+            let read = gateway.read(handle, cx).unwrap();
+            gateway.splice(handle, read.epoch, 0..0, "abc", cx).unwrap();
+        }
         let key = cx.add(intern("domain-property", cx));
         let value = cx.add("shared allocated property value");
         crate::textprops::put_text_property(1, 3, key, value, Some(first.bind(cx)), env, cx)
@@ -205,7 +203,7 @@ mod ownership_tests {
         // Explicitly targeting a non-current buffer must register it too.
         crate::textprops::put_text_property(1, 3, key, value, Some(other.bind(cx)), env, cx)
             .unwrap();
-        env.set_buffer(other.bind(cx).buffer().unwrap());
+        env.set_buffer(other.bind(cx).buffer().unwrap(), cx).unwrap();
         for iteration in 0..30 {
             for garbage in 0..50 {
                 let _ = cx.add(format!("garbage {iteration} {garbage}"));
@@ -267,69 +265,65 @@ mod ownership_tests {
     fn foreign_text_edits_are_rejected_before_mutation() {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        let name = format!("foreign-edit-domain-{}", cx.domain_id());
-        {
-            let object = crate::buffer::get_buffer_create(cx.add(name.clone()), None, cx).unwrap();
-            object.buffer().unwrap().lock().unwrap().insert(cx.add("owner"), cx).unwrap();
-        }
+        let gateway = cx.editor_gateway().unwrap();
+        let handle = gateway.create("foreign-owned-edit", "owner", cx).unwrap();
         let thread = std::thread::spawn(move || {
             let roots = RootSet::default();
-            let cx = Context::new(&roots);
-            let object = crate::buffer::get_buffer_create(cx.add(name), None, &cx).unwrap();
-            let mut buffer = object.buffer().unwrap().lock().unwrap();
-            assert!(buffer.insert(cx.add("foreign"), &cx).is_err());
-            assert!(buffer.delete(1, 3, &cx).is_err());
-            assert!(buffer.replace_text(0, 3, "foreign", &cx).is_err());
-            assert_eq!(buffer.text, "owner");
+            let foreign = Context::new(&roots);
+            let other = foreign.editor_gateway().unwrap();
+            assert!(other.read(handle, &foreign).is_err());
+            assert!(other.splice(handle, 0, 0..3, "foreign", &foreign).is_err());
         });
         for _ in 0..10 {
             cx.garbage_collect(true);
         }
         thread.join().unwrap();
+        assert_eq!(gateway.read(handle, cx).unwrap().document.text().to_string(), "owner");
     }
 
     #[test]
     fn retained_metadata_survives_killed_buffer_and_collection() {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
-        let properties = {
-            let name = format!("retained-killed-domain-{}", cx.domain_id());
-            let object = crate::buffer::get_buffer_create(cx.add(name), None, cx).unwrap();
-            let mut buffer = object.buffer().unwrap().lock().unwrap();
-            buffer.insert(cx.add("abc"), cx).unwrap();
-            let properties = buffer.textprops.clone();
-            let plist = Cons::new(cx.add("key"), Cons::new(cx.add("retained value"), NIL, cx), cx);
-            properties.lock(cx).unwrap().set_properties(1, 3, plist.into());
-            assert!(buffer.kill());
-            properties
-        };
+        let gateway = cx.editor_gateway().unwrap();
+        let handle = gateway.create("retained-killed-domain", "abc", cx).unwrap();
+        // SAFETY: fresh scalar value allocated in this exact owner Context.
+        let property = unsafe { gateway.intern_property(cx.add("retained value"), cx) }.unwrap();
+        let id = property.id();
+        let read = gateway.read(handle, cx).unwrap();
+        let prepared = gateway
+            .prepare_properties(&read, rune_text::CharPos(0)..rune_text::CharPos(3), &property, cx)
+            .unwrap();
+        gateway.publish_properties(prepared, cx).unwrap();
+        drop(property);
+        drop(read);
+        let retained = gateway.read(handle, cx).unwrap();
+        gateway.kill(handle, true, cx).unwrap();
         for _ in 0..10 {
             cx.garbage_collect(true);
-            let tree = properties.lock(cx).unwrap();
-            let plist = *tree.find(1).unwrap().val;
-            assert!(plist.to_string().contains("retained value"));
+            assert_eq!(retained.document.resolve(id, cx).unwrap(), "retained value");
         }
+        assert!(gateway.read(handle, cx).is_err());
     }
 
     #[test]
-    fn retired_named_buffer_rejects_edits_without_changing_text() {
-        let name;
-        {
+    fn retired_shell_rejects_edits_and_same_name_new_owner_is_independent() {
+        let (old, retained) = {
             let roots = RootSet::default();
             let cx = Context::new(&roots);
-            name = format!("retired-domain-{}", cx.domain_id());
-            let object = crate::buffer::get_buffer_create(cx.add(name.clone()), None, &cx).unwrap();
-            let mut buffer = object.buffer().unwrap().lock().unwrap();
-            buffer.insert(cx.add("original"), &cx).unwrap();
-        }
+            let gateway = cx.editor_gateway().unwrap();
+            let old = gateway.create("retired-domain-name", "original", &cx).unwrap();
+            (old, gateway.read(old, &cx).unwrap())
+        };
         let roots = RootSet::default();
         let cx = Context::new(&roots);
-        let object = crate::buffer::get_buffer_create(cx.add(name), None, &cx).unwrap();
-        let mut buffer = object.buffer().unwrap().lock().unwrap();
-        assert!(buffer.insert(cx.add("foreign"), &cx).is_err());
-        assert!(buffer.delete(1, 3, &cx).is_err());
-        assert!(buffer.replace_text(0, 3, "foreign", &cx).is_err());
-        assert_eq!(buffer.text, "original");
+        let gateway = cx.editor_gateway().unwrap();
+        assert!(gateway.read(old, &cx).is_err());
+        assert!(gateway.splice(old, retained.epoch, 0..3, "foreign", &cx).is_err());
+        let fresh = gateway.create("retired-domain-name", "new", &cx).unwrap();
+        assert_ne!(old, fresh);
+        assert_eq!(gateway.read(fresh, &cx).unwrap().document.text().to_string(), "new");
+        assert_eq!(retained.document.text().to_string(), "original");
     }
 
     #[test]
