@@ -1,13 +1,20 @@
 //! Search utilities.
 use crate::core::{
-    env::Env,
+    env::{Env, sym},
     gc::{Context, Rt},
     object::{List, NIL, Object, ObjectType, OptionalFlag},
 };
 use anyhow::{Result, bail, ensure};
 use fallible_iterator::FallibleIterator;
-use fancy_regex::Regex;
+use fancy_regex::RegexBuilder;
 use rune_macros::defun;
+
+// Scoped Env/dynamic default. GNU buffer-local case tables/forwarding remain
+// separate; do not claim per-buffer behavior from this variable alone.
+defvar_bool!(CASE_FOLD_SEARCH, true);
+fn case_fold(env: &Rt<Env>, cx: &Context) -> Result<bool> {
+    Ok(!crate::data::symbol_value(sym::CASE_FOLD_SEARCH, env, cx)?.is_nil())
+}
 
 /// Unicode strings keep the existing character-based engine. Unibyte RPC
 /// strings use a real byte regex engine and byte (Lisp unibyte character) indices.
@@ -54,7 +61,10 @@ fn byte_string_match<'ob>(
         }
     }
     let pattern = lisp_regex_to_rust(&escaped);
-    let regex = regex::bytes::RegexBuilder::new(&pattern).unicode(false).build()?;
+    let regex = regex::bytes::RegexBuilder::new(&pattern)
+        .unicode(false)
+        .case_insensitive(case_fold(env, cx)?)
+        .build()?;
     let start = start.unwrap_or(0);
     let start = if start < 0 { text.len() as i128 + start as i128 } else { start as i128 };
     ensure!(start >= 0 && start <= text.len() as i128, "string-match start out of range");
@@ -86,7 +96,9 @@ fn string_match<'ob>(
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     // TODO: implement inhibit-modify
-    let re = Regex::new(&lisp_regex_to_rust(regexp))?;
+    let re = RegexBuilder::new(&lisp_regex_to_rust(regexp))
+        .case_insensitive(case_fold(env, cx)?)
+        .build()?;
 
     let char_len = string.chars().count();
     let start = start.unwrap_or(0);
@@ -298,6 +310,7 @@ mod test {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         let position: usize =
             string_match("b", "éab", Some(1), None, env, cx).unwrap().try_into().unwrap();
         assert_eq!(position, 2);
@@ -316,6 +329,7 @@ mod test {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         string_match("\\(a\\)?\\(b\\)", "éb", None, None, env, cx).unwrap();
         assert_eq!(match_beginning(1, env, cx).unwrap(), NIL);
         let beginning: usize = match_beginning(2, env, cx).unwrap().try_into().unwrap();
@@ -332,6 +346,7 @@ mod test {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         assert_eq!(string_match("^b", "ab", Some(1), None, env, cx).unwrap(), NIL);
         let pos: usize = string_match("\\(?<=é\\)b", "éb", Some(1), None, env, cx)
             .unwrap()
@@ -345,6 +360,7 @@ mod test {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         string_match("\\(a\\)?b", "éb", None, None, env, cx).unwrap();
         match_data__translate(2, env, cx).unwrap();
         let pos: usize = match_beginning(0, env, cx).unwrap().try_into().unwrap();
@@ -362,6 +378,7 @@ mod test {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         for (beg, end) in [(2usize, 1usize), (0, 10)] {
             env.match_data
                 .set(crate::fns::slice_into_list(&[beg.into(), end.into()], None, cx));
@@ -374,6 +391,7 @@ mod test {
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         let string = "foo bar baz";
         let newtext = "quux";
         string_match("bar", string, None, None, env, cx).unwrap();
@@ -393,6 +411,7 @@ mod raw_byte_tests {
         let cx = &Context::new(&roots);
         crate::core::env::sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         let pattern = cx.add(vec![
             254, b'\\', b'(', b'[', b'0', b'-', b'9', b'a', b'-', b'f', b']', b'+', b'\\', b')',
             255,
@@ -417,6 +436,7 @@ mod raw_byte_tests {
         let roots = RootSet::default();
         let cx = &Context::new(&roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         assert_eq!(byte_string_match(b".", &[255], None, env, cx).unwrap(), Object::from(0));
         assert_eq!(
             byte_string_match(&[0], &[255, 0, 254], None, env, cx).unwrap(),
@@ -424,5 +444,40 @@ mod raw_byte_tests {
         );
         assert_eq!(byte_string_match(b"^x", b"ax", Some(1), env, cx).unwrap(), NIL);
         assert!(byte_string_match(b"x", b"x", Some(2), env, cx).is_err());
+    }
+}
+
+#[cfg(test)]
+mod case_fold_scope_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+    #[test]
+    fn default_dynamic_override_and_restoration_match_gnu() {
+        let source = r#"(list case-fold-search (string-match "a" "A") (let ((case-fold-search nil)) (string-match "a" "A")) (string-match "a" "A") (let ((case-fold-search 'raw)) (list case-fold-search (string-match "é" "É"))))"#;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let form = crate::reader::read(source, cx).unwrap().0;
+        root!(form, cx);
+        let value = crate::interpreter::eval(form, None, env, cx).unwrap();
+        assert_eq!(format!("{value}"), "(t 0 nil 0 (raw 0))");
+        crate::library::elprop::start_emacs().unwrap();
+        assert_eq!(crate::library::elprop::eval(source).unwrap(), "(t 0 nil 0 (raw 0))");
+    }
+    #[test]
+    fn byte_case_fold_is_ascii_only_and_respects_contextual_binding() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        assert_eq!(byte_string_match(b"a", b"A", None, env, cx).unwrap(), Object::from(0));
+        assert_eq!(byte_string_match(&[201], &[233], None, env, cx).unwrap(), NIL);
+        env.set_var_context(sym::CASE_FOLD_SEARCH, NIL, cx).unwrap();
+        assert_eq!(byte_string_match(b"a", b"A", None, env, cx).unwrap(), NIL);
+        assert_eq!(byte_string_match(b"A", b"A", None, env, cx).unwrap(), Object::from(0));
     }
 }
