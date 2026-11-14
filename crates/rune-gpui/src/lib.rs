@@ -20,6 +20,8 @@ use std::{
 
 mod font_geometry;
 mod input_policy;
+#[cfg(feature = "editor")]
+mod wheel;
 use input_policy::InputPolicy;
 pub use input_policy::{InputReadiness, RejectionReason};
 
@@ -138,6 +140,8 @@ pub struct FrameView {
     input: FrameInput,
     resize: ResizeTracker,
     #[cfg(feature = "editor")]
+    wheel: Rc<RefCell<wheel::WheelLines>>,
+    #[cfg(feature = "editor")]
     ime: Option<platform_handler::ImeBinding>,
 }
 impl FrameView {
@@ -165,6 +169,8 @@ impl FrameView {
             }))),
             resize: ResizeTracker::default(),
             #[cfg(feature = "editor")]
+            wheel: Rc::new(RefCell::new(wheel::WheelLines::default())),
+            #[cfg(feature = "editor")]
             ime: None,
         }
     }
@@ -191,6 +197,8 @@ impl FrameView {
                 sender, replies, quit, rejected, outcome,
             )),
             resize: ResizeTracker::default(),
+            #[cfg(feature = "editor")]
+            wheel: Rc::new(RefCell::new(wheel::WheelLines::default())),
             #[cfg(feature = "editor")]
             ime: None,
         }
@@ -450,6 +458,14 @@ impl Render for FrameView {
         let pointer_focus = self.focus.clone();
         let pointer_input = self.input.clone();
         let wheel_input = self.input.clone();
+        #[cfg(feature = "editor")]
+        let wheel_state = self.wheel.clone();
+        #[cfg(feature = "editor")]
+        let wheel_ime = self.ime.clone();
+        #[cfg(feature = "editor")]
+        let wheel_frame = frame.clone();
+        #[cfg(feature = "editor")]
+        let wheel_bounds = painted_bounds.clone();
         let metrics = self.font.metrics();
         let font = self.font.clone();
         let input = self.input.clone();
@@ -517,6 +533,45 @@ impl Render for FrameView {
             })
             .on_scroll_wheel(move |event: &ScrollWheelEvent, _, cx| {
                 let delta = event.delta.pixel_delta(px(metrics.line_height()));
+                #[cfg(feature = "editor")]
+                if let (FrameInput::Owner(owner), Some(ime)) = (&wheel_input, &wheel_ime) {
+                    let identity = ime.state.borrow().wheel_identity();
+                    if let (Some(identity), Some(bounds)) = (identity, wheel_bounds.get()) {
+                        let local = rune_display::Point {
+                            x: (event.position.x - bounds.origin.x).into(),
+                            y: (event.position.y - bounds.origin.y).into(),
+                        };
+                        if wheel_frame.windows.iter().any(|w| {
+                            w.window_id == identity.window_id
+                                && w.buffer_id == identity.buffer_id
+                                && w.revision == identity.publication_epoch
+                                && w.viewport.contains(local)
+                        }) {
+                            let lines = wheel_state.borrow_mut().take(
+                                (
+                                    identity.window_id,
+                                    identity.buffer_id,
+                                    identity.publication_epoch,
+                                ),
+                                delta.y.into(),
+                                metrics.line_height(),
+                            );
+                            if lines != 0 {
+                                owner_input::OwnerInput::submit(
+                                    owner,
+                                    editor_transport::OwnerEvent::ScrollWindow {
+                                        window_id: identity.window_id,
+                                        buffer_id: identity.buffer_id,
+                                        expected_sequence: identity.owner_sequence,
+                                        lines: i64::from(lines),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 FrameInput::submit(
                     &wheel_input,
                     InputEvent::Scroll { dx: delta.x.into(), dy: delta.y.into() },

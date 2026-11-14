@@ -42,6 +42,7 @@ where
     generation: u64,
     text_source: TextSource,
     anchors: BTreeMap<u64, (u64, usize)>,
+    manual_scroll: Option<(u64, u64, usize)>,
 }
 impl<H: EditorHost> EditorBridge<H>
 where
@@ -83,6 +84,7 @@ where
             generation: 0,
             text_source: TextSource::KeyDown,
             anchors: BTreeMap::new(),
+            manual_scroll: None,
         })
     }
     pub fn snapshot(&self) -> Result<rune_editor::SessionSnapshot<H::Doc>, BridgeError> {
@@ -162,7 +164,30 @@ where
     pub fn execute_command(&mut self, command: Command) -> Result<bool, BridgeError> {
         self.host.cancel_prefix()?;
         self.host.execute(command)?;
+        self.manual_scroll = None;
         Ok(true)
+    }
+    pub fn scroll_window(
+        &mut self,
+        window_id: u64,
+        buffer_id: u64,
+        expected_sequence: u64,
+        lines: i64,
+    ) -> Result<bool, BridgeError> {
+        let s = self.host.snapshot()?;
+        let v = s
+            .views
+            .iter()
+            .find(|v| v.id.as_u64() == window_id && v.view.buffer.as_u64() == buffer_id)
+            .ok_or(EditorError::StaleInput)?;
+        let (window, buffer, point) = (v.id, v.view.buffer, v.view.point);
+        drop(s);
+        let changed = self.host.scroll_window(window, buffer, expected_sequence, lines)?;
+        if changed {
+            self.anchors.clear();
+            self.manual_scroll = Some((window_id, buffer_id, point));
+        }
+        Ok(changed)
     }
     /// Apply once. A later layout failure must retry layout, never this mutation.
     pub fn apply(&mut self, event: &InputEvent) -> Result<bool, BridgeError> {
@@ -278,13 +303,15 @@ where
             spec.point = view.view.point;
             spec.hscroll = view.view.hscroll as f32 * self.metrics.0.advance;
             let published = buffer.display_snapshot();
-            if let Some(&(epoch, anchor)) = self.anchors.get(&spec.window_id) {
+            let manual =
+                self.manual_scroll == Some((spec.window_id, buffer.id.as_u64(), view.view.point));
+            if let Some(&(epoch, anchor)) = self.anchors.get(&spec.window_id).filter(|_| !manual) {
                 if epoch == published.revision() && anchor <= published.len_chars() {
                     spec.anchor = anchor;
                 }
             }
             let mut window = layout_window(&published, &spec, &[], &self.metrics)?;
-            if view.id == s.selected_window && window.cursor.is_none() {
+            if view.id == s.selected_window && window.cursor.is_none() && !manual {
                 spec.anchor = spec.point;
                 window = layout_window(&published, &spec, &[], &self.metrics)?;
             }
@@ -370,6 +397,30 @@ mod tests {
     }
     fn bounds() -> Rect {
         Rect { x: 0., y: 0., width: 640., height: 480. }
+    }
+    #[test]
+    fn manual_scroll_survives_metadata_sequence_but_not_point_change() {
+        let mut session =
+            rune_editor::Session::<RopeDocument>::new(RopeDocument::empty(), 80, 24).unwrap();
+        session.execute(Command::Insert("line\n".repeat(1000))).unwrap();
+        session.execute(Command::GoTo(0)).unwrap();
+        let mut bridge = EditorBridge::new(session, FixedMetrics::default(), bounds()).unwrap();
+        let s = bridge.snapshot().unwrap();
+        let v = s.views.iter().find(|v| v.id == s.selected_window).unwrap();
+        let (w, b) = (v.id, v.view.buffer);
+        bridge.scroll_window(w.as_u64(), b.as_u64(), s.sequence, 100).unwrap();
+        let before = bridge.prepare_frame().unwrap();
+        assert!(before.windows[0].cursor.is_none());
+        let sequence = bridge.snapshot().unwrap().sequence;
+        bridge.host.set_read_only(b, true).unwrap();
+        assert!(bridge.snapshot().unwrap().sequence > sequence);
+        let after = bridge.prepare_frame().unwrap();
+        assert_eq!(before.windows[0].rows[0].source, after.windows[0].rows[0].source);
+        assert!(after.windows[0].cursor.is_none());
+        bridge.execute_command(Command::GoTo(0)).unwrap();
+        assert!(bridge.prepare_frame().unwrap().windows[0].cursor.is_some());
+        bridge.host.execute(Command::GoTo(1)).unwrap();
+        assert!(bridge.prepare_frame().unwrap().windows[0].cursor.is_some());
     }
     #[test]
     fn non_send_host_owns_exactly_one_insert_and_one_undo() {

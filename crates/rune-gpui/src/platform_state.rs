@@ -146,6 +146,12 @@ impl PlatformInputState {
     pub fn composing(&self) -> bool {
         self.draft.as_ref().is_some_and(|d| !d.emitted)
     }
+    pub(crate) fn wheel_identity(&self) -> Option<crate::ime_context::ImeIdentity> {
+        if !self.active || self.composing() || self.awaiting_ack() {
+            return None;
+        }
+        self.input.as_ref().map(|i| i.identity())
+    }
     pub fn selected_range(&self) -> Option<Range<usize>> {
         if !self.active {
             return None;

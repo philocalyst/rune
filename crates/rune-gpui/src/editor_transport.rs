@@ -18,6 +18,12 @@ pub struct CompositionRequest {
 #[derive(Debug)]
 pub enum OwnerEvent {
     Input(InputEvent),
+    ScrollWindow {
+        window_id: u64,
+        buffer_id: u64,
+        expected_sequence: u64,
+        lines: i64,
+    },
     /// Save only the owner-selected, already-associated visited file.
     SaveVisited {
         request_id: u64,
@@ -423,6 +429,9 @@ where
                 }
             }
             OwnerEvent::Input(e) => self.bridge.apply(&e),
+            OwnerEvent::ScrollWindow { window_id, buffer_id, expected_sequence, lines } => {
+                self.bridge.scroll_window(window_id, buffer_id, expected_sequence, lines)
+            }
             OwnerEvent::Command(command) => self.bridge.execute_command(command),
             OwnerEvent::TextInsertion { window_id, buffer_id, text } => {
                 self.bridge.commit_text(window_id, buffer_id, text)

@@ -577,4 +577,132 @@ mod joined_owner_tests {
             .unwrap();
         }
     }
+    #[test]
+    fn long_org_scoped_wheel_moves_viewport_without_point_or_text_and_rejects_stale() {
+        use std::{
+            future::Future,
+            task::{Context as TaskContext, Poll, Waker},
+        };
+        let dir = OwnedStartupDirectory::new();
+        let path = dir.0.join("long.org");
+        let source = (0..2000)
+            .map(|n| format!("* TODO Item {n} λ🙂\n  body {n}\n"))
+            .collect::<String>();
+        std::fs::write(&path, &source).unwrap();
+        with_lisp_runtime_owner(80, 24, |mut host| {
+            prepare_explicit_file(&mut host, Some(&path)).map_err(anyhow::Error::msg)?;
+            let (publisher, mut updates) = host_updates();
+            let (sender, _replies, pending) = pending_editor_transport(8, publisher);
+            let bridge = EditorBridge::new(
+                host,
+                FixedMetrics::default(),
+                Rect { x: 0., y: 0., width: 640., height: 480. },
+            )
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let mut worker = pending
+                .bind_initialized(bridge)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                .with_evaluator(evaluate_source);
+            let before = worker.bridge().snapshot().unwrap();
+            let view = before.views.iter().find(|v| v.id == before.selected_window).unwrap();
+            let (window_id, buffer_id, point, start, sequence) = (
+                view.id.as_u64(),
+                view.view.buffer.as_u64(),
+                view.view.point,
+                view.view.start,
+                before.sequence,
+            );
+            sender
+                .try_send(OwnerEvent::ScrollWindow {
+                    window_id,
+                    buffer_id,
+                    expected_sequence: sequence,
+                    lines: 100,
+                })
+                .unwrap();
+            assert_eq!(worker.try_step().unwrap().edit.unwrap(), true);
+            let after = worker.bridge().snapshot().unwrap();
+            let v = after.views.iter().find(|v| v.id == after.selected_window).unwrap();
+            assert!(v.view.start > start);
+            assert_eq!(v.view.point, point);
+            assert_eq!(
+                after.buffers.iter().find(|b| b.id == v.view.buffer).unwrap().document.to_text(),
+                source
+            );
+            let update = {
+                let mut next = std::pin::pin!(updates.next());
+                let mut cx = TaskContext::from_waker(Waker::noop());
+                match next.as_mut().poll(&mut cx) {
+                    Poll::Ready(Some(u)) => u,
+                    _ => panic!("published scroll frame missing"),
+                }
+            };
+            let frame = update.frame.unwrap();
+            let painted = frame.windows.iter().find(|w| w.window_id == window_id).unwrap();
+            assert!(
+                painted.cursor.is_none(),
+                "manual scrolling must not snap back to offscreen point"
+            );
+            assert!(painted.rows.first().unwrap().source.start >= v.view.start);
+            assert!(
+                painted.scanned_chars < source.chars().count() / 4,
+                "layout stays viewport bounded"
+            );
+            sender
+                .try_send(OwnerEvent::Evaluate {
+                    request_id: 99,
+                    source: "(put-text-property 1 2 'face 'bold)".into(),
+                })
+                .unwrap();
+            assert!(worker.try_step().unwrap().evaluation.unwrap().outcome.is_ok());
+            let property_snapshot = worker.bridge().snapshot().unwrap();
+            assert!(property_snapshot.sequence > after.sequence);
+            let update = {
+                let mut next = std::pin::pin!(updates.next());
+                let mut cx = TaskContext::from_waker(Waker::noop());
+                match next.as_mut().poll(&mut cx) {
+                    Poll::Ready(Some(u)) => u,
+                    _ => panic!("property frame missing"),
+                }
+            };
+            let property_frame = update.frame.unwrap();
+            assert_eq!(property_frame.windows[0].rows[0].source, painted.rows[0].source);
+            assert!(property_frame.windows[0].cursor.is_none());
+            let after = property_snapshot;
+            sender
+                .try_send(OwnerEvent::ScrollWindow {
+                    window_id,
+                    buffer_id,
+                    expected_sequence: sequence,
+                    lines: 100,
+                })
+                .unwrap();
+            assert!(worker.try_step().unwrap().edit.is_err());
+            assert_eq!(worker.bridge().snapshot().unwrap().sequence, after.sequence);
+            sender
+                .try_send(OwnerEvent::ScrollWindow {
+                    window_id,
+                    buffer_id,
+                    expected_sequence: after.sequence,
+                    lines: -100,
+                })
+                .unwrap();
+            assert!(worker.try_step().unwrap().edit.unwrap());
+            assert_eq!(
+                worker
+                    .bridge()
+                    .snapshot()
+                    .unwrap()
+                    .views
+                    .iter()
+                    .find(|v| v.id == after.selected_window)
+                    .unwrap()
+                    .view
+                    .start,
+                start
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
 }
