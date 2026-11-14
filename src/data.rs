@@ -323,7 +323,7 @@ fn string_to_number<'ob>(string: &str, base: Option<i64>, cx: &'ob Context) -> R
                 special = if tail.starts_with("INF") {
                     Some(f64::INFINITY)
                 } else if tail.starts_with("NaN") {
-                    Some(f64::NAN)
+                    Some(crate::core::object::nan_from_decimal_prefix(&string[sign..]))
                 } else {
                     None
                 };
@@ -835,6 +835,39 @@ mod test {
             (r#"(string-to-number "+")"#, "0"),
         ] {
             assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn decimal_nan_payloads_match_reader_modulo_51_bits() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = Context::new(&roots);
+        let mut state = 857044_u64;
+        for _ in 0..256 {
+            let mut integer = num_bigint::BigInt::from(0_u8);
+            for _ in 0..8 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                integer = (integer << 64_usize) + state;
+            }
+            let payload = state & ((1_u64 << 51) - 1);
+            for negative in [false, true] {
+                let sign = if negative { "-" } else { "" };
+                let source = format!("{sign}{integer}.125e+NaN");
+                let parsed = string_to_number(&format!("{source}tail"), None, &cx).unwrap();
+                let ObjectType::Float(parsed) = parsed.as_obj_copy().untag() else {
+                    panic!("float expected")
+                };
+                let ObjectType::Float(read) = crate::reader::read(&source, &cx).unwrap().0.untag()
+                else {
+                    panic!("float expected")
+                };
+                let expected = 0x7ff8_0000_0000_0000 | payload | (u64::from(negative) << 63);
+                assert_eq!(parsed.to_bits(), expected);
+                assert_eq!(read.to_bits(), expected);
+                assert_eq!(parsed.to_string(), format!("{sign}{payload}.0e+NaN"));
+            }
         }
     }
 

@@ -369,8 +369,10 @@ fn lisp_float(slice: &str) -> Option<f64> {
                     f64::INFINITY
                 });
             }
-            // The current float object preserves NaN classification/sign, not GNU's payload.
-            "+NaN" => return Some(if slice.starts_with('-') { -f64::NAN } else { f64::NAN }),
+            "+NaN" => {
+                let value = crate::core::object::nan_from_decimal_prefix(unsigned);
+                return Some(if slice.starts_with('-') { -value } else { value });
+            }
             _ => {}
         }
         let exponent_digits = exponent.strip_prefix(['+', '-']).unwrap_or(&exponent);
@@ -1240,6 +1242,22 @@ mod m0_reader_regressions {
             assert_eq!(lisp_float(source), None, "{source}");
         }
         assert!(lisp_float("-0.0").unwrap().is_sign_negative());
+    }
+
+    #[test]
+    fn nan_payload_reader_preserves_gnu_decimal_prefix_policy() {
+        for (source, payload) in [
+            ("1.5e+NaN", 1),
+            (".5e+NaN", (1_u64 << 51) - 2),
+            ("2251799813685247.0e+NaN", (1_u64 << 51) - 1),
+            ("2251799813685248.0e+NaN", 0),
+            ("18446744073709551616.0e+NaN", 0),
+        ] {
+            assert_eq!(lisp_float(source).unwrap().to_bits(), 0x7ff8_0000_0000_0000 | payload);
+        }
+        crate::interpreter::assert_lisp("(eql 0.0e+NaN 1.0e+NaN)", "nil");
+        crate::interpreter::assert_lisp("(eql 1.5e+NaN 1.0e+NaN)", "t");
+        crate::interpreter::assert_lisp("(eql -1.0e+NaN 1.0e+NaN)", "nil");
     }
 
     #[test]

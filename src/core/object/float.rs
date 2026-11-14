@@ -45,14 +45,32 @@ impl Display for LispFloat {
     }
 }
 
+const NAN_PAYLOAD_MASK: u64 = (1_u64 << 51) - 1;
+
+/// GNU lread.c stores the leading decimal integer modulo 2^51 in a quiet
+/// NaN's payload. Fractional digits do not contribute. A dot-leading number
+/// starts with digit_to_number('.') == -2, retained as an unsigned sentinel.
+/// Callers have already validated numeric syntax and stripped a leading sign.
+pub(crate) fn nan_from_decimal_prefix(prefix: &str) -> f64 {
+    let payload = if prefix.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        prefix.bytes().take_while(u8::is_ascii_digit).fold(0_u64, |value, digit| {
+            value.wrapping_mul(10).wrapping_add(u64::from(digit - b'0'))
+        })
+    } else {
+        u64::MAX - 1
+    };
+    f64::from_bits(0x7ff8_0000_0000_0000 | (payload & NAN_PAYLOAD_MASK))
+}
+
 /// Format a numeric literal, not Rust's `inf`/`NaN` symbol spellings. Share
 /// this boundary with generated Lisp fixtures so nonfinite cases stay numbers.
 pub(crate) fn fmt_float(value: f64, f: &mut std::fmt::Formatter) -> std::fmt::Result {
     if value.is_nan() {
+        let payload = value.to_bits() & NAN_PAYLOAD_MASK;
         if value.is_sign_negative() {
-            f.write_str("-0.0e+NaN")
+            write!(f, "-{payload}.0e+NaN")
         } else {
-            f.write_str("0.0e+NaN")
+            write!(f, "{payload}.0e+NaN")
         }
     } else if value.is_infinite() {
         if value.is_sign_negative() {
@@ -156,6 +174,45 @@ mod tests {
             (-1.5, "-1.5"),
         ] {
             assert_eq!(LispFloat::new(value, false).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn quiet_nan_payload_literals_preserve_all_51_payload_bits() {
+        let mut payload = 1_u64;
+        for _ in 0..4096 {
+            payload ^= payload << 13;
+            payload ^= payload >> 7;
+            payload ^= payload << 17;
+            payload &= NAN_PAYLOAD_MASK;
+            for negative in [false, true] {
+                let bits = 0x7ff8_0000_0000_0000 | payload | (u64::from(negative) << 63);
+                let value = LispFloat::new(f64::from_bits(bits), false);
+                let literal = value.to_string();
+                let roots = crate::core::gc::RootSet::default();
+                let cx = crate::core::gc::Context::new(&roots);
+                let parsed = crate::reader::read(&literal, &cx).unwrap().0;
+                let crate::core::object::ObjectType::Float(parsed) = parsed.untag() else {
+                    panic!("float expected")
+                };
+                assert_eq!(parsed.to_bits(), bits);
+            }
+        }
+    }
+
+    #[test]
+    fn signaling_nan_literal_readback_is_explicitly_quieted() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = crate::core::gc::Context::new(&roots);
+        for sign in [0, 1_u64 << 63] {
+            let bits = sign | 0x7ff0_0000_0000_0001;
+            let literal = LispFloat::new(f64::from_bits(bits), false).to_string();
+            let crate::core::object::ObjectType::Float(parsed) =
+                crate::reader::read(&literal, &cx).unwrap().0.untag()
+            else {
+                panic!("float expected")
+            };
+            assert_eq!(parsed.to_bits(), bits | (1_u64 << 51));
         }
     }
 

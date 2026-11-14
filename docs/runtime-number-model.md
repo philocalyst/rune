@@ -148,7 +148,8 @@ regressions are included in the latest unit run described above:
 * Runtime floats and property-test fixtures share a formatter for Lisp's
   `1.0e+INF` and `0.0e+NaN` spellings, including signs. Rust's bare `inf`/`NaN`
   would be read as symbols. Added display/read-back tests preserve finite bits,
-  signed zero, and NaN class/sign, but do not claim NaN payload preservation.
+  signed zero, and quiet-NaN sign/payload. See [NaN payload semantics](runtime-nan-payloads.md)
+  for the modulo-prefix rule and the signaling-NaN limitation.
 
 Source-only formatting and apply checks do not qualify these new regressions.
 The compatibility plan calls for normal/test builds with regenerated symbols,
