@@ -92,7 +92,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
     /// unwind the Rust process. Opcode semantics remain deliberately unimplemented.
     fn unsupported_opcode(&mut self, opcode: opcode::OpCode, cx: &Context) -> EvalError {
         let data = Cons::new1(cx.add(format!("Unsupported bytecode opcode: {opcode:?}")), cx);
-        EvalError::signal(sym::RUNE_UNIMPLEMENTED.into(), data.into(), self.env)
+        EvalError::signal(sym::RUNE_UNIMPLEMENTED.into(), data.into(), cx)
     }
 
     fn require_stack(&self, count: usize) -> Result<()> {
@@ -325,15 +325,12 @@ impl<'ob> RootedVM<'_, '_, '_> {
             while let Some(handler) = self.handlers.bind_mut(cx).pop() {
                 self.env.catch_stack.truncate(handler.catch_depth);
                 if handler.is_catch {
-                    let ErrorType::Throw(id) = &err.error else { continue };
-                    let Some((tag, value)) = self.env.get_exception(*id) else {
-                        bail_err!("Exception not found");
-                    };
-                    if !handler.condition.ptr_eq(tag.bind(cx)) {
+                    let ErrorType::Throw(payload) = &err.error else { continue };
+                    let pair = payload.bind(cx)?;
+                    if !handler.condition.ptr_eq(pair.car()) {
                         continue;
                     }
-                    let value = value.bind(cx);
-                    self.resume_handler(&handler, value, cx)?;
+                    self.resume_handler(&handler, pair.cdr(), cx)?;
                     continue 'main;
                 }
                 // Conditions never intercept a nonlocal throw.
@@ -356,12 +353,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
 
                 let rendered = format!("{err}");
                 let error = match err.error {
-                    ErrorType::Signal(id) => {
-                        let Some((sym, data)) = self.env.get_exception(id) else {
-                            bail_err!("Exception not found")
-                        };
-                        Cons::new(sym, data, cx)
-                    }
+                    ErrorType::Signal(payload) => payload.condition(cx),
                     ErrorType::Err(error) => {
                         // Preserve the condition symbol and data just as the
                         // interpreter does. LispError owns its GC-safe payload;
@@ -1440,6 +1432,45 @@ mod test {
     }
 
     #[test]
+    fn pushcatch_preserves_pending_throw_through_cleanup_local_exits() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let form = crate::reader::read("(function (lambda () (unwind-protect (throw 17 7) (catch 19 (throw 19 2)) (garbage-collect))))", cx).unwrap().0;
+        root!(form, cx);
+        root!(env, new(Env), cx);
+        let closure = crate::interpreter::eval(form, None, env, cx).unwrap();
+        root!(closure, cx);
+        make_bytecode!(
+            bytecode,
+            0,
+            [
+                O::Constant0,
+                O::PushCatch,
+                8,
+                0,
+                O::Constant1,
+                O::Call0,
+                O::PopHandler,
+                O::Return,
+                O::Return
+            ],
+            [17, closure.bind(cx)],
+            cx
+        );
+        for _ in 0..3 {
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments();
+            assert_eq!(
+                call(bytecode, 0, "pending-cleanup-catch", &mut frame, cx).unwrap(),
+                Object::from(7)
+            );
+            assert!(frame.catch_stack.is_empty());
+        }
+    }
+
+    #[test]
     fn pushcatch_rejects_operand_target_before_registering_tag() {
         use OpCode as O;
         let roots = &RootSet::default();
@@ -2175,12 +2206,12 @@ mod test {
         let frame = &mut CallFrame::new(env);
         frame.finalize_arguments();
         let error = call(bytecode, 0, "throw-through-condition", frame, cx).unwrap_err();
-        let ErrorType::Throw(id) = error.error else {
+        let ErrorType::Throw(payload) = error.error else {
             panic!("condition handler intercepted nonlocal throw");
         };
-        let (actual_tag, data) = frame.get_exception(id).unwrap();
-        assert_eq!(actual_tag.bind(cx), Object::from(17));
-        assert_eq!(data.bind(cx), Object::from(7));
+        let pair = payload.bind(cx).unwrap();
+        assert_eq!(pair.car(), Object::from(17));
+        assert_eq!(pair.cdr(), Object::from(7));
         assert_eq!(frame.binding_depth(), initial);
         assert_eq!(
             frame
@@ -2569,12 +2600,12 @@ mod test {
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments();
             let error = call(bytecode, 0, "unsupported-opcode", frame, cx).unwrap_err();
-            let ErrorType::Signal(id) = error.error else {
+            let ErrorType::Signal(payload) = error.error else {
                 panic!("Expected named signal for {opcode:?}");
             };
-            let (symbol, data) = frame.get_exception(id).unwrap();
-            assert_eq!(symbol.bind(cx), sym::RUNE_UNIMPLEMENTED);
-            let data = data.bind(cx).cons().unwrap();
+            let pair = payload.bind(cx).unwrap();
+            assert_eq!(pair.car(), sym::RUNE_UNIMPLEMENTED);
+            let data = pair.cdr().cons().unwrap();
             assert_eq!(data.car(), cx.add(format!("Unsupported bytecode opcode: {opcode:?}")));
         }
     }

@@ -105,16 +105,17 @@ impl Interpreter<'_, '_> {
         let result = match self.implicit_progn(forms, cx) {
             Ok(x) => Ok(rebind!(x, cx)),
             Err(e) => {
-                if let ErrorType::Throw(id) = e.error
-                    && let Some((throw_tag, data)) = self.env.get_exception(id)
-                {
-                    let catch_tag = self.env.catch_stack.last().unwrap();
-                    if catch_tag.bind(cx).ptr_eq(throw_tag.bind(cx)) {
-                        // Continue through the common cleanup below: a caught
-                        // throw must not leave its tag active in the environment.
-                        Ok(data.bind(cx))
-                    } else {
-                        Err(e)
+                if let ErrorType::Throw(payload) = &e.error {
+                    match payload.bind(cx) {
+                        Ok(pair) => {
+                            let catch_tag = self.env.catch_stack.last().unwrap();
+                            if catch_tag.bind(cx).ptr_eq(pair.car()) {
+                                Ok(pair.cdr())
+                            } else {
+                                Err(e)
+                            }
+                        }
+                        Err(error) => Err(error.into()),
                     }
                 } else {
                     Err(e)
@@ -684,12 +685,7 @@ impl Interpreter<'_, '_> {
 
                     // Call handlers with error
                     let error = match err.error {
-                        ErrorType::Signal(id) => {
-                            let Some((sym, data)) = self.env.get_exception(id) else {
-                                unreachable!("Exception not found")
-                            };
-                            Cons::new(sym, data, cx)
-                        }
+                        ErrorType::Signal(payload) => payload.condition(cx),
                         ErrorType::Err(err) => {
                             let err_str = format!("{err}");
                             if let Ok(lisp_error) = err.downcast::<LispError>() {
@@ -1335,6 +1331,23 @@ mod test {
             "7",
         );
         assert_lisp("(condition-case nil (catch (list 1) (throw (list 1) 7)) (error 9))", "9");
+    }
+
+    #[test]
+    fn pending_exits_survive_cleanup_local_handled_exits() {
+        assert_lisp(
+            "(catch 'outer (unwind-protect (throw 'outer 1) (catch 'inner (throw 'inner 2))))",
+            "1",
+        );
+        assert_lisp(
+            "(condition-case e (unwind-protect (signal 'error '(1)) (condition-case nil (signal 'error '(2)) (error nil))) (error (car (cdr e))))",
+            "1",
+        );
+        assert_lisp(
+            "(let ((tag (list 17)) (value (list 7))) (eq (catch tag (unwind-protect (throw tag value) (catch 'inner (throw 'inner 2)) (garbage-collect))) value))",
+            "t",
+        );
+        assert_lisp("(catch 'outer (unwind-protect (throw 'outer 1) (throw 'outer 3)))", "3");
     }
 
     #[test]

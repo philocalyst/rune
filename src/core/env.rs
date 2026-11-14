@@ -29,9 +29,6 @@ pub(crate) struct Env<'a> {
     pub(crate) vars: ObjectMap<Slot<Symbol<'a>>, Slot<Object<'a>>>,
     pub(crate) props: PropertyMap<'a>,
     pub(crate) catch_stack: Vec<Slot<Object<'a>>>,
-    exception: (Slot<Object<'a>>, Slot<Object<'a>>),
-    #[no_trace]
-    exception_id: u32,
     binding_stack: Vec<(Slot<Symbol<'a>>, Option<Slot<Object<'a>>>)>,
     pub(crate) match_data: Slot<Object<'a>>,
     features: Vec<Slot<Symbol<'a>>>,
@@ -179,17 +176,6 @@ impl<'a> RootedEnv<'a> {
                 self.props.insert(symbol, vec![(propname, value)]);
             }
         }
-    }
-
-    pub(crate) fn set_exception(&mut self, tag: Object, data: Object) -> u32 {
-        self.exception.0.set(tag);
-        self.exception.1.set(data);
-        self.exception_id += 1;
-        self.exception_id
-    }
-
-    pub(crate) fn get_exception(&self, id: u32) -> Option<(&Rto<Object<'a>>, &Rto<Object<'a>>)> {
-        (id == self.exception_id).then_some((&self.exception.0, &self.exception.1))
     }
 
     pub(crate) fn varbind(&mut self, var: Symbol, value: Object, cx: &Context) {

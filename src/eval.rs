@@ -4,7 +4,8 @@ use crate::core::env::{ArgSlice, CallFrame, Env, sym};
 use crate::core::error::{Type, TypeError};
 use crate::core::gc::{Rt, Rto};
 use crate::core::object::{
-    FnArgs, Function, LispString, NIL, ObjectType, Symbol, TagType, WithLifetime, display_slice,
+    FnArgs, Function, HeapDomainValue, LispString, NIL, ObjectType, Symbol, TagType, WithLifetime,
+    display_slice,
 };
 use crate::core::{
     gc::Context,
@@ -28,9 +29,42 @@ pub(crate) struct EvalError {
 
 #[derive(Debug)]
 pub(crate) enum ErrorType {
-    Throw(u32),
-    Signal(u32),
+    Throw(PendingExit),
+    Signal(PendingExit),
     Err(anyhow::Error),
+}
+
+/// Independently retained payload for one pending nonlocal exit. A cleanup
+/// can raise and handle another exit without replacing this payload's GC root.
+#[derive(Debug)]
+pub(crate) struct PendingExit {
+    payload: HeapDomainValue,
+}
+
+impl PendingExit {
+    fn new(tag: Object, data: Object, cx: &Context) -> Self {
+        let pair = Cons::new(tag, data, cx);
+        Self {
+            // SAFETY: pair is freshly allocated in cx; its inputs are the
+            // current evaluator's owner-domain values (or audited globals).
+            payload: unsafe { HeapDomainValue::new(pair.into(), cx) },
+        }
+    }
+
+    /// Binding never reconstructs tag identity from a diagnostic. In another
+    /// or retired owner domain a throw must fail closed, not match a new catch.
+    pub(crate) fn bind<'ob>(&self, cx: &'ob Context) -> Result<&'ob Cons> {
+        self.payload
+            .bind(cx)?
+            .cons()
+            .ok_or_else(|| anyhow!("Invalid pending exit payload"))
+    }
+
+    pub(crate) fn condition<'ob>(&self, cx: &'ob Context) -> &'ob Cons {
+        self.bind(cx).unwrap_or_else(|_| {
+            Cons::new(sym::ERROR, "Signal payload unavailable in this heap domain", cx)
+        })
+    }
 }
 
 impl std::error::Error for EvalError {}
@@ -51,15 +85,15 @@ impl EvalError {
         Self { backtrace: Vec::new(), error: ErrorType::Err(error) }
     }
 
-    pub(crate) fn signal(error_symbol: Object, data: Object, env: &mut Rt<Env>) -> Self {
+    pub(crate) fn signal(error_symbol: Object, data: Object, cx: &Context) -> Self {
         Self {
             backtrace: Vec::new(),
-            error: ErrorType::Signal(env.set_exception(error_symbol, data)),
+            error: ErrorType::Signal(PendingExit::new(error_symbol, data, cx)),
         }
     }
 
-    pub(crate) fn throw(tag: Object, data: Object, env: &mut Rt<Env>) -> Self {
-        Self { backtrace: Vec::new(), error: ErrorType::Throw(env.set_exception(tag, data)) }
+    pub(crate) fn throw(tag: Object, data: Object, cx: &Context) -> Self {
+        Self { backtrace: Vec::new(), error: ErrorType::Throw(PendingExit::new(tag, data, cx)) }
     }
 
     pub(crate) fn new(error: impl Into<Self>) -> Self {
@@ -398,7 +432,7 @@ pub(crate) fn throw_value(
     cx: &Context,
 ) -> EvalError {
     if env.catch_stack.iter().any(|entry| entry.bind(cx).ptr_eq(tag)) {
-        EvalError::throw(tag, value, env)
+        EvalError::throw(tag, value, cx)
     } else {
         EvalError::new_error(anyhow!("No catch for {tag}"))
     }
@@ -410,11 +444,11 @@ fn throw(tag: Object, value: Object, env: &mut Rt<Env>, cx: &Context) -> Result<
 }
 
 #[defun]
-fn signal(mut error_symbol: Object, data: Object, env: &mut Rt<Env>) -> Result<bool> {
+fn signal(mut error_symbol: Object, data: Object, cx: &Context) -> Result<bool> {
     if error_symbol.is_nil() && data.is_nil() {
         error_symbol = sym::ERROR.into();
     }
-    Err(EvalError::signal(error_symbol, data, env).into())
+    Err(EvalError::signal(error_symbol, data, cx).into())
 }
 
 #[defun]
@@ -534,3 +568,90 @@ defsym!(VOID_VARIABLE);
 
 defvar!(DEBUG_ON_ERROR, false);
 defvar!(INTERNAL_MAKE_INTERPRETED_CLOSURE_FUNCTION);
+
+#[cfg(test)]
+mod pending_exit_tests {
+    use super::*;
+    use crate::core::{gc::RootSet, object::IntoObject};
+
+    #[test]
+    fn pending_exit_keeps_original_identity_across_other_exits_and_collections() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let tag = Cons::new1(17, cx);
+        root!(tag, cx);
+        let value = vec![Object::from(7)].into_obj(&cx.block);
+        root!(value, cx);
+        let error = EvalError::throw(tag.bind(cx).into(), value.bind(cx).into(), cx);
+        for _ in 0..5 {
+            let _other = EvalError::signal(sym::ERROR.into(), NIL, cx);
+            cx.garbage_collect(true);
+            let ErrorType::Throw(payload) = &error.error else { panic!("expected throw") };
+            let pair = payload.bind(cx).unwrap();
+            assert!(pair.car().ptr_eq(Object::from(tag.bind(cx))));
+            assert!(pair.cdr().ptr_eq(Object::from(value.bind(cx))));
+        }
+    }
+
+    #[test]
+    fn constructing_pending_exit_does_not_render_recursive_payload() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let cycle = Cons::new1(17, cx);
+        cycle.set_cdr(cycle.into()).unwrap();
+        let error = EvalError::throw(Object::from(17), cycle.into(), cx);
+        for _ in 0..5 {
+            cx.garbage_collect(true);
+        }
+        let ErrorType::Throw(payload) = &error.error else { panic!("expected throw") };
+        let pair = payload.bind(cx).unwrap();
+        let cycle = pair.cdr().cons().unwrap();
+        assert!(cycle.cdr().ptr_eq(pair.cdr()));
+    }
+
+    #[test]
+    fn live_foreign_binding_fails_without_disturbing_owner_payload() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let tag = Cons::new1(17, cx);
+        root!(tag, cx);
+        let error = EvalError::throw(Object::from(tag.bind(cx)), Object::from(7), cx);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let roots = RootSet::default();
+                    let foreign = Context::new(&roots);
+                    let ErrorType::Throw(payload) = &error.error else { panic!("expected throw") };
+                    assert!(payload.bind(&foreign).is_err());
+                    assert_eq!(payload.condition(&foreign).car(), sym::ERROR);
+                })
+                .join()
+                .unwrap();
+        });
+        cx.garbage_collect(true);
+        let ErrorType::Throw(payload) = &error.error else { panic!("expected throw") };
+        let pair = payload.bind(cx).unwrap();
+        assert!(pair.car().ptr_eq(Object::from(tag.bind(cx))));
+        assert_eq!(pair.cdr(), Object::from(7));
+    }
+
+    #[test]
+    fn retired_and_foreign_payload_never_recreates_catch_identity() {
+        let error = {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            EvalError::throw(cx.add("owner-tag"), Object::from(7), &cx)
+        };
+        std::thread::spawn(move || {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            let ErrorType::Throw(payload) = &error.error else { panic!("expected throw") };
+            assert!(payload.bind(&cx).is_err());
+            let fallback = payload.condition(&cx);
+            assert_eq!(fallback.car(), sym::ERROR);
+            assert!(matches!(fallback.cdr().untag(), ObjectType::String(_)));
+        })
+        .join()
+        .unwrap();
+    }
+}
