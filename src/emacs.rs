@@ -5,7 +5,27 @@ use rune_macros::defun;
 fn kill_emacs() {}
 
 defvar!(EMACS_VERSION, "27.1");
-defvar!(SYSTEM_TYPE, "darwin");
+defvar!(SYSTEM_TYPE, crate::core::env::intern(env.startup_system_type, cx));
+
+/// Native startup input, not an advertised Emacs compatibility version.
+pub(crate) fn startup_system_type() -> anyhow::Result<&'static str> {
+    system_type_for_target(std::env::consts::OS, cfg!(target_env = "gnu"))
+}
+fn system_type_for_target(os: &str, gnu_environment: bool) -> anyhow::Result<&'static str> {
+    Ok(match os {
+        "linux" => "gnu/linux",
+        "macos" => "darwin",
+        "windows" => "windows-nt",
+        "freebsd" if gnu_environment => "gnu/kfreebsd",
+        "freebsd" | "openbsd" | "netbsd" | "dragonfly" => "berkeley-unix",
+        "solaris" | "illumos" => "usg-unix-v",
+        "android" => "android",
+        "haiku" => "haiku",
+        "hurd" => "gnu",
+        "aix" => "aix",
+        _ => anyhow::bail!("Unsupported target operating system for system-type: {os}"),
+    })
+}
 defvar!(DUMP_MODE);
 defvar!(COMMAND_LINE_ARGS, list![""]);
 defvar!(DEFAULT_DIRECTORY, env.startup_default_directory.clone());
@@ -203,5 +223,33 @@ mod environment_tests {
             assert_eq!(snapshot[0].1.as_bytes(), &[0xff, 0xfe]);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod system_type_tests {
+    use super::*;
+    #[test]
+    fn native_platform_name_mapping_fails_closed_for_unknown_targets() {
+        for (os, gnu, expected) in [
+            ("linux",true,"gnu/linux"), ("macos",false,"darwin"),
+            ("windows",false,"windows-nt"), ("freebsd",false,"berkeley-unix"),
+            ("freebsd",true,"gnu/kfreebsd"), ("openbsd",false,"berkeley-unix"),
+            ("netbsd",false,"berkeley-unix"), ("dragonfly",false,"berkeley-unix"),
+            ("solaris",false,"usg-unix-v"), ("illumos",false,"usg-unix-v"),
+            ("android",false,"android"), ("haiku",false,"haiku"),
+            ("hurd",true,"gnu"), ("aix",false,"aix"),
+        ] { assert_eq!(system_type_for_target(os,gnu).unwrap(),expected); }
+        assert!(system_type_for_target("unknown-os",false).is_err());
+    }
+    #[test]
+    fn initialized_system_type_is_a_symbol_and_matches_native_gnu_host() {
+        #[cfg(target_os = "linux")]
+        {
+            let source = "(list (symbolp system-type) (eq system-type 'gnu/linux))";
+            crate::library::elprop::start_emacs().unwrap();
+            let expected = crate::library::elprop::eval(source).unwrap();
+            crate::interpreter::assert_lisp(source,&expected);
+        }
     }
 }

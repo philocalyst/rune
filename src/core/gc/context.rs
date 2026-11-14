@@ -267,6 +267,7 @@ pub(crate) struct Context<'rt> {
     editor_gateway: OnceCell<crate::editor_document::RuntimeEditorGateway>,
     pub(in crate::core) overlay_registry: RefCell<OverlayRegistry>,
     pub(in crate::core) frame_registry: RefCell<FrameRegistry>,
+    echo_state: RefCell<crate::echo::EchoState>,
     pub(in crate::core) process_registry: RefCell<ProcessRegistry>,
 }
 
@@ -526,8 +527,24 @@ impl<'ob, 'rt> Context<'rt> {
             editor_gateway: OnceCell::new(),
             process_registry: RefCell::new(ProcessRegistry::default()),
             frame_registry: RefCell::new(FrameRegistry::default()),
+            echo_state: RefCell::new(crate::echo::EchoState::default()),
             overlay_registry: RefCell::new(OverlayRegistry::default()),
         }
+    }
+
+    /// Native owned bytes only; no Lisp value or Context self-root is retained.
+    pub(crate) fn replace_echo_message(&self, text: Option<String>) -> anyhow::Result<()> {
+        let frame = self.selected_frame()?;
+        frame.validate(self)?;
+        self.echo_state.try_borrow_mut()?.replace(frame.id(), text)
+    }
+    pub(crate) fn echo_snapshot(&self) -> anyhow::Result<crate::echo::EchoSnapshot> {
+        let frame = self.selected_frame()?;
+        frame.validate(self)?;
+        let displayed = match frame.backend() {
+            crate::core::object::FrameBackend::Terminal => false,
+        };
+        self.echo_state.try_borrow()?.snapshot(frame.id(), displayed)
     }
 
     /// Native observation only, not a root, heap borrow or access credential.

@@ -1202,6 +1202,46 @@ mod test {
     }
 
     #[test]
+    fn preserving_concat_opcode_keeps_properties_and_byte_storage_across_gc() {
+        use OpCode as O;
+        use crate::core::object::{StringPropertyRun,ObjectType};
+        for binary in [false,true] {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            sym::init_symbols();
+            let input = if binary { cx.add(vec![0xff]) } else { cx.add("é") };
+            let plist = list![sym::FACE,7;cx];
+            let runs = [StringPropertyRun { start:0,end:1,plist }];
+            // SAFETY: input, fresh plist spine and its scalar/global values all
+            // belong to this Context; no collection/evaluation before publish.
+            match input.untag() {
+                ObjectType::String(value) => unsafe { value.set_property_runs(&runs,cx).unwrap(); },
+                ObjectType::ByteString(value) => unsafe { value.set_property_runs(&runs,cx).unwrap(); },
+                _ => unreachable!(),
+            }
+            root!(input,cx);
+            let suffix = if binary { cx.add(vec![b'x']) } else { cx.add("🙂") };
+            make_bytecode!(bytecode,0,[O::Constant0,O::Constant1,O::Concat2,O::Return],[input.bind(cx),suffix],cx);
+            root!(env,init(Env::new(cx).unwrap()),cx);
+            let output = {
+                let mut frame = CallFrame::new(env);
+                frame.finalize_arguments().unwrap();
+                rebind!(call(bytecode,0,"preserving-concat",&mut frame,cx).unwrap())
+            };
+            root!(output,cx);
+            cx.garbage_collect(true);
+            let runs = crate::core::object::string_property_runs(output.bind(cx)).unwrap();
+            assert_eq!((runs[0].start,runs[0].end),(0,1));
+            assert_eq!(runs[0].plist.cons().unwrap().cdr().cons().unwrap().car(),Object::from(7));
+            match output.bind(cx).untag() {
+                ObjectType::String(value) if !binary => assert_eq!(value.inner(),"é🙂"),
+                ObjectType::ByteString(value) if binary => assert_eq!(value.inner(),&[0xff,b'x']),
+                _ => panic!("Concat changed string storage kind"),
+            }
+        }
+    }
+
+    #[test]
     fn function_alias_fset_opcode_cycle_is_caught_by_named_handler() {
         use OpCode as O;
         struct Cleanup;

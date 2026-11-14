@@ -36,6 +36,8 @@ pub(crate) struct Env<'a> {
     // Immutable native initialization input, not a second mutable variable store.
     #[no_trace]
     pub(crate) startup_default_directory: String,
+    #[no_trace]
+    pub(crate) startup_system_type: &'static str,
     pub(crate) props: PropertyMap<'a>,
     pub(crate) catch_stack: Vec<Slot<Object<'a>>>,
     binding_stack: Vec<(Slot<Symbol<'a>>, Option<Slot<Object<'a>>>)>,
@@ -73,6 +75,7 @@ pub(crate) struct ExcursionToken {
 }
 impl<'a> Env<'a> {
     pub(crate) fn new(cx: &Context) -> Result<Self> {
+        let startup_system_type = crate::emacs::startup_system_type()?;
         let cwd = std::env::current_dir()?;
         anyhow::ensure!(cwd.is_absolute(), "Initial working directory is not absolute");
         let mut startup_default_directory = cwd.to_str()
@@ -86,6 +89,7 @@ impl<'a> Env<'a> {
             vars: Default::default(),
             variable_aliases: Default::default(),
             startup_default_directory,
+            startup_system_type,
             props: Default::default(),
             catch_stack: Default::default(),
             binding_stack: Default::default(),

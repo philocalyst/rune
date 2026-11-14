@@ -13,6 +13,7 @@ use rune_macros::defun;
 
 defsym!(KEYMAP);
 defsym!(GLOBAL_MAP);
+defsym!(MAP_KEYMAP_SORTED);
 // GNU Emacs 30.1 src/keymap.c::syms_of_keymap creates this real sparse
 // map before Lisp subr.el adds bindings. Unlike global-map it has no Lisp
 // initializer before minibuffer-local-password-map inherits it.
@@ -842,4 +843,15 @@ pub(crate) fn preflight_keymap_alias(
         current = crate::data::symbol_function_owner(s, env, cx);
     }
     bail!("keymap symbol indirection too deep")
+}
+
+mod mapping;
+
+#[defun]
+fn map_keymap(function:&crate::core::gc::Rto<Object>,keymap:&crate::core::gc::Rto<Object>,sort_first:crate::core::object::OptionalFlag,env:&mut Rt<Env>,cx:&mut Context)->Result<()> {
+    mapping::map_keymap(function,keymap,sort_first,env,cx)
+}
+#[defun]
+fn map_keymap_internal<'a>(function:&crate::core::gc::Rto<Object>,keymap:&crate::core::gc::Rto<Object>,env:&mut Rt<Env>,cx:&'a mut Context)->Result<Object<'a>> {
+    mapping::map_keymap_internal(function,keymap,env,cx)
 }

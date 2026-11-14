@@ -24,11 +24,22 @@ fn plain_format_control<'ob>(object: Object<'ob>) -> Result<&'ob str> {
 }
 
 #[defun]
-fn message(format_string: Object, args: &[Object]) -> Result<String> {
+pub(crate) fn message<'ob>(format_string: Object, args: &[Object], cx: &'ob Context) -> Result<Object<'ob>> {
+    if format_string.is_nil() {
+        cx.replace_echo_message(None)?;
+        println!("MESSAGE: ");
+        std::io::stdout().flush()?;
+        return Ok(crate::core::object::NIL);
+    }
     let message = format(plain_format_control(format_string)?, args)?;
+    ensure!(message.len() <= crate::echo::MAX_ECHO_BYTES, "Echo request exceeds 16 MiB retention limit");
+    let mut retained = String::new();
+    retained.try_reserve_exact(message.len())?;
+    retained.push_str(&message);
+    cx.replace_echo_message(Some(retained))?;
     println!("MESSAGE: {message}");
     std::io::stdout().flush()?;
-    Ok(message)
+    Ok(cx.add(message))
 }
 
 defvar!(MESSAGE_NAME);
