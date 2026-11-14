@@ -275,20 +275,64 @@ fn save_current_visited_buffer(max_bytes: usize, env: &Rt<Env>, cx: &Context) ->
 }
 
 defsym!(EXCL);
-#[defun]
+#[defun(name = "write-region")]
+#[expect(clippy::too_many_arguments)]
+fn write_region_lisp(
+    start: Object, end: Object, filename: &str, append: Option<Object>,
+    visit: OptionalFlag, lockname: OptionalFlag, mustbenew: Option<Object>,
+    env: &Rt<Env>, cx: &Context,
+) -> Result<()> {
+    if start.is_nil() {
+        let end = env.buffer_read(cx)?.document.text().len_chars().checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Buffer position overflow"))?;
+        return write_region(1, i64::try_from(end)?, filename, append, visit, lockname, mustbenew, env, cx);
+    }
+    match start.untag() {
+        ObjectType::String(text) => write_region_to(filename, append, visit, lockname, mustbenew, |file| {
+            std::io::Write::write_all(file, text.as_bytes())?;
+            Ok(())
+        }),
+        ObjectType::ByteString(bytes) => write_region_to(filename, append, visit, lockname, mustbenew, |file| {
+            std::io::Write::write_all(file, bytes)?;
+            Ok(())
+        }),
+        ObjectType::Int(start) => {
+            let ObjectType::Int(end) = end.untag() else { bail!("END must be a fixnum buffer position") };
+            write_region(start, end, filename, append, visit, lockname, mustbenew, env, cx)
+        }
+        _ => bail!("START must be nil, a string, or a fixnum buffer position"),
+    }
+}
+
 #[expect(clippy::too_many_arguments)]
 fn write_region(
-    start: i64,
-    end: i64,
-    filename: &str,
-    append: Option<Object>,
-    visit: OptionalFlag,
-    lockname: OptionalFlag,
-    mustbenew: Option<Object>,
-    env: &Rt<Env>,
-    cx: &Context,
+    start: i64, end: i64, filename: &str, append: Option<Object>,
+    visit: OptionalFlag, lockname: OptionalFlag, mustbenew: Option<Object>,
+    env: &Rt<Env>, cx: &Context,
 ) -> Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::Write;
+    // Resolve every scalar range before opening/truncating the destination.
+    let start = usize::try_from(start)?;
+    let end = usize::try_from(end)?;
+    let (start, end) = (start.min(end), start.max(end));
+    let read = env.buffer_read(cx)?;
+    let text = read.document.text();
+    ensure!(start > 0 && end <= text.len_chars() + 1, "Buffer range out of bounds");
+    let bytes = text.char_to_byte(rune_text::CharPos(start - 1))?
+        ..text.char_to_byte(rune_text::CharPos(end - 1))?;
+    let chunks = text.chunks(bytes)?;
+    write_region_to(filename, append, visit, lockname, mustbenew, |file| {
+        for chunk in chunks { file.write_all(chunk.as_bytes())?; }
+        Ok(())
+    })
+}
+
+fn write_region_to(
+    filename: &str, append: Option<Object>, visit: OptionalFlag,
+    lockname: OptionalFlag, mustbenew: Option<Object>,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
     enum Destination { Truncate, Append, Offset(u64) }
     let destination = match append {
         None => Destination::Truncate,
@@ -311,16 +355,6 @@ fn write_region(
         Some(value) if value == Object::from(sym::EXCL) => true,
         _ => bail!("Confirmation-requiring mustbenew modes are not implemented"),
     };
-    // Capture and validate an immutable owner root before opening/truncating.
-    let start = usize::try_from(start)?;
-    let end = usize::try_from(end)?;
-    let (start, end) = (start.min(end), start.max(end));
-    let read = env.buffer_read(cx)?;
-    let text = read.document.text();
-    ensure!(start > 0 && end <= text.len_chars() + 1, "Buffer range out of bounds");
-    let bytes = text.char_to_byte(rune_text::CharPos(start - 1))?
-        ..text.char_to_byte(rune_text::CharPos(end - 1))?;
-    let chunks = text.chunks(bytes)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -331,10 +365,7 @@ fn write_region(
     if let Destination::Offset(offset) = destination {
         file.seek(SeekFrom::Start(offset))?;
     }
-    for chunk in chunks {
-        file.write_all(chunk.as_bytes())?;
-    }
-    Ok(())
+    write(&mut file)
 }
 
 /// Concatenate components to directory, inserting path separators as required.
@@ -746,6 +777,102 @@ mod visited_save_buffer_tests {
         assert!(save_buffer(None, env, cx).is_err());
         assert!(gateway.modified(before.handle, cx)?);
         assert_eq!(env.buffer_read(cx)?.epoch, read.epoch);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_region_source_form_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Result<Self> {
+            let path = std::env::temp_dir().join(format!("rune-write-source-{}-{}", std::process::id(), rand::random::<u64>()));
+            std::fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+    }
+    impl Drop for Directory { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    #[test]
+    fn lisp_nil_and_string_sources_ignore_end_without_mutating_buffer() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let g = env.editor_gateway();
+        let empty = env.buffer_read(cx)?;
+        g.splice(empty.handle, empty.epoch, 0..0, "aé🙂z", cx)?;
+        g.set_point(empty.handle, 2, cx)?;
+        let before = env.buffer_read(cx)?;
+        let dir = Directory::new()?;
+        let path = dir.0.join("file");
+        for (start, end, expected) in [
+            ("nil", "nil", "aé🙂z".as_bytes()),
+            ("nil", "'ignored", "aé🙂z".as_bytes()),
+            ("nil", "1.5", "aé🙂z".as_bytes()),
+            (r#""xy""#, "nil", b"xy".as_slice()),
+            (r#""λ🙂""#, "'(ignored)", "λ🙂".as_bytes()),
+            ("(unibyte-string 0 255 65)", "'ignored", &[0, 255, 65]),
+        ] {
+            crate::lread::load_internal(&format!("(write-region {start} {end} {:?})", path.to_str().unwrap()), cx, env)?;
+            assert_eq!(std::fs::read(&path)?, expected);
+        }
+        let after = env.buffer_read(cx)?;
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(after.point, before.point);
+        assert!(g.modified(before.handle, cx)?);
+        Ok(())
+    }
+    #[test]
+    fn invalid_source_windows_and_modes_never_touch_destination() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let dir = Directory::new()?;
+        let existing = dir.0.join("existing");
+        let absent = dir.0.join("absent");
+        std::fs::write(&existing, b"must survive")?;
+        for path in [&existing, &absent] {
+            for (start, end, options) in [
+                ("1", "nil", ""), ("t", "2", ""), ("1.5", "2", ""),
+                ("1", r#""bad""#, ""), ("0", "1", ""), ("1", "99", ""),
+                (r#""xy""#, "'ignored", "1.5"),
+                (r#""xy""#, "nil", "nil t"),
+                (r#""xy""#, "nil", "nil nil nil t"),
+            ] {
+                assert!(crate::lread::load_internal(&format!("(write-region {start} {end} {:?} {options})", path.to_str().unwrap()), cx, env).is_err());
+                assert_eq!(std::fs::read(&existing)?, b"must survive");
+                assert!(!absent.exists());
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn concurrent_string_source_exclusive_create_has_one_complete_winner() -> Result<()> {
+        let dir = Directory::new()?;
+        let path = dir.0.join("target");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for payload in ["first-é", "second-🙂"] {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let roots = RootSet::default();
+                let cx = &Context::new(&roots);
+                root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+                let source = cx.add(payload);
+                barrier.wait();
+                let won = write_region_lisp(source, NIL.into(), path.to_str().unwrap(), None, None, None, Some(sym::EXCL.into()), env, cx).is_ok();
+                (won, payload)
+            }));
+        }
+        let outcomes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        let winners: Vec<_> = outcomes.iter().filter(|(won, _)| *won).collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(std::fs::read(&path)?, winners[0].1.as_bytes());
         Ok(())
     }
 }
