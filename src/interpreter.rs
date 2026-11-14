@@ -848,7 +848,8 @@ pub(crate) fn call_closure<'ob>(
             rooted_iter!(forms, closure.cdr(), cx);
             let args = Rt::bind_slice(&env.stack[..arg_cnt], cx);
             let (vars, local_specials) = bind_variables(&mut forms, args, name, cx)?;
-            debug!("call vars: {vars:?}");
+            // Argument values can contain cyclic graphs. Count only.
+            debug!("call variable count: {}", vars.len());
             root!(vars, cx);
             root!(local_specials, cx);
             Interpreter { vars, env, local_specials, declaration_scopes: Vec::new() }

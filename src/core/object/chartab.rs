@@ -101,6 +101,51 @@ impl<'new> CloneIn<'new, &'new Self> for CharTable {
 }
 
 impl CharTable {
+    /// Next live explicit non-NIL range, within GNU's character code domain.
+    /// Object values are borrowed only: the owner must exclude GC/callbacks
+    /// until it roots the returned value. Never hold these native locks while
+    /// invoking Lisp; rebind the rooted table and query again after each call.
+    /// Parent/default inheritance is deliberately not fabricated by this slice.
+    /// Cost counts the bounded snapshot scan, including an empty result, so a
+    /// caller can cap cumulative work rather than only each individual query.
+    pub(crate) fn mapping_next(
+        &self, start: usize, remaining: usize,
+    ) -> Result<(Option<(usize, usize, Object<'_>)>, usize)> {
+        const MAX_CHARACTER: usize = 0x3f_ffff;
+        const MAX_ENTRIES: usize = 65_536;
+        if start > MAX_CHARACTER { return Ok((None, 0)); }
+        let mut entries = {
+            let parent = lock(&self.0.parent);
+            ensure!(parent.is_none(), "map-char-table parent inheritance is unsupported");
+            ensure!(self.0.init.is_nil(), "map-char-table non-NIL defaults are unsupported");
+            let data = lock(&self.0.data);
+            let cost = data.len().checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("map-char-table scan cost overflow"))?;
+            ensure!(data.len() <= MAX_ENTRIES && cost <= remaining,
+                "map-char-table scan budget exceeded");
+            let mut entries = Vec::new();
+            entries.try_reserve_exact(data.len())?;
+            for (&key, value) in data.iter() {
+                ensure!(key <= MAX_CHARACTER, "map-char-table character is out of range");
+                entries.push((key, **value));
+            }
+            entries
+        };
+        let cost = entries.len() + 1; // checked under lock before allocation
+        entries.sort_unstable_by_key(|(key, _)| *key);
+        let mut entries = entries.into_iter().filter(|(key, _)| *key >= start);
+        while let Some((first, value)) = entries.next() {
+            if value.is_nil() { continue; }
+            let mut end = first;
+            for (key, next) in entries {
+                // Identity, never structural equality of arbitrary/cyclic values.
+                if key != end + 1 || !next.ptr_eq(value) { break; }
+                end = key;
+            }
+            return Ok((Some((first, end, value)), cost));
+        }
+        Ok((None, cost))
+    }
     /// Borrowed clone edges only. Caller must not collect/evaluate while these
     /// objects are retained; no lock escapes into recursive graph traversal.
     pub(crate) fn clone_children_snapshot(&self, limit: usize) -> Result<Vec<Object<'_>>> {
@@ -335,5 +380,40 @@ mod parent_copy_guard_tests {
         sender.try_send(cx.add(42)).unwrap();
         assert_eq!(receiver.try_recv(cx).unwrap(), cx.add(42));
         sender.close(); receiver.close();
+    }
+}
+
+#[cfg(test)]
+mod live_mapping_tests {
+    use super::*;
+    use crate::core::gc::{Context, RootSet};
+    #[test]
+    fn mapping_is_sorted_identity_coalesced_and_requeries_live_values() {
+        let roots=RootSet::default();let cx=&Context::new(&roots);
+        let table=CharTableInner::new(None).into_obj(&cx.block);let table=table.untag();
+        let value=cx.add(vec![NIL]);let equal_but_distinct=cx.add(vec![NIL]);
+        table.set(100,value).unwrap();table.set(98,value).unwrap();table.set(99,value).unwrap();
+        table.set(101,equal_but_distinct).unwrap();table.set(97,NIL).unwrap();
+        let (run,cost)=table.mapping_next(0,65536).unwrap();let(start,end,found)=run.unwrap();
+        assert_eq!((start,end,cost),(98,100,6));assert!(found.ptr_eq(value));
+        let (run,_)=table.mapping_next(end+1,65536).unwrap();assert_eq!((run.unwrap().0,run.unwrap().1),(101,101));
+        table.set(102,value).unwrap();table.set(101,NIL).unwrap();
+        let (run,_)=table.mapping_next(101,65536).unwrap();let(start,end,found)=run.unwrap();
+        assert_eq!((start,end),(102,102));assert!(found.ptr_eq(value));
+    }
+    #[test]
+    fn mapping_rejects_unsupported_inheritance_and_bounds_without_mutation() {
+        let roots=RootSet::default();let cx=&Context::new(&roots);
+        let table=CharTableInner::new(None).into_obj(&cx.block);let table=table.untag();
+        assert!(table.mapping_next(0,0).is_err());
+        assert!(table.mapping_next(0,1).unwrap().0.is_none());
+        table.set(0x3f_ffff,1.into()).unwrap();
+        let (run,cost)=table.mapping_next(0,2).unwrap();assert_eq!(run.unwrap().1,0x3f_ffff);assert_eq!(cost,2);
+        assert_eq!(table.mapping_next(0x40_0000,0).unwrap().1,0);
+        assert!(table.mapping_next(0,1).is_err());
+        table.set(0x40_0000,1.into()).unwrap();assert!(table.mapping_next(0,3).is_err());
+        let parent=CharTableInner::new(None).into_obj(&cx.block);table.set_parent(Some(parent.untag())).unwrap();
+        assert!(table.mapping_next(0,3).is_err());
+        let default=CharTableInner::new(Some(1.into())).into_obj(&cx.block);assert!(default.untag().mapping_next(0,2).is_err());
     }
 }

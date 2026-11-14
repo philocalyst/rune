@@ -639,7 +639,9 @@ impl Rto<Function<'_>> {
         name: Option<&str>,
         cx: &'ob mut Context,
     ) -> EvalResult<'ob> {
-        debug!("calling: {self}");
+        // Never recursively format a function graph: closures can capture
+        // themselves or cyclic owner objects even on a successful call.
+        debug!("calling function");
         let name = name.unwrap_or("lambda");
         frame.finalize_arguments()?;
         let arg_cnt = frame.arg_count();
