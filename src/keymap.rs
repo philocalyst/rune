@@ -276,10 +276,10 @@ fn current_global_map<'a>(env: &Rt<Env>, cx: &'a Context) -> Object<'a> {
 #[cfg(test)]
 mod tests {
     use crate::interpreter::assert_lisp;
-    struct FunctionCycleCleanup<'a>([crate::core::object::Symbol<'a>; 2]);
+    struct FunctionCycleCleanup<'a>(Vec<crate::core::object::Symbol<'a>>);
     impl Drop for FunctionCycleCleanup<'_> {
         fn drop(&mut self) {
-            for symbol in self.0 {
+            for symbol in &self.0 {
                 symbol.unbind_func();
             }
         }
@@ -394,12 +394,14 @@ mod tests {
         root!(env, init(Env::new_isolated(cx).unwrap()), cx);
         let a = crate::lread::intern("native-keymap-cycle-a", cx);
         let b = crate::lread::intern("native-keymap-cycle-b", cx);
-        let cleanup = FunctionCycleCleanup([a, b]);
+        let cleanup = FunctionCycleCleanup(vec![a, b]);
         crate::data::fset(a, b.into()).unwrap();
-        crate::data::fset(b, a.into()).unwrap();
+        let rejected = crate::data::fset(b, a.into()).is_err();
         let outcome = keymapp(a.into(), env, cx);
         drop(cleanup);
-        assert!(outcome.is_err());
+        assert!(rejected);
+        assert_eq!(outcome.unwrap(),false);
+
     }
     #[test]
     fn owner_map_identity_replacement_and_failed_replacement_match_gnu() {
@@ -508,15 +510,14 @@ mod tests {
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
         root!(env, init(Env::new_isolated(cx).unwrap()), cx);
-        let a = crate::lread::intern("native-preflight-cycle-a", cx);
-        let b = crate::lread::intern("native-preflight-cycle-b", cx);
+        let links: Vec<_> = (0..300).map(|i| crate::lread::intern(&format!("native-preflight-deep-{i}"),cx)).collect();
+        let cleanup = FunctionCycleCleanup(links.clone());
         let target = crate::lread::intern("native-preflight-target", cx);
-        let cleanup = FunctionCycleCleanup([a, b]);
-        crate::data::fset(a, b.into()).unwrap();
-        crate::data::fset(b, a.into()).unwrap();
-        let outcome = preflight_keymap_alias(target, a.into(), env, cx);
+        for pair in links.windows(2) { crate::data::fset(pair[0],pair[1].into()).unwrap(); }
+        let outcome = preflight_keymap_alias(target,links[0].into(),env,cx);
         drop(cleanup);
-        assert!(outcome.is_err(), "cycle errors must propagate before publication");
+        assert!(outcome.is_err(), "depth errors must propagate before publication");
+
     }
     #[test]
     fn explicit_nil_prefix_is_terminal_for_too_long_lookup() {

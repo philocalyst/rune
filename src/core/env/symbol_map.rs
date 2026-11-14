@@ -69,6 +69,7 @@ impl SymbolMap {
     ) -> Result<()> {
         // INTERNED_SYMBOLS is held by callers throughout validation and copy;
         // this excludes global hash-table insertion changing the source graph.
+        symbol.get().validate_alias(func)?;
         crate::core::object::validate_function_clone(func.into())?;
         // SAFETY: target copy is exclusive and unpublished until commit; deferred outlives locks.
         let transaction = unsafe { self.block.copy_transaction(deferred) };

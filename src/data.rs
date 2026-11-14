@@ -36,7 +36,7 @@ pub(crate) fn defalias<'ob>(
 /// Only direct keymap graphs are owner-local. Ordinary functions and immutable
 /// symbol-alias edges retain the existing global publication path.
 #[defun(name = "fset")]
-fn fset_owner<'a>(
+pub(crate) fn fset_owner<'a>(
     symbol: Symbol<'a>,
     definition: Object<'a>,
     env: &mut Rt<Env>,
@@ -51,7 +51,13 @@ fn fset_owner<'a>(
         env.keymap_functions.insert(symbol, definition);
     } else {
         crate::keymap::preflight_keymap_alias(symbol, definition, env, cx)?;
-        fset(symbol, definition)?;
+        let result = fset(symbol, definition);
+        if let Err(error) = result {
+            if error.is::<crate::core::object::FunctionAliasCycle>() {
+                return Err(crate::eval::EvalError::signal(sym::CYCLIC_FUNCTION_INDIRECTION.into(), Cons::new1(symbol, cx).into(), cx).into());
+            }
+            return Err(error);
+        }
         env.keymap_functions.remove(symbol);
     }
     crate::keymap::cancel_native_prefix(env);
@@ -672,6 +678,9 @@ fn type_of(object: Object) -> Object {
 /// GNU's indirect-function detects cycles; a malformed function chain must
 /// cross the Lisp error boundary rather than overflow the Rust stack.
 fn resolve_function_chain<'ob>(object: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
+    resolve_function_chain_with_limit(object,cx,100_000)
+}
+fn resolve_function_chain_with_limit<'ob>(object: Object<'ob>, cx: &'ob Context, limit: usize) -> Result<Object<'ob>> {
     fn next<'ob>(object: Object<'ob>, cx: &'ob Context) -> Option<Object<'ob>> {
         match object.untag() {
             ObjectType::Symbol(symbol) if !object.is_nil() => {
@@ -683,10 +692,15 @@ fn resolve_function_chain<'ob>(object: Object<'ob>, cx: &'ob Context) -> Result<
 
     let mut slow = object;
     let mut fast = object;
+    let mut steps = 0usize;
     loop {
         let Some(next_fast) = next(fast, cx) else { return Ok(fast) };
+        anyhow::ensure!(steps < limit, "Function alias resolution exceeds work budget");
+        steps += 1;
         fast = next_fast;
         let Some(next_fast) = next(fast, cx) else { return Ok(fast) };
+        anyhow::ensure!(steps < limit, "Function alias resolution exceeds work budget");
+        steps += 1;
         fast = next_fast;
         // If the fast cursor advanced twice, the slow cursor can advance once.
         slow = next(slow, cx).ok_or_else(|| anyhow!("function chain changed during lookup"))?;
@@ -1295,17 +1309,24 @@ mod test {
         let cx = Context::new(&roots);
         let a = crate::core::env::intern("m0-data-cycle-a", &cx);
         let b = crate::core::env::intern("m0-data-cycle-b", &cx);
-        fset(a, cx.add(b)).unwrap();
-        fset(b, cx.add(a)).unwrap();
-        assert!(indirect_function(cx.add(a), &cx).unwrap_err().to_string().contains("cyclic"));
-        assert!(functionp(cx.add(a), &cx).is_err());
-        fmakunbound(a);
-        fmakunbound(b);
-        fset(a, cx.add(a)).unwrap();
-        assert!(indirect_function(cx.add(a), &cx).is_err());
-        fmakunbound(a);
-        assert_eq!(indirect_function(cx.add(a), &cx).unwrap(), NIL);
-        assert_eq!(indirect_function(cx.add(42_i64), &cx).unwrap(), cx.add(42_i64));
+        struct Cleanup<'a>([Symbol<'a>;2]);
+        impl Drop for Cleanup<'_> { fn drop(&mut self) { for symbol in self.0 { symbol.unbind_func(); } } }
+        let cleanup = Cleanup([a,b]);
+        fset(a,cx.add(b)).unwrap();
+        let cycle_rejected = fset(b,cx.add(a)).is_err();
+        let unresolved = indirect_function(cx.add(a),&cx).unwrap();
+        let callable = functionp(cx.add(a),&cx).unwrap();
+        let self_rejected = fset(a,cx.add(a)).is_err();
+        let bounded = resolve_function_chain_with_limit(cx.add(a),&cx,1).unwrap_err().to_string().contains("budget");
+        let exact_limit = resolve_function_chain_with_limit(cx.add(a),&cx,2).unwrap();
+        drop(cleanup);
+        assert!(bounded);
+        assert_eq!(exact_limit,NIL);
+        assert!(cycle_rejected && self_rejected);
+        assert_eq!(unresolved,NIL);
+        assert!(!callable);
+        assert_eq!(indirect_function(cx.add(a),&cx).unwrap(),NIL);
+        assert_eq!(indirect_function(cx.add(42_i64),&cx).unwrap(),cx.add(42_i64));
     }
 
     #[test]
@@ -1479,3 +1500,5 @@ mod binary_numeric_cookie_tests {
         assert_eq!(&**bytes,&[b'f',0xfe]);
     }
 }
+
+defsym!(CYCLIC_FUNCTION_INDIRECTION);

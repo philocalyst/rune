@@ -130,6 +130,7 @@ impl<'a> RootedEnv<'a> {
         use super::cons::Cons;
         use super::object::NIL;
         let simple = [
+            sym::CYCLIC_FUNCTION_INDIRECTION,
             sym::WRONG_NUMBER_OF_ARGUMENTS,
             sym::SEARCH_FAILED,
             sym::INVALID_REGEXP,

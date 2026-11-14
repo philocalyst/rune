@@ -1,12 +1,22 @@
 use crate::core::env::sym::BUILTIN_SYMBOLS;
 use crate::core::gc::{Block, Context, GcHeap, GcMoveable, GcState, Trace, TracePtr};
 use crate::core::object::{CloneIn, Function, FunctionType, Gc, IntoObject, TagType, WithLifetime};
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use std::cell::Cell;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+/// Typed scalar-only publication failure; converted to a Lisp condition only
+/// after releasing the symbol-map mutex.
+#[derive(Debug)]
+pub(crate) struct FunctionAliasCycle;
+impl fmt::Display for FunctionAliasCycle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("Cyclic function indirection") }
+}
+impl std::error::Error for FunctionAliasCycle {}
+const MAX_ALIAS_LINKS: usize = 100_000;
 
 /// The allocation of a global symbol. This is shared between threads, so the
 /// interned value of a symbol will be the same location no matter which thread
@@ -350,11 +360,30 @@ impl SymbolCell {
 
     /// Follow the chain of symbols to find the function at the end, if any.
     pub(crate) fn follow_indirect<'ob>(&self, cx: &'ob Context) -> Option<Function<'ob>> {
-        let func = self.func(cx)?;
-        match func.untag() {
-            FunctionType::Symbol(sym) => sym.follow_indirect(cx),
-            _ => Some(func),
+        let mut function = self.func(cx)?;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            match function.untag() {
+                FunctionType::Symbol(symbol) => {
+                    if seen.len() >= MAX_ALIAS_LINKS || seen.try_reserve(1).is_err() || !seen.insert(symbol.as_ptr() as usize) { return None; }
+                    function = symbol.func(cx)?;
+                }
+                _ => return Some(function),
+            }
         }
+    }
+
+    /// Called under INTERNED_SYMBOLS before recursive copying/publication.
+    pub(in crate::core) fn validate_alias(&self, mut function: Function) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        while let FunctionType::Symbol(symbol) = function.untag() {
+            ensure!(seen.len() < MAX_ALIAS_LINKS, "Function alias link budget exceeded");
+            seen.try_reserve(1)?;
+            if std::ptr::eq(self, symbol.get()) || !seen.insert(symbol.as_ptr() as usize) { bail!(FunctionAliasCycle); }
+            let Some(next) = symbol.get().get() else { return Ok(()) };
+            function = next;
+        }
+        Ok(())
     }
 
     /// Set the function for this symbol. This function is unsafe to call and
@@ -517,5 +546,83 @@ mod clone_session_tests {
         }));
         assert!(result.is_err());
         assert!(cx.block.uninterned_symbol_map.map.borrow().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod alias_cycle_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use crate::core::env::sym;
+    use crate::lread::intern;
+    struct Cleanup<'a>(Vec<Symbol<'a>>);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) { for symbol in &self.0 { symbol.unbind_func(); } }
+    }
+    #[test]
+    fn legacy_function_alias_cycle_resolution_is_iterative() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        sym::init_symbols();
+        let a = intern("rune-legacy-function-cycle-a",&cx);
+        let b = intern("rune-legacy-function-cycle-b",&cx);
+        let cleanup = Cleanup(vec![a,b]);
+        {
+            let _publication = crate::core::env::INTERNED_SYMBOLS.lock().unwrap();
+            // SAFETY: test-only legacy graph; both edges point exclusively to
+            // stable immutable interned symbols. Cleanup precedes assertions.
+            unsafe { a.get().set_func(b.into()).unwrap(); b.get().set_func(a.into()).unwrap(); }
+        }
+        let unresolved = a.follow_indirect(&cx).is_none();
+        let public_rejected = crate::data::indirect_function(a.into(),&cx).is_err();
+        let predicate_rejected = crate::data::functionp(a.into(),&cx).is_err();
+        drop(cleanup);
+        assert!(unresolved && public_rejected && predicate_rejected);
+    }
+    #[test]
+    fn long_function_alias_chain_resolves_without_stack_recursion() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        sym::init_symbols();
+        let links: Vec<_> = (0..2048).map(|i| intern(&format!("rune-long-function-alias-{i}"),&cx)).collect();
+        let cleanup = Cleanup(links.clone());
+        for pair in links.windows(2) { crate::data::fset(pair[0],pair[1].into()).unwrap(); }
+        crate::data::fset(*links.last().unwrap(),sym::CAR.into()).unwrap();
+        let resolved = links[0].follow_indirect(&cx);
+        let expected = sym::CAR.func(&cx);
+        let same = resolved == expected;
+        drop(cleanup);
+        assert!(same);
+    }
+    #[test]
+    fn opposite_function_alias_assignments_cannot_publish_a_cycle() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        sym::init_symbols();
+        let names = ["rune-racing-function-alias-a", "rune-racing-function-alias-b"];
+        let cleanup = Cleanup(names.iter().map(|name| intern(name,&cx)).collect());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0..2).map(|index| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let roots = RootSet::default();
+                let cx = Context::new(&roots);
+                let source = intern(names[index],&cx);
+                let target = intern(names[1-index],&cx);
+                barrier.wait();
+                crate::data::fset(source,target.into()).is_ok()
+            })
+        }).collect();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join()).collect();
+        drop(cleanup);
+        let successful = results.into_iter().map(|result| usize::from(result.unwrap())).sum::<usize>();
+        assert_eq!(successful,1);
+    }
+    #[test]
+    fn function_alias_rejection_is_named_and_preserves_previous_definition() {
+        crate::interpreter::assert_lisp(
+            "(unwind-protect (progn (fset 'rune-fn-kept 'car) (condition-case e (fset 'rune-fn-kept 'rune-fn-kept) (cyclic-function-indirection (list e (eq (symbol-function 'rune-fn-kept) 'car))))) (fmakunbound 'rune-fn-kept))",
+            "((cyclic-function-indirection rune-fn-kept) t)",
+        );
     }
 }

@@ -620,9 +620,10 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     self.env.stack.top().set(value);
                 }
                 op::Fset => {
-                    let def = self.env.stack.pop(cx);
-                    let top = self.env.stack.top();
-                    top.set::<Object>(data::fset(top.bind_as(cx)?, def)?.into());
+                    let definition = self.env.stack.pop(cx);
+                    let symbol = self.env.stack.top().bind_as(cx)?;
+                    let result = data::fset_owner(symbol, definition, self.env, cx)?;
+                    self.env.stack.top().set::<Object>(result);
                 }
                 op::Get => {
                     let prop = self.env.stack.pop(cx).try_into()?;
@@ -1198,6 +1199,69 @@ mod test {
         let val = rebind!(call(bytecode, frame.arg_count(), "test", frame, cx).unwrap());
         let expect = expect.bind(cx);
         assert_eq!(val, expect);
+    }
+
+    #[test]
+    fn function_alias_fset_opcode_cycle_is_caught_by_named_handler() {
+        use OpCode as O;
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(symbol) = crate::core::env::INTERNED_SYMBOLS.lock().unwrap().get("vm-fset-cycle") { symbol.unbind_func(); }
+            }
+        }
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        let target = crate::lread::intern("vm-fset-cycle",cx);
+        root!(target,cx);
+        let cleanup = Cleanup;
+        crate::data::fset(target.bind(cx),sym::CAR.into()).unwrap();
+        make_bytecode!(bytecode,0,[O::Constant0,O::PushCondtionCase,9,0,O::Constant1,O::Constant1,O::Fset,O::PopHandler,O::Return,O::Return],[sym::CYCLIC_FUNCTION_INDIRECTION,target.bind(cx)],cx);
+        root!(env,init(Env::new(cx).unwrap()),cx);
+        env.initialize_condition_metadata(cx);
+        let result = {
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments().unwrap();
+            rebind!(call(bytecode,0,"fset-cycle-handler",&mut frame,cx).unwrap())
+        };
+        let condition = result.as_cons_pair().unwrap().0;
+        let kept = crate::data::symbol_function(target.bind(cx),cx) == sym::CAR;
+        drop(cleanup);
+        assert_eq!(condition,sym::CYCLIC_FUNCTION_INDIRECTION);
+        assert!(kept);
+    }
+
+    #[test]
+    fn function_alias_fset_opcode_returns_definition_and_keeps_owner_keymap_identity() {
+        use OpCode as O;
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(symbol) = crate::core::env::INTERNED_SYMBOLS.lock().unwrap().get("vm-fset-owner-map") {
+                    symbol.unbind_func();
+                }
+            }
+        }
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        let target = crate::lread::intern("vm-fset-owner-map",cx);
+        root!(target,cx);
+        let _cleanup = Cleanup;
+        let map = list![sym::KEYMAP;cx];
+        root!(map,cx);
+        make_bytecode!(bytecode,0,[O::Constant0,O::Constant1,O::Fset,O::Return],[target.bind(cx),map.bind(cx)],cx);
+        root!(env,init(Env::new(cx).unwrap()),cx);
+        let result = {
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments().unwrap();
+            rebind!(call(bytecode,0,"fset-owner-map",&mut frame,cx).unwrap())
+        };
+        root!(result,cx);
+        cx.garbage_collect(true);
+        assert!(result.bind(cx).ptr_eq(map.bind(cx)));
+        assert!(crate::data::symbol_function_owner(target.bind(cx),env,cx).ptr_eq(map.bind(cx)));
     }
 
     #[test]
