@@ -104,6 +104,70 @@ fn read_lisp<'ob>(stream: Option<Object<'ob>>, env: &mut Rt<Env>, cx: &'ob Conte
     }
 }
 
+// Source-text candidates only; no bytecode, module or compression backend.
+pub(crate) const SOURCE_LOAD_SUFFIX: &str = ".el";
+defvar!(LOAD_SUFFIXES, list![crate::lread::SOURCE_LOAD_SUFFIX]);
+defvar!(LOAD_FILE_REP_SUFFIXES, list![""]);
+
+fn suffix_entries(value: Object) -> Result<Vec<Object>> {
+    let mut tail = value;
+    let mut seen = std::collections::HashSet::new();
+    let mut values = Vec::new();
+    while let ObjectType::Cons(pair) = tail.untag() {
+        ensure!(seen.len() < 4096, "Load suffix list exceeds traversal budget");
+        seen.try_reserve(1)?;
+        ensure!(seen.insert(tail.into_raw().addr()), "Cyclic load suffix list is unsupported");
+        values.try_reserve(1)?;
+        values.push(pair.car());
+        tail = pair.cdr();
+    }
+    // GNU's FOR_EACH_TAIL ignores non-list values and improper tails.
+    Ok(values)
+}
+fn suffix_text(value: Object<'_>) -> Result<&str> {
+    let text = match value.untag() {
+        ObjectType::String(text) => {
+            ensure!(!text.has_properties(), "Property-bearing load suffixes are unsupported");
+            &**text
+        },
+        ObjectType::ByteString(bytes) => {
+            ensure!(bytes.len() <= 4096, "Load suffix exceeds byte budget");
+            ensure!(!bytes.has_properties(), "Property-bearing load suffixes are unsupported");
+            std::str::from_utf8(bytes)?
+        },
+        _ => bail!("Load suffix entries must be strings"),
+    };
+    ensure!(text.len() <= 4096, "Load suffix exceeds byte budget");
+    Ok(text)
+}
+fn configured_load_suffixes(env: &Rt<Env>, cx: &Context) -> Result<Vec<String>> {
+    let formats = suffix_entries(env.variable_value(sym::LOAD_SUFFIXES, cx)?.context("load-suffixes is unbound")?)?;
+    if formats.is_empty() { return Ok(Vec::new()); }
+    let representations = suffix_entries(env.variable_value(sym::LOAD_FILE_REP_SUFFIXES, cx)?.context("load-file-rep-suffixes is unbound")?)?;
+    let mut result = Vec::new();
+    let mut bytes = 0usize;
+    for format in &formats {
+        for representation in &representations {
+            let format = suffix_text(*format)?;
+            let representation = suffix_text(*representation)?;
+            ensure!(representation.is_empty(), "Compressed load representations are unsupported");
+            ensure!(![".elc", ".eln", ".so", ".dll", ".dylib", ".gz"].iter().any(|suffix| format.ends_with(suffix)), "Compiled or compressed load suffixes are unsupported");
+            ensure!(result.len() < 4096, "Load suffix product exceeds entry budget");
+            bytes = bytes.checked_add(format.len()).context("Load suffix byte budget overflow")?;
+            ensure!(bytes <= 1024 * 1024, "Load suffix product exceeds byte budget");
+            result.try_reserve(1)?;
+            result.push(format.to_owned());
+        }
+    }
+    Ok(result)
+}
+#[defun]
+fn get_load_suffixes<'a>(env: &Rt<Env>, cx: &'a Context) -> Result<Object<'a>> {
+    let suffixes = configured_load_suffixes(env, cx)?;
+    let values: Vec<_> = suffixes.into_iter().map(|suffix| cx.add(suffix)).collect();
+    Ok(crate::fns::slice_into_list(&values, None, cx))
+}
+
 /// Default diagnostics expose only a bounded call identifier/type and byte
 /// range, never literal values, comments, argument graphs or full source text.
 fn load_error_excerpt<'a>(
@@ -207,22 +271,26 @@ fn file_in_path_options(
     no_suffix: bool,
     must_suffix: bool,
 ) -> Option<PathBuf> {
+    file_in_path_suffixes(file, directory, no_suffix, must_suffix, &[SOURCE_LOAD_SUFFIX.to_owned()])
+}
+fn file_in_path_suffixes(file: &str, directory: &str, no_suffix: bool, must_suffix: bool, suffixes: &[String]) -> Option<PathBuf> {
     let path = Path::new(directory).join(file);
     if no_suffix {
         return path.is_file().then_some(path);
     }
-    let mut source_name = path.as_os_str().to_os_string();
-    source_name.push(".el");
-    let source = PathBuf::from(source_name);
-    if source.is_file() {
-        return Some(source);
+    for suffix in suffixes {
+        let mut source_name = path.as_os_str().to_os_string();
+        source_name.push(suffix);
+        let source = PathBuf::from(source_name);
+        if source.is_file() { return Some(source); }
     }
     // GNU ignores MUST-SUFFIX for explicit directory names. NOSUFFIX above
     // also takes precedence, as qualified by direct GNU load probes.
     let directory_name = Path::new(file).parent().is_some_and(|p| !p.as_os_str().is_empty());
     let recognized = [".el", ".elc", ".so", ".dll", ".dylib"]
         .iter()
-        .any(|suffix| file.ends_with(suffix));
+        .any(|suffix| file.ends_with(suffix))
+        || suffixes.iter().any(|suffix| !suffix.is_empty() && file.ends_with(suffix));
     if must_suffix && !directory_name && !recognized {
         return None;
     }
@@ -235,12 +303,13 @@ fn search_load_path(
     no_suffix: bool,
     must_suffix: bool,
 ) -> Result<Option<PathBuf>> {
+    let suffixes = if no_suffix { Vec::new() } else { configured_load_suffixes(env, cx)? };
     if Path::new(file).is_absolute() {
-        return Ok(file_in_path_options(file, "", no_suffix, must_suffix));
+        return Ok(file_in_path_suffixes(file, "", no_suffix, must_suffix, &suffixes));
     }
     let load_path = env.variable_value(sym::LOAD_PATH,cx)?.context("`load-path' is unbound")?;
     if load_path.is_nil() {
-        return Ok(file_in_path_options(file, "", no_suffix, must_suffix));
+        return Ok(file_in_path_suffixes(file, "", no_suffix, must_suffix, &suffixes));
     }
     // GNU ignores non-string entries and non-list/improper tails. Keep the
     // spine walk bounded instead of recursively printing a malformed value.
@@ -253,8 +322,8 @@ fn search_load_path(
             break;
         }
         let found = match pair.car().untag() {
-            ObjectType::String(path) => file_in_path_options(file, path, no_suffix, must_suffix),
-            ObjectType::NIL => file_in_path_options(file, "", no_suffix, must_suffix),
+            ObjectType::String(path) => file_in_path_suffixes(file, path, no_suffix, must_suffix, &suffixes),
+            ObjectType::NIL => file_in_path_suffixes(file, "", no_suffix, must_suffix, &suffixes),
             _ => None,
         };
         if found.is_some() {
@@ -500,6 +569,7 @@ mod test {
         let cx = &Context::new(&roots);
         sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         let path = crate::core::env::intern("load-path", cx);
         let directories = list!(fixture.0.join("first").to_str().unwrap(), fixture.0.join("second").to_str().unwrap(); cx);
         env.vars.insert(path, directories);
@@ -533,6 +603,7 @@ mod test {
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         load_internal("#!/usr/bin/env rune\n(setq shebang-loaded-value 41)\n#! ignored\n(setq shebang-loaded-value (+ shebang-loaded-value 1))", cx, env).unwrap();
         let form = reader::read("shebang-loaded-value", cx).unwrap().0;
         root!(form, cx);
@@ -546,6 +617,7 @@ mod test {
         let cx = &mut Context::new(roots);
         sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         load_internal("(setq foo 1) (setq bar 2) (setq baz 1.5)", cx, env).unwrap();
 
         let obj = reader::read("(+ foo bar baz)", cx).unwrap().0;
@@ -668,6 +740,7 @@ mod file_declaration_tests {
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         init_variables(cx, env);
         load_internal("(defvar vm-file-args)\n(garbage-collect)\n(defalias 'vm-file-reader (function (lambda () (car vm-file-args))))\n(defalias 'vm-file-call (function (lambda (args) (let ((vm-file-args args)) (vm-file-reader)))))\n(setq vm-file-observed (vm-file-call '(7)))", cx, env).unwrap();
         assert_eq!(env.vars.get(intern("vm-file-observed", cx)).unwrap().bind(cx), Object::from(7));
@@ -684,6 +757,7 @@ mod file_declaration_tests {
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         init_variables(cx, env);
         let function_form =
             reader::read("(function (lambda (form &optional final) form))", cx).unwrap().0;
@@ -704,6 +778,7 @@ mod file_declaration_tests {
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         init_variables(cx, env);
         let directory =
             std::env::temp_dir().join(format!("rune-file-declarations-{}", std::process::id()));
@@ -779,6 +854,7 @@ mod read_string_entry_tests {
         let cx = &Context::new(&roots);
         sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         let oversized = cx.add(vec![255_u8; 1024 * 1024 + 1]);
         let error = read_lisp(Some(oversized), env, cx).unwrap_err();
         assert_eq!(error.to_string(), "read: input exceeds 1 MiB limit");
@@ -792,5 +868,49 @@ mod read_string_entry_tests {
         let source = format!("{}0{}", "(".repeat(10000), ")".repeat(10000));
         assert_eq!(crate::reader::read(&source, &cx).unwrap_err(), crate::reader::Error::ResourceLimit);
         assert!(crate::reader::read("42", &cx).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod supported_load_suffix_tests {
+    #[test]
+    fn configured_source_suffix_order_and_duplicates_match_gnu() {
+        for form in [
+            r#"(let ((load-suffixes '(".el")) (load-file-rep-suffixes '(""))) (get-load-suffixes))"#,
+            r#"(let ((load-suffixes '(".lisp" ".el" ".el")) (load-file-rep-suffixes '("" ""))) (get-load-suffixes))"#,
+            r#"(let ((load-suffixes nil) (load-file-rep-suffixes '(""))) (get-load-suffixes))"#,
+            r#"(let ((load-suffixes '(".el")) (load-file-rep-suffixes nil)) (get-load-suffixes))"#,
+            r#"(let ((load-suffixes '(".el" . ignored)) (load-file-rep-suffixes '("" . ignored))) (get-load-suffixes))"#,
+        ] { crate::assert_elprop!("{}", form); }
+    }
+    #[test]
+    fn loader_consumes_configured_source_suffix_order() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let directory = loop {
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("rune-source-suffix-{}-{n}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("Cannot create suffix fixture: {error}"),
+            }
+        };
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(directory.clone());
+        std::fs::write(directory.join("candidate.lisp"), "(setq rune-source-suffix-hit 7)").unwrap();
+        std::fs::write(directory.join("candidate.el"), "(setq rune-source-suffix-hit 9)").unwrap();
+        crate::assert_elprop!(r#"(let ((load-path '({:?})) (load-suffixes '(".lisp" ".el")) (load-file-rep-suffixes '(""))) (load "candidate" nil t) rune-source-suffix-hit)"#, directory.to_str().unwrap());
+    }
+    #[test]
+    fn byte_suffix_budget_precedes_utf8_validation() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = crate::core::gc::Context::new(&roots);
+        let oversized = cx.add(vec![255_u8; 4097]);
+        assert_eq!(super::suffix_text(oversized).unwrap_err().to_string(), "Load suffix exceeds byte budget");
+    }
+    #[test]
+    fn source_policy_does_not_advertise_unsupported_backends_or_loop() {
+        crate::interpreter::assert_lisp(r#"(list (get-load-suffixes) load-suffixes load-file-rep-suffixes (let ((load-file-rep-suffixes '(".gz"))) (condition-case nil (get-load-suffixes) (error 'unsupported))) (let ((load-suffixes '(".elc"))) (condition-case nil (get-load-suffixes) (error 'unsupported))) (let ((load-suffixes (list ".el"))) (setcdr load-suffixes load-suffixes) (condition-case nil (get-load-suffixes) (error 'bounded))) (let ((load-suffixes (list (propertize ".el" 'face 'bold)))) (condition-case nil (get-load-suffixes) (error 'unsupported))))"#, r#"((".el") (".el") ("") unsupported unsupported bounded unsupported)"#);
     }
 }

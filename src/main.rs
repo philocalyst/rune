@@ -441,6 +441,7 @@ mod command_line_load_tests {
         let cx = &mut Context::new(&roots);
         sym::init_symbols();
         root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
         // A nonempty unrelated path must not intercept explicit CLI files.
         env.vars.insert(
             sym::LOAD_PATH,
