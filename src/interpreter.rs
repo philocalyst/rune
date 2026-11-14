@@ -81,7 +81,7 @@ impl Interpreter<'_, '_> {
                 sym::FUNCTION => self.eval_function(forms, cx),
                 sym::INTERACTIVE => Ok(NIL), // TODO: implement
                 sym::CATCH => self.catch(forms, cx),
-                sym::THROW => self.throw(forms.bind(cx), cx),
+                sym::THROW => self.throw(forms, cx),
                 sym::CONDITION_CASE => self.condition_case(forms, cx),
                 sym::SAVE_CURRENT_BUFFER => self.save_current_buffer(forms, cx),
                 sym::SAVE_EXCURSION => self.save_excursion(forms, cx),
@@ -100,7 +100,8 @@ impl Interpreter<'_, '_> {
         let Some(tag) = forms.next()? else {
             bail_err!(LispError::arg_cnt(sym::CATCH, 1, 0, cx))
         };
-        // push this tag on the catch stack
+        // Evaluate before installing the tag, so errors cannot leak a catch.
+        let tag = rebind!(self.eval_form(tag, cx)?);
         self.env.catch_stack.push(tag);
         let result = match self.implicit_progn(forms, cx) {
             Ok(x) => Ok(rebind!(x, cx)),
@@ -109,7 +110,7 @@ impl Interpreter<'_, '_> {
                     && let Some((throw_tag, data)) = self.env.get_exception(id)
                 {
                     let catch_tag = self.env.catch_stack.last().unwrap();
-                    if catch_tag == throw_tag {
+                    if catch_tag.bind(cx).ptr_eq(throw_tag.bind(cx)) {
                         // Continue through the common cleanup below: a caught
                         // throw must not leave its tag active in the environment.
                         Ok(data.bind(cx))
@@ -126,15 +127,23 @@ impl Interpreter<'_, '_> {
         result
     }
 
-    fn throw<'ob>(&mut self, obj: Object, cx: &'ob Context) -> EvalResult<'ob> {
-        let [tag, value] = match obj.into_array()? {
+    fn throw<'ob>(&mut self, obj: &Rto<Object>, cx: &'ob mut Context) -> EvalResult<'ob> {
+        let [tag, value] = match obj.bind(cx).into_array()? {
             Ok(x) => x,
             Err(e) => bail_err!(LispError::arg_cnt(sym::THROW, 2, e, cx)),
         };
+        root!(tag, cx);
+        root!(value, cx);
+        // Both forms are evaluated exactly once, left to right. Root the
+        // evaluated tag while the value expression can collect or throw.
+        let tag = rebind!(self.eval_form(tag, cx)?);
+        root!(tag, cx);
+        let value = rebind!(self.eval_form(value, cx)?);
+        let tag = tag.bind(cx);
 
-        // Need to check now that there is a catch, because we may have a
-        // condition-case along the unwind path
-        if self.env.catch_stack.iter().any(|x| x.bind(cx) == tag) {
+        // Determine whether an eq-identical catch exists before crossing any
+        // condition-case along the nonlocal unwind path.
+        if self.env.catch_stack.iter().any(|x| x.bind(cx).ptr_eq(tag)) {
             Err(EvalError::throw(tag, value, self.env))
         } else {
             Err(error!("No catch for {tag}"))
@@ -1198,6 +1207,9 @@ mod test {
             ("(catch 1 (throw 1 2))", Some(2)),
             ("(catch 1 (catch 2 (throw 1 3)))", Some(3)),
             ("(catch 1 (if))", None),
+            ("(catch (if) 7)", None),
+            ("(catch 1 (throw (if) 9))", None),
+            ("(catch 1 (throw 1 (if)))", None),
         ] {
             let roots = &RootSet::default();
             let cx = &mut Context::new(roots);
@@ -1219,6 +1231,42 @@ mod test {
             assert!(!matches!(error.error, ErrorType::Throw(_)));
             assert!(env.catch_stack.is_empty());
         }
+    }
+
+    #[test]
+    fn catch_and_throw_evaluate_tags_and_values_once_in_order() {
+        assert_lisp("(let ((tag 'target)) (catch tag (throw tag (+ 2 3))))", "5");
+        assert_lisp(
+            "(let ((n 0)) (catch (progn (setq n (+ n 1)) 'target) (throw (progn (setq n (+ n 1)) 'target) (progn (setq n (+ n 1)) n))))",
+            "3",
+        );
+        assert_lisp(
+            "(let ((n 0)) (condition-case nil (throw 'absent (progn (setq n (+ n 1)) 7)) (error n)))",
+            "1",
+        );
+        assert_lisp("(catch 'target (throw 'target 7))", "7");
+    }
+
+    #[test]
+    fn throw_validates_arity_before_effects_and_nested_exits_take_priority() {
+        assert_lisp("(let ((n 0)) (condition-case nil (throw (setq n 1)) (error n)))", "0");
+        assert_lisp(
+            "(let ((n 0)) (condition-case nil (throw (setq n 1) (setq n 2) (setq n 3)) (error n)))",
+            "0",
+        );
+        assert_lisp("(catch 'tag (throw 'tag (throw 'tag 11)))", "11");
+        assert_lisp("(catch 'outer (catch (throw 'outer 7) 9))", "7");
+        assert_lisp("(catch 'outer (throw (throw 'outer 7) 9))", "7");
+    }
+
+    #[test]
+    fn catch_matching_uses_identity_and_evaluated_tags_survive_collection() {
+        assert_lisp("(let ((tag (list 1))) (catch tag (garbage-collect) (throw tag 7)))", "7");
+        assert_lisp(
+            "(let ((tag (list 1))) (catch tag (throw (progn (garbage-collect) tag) (progn (garbage-collect) 7))))",
+            "7",
+        );
+        assert_lisp("(condition-case nil (catch (list 1) (throw (list 1) 7)) (error 9))", "9");
     }
 
     #[test]
