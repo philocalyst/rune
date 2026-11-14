@@ -199,6 +199,31 @@ fn char_after(position: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<Opti
 fn char_before(position: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<Option<usize>> {
     character_at_point(position, true, env, cx)
 }
+/// Unicode buffer byte coordinates are one-based UTF-8 offsets.
+#[defun]
+fn position_bytes(position: i64, env: &Rt<Env>, cx: &Context) -> Result<Option<usize>> {
+    let read = env.buffer_read(cx)?;
+    let Some(index) = usize::try_from(position).ok().and_then(|p| p.checked_sub(1)) else { return Ok(None) };
+    if index > read.document.text().len_chars() { return Ok(None); }
+    Ok(Some(read.document.text().char_to_byte(rune_text::CharPos(index))?.0 + 1))
+}
+#[defun]
+fn byte_to_position(byte: i64, env: &Rt<Env>, cx: &Context) -> Result<Option<usize>> {
+    let read = env.buffer_read(cx)?;
+    let Some(mut index) = usize::try_from(byte).ok().and_then(|p| p.checked_sub(1)) else { return Ok(None) };
+    let text = read.document.text();
+    if index > text.len_bytes() { return Ok(None); }
+    // GNU rounds an interior byte back to the containing character. In UTF-8
+    // at most three continuation bytes precede the next scalar boundary.
+    for _ in 0..4 {
+        match text.byte_to_char(rune_text::BytePos(index)) {
+            Ok(position) => return Ok(Some(position.0 + 1)),
+            Err(rune_text::TextError::NotCharBoundary) => index -= 1,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("Invalid UTF-8 character boundary")
+}
 #[defun]
 fn following_char(env: &Rt<Env>, cx: &Context) -> Result<usize> {
     Ok(character_at_point(None, false, env, cx)?.unwrap_or(0))
@@ -427,6 +452,13 @@ mod owner_buffer_primitives_tests {
                   (list (bobp) (eobp) (following-char) (preceding-char) (point))
                   (progn (goto-char 2) (list (following-char) (preceding-char) (point)))
                   (progn (goto-char 4) (list (bobp) (eobp) (bolp) (eolp) (following-char) (preceding-char) (point))))))"#);
+    }
+    #[test]
+    fn unicode_byte_coordinates_match_gnu_interior_rounding() {
+        crate::assert_elprop!(r#"(progn (erase-buffer) (insert "aé🙂z") (goto-char 3)
+          (list (mapcar (function position-bytes) (quote (0 1 2 3 4 5 6)))
+                (mapcar (function byte-to-position) (quote (0 1 2 3 4 5 6 7 8 9 10)))
+                (point)))"#);
     }
     #[test]
     fn lisp_character_queries_match_gnu_unicode_and_boundaries() {
