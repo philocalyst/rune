@@ -23,6 +23,7 @@ pub(crate) enum Type {
     BigInt,
     ChannelSender,
     ChannelReceiver,
+    Process,
 }
 
 /// Error provided if object was the wrong type

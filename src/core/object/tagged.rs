@@ -5,7 +5,7 @@ use super::{
         gc::Block,
     },
     ByteFnPrototype, ByteString, ChannelReceiver, ChannelSender, CharTableInner, GcString,
-    LispBigInt, LispBuffer,
+    LispBigInt, LispBuffer, LispProcess,
 };
 use super::{
     ByteFn, CharTable, HashTable, LispFloat, LispHashTable, LispString, LispVec, Record,
@@ -309,6 +309,7 @@ object_trait_impls!(CharTable);
 object_trait_impls!(LispBigInt);
 object_trait_impls!(ChannelSender);
 object_trait_impls!(ChannelReceiver);
+object_trait_impls!(LispProcess);
 
 /// Trait for types that can be managed by the GC. This trait is implemented for
 /// as many types as possible, even for types that are already Gc managed, Like
@@ -573,6 +574,18 @@ impl IntoObject for ChannelReceiver {
     }
 }
 
+impl IntoObject for LispProcess {
+    type Out<'ob> = &'ob LispProcess;
+    fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
+        let LispProcess(heap) = self;
+        let ptr = block.objects.alloc(LispProcess(heap.for_block::<C>()));
+        if !C {
+            block.lisp_processes.borrow_mut().push(ptr);
+        }
+        unsafe { <&LispProcess>::tag_ptr(ptr) }
+    }
+}
+
 mod private {
     use super::{Gc, WithLifetime};
 
@@ -595,6 +608,7 @@ mod private {
         BigInt,
         ChannelSender,
         ChannelReceiver,
+        Process,
     }
 
     /// Trait for tagged pointers. Anything that can be stored and passed around
@@ -709,6 +723,7 @@ impl<'a> TaggedPtr for ObjectType<'a> {
                 Tag::ChannelReceiver => {
                     ObjectType::ChannelReceiver(<&ChannelReceiver>::from_obj_ptr(ptr))
                 }
+                Tag::Process => ObjectType::Process(<&LispProcess>::from_obj_ptr(ptr)),
             }
         }
     }
@@ -731,6 +746,7 @@ impl<'a> TaggedPtr for ObjectType<'a> {
             ObjectType::BigInt(x) => TaggedPtr::tag(x).into(),
             ObjectType::ChannelSender(x) => TaggedPtr::tag(x).into(),
             ObjectType::ChannelReceiver(x) => TaggedPtr::tag(x).into(),
+            ObjectType::Process(x) => TaggedPtr::tag(x).into(),
         }
     }
 }
@@ -1036,6 +1052,17 @@ impl TaggedPtr for &ChannelReceiver {
     }
 }
 
+impl TaggedPtr for &LispProcess {
+    type Ptr = LispProcess;
+    const TAG: Tag = Tag::Process;
+    unsafe fn from_obj_ptr(ptr: *const u8) -> Self {
+        &*ptr.cast::<Self::Ptr>()
+    }
+    fn get_ptr(self) -> *const Self::Ptr {
+        self as *const Self::Ptr
+    }
+}
+
 impl<T> TracePtr for Gc<T> {
     fn trace_ptr(&self, state: &mut GcState) {
         match self.as_obj().untag() {
@@ -1054,6 +1081,7 @@ impl<T> TracePtr for Gc<T> {
             ObjectType::BigInt(x) => x.trace(state),
             ObjectType::ChannelSender(x) => x.0.trace(state),
             ObjectType::ChannelReceiver(x) => x.0.trace(state),
+            ObjectType::Process(x) => x.0.trace(state),
         }
     }
 }
@@ -1179,6 +1207,7 @@ pub(crate) enum ObjectType<'ob> {
     BigInt(&'ob LispBigInt) = Tag::BigInt as u8,
     ChannelSender(&'ob ChannelSender) = Tag::ChannelSender as u8,
     ChannelReceiver(&'ob ChannelReceiver) = Tag::ChannelReceiver as u8,
+    Process(&'ob LispProcess) = Tag::Process as u8,
 }
 
 /// The Object defintion that contains all other possible lisp objects. This
@@ -1203,7 +1232,8 @@ cast_gc!(ObjectType<'ob> => NumberType<'ob>,
          &'ob CharTable,
          &'ob LispBigInt,
          &'ob ChannelSender,
-         &'ob ChannelReceiver
+         &'ob ChannelReceiver,
+         &'ob LispProcess
 );
 
 impl ObjectType<'_> {
@@ -1227,6 +1257,7 @@ impl ObjectType<'_> {
             ObjectType::BigInt(_) => Type::BigInt,
             ObjectType::ChannelSender(_) => Type::ChannelSender,
             ObjectType::ChannelReceiver(_) => Type::ChannelReceiver,
+            ObjectType::Process(_) => Type::Process,
         }
     }
 }
@@ -1536,6 +1567,22 @@ impl<'ob> std::ops::Deref for Gc<&'ob Cons> {
     }
 }
 
+impl<'ob> TryFrom<Object<'ob>> for Gc<&'ob LispProcess> {
+    type Error = TypeError;
+    fn try_from(value: Object<'ob>) -> Result<Self, Self::Error> {
+        match value.get_tag() {
+            Tag::Process => unsafe { Ok(cast_gc(value)) },
+            _ => Err(TypeError::new(Type::Process, value)),
+        }
+    }
+}
+impl<'ob> std::ops::Deref for Gc<&'ob LispProcess> {
+    type Target = LispProcess;
+    fn deref(&self) -> &'ob Self::Target {
+        self.untag()
+    }
+}
+
 pub(crate) trait CloneIn<'new, T>
 where
     T: 'new,
@@ -1567,6 +1614,7 @@ where
             ObjectType::BigInt(x) => x.clone_in(bk).into(),
             ObjectType::ChannelSender(x) => x.clone_in(bk).into(),
             ObjectType::ChannelReceiver(x) => x.clone_in(bk).into(),
+            ObjectType::Process(x) => x.clone_in(bk).into(),
         };
         let Ok(x) = Gc::<U>::try_from(obj) else { unreachable!() };
         x
@@ -1610,6 +1658,7 @@ impl GcMoveable for Object<'_> {
             ObjectType::BigInt(x) => cast_pair(x.move_value(to_space)?),
             ObjectType::ChannelSender(x) => cast_pair(x.move_value(to_space)?),
             ObjectType::ChannelReceiver(x) => cast_pair(x.move_value(to_space)?),
+            ObjectType::Process(x) => cast_pair(x.move_value(to_space)?),
         };
 
         let tag = self.get_tag();
@@ -1830,6 +1879,7 @@ impl ObjectType<'_> {
             ObjectType::BigInt(x) => D::fmt(x, f),
             ObjectType::ChannelSender(x) => D::fmt(x, f),
             ObjectType::ChannelReceiver(x) => D::fmt(x, f),
+            ObjectType::Process(x) => D::fmt(x, f),
         }
     }
 }

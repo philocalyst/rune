@@ -219,6 +219,7 @@ impl DumpState {
             ObjectType::BigInt(n) => DumpedObject::BigInt(n.to_string()),
             ObjectType::ChannelSender(_) => DumpedObject::ChannelSender,
             ObjectType::ChannelReceiver(_) => DumpedObject::ChannelReceiver,
+            ObjectType::Process(_) => DumpedObject::Nil,
         };
 
         // Overwrite the Nil placeholder with the real object
