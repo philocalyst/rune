@@ -46,6 +46,15 @@ fn display_graphic_p(frame: Option<Object>, cx: &Context) -> Result<bool> {
     let _frame = live_frame(frame, cx)?;
     Ok(false)
 }
+/// Return the window-system symbol for a validated owner frame. The current
+/// logical terminal has no window-system connection, so its genuine value is nil.
+#[defun]
+fn window_system<'a>(frame: Option<Object<'a>>, cx: &'a Context) -> Result<Object<'a>> {
+    let frame = live_frame(frame, cx)?;
+    match frame.backend() {
+        crate::core::object::FrameBackend::Terminal => Ok(NIL),
+    }
+}
 /// Whether this frame can faithfully realize the requested face attributes.
 /// The only current backend is a logical headless terminal, with no terminal
 /// capability driver or graphical renderer attached. GNU's batch terminal
@@ -89,6 +98,17 @@ fn frame_parameter<'a>(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_window_system_matches_gnu_batch() {
+        crate::assert_elprop!("(list (window-system) (window-system (selected-frame)))");
+        let roots = crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(&roots);
+        assert!(super::window_system(Some(42_i64.into()), cx).is_err());
+        let frame = cx.selected_frame().unwrap();
+        frame.delete(cx).unwrap();
+        assert!(super::window_system(Some(frame.into()), cx).is_err());
+        assert!(super::window_system(None, cx).is_err());
+    }
     #[test]
     fn headless_face_capabilities_match_gnu_batch() {
         crate::assert_elprop!(
