@@ -13,6 +13,11 @@ use rune_macros::defun;
 
 defsym!(KEYMAP);
 defsym!(GLOBAL_MAP);
+defsym!(UNDEFINED);
+// GNU keyboard.c::syms_of_keyboard and init_kboard: separate real maps,
+// with the logical terminal's local map inheriting the original global object.
+defvar!(FUNCTION_KEY_MAP, crate::keymap::make_sparse_keymap(None, cx));
+defvar!(LOCAL_FUNCTION_KEY_MAP, crate::keymap::initial_local_function_map(env, cx));
 defsym!(MAP_KEYMAP_SORTED);
 // GNU Emacs 30.1 src/keymap.c::syms_of_keymap creates this real sparse
 // map before Lisp subr.el adds bindings. Unlike global-map it has no Lisp
@@ -695,6 +700,13 @@ pub(crate) fn dispatch_native_event(
     let key = cx.add(vec![event]);
     let definition = lookup_key(map.bind(cx), key, None, env, cx)?;
     root!(definition, cx);
+    if definition.bind(cx).is_nil() || definition.bind(cx)==sym::UNDEFINED || definition.bind(cx)==crate::core::object::TRUE {
+        match translation::fallback_definition(map.bind(cx),key,env,cx) {
+            Ok(Some(translated))=>definition.set(translated),
+            Ok(None)=>{},
+            Err(error)=>{cancel_native_prefix(env);return Err(error);}
+        }
+    }
     if keymapp(definition.bind(cx), env, cx)? {
         env.native_key_prefix.set(definition.bind(cx));
         env.native_key_sequence = Some(sequence);
@@ -855,3 +867,6 @@ fn map_keymap(function:&crate::core::gc::Rto<Object>,keymap:&crate::core::gc::Rt
 fn map_keymap_internal<'a>(function:&crate::core::gc::Rto<Object>,keymap:&crate::core::gc::Rto<Object>,env:&mut Rt<Env>,cx:&'a mut Context)->Result<Object<'a>> {
     mapping::map_keymap_internal(function,keymap,env,cx)
 }
+
+mod translation;
+pub(crate) fn initial_local_function_map<'a>(env:&Rt<Env>,cx:&'a Context)->Object<'a>{translation::initial_local_map(env,cx)}

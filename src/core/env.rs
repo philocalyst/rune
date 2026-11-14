@@ -38,6 +38,8 @@ pub(crate) struct Env<'a> {
     pub(crate) startup_default_directory: String,
     #[no_trace]
     pub(crate) startup_system_type: &'static str,
+    #[no_trace]
+    pub(crate) startup_shell_file_name: std::ffi::OsString,
     pub(crate) props: PropertyMap<'a>,
     pub(crate) catch_stack: Vec<Slot<Object<'a>>>,
     binding_stack: Vec<(Slot<Symbol<'a>>, Option<Slot<Object<'a>>>)>,
@@ -76,6 +78,7 @@ pub(crate) struct ExcursionToken {
 impl<'a> Env<'a> {
     pub(crate) fn new(cx: &Context) -> Result<Self> {
         let startup_system_type = crate::emacs::startup_system_type()?;
+        let startup_shell_file_name = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
         let cwd = std::env::current_dir()?;
         anyhow::ensure!(cwd.is_absolute(), "Initial working directory is not absolute");
         let mut startup_default_directory = cwd.to_str()
@@ -90,6 +93,7 @@ impl<'a> Env<'a> {
             variable_aliases: Default::default(),
             startup_default_directory,
             startup_system_type,
+            startup_shell_file_name,
             props: Default::default(),
             catch_stack: Default::default(),
             binding_stack: Default::default(),

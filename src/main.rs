@@ -3,6 +3,7 @@
 mod macros;
 mod process_transport;
 mod process;
+mod shell_startup;
 mod process_events;
 #[macro_use]
 mod core;
@@ -26,6 +27,7 @@ mod editor_document;
 mod emacs;
 mod eval;
 mod fileio;
+mod file_access;
 mod face;
 mod face_attributes;
 mod frame;
