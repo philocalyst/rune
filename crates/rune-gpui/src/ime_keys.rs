@@ -5,6 +5,7 @@ use rune_editor::Command;
 #[derive(Debug)]
 pub(crate) enum ImeKey {
     Platform,
+    Paste,
     Command(Command),
     Cancel,
     Unsupported,
@@ -28,6 +29,7 @@ pub(crate) fn route(
     }
     if control || platform {
         return match (key, shift) {
+            ("v", _) => ImeKey::Paste,
             ("z", false) => ImeKey::Command(Command::Undo),
             ("z", true) | ("r", false) => ImeKey::Command(Command::Redo),
             ("space", _) => ImeKey::Platform,
@@ -73,5 +75,12 @@ mod tests {
         assert!(matches!(route("2", false, false, false, false, false), ImeKey::Platform));
         assert!(matches!(route("g", true, false, false, false, true), ImeKey::Cancel));
         assert!(matches!(route("left", false, false, false, true, false), ImeKey::Unsupported));
+    }
+    #[test]
+    fn clipboard_shortcut_is_explicit_only_outside_composition() {
+        assert!(matches!(route("v", true, false, false, false, false), ImeKey::Paste));
+        assert!(matches!(route("v", false, true, false, true, false), ImeKey::Paste));
+        assert!(matches!(route("v", true, false, false, false, true), ImeKey::Platform));
+        assert!(matches!(route("v", true, false, true, false, false), ImeKey::Platform));
     }
 }

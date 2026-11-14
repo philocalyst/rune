@@ -10,7 +10,7 @@ Native paths are lossless. This Lisp Unicode-string getter rejects non-UTF8 path
 
 ## Explicit limitations
 
-This function does not forward the same-named Lisp variable: the existing global `buffer-file-name` variable is not a supported way to set or query owner associations. Full buffer-local variable binding, `set-visited-file-name`, `find-file`, `save-buffer`, coding detection, file handlers, backups, locks and raw-byte Emacs filename semantics are not claimed. Native metadata association and bounded save APIs are separate typed operations.
+This function does not forward the same-named Lisp variable: the existing global `buffer-file-name` variable is not a supported way to set or query owner associations. Full buffer-local variable binding, `set-visited-file-name`, `find-file`, full GNU `save-buffer` behavior, coding detection, file handlers, backups, locks and raw-byte Emacs filename semantics are not claimed. Native metadata association and bounded save APIs are separate typed operations.
 
 The build generator must share one canonical symbol between this function and the existing special variable, with independent function/value cells. Renaming a Rust function to hide duplicate Lisp symbols is not a valid substitute.
 

@@ -18,6 +18,14 @@ use fallible_streaming_iterator::FallibleStreamingIterator;
 use rune_core::macros::{bail_err, call, error, rebind, root};
 use rune_macros::defun;
 
+/// Ephemeral resolution provenance, consumed before any evaluator callback or
+/// binding-scope mutation. An index is not a cached Lisp reference/root.
+#[derive(Debug, PartialEq, Eq)]
+enum BindingLocation {
+    Lexical(usize),
+    Dynamic,
+}
+
 struct Interpreter<'brw, 'rt> {
     vars: &'brw mut Rt<Vec<Slot<&'rt Cons>>>,
     env: &'brw mut Rt<Env<'rt>>,
@@ -464,14 +472,24 @@ impl Interpreter<'_, '_> {
         Ok(first.map(|first| (first, second)))
     }
 
+    fn binding_location(&self, name: Symbol, cx: &Context) -> BindingLocation {
+        self.vars
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, cell)| {
+                (cell.car(cx) == name).then_some(BindingLocation::Lexical(index))
+            })
+            .unwrap_or(BindingLocation::Dynamic)
+    }
+
     fn var_ref<'ob>(&self, sym: Symbol, cx: &'ob Context) -> EvalResult<'ob> {
         if sym.is_const() {
             Ok(sym.into())
         } else {
-            let mut iter = self.vars.iter().rev();
-            match iter.find_map(|cons| (cons.car(cx) == sym).then(|| cons.cdr(cx))) {
-                Some(value) => Ok(value),
-                None => match self.env.vars.get(sym) {
+            match self.binding_location(sym, cx) {
+                BindingLocation::Lexical(index) => Ok(self.vars[index].cdr(cx)),
+                BindingLocation::Dynamic => match self.env.vars.get(sym) {
                     Some(v) => Ok(v.bind(cx)),
                     None => Err(EvalError::signal(
                         sym::VOID_VARIABLE.into(),
@@ -484,13 +502,15 @@ impl Interpreter<'_, '_> {
     }
 
     fn var_set(&mut self, name: Symbol, new_value: Object, cx: &Context) -> AnyResult<()> {
-        let mut iter = self.vars.iter().rev();
-        match iter.find(|cons| cons.car(cx) == name) {
-            Some(value) => {
-                value.bind(cx).set_cdr(new_value).expect("variables should never be immutable");
+        match self.binding_location(name, cx) {
+            BindingLocation::Lexical(index) => {
+                self.vars[index]
+                    .bind(cx)
+                    .set_cdr(new_value)
+                    .expect("variables should never be immutable");
                 Ok(())
             }
-            None => self.env.set_var(name, new_value),
+            BindingLocation::Dynamic => self.env.set_var(name, new_value),
         }
     }
 
@@ -1027,6 +1047,32 @@ mod test {
             let result = rebind!(eval(form, None, env, cx).unwrap(), cx);
             let expected = crate::reader::read(expected, cx).unwrap().0;
             assert_eq!(result, expected);
+        }
+    }
+
+    #[test]
+    fn provenance_resolution_keeps_lexical_cells_and_dynamic_set_separate() {
+        for (source, expected) in [
+            ("(let ((x 1)) (list (let ((x 2)) (setq x 3) x) x))", "(3 1)"),
+            ("(let ((x 1)) (list (catch 'done (setq x (throw 'done 7))) x))", "(7 1)"),
+            (
+                "(let ((x 1)) (list (condition-case nil (let ((x 2)) (error \"x\")) (error (setq x 3))) x))",
+                "(3 3)",
+            ),
+            (
+                "(let ((integer-width 128)) (list (funcall (function (lambda (integer-width) (setq integer-width nil) integer-width)) 1) integer-width))",
+                "(nil 128)",
+            ),
+            (
+                "(let ((f (funcall (function (lambda (x) (function (lambda () (setq x (+ x 1)))))) 1))) (garbage-collect) (list (funcall f) (funcall f)))",
+                "(2 3)",
+            ),
+            (
+                "(let ((x 1)) (setq x (condition-case x (error \"x\") (error (setq x 7)))) x)",
+                "7",
+            ),
+        ] {
+            assert_lisp(source, expected);
         }
     }
 

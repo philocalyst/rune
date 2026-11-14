@@ -375,12 +375,13 @@ mod no_clobber_tests {
     }
 }
 fn absolute_path(path: &Path) -> Result<PathBuf> {
-    Ok(if path.is_absolute() {
-        path.to_owned()
-    } else {
-        std::env::current_dir()?.join(path)
-    })
+    // Resolve drive-relative/root-relative Windows paths too. Joining cwd is
+    // insufficient there: PathBuf::push can retain a drive-relative prefix.
+    let absolute = std::path::absolute(path)?;
+    ensure!(absolute.is_absolute(), "Save path could not be made absolute");
+    Ok(absolute)
 }
+
 impl RuntimeEditorGateway {
     pub(crate) fn file_name(
         &self,
@@ -653,6 +654,14 @@ impl super::LispRuntimeHost<'_, '_, '_> {
             .buffer_handle(buffer, self.owner.cx)
             .map_err(|e| e.to_string())?;
         let read = gateway.read(handle, self.owner.cx).map_err(|e| e.to_string())?;
+        let path = read.file.path().ok_or_else(|| "Save not started: buffer has no visited file".to_owned())?;
+        if !gateway.modified(handle, self.owner.cx).map_err(|e| e.to_string())?
+            && path.try_exists().map_err(|e| e.to_string())?
+        {
+            // Clean existing visited files are not rewritten. bytes=0 means
+            // no bytes were written; a missing target is recreated below.
+            return Ok(SaveOutcome { path: path.to_owned(), bytes: 0 });
+        }
         let pending = gateway
             .prepare_visited_save(handle, read.epoch, max_bytes, self.owner.cx)
             .map_err(|e| format!("Save not started: {e}"))?;
@@ -693,9 +702,41 @@ mod command_tests {
             assert_eq!(fs::read_to_string(&outcome.path)?, "selected");
             assert_eq!(outcome.bytes, 8);
             assert!(!gateway.modified(handle,host.owner.cx)?);
+            // A clean existing visited file is not rewritten, even if an
+            // external actor changed its bytes. No dirty-conflict claim.
+            fs::write(&outcome.path, "external")?;
+            assert_eq!(host.save_selected_visited(0).unwrap().bytes, 0);
+            assert_eq!(fs::read_to_string(&outcome.path)?, "external");
+            // A clean missing visited target is recreated from the buffer.
+            fs::remove_file(&outcome.path)?;
+            assert_eq!(host.save_selected_visited(64).unwrap().bytes, 8);
+            assert_eq!(fs::read_to_string(&outcome.path)?, "selected");
+            assert!(!gateway.modified(handle, host.owner.cx)?);
             drop(cleanup);
             fs::remove_dir(dir)?;
             Ok(())
         }).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod absolute_save_path_tests {
+    use super::*;
+    #[test]
+    fn captures_absolute_nonexistent_target_without_changing_cwd() {
+        let before = std::env::current_dir().unwrap();
+        let path = absolute_path(Path::new("rune-absent-save-target/subdir/file")).unwrap();
+        assert!(path.is_absolute());
+        assert_eq!(path, before.join("rune-absent-save-target/subdir/file"));
+        assert_eq!(std::env::current_dir().unwrap(), before);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_paths_never_escape_as_relative_capture() {
+        // Drive availability may cause an error, but never accept C:foo as a
+        // captured relative path. No process-global current directory changes.
+        if let Ok(path) = absolute_path(Path::new(r"C:rune-save-target")) {
+            assert!(path.is_absolute());
+        }
     }
 }

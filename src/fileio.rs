@@ -251,6 +251,29 @@ fn test_case_sensative_call() {
     let _ = file_name_case_insensitive_p("/");
 }
 
+// Deliberately bounded, UTF-8 visited-only save surface. No interactive chooser.
+const SAVE_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
+#[defun]
+fn save_buffer(prefix: OptionalFlag, env: &Rt<Env>, cx: &Context) -> Result<()> {
+    ensure!(prefix.is_none(), "save-buffer prefix/backup modes are not implemented");
+    save_current_visited_buffer(SAVE_BUFFER_MAX_BYTES, env, cx)
+}
+fn save_current_visited_buffer(max_bytes: usize, env: &Rt<Env>, cx: &Context) -> Result<()> {
+    let gateway = env.editor_gateway();
+    let read = env.buffer_read(cx)?;
+    let path = read.file.path().ok_or_else(|| anyhow::anyhow!("Buffer has no visited file"))?;
+    // Existing clean files are not overwritten; a missing visited file is
+    // recreated, as GNU does. This is not external-modification detection.
+    if !gateway.modified(read.handle, cx)? && path.try_exists()? { return Ok(()); }
+    let pending = gateway.prepare_visited_save(read.handle, read.epoch, max_bytes, cx)?;
+    // This call holds no gateway borrow. Only successful checkpoint completion
+    // marks saved; an error after disk success must never trigger I/O replay.
+    let written = pending.write(crate::editor_document::SaveMode::ReplaceExisting)?;
+    gateway.finish_save(written, cx)
+        .map_err(|error| error.context("File snapshot written, but save checkpoint rejected; do not replay the write"))?;
+    Ok(())
+}
+
 defsym!(EXCL);
 #[defun]
 #[expect(clippy::too_many_arguments)]
@@ -625,6 +648,104 @@ mod append_float_rejection_tests {
             assert_eq!(std::fs::read(&existing)?, b"must survive");
             assert!(!absent.exists());
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod visited_save_buffer_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+    use rune_editor::{Command, EditorHost};
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Result<Self> {
+            let path = std::env::temp_dir().join(format!("rune-lisp-save-{}-{}", std::process::id(), rand::random::<u64>()));
+            std::fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+    }
+    impl Drop for Directory { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    #[test]
+    fn lisp_save_targets_env_buffer_and_fences_real_save_undo() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let gateway = env.editor_gateway();
+        gateway.rename(env.current_buffer_handle(), "lisp-visited-save", false, cx)?;
+        let before = env.buffer_read(cx)?;
+        gateway.splice(before.handle, before.epoch, 0..0, "é🙂", cx)?;
+        let dir = Directory::new()?;
+        let path = dir.0.join("env-file");
+        std::fs::write(&path, b"old")?;
+        gateway.set_file_association(before.handle, before.file.revision(), Some(&path), cx)?;
+        let ui = gateway.scratch(cx)?;
+        let ui_before = gateway.read(ui, cx)?;
+        gateway.splice(ui, ui_before.epoch, 0..0, "UI", cx)?;
+        let ui_path = dir.0.join("ui-file");
+        std::fs::write(&ui_path, b"UI sentinel")?;
+        gateway.set_file_association(ui, ui_before.file.revision(), Some(&ui_path), cx)?;
+        let edited = env.buffer_read(cx)?;
+        crate::lread::load_internal("(save-buffer)", cx, env)?;
+        assert_eq!(std::fs::read(&path)?, "é🙂".as_bytes());
+        assert_eq!(std::fs::read(&ui_path)?, b"UI sentinel");
+        assert!(!gateway.modified(before.handle, cx)?);
+        assert!(gateway.modified(ui, cx)?);
+        assert_eq!(env.buffer_read(cx)?.epoch, edited.epoch);
+        let mut native = gateway.host(cx)?;
+        let selected = native.snapshot()?.buffers.iter().find(|b| b.name == before.name).unwrap().id;
+        native.execute(Command::SwitchBuffer(selected))?;
+        native.execute(Command::Undo)?;
+        assert!(gateway.modified(before.handle, cx)?);
+        native.execute(Command::Redo)?;
+        assert!(!gateway.modified(before.handle, cx)?);
+        Ok(())
+    }
+    #[test]
+    fn clean_save_preserves_existing_changes_but_recreates_missing_file() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let gateway = env.editor_gateway();
+        let before = env.buffer_read(cx)?;
+        gateway.splice(before.handle, before.epoch, 0..0, "inside", cx)?;
+        let dir = Directory::new()?;
+        let path = dir.0.join("file");
+        gateway.set_file_association(before.handle, before.file.revision(), Some(&path), cx)?;
+        save_buffer(None, env, cx)?;
+        std::fs::write(&path, b"external")?;
+        save_buffer(None, env, cx)?;
+        assert_eq!(std::fs::read(&path)?, b"external");
+        assert!(!gateway.modified(before.handle, cx)?);
+        std::fs::remove_file(&path)?;
+        save_buffer(None, env, cx)?;
+        assert_eq!(std::fs::read(&path)?, b"inside");
+        assert!(!gateway.modified(before.handle, cx)?);
+        Ok(())
+    }
+    #[test]
+    fn unsupported_or_failed_save_preserves_files_and_dirty_state() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let gateway = env.editor_gateway();
+        let before = env.buffer_read(cx)?;
+        gateway.splice(before.handle, before.epoch, 0..0, "é🙂", cx)?;
+        assert!(save_buffer(None, env, cx).is_err());
+        let dir = Directory::new()?;
+        let path = dir.0.join("existing");
+        std::fs::write(&path, b"must survive")?;
+        gateway.set_file_association(before.handle, before.file.revision(), Some(&path), cx)?;
+        assert!(save_buffer(Some(()), env, cx).is_err());
+        assert!(save_current_visited_buffer(1, env, cx).is_err());
+        assert_eq!(std::fs::read(&path)?, b"must survive");
+        let read = env.buffer_read(cx)?;
+        gateway.set_file_association(before.handle, read.file.revision(), Some(&dir.0), cx)?;
+        assert!(save_buffer(None, env, cx).is_err());
+        assert!(gateway.modified(before.handle, cx)?);
+        assert_eq!(env.buffer_read(cx)?.epoch, read.epoch);
         Ok(())
     }
 }

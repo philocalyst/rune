@@ -29,6 +29,9 @@ pub enum ImeOperation {
         text: String,
         selection: Option<Range<usize>>,
     },
+    Paste {
+        bytes: usize,
+    },
     Unmark,
     Shortcut(String),
     Outcome,
@@ -194,6 +197,31 @@ pub(crate) fn keydown(
         composing,
     ) {
         ImeKey::Platform => {}
+        ImeKey::Paste => {
+            if !event.is_held {
+                match cx.read_from_clipboard().and_then(|item| item.text()) {
+                    Some(text) if !text.is_empty() => {
+                        let result = ime.state.borrow_mut().commit(None, &text);
+                        match result {
+                            Ok(event) => {
+                                if let FrameInput::Owner(input) = input {
+                                    OwnerInput::submit(input, event);
+                                }
+                            }
+                            Err(error) => {
+                                ime.report(ImeOperation::Paste { bytes: text.len() }, error)
+                            }
+                        }
+                    }
+                    _ => ime.report(ImeOperation::Paste { bytes: 0 }, "clipboard contains no text"),
+                }
+            }
+            // One source: never let platform fallback repeat an explicit paste.
+            window.prevent_default();
+            cx.stop_propagation();
+            window.invalidate_character_coordinates();
+            window.refresh();
+        }
         ImeKey::Command(command) => {
             ime.state.borrow_mut().defer_scoped_input();
             if let FrameInput::Owner(input) = input {
