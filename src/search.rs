@@ -54,16 +54,11 @@ fn byte_string_match<'ob>(
 ) -> Result<Object<'ob>> {
     // Preserve syntax bytes and escape only high-bit literal bytes. Never turn
     // FE/FF wire cookies into their two-byte Unicode UTF8 encodings.
-    let mut escaped = String::new();
-    for byte in pattern {
-        if *byte >= 128 {
-            use std::fmt::Write;
-            write!(&mut escaped, "\\x{byte:02X}")?;
-        } else {
-            escaped.push(char::from(*byte));
-        }
-    }
-    let pattern = lisp_regex_to_rust(&escaped);
+    ensure!(pattern.len()<=1024*1024,"Byte regexp exceeds 1 MiB pattern limit");
+    // Private pattern IR maps each native byte to one scalar, then emits
+    // byte escapes AFTER Emacs syntax/class parsing. Never decode wire UTF8.
+    let escaped: String=pattern.iter().map(|byte|char::from(*byte)).collect();
+    let pattern = lisp_regex_to_rust_domain(&escaped,true);
     let regex = regex::bytes::RegexBuilder::new(&pattern)
         .unicode(false)
         .case_insensitive(case_fold(env, cx)?)
@@ -346,10 +341,69 @@ fn regexp_quote(string: &str) -> String {
     quoted
 }
 
-pub(crate) fn lisp_regex_to_rust(regexp: &str) -> String {
+// Emacs brackets are not Rust nested/set-operation classes: bare `[` and
+// backslash are literal, and descending ranges contribute no characters.
+#[derive(Debug)]
+enum ClassItem { Character(char), Named(String) }
+fn class_character(c:char,bytes:bool)->String {
+    if bytes && c as u32>=128 {return format!("\\x{:02X}",c as u32);}
+    match c {
+        '['|']'|'\\'|'-'|'^'|'&'|'~'|'|' => format!("\\x{{{:X}}}",c as u32),
+        _=>c.to_string(),
+    }
+}
+fn class_name_within_budget(name:&str)->bool {name.len()<=128}
+fn emacs_class(chars:&mut std::iter::Peekable<std::str::CharIndices<'_>>,regexp:&str,bytes:bool)->Option<String> {
+    let negated=chars.peek().is_some_and(|(_,c)|*c=='^');
+    if negated {chars.next();}
+    let mut items=Vec::new();
+    if chars.peek().is_some_and(|(_,c)|*c==']') {chars.next();items.push(ClassItem::Character(']'));}
+    let mut closed=false;
+    while let Some((index,c))=chars.next() {
+        if c==']' {closed=true;break;}
+        if items.len()>=16384 {return None;}
+        if c=='[' && regexp[index..].starts_with("[:") {
+            let Some(end)=regexp[index+2..].find(":]").map(|n|index+2+n) else{return None};
+            if !class_name_within_budget(&regexp[index+2..end]) {return None;}
+            let name=&regexp[index+2..end];
+            if !matches!(name,"alnum"|"alpha"|"ascii"|"blank"|"cntrl"|"digit"|"graph"|"lower"|"print"|"punct"|"space"|"upper"|"word"|"xdigit") {return None;}
+            items.push(ClassItem::Named(name.to_owned()));
+            let finish=end+2;
+            while chars.peek().is_some_and(|(i,_)|*i<finish) {chars.next();}
+        } else {items.push(ClassItem::Character(c));}
+    }
+    if !closed {return None;}
+    let mut body=String::new();let mut i=0;
+    while i<items.len() {
+        if i+2<items.len() && matches!(items[i+1],ClassItem::Character('-')) {
+            match (&items[i],&items[i+2]) {
+                (ClassItem::Character(a),ClassItem::Character(b))=>{
+                    if a<=b {body+=&class_character(*a,bytes);body.push('-');body+=&class_character(*b,bytes);}
+                },
+                // Named-class range endpoints require a separate syntax-table
+                // policy; fail closed rather than invent Rust set operations.
+                _=>return None,
+            }
+            i+=3;continue;
+        }
+        match &items[i] {
+            ClassItem::Character(c)=>body+=&class_character(*c,bytes),
+            ClassItem::Named(name) if name=="word"=>body+="a-zA-Z",
+            ClassItem::Named(name)=>{body+="[:";body+=name;body+=":]";},
+        }
+        i+=1;
+    }
+    if body.is_empty() {return Some(if negated {"[\\s\\S]"} else {"[^\\s\\S]"}.into());}
+    Some(format!("[{}{}]",if negated {"^"}else{""},body))
+}
+
+pub(crate) fn lisp_regex_to_rust(regexp: &str) -> String { lisp_regex_to_rust_domain(regexp,false) }
+fn lisp_regex_to_rust_domain(regexp:&str,bytes:bool)->String {
+    let size=if bytes {regexp.chars().count()}else{regexp.len()};
+    if size>1024*1024 {return "[[:rune-pattern-budget:]]".into();}
     let mut norm_regex = String::new();
-    let mut chars = regexp.char_indices();
-    while let Some((idx, ch)) = chars.next() {
+    let mut chars = regexp.char_indices().peekable();
+    while let Some((_idx, ch)) = chars.next() {
         match ch {
             // Invert Emacs grouping/count/alternation escapes for Rust syntax.
             // Pipes stay literal inside classes in either spelling (| or \|).
@@ -361,21 +415,18 @@ pub(crate) fn lisp_regex_to_rust(regexp: &str) -> String {
                 Some((_, c @ '('..=')' | c @ '{' | c @ '}' | c @ '|')) => norm_regex.push(c),
                 Some((_, '`')) => norm_regex += "\\A",
                 Some((_, '\'')) => norm_regex += "\\z",
+                Some((_, c)) if bytes && c as u32>=128 => norm_regex+=&class_character(c,true),
                 Some((_, c)) => {
                     norm_regex.push('\\');
                     norm_regex.push(c);
                 }
                 None => norm_regex.push('\\'),
             },
-            '[' => {
-                let word = "[:word:]";
-                if regexp[idx..].starts_with(word) {
-                    chars.nth(word.len() - 2);
-                    norm_regex.push_str("a-zA-Z");
-                } else {
-                    norm_regex.push('[');
-                }
-            }
+            '[' => match emacs_class(&mut chars,regexp,bytes) {
+                Some(class)=>norm_regex+=&class,
+                None=>return "[[:rune-unsupported-class:]]".into(),
+            },
+            c if bytes && c as u32>=128=>norm_regex+=&class_character(c,true),
             c => norm_regex.push(c),
         }
     }
@@ -485,6 +536,50 @@ mod test {
         // live root throughout. Do not use the pre-move local original again.
         cx.garbage_collect(true);
         assert_eq!(env.match_data.bind(cx).to_string(),"(7 8 9 10)");
+    }
+
+    #[test]
+    fn emacs_bracket_classes_match_gnu_derived_pattern_and_ascii_matrix() {
+        for form in [
+            r###"(let ((case-fold-search nil)) (list (string-match "[{[]" "a") (string-match "[{[]" "b") (string-match "[{[]" "c") (string-match "[{[]" "z") (string-match "[{[]" "A") (string-match "[{[]" "0") (string-match "[{[]" "_") (string-match "[{[]" "[") (string-match "[{[]" "]") (string-match "[{[]" "{") (string-match "[{[]" "}") (string-match "[{[]" "(") (string-match "[{[]" ")") (string-match "[{[]" "&") (string-match "[{[]" "~") (string-match "[{[]" "-") (string-match "[{[]" "|") (string-match "[{[]" "\\") (string-match "[{[]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[[]" "a") (string-match "[[]" "b") (string-match "[[]" "c") (string-match "[[]" "z") (string-match "[[]" "A") (string-match "[[]" "0") (string-match "[[]" "_") (string-match "[[]" "[") (string-match "[[]" "]") (string-match "[[]" "{") (string-match "[[]" "}") (string-match "[[]" "(") (string-match "[[]" ")") (string-match "[[]" "&") (string-match "[[]" "~") (string-match "[[]" "-") (string-match "[[]" "|") (string-match "[[]" "\\") (string-match "[[]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[]]" "a") (string-match "[]]" "b") (string-match "[]]" "c") (string-match "[]]" "z") (string-match "[]]" "A") (string-match "[]]" "0") (string-match "[]]" "_") (string-match "[]]" "[") (string-match "[]]" "]") (string-match "[]]" "{") (string-match "[]]" "}") (string-match "[]]" "(") (string-match "[]]" ")") (string-match "[]]" "&") (string-match "[]]" "~") (string-match "[]]" "-") (string-match "[]]" "|") (string-match "[]]" "\\") (string-match "[]]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[^]]" "a") (string-match "[^]]" "b") (string-match "[^]]" "c") (string-match "[^]]" "z") (string-match "[^]]" "A") (string-match "[^]]" "0") (string-match "[^]]" "_") (string-match "[^]]" "[") (string-match "[^]]" "]") (string-match "[^]]" "{") (string-match "[^]]" "}") (string-match "[^]]" "(") (string-match "[^]]" ")") (string-match "[^]]" "&") (string-match "[^]]" "~") (string-match "[^]]" "-") (string-match "[^]]" "|") (string-match "[^]]" "\\") (string-match "[^]]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[][]" "a") (string-match "[][]" "b") (string-match "[][]" "c") (string-match "[][]" "z") (string-match "[][]" "A") (string-match "[][]" "0") (string-match "[][]" "_") (string-match "[][]" "[") (string-match "[][]" "]") (string-match "[][]" "{") (string-match "[][]" "}") (string-match "[][]" "(") (string-match "[][]" ")") (string-match "[][]" "&") (string-match "[][]" "~") (string-match "[][]" "-") (string-match "[][]" "|") (string-match "[][]" "\\") (string-match "[][]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[a[b]" "a") (string-match "[a[b]" "b") (string-match "[a[b]" "c") (string-match "[a[b]" "z") (string-match "[a[b]" "A") (string-match "[a[b]" "0") (string-match "[a[b]" "_") (string-match "[a[b]" "[") (string-match "[a[b]" "]") (string-match "[a[b]" "{") (string-match "[a[b]" "}") (string-match "[a[b]" "(") (string-match "[a[b]" ")") (string-match "[a[b]" "&") (string-match "[a[b]" "~") (string-match "[a[b]" "-") (string-match "[a[b]" "|") (string-match "[a[b]" "\\") (string-match "[a[b]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[a&&b]" "a") (string-match "[a&&b]" "b") (string-match "[a&&b]" "c") (string-match "[a&&b]" "z") (string-match "[a&&b]" "A") (string-match "[a&&b]" "0") (string-match "[a&&b]" "_") (string-match "[a&&b]" "[") (string-match "[a&&b]" "]") (string-match "[a&&b]" "{") (string-match "[a&&b]" "}") (string-match "[a&&b]" "(") (string-match "[a&&b]" ")") (string-match "[a&&b]" "&") (string-match "[a&&b]" "~") (string-match "[a&&b]" "-") (string-match "[a&&b]" "|") (string-match "[a&&b]" "\\") (string-match "[a&&b]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[a~~b]" "a") (string-match "[a~~b]" "b") (string-match "[a~~b]" "c") (string-match "[a~~b]" "z") (string-match "[a~~b]" "A") (string-match "[a~~b]" "0") (string-match "[a~~b]" "_") (string-match "[a~~b]" "[") (string-match "[a~~b]" "]") (string-match "[a~~b]" "{") (string-match "[a~~b]" "}") (string-match "[a~~b]" "(") (string-match "[a~~b]" ")") (string-match "[a~~b]" "&") (string-match "[a~~b]" "~") (string-match "[a~~b]" "-") (string-match "[a~~b]" "|") (string-match "[a~~b]" "\\") (string-match "[a~~b]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[a--c]" "a") (string-match "[a--c]" "b") (string-match "[a--c]" "c") (string-match "[a--c]" "z") (string-match "[a--c]" "A") (string-match "[a--c]" "0") (string-match "[a--c]" "_") (string-match "[a--c]" "[") (string-match "[a--c]" "]") (string-match "[a--c]" "{") (string-match "[a--c]" "}") (string-match "[a--c]" "(") (string-match "[a--c]" ")") (string-match "[a--c]" "&") (string-match "[a--c]" "~") (string-match "[a--c]" "-") (string-match "[a--c]" "|") (string-match "[a--c]" "\\") (string-match "[a--c]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[--a]" "a") (string-match "[--a]" "b") (string-match "[--a]" "c") (string-match "[--a]" "z") (string-match "[--a]" "A") (string-match "[--a]" "0") (string-match "[--a]" "_") (string-match "[--a]" "[") (string-match "[--a]" "]") (string-match "[--a]" "{") (string-match "[--a]" "}") (string-match "[--a]" "(") (string-match "[--a]" ")") (string-match "[--a]" "&") (string-match "[--a]" "~") (string-match "[--a]" "-") (string-match "[--a]" "|") (string-match "[--a]" "\\") (string-match "[--a]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[-a]" "a") (string-match "[-a]" "b") (string-match "[-a]" "c") (string-match "[-a]" "z") (string-match "[-a]" "A") (string-match "[-a]" "0") (string-match "[-a]" "_") (string-match "[-a]" "[") (string-match "[-a]" "]") (string-match "[-a]" "{") (string-match "[-a]" "}") (string-match "[-a]" "(") (string-match "[-a]" ")") (string-match "[-a]" "&") (string-match "[-a]" "~") (string-match "[-a]" "-") (string-match "[-a]" "|") (string-match "[-a]" "\\") (string-match "[-a]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[a-]" "a") (string-match "[a-]" "b") (string-match "[a-]" "c") (string-match "[a-]" "z") (string-match "[a-]" "A") (string-match "[a-]" "0") (string-match "[a-]" "_") (string-match "[a-]" "[") (string-match "[a-]" "]") (string-match "[a-]" "{") (string-match "[a-]" "}") (string-match "[a-]" "(") (string-match "[a-]" ")") (string-match "[a-]" "&") (string-match "[a-]" "~") (string-match "[a-]" "-") (string-match "[a-]" "|") (string-match "[a-]" "\\") (string-match "[a-]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[a-z]" "a") (string-match "[a-z]" "b") (string-match "[a-z]" "c") (string-match "[a-z]" "z") (string-match "[a-z]" "A") (string-match "[a-z]" "0") (string-match "[a-z]" "_") (string-match "[a-z]" "[") (string-match "[a-z]" "]") (string-match "[a-z]" "{") (string-match "[a-z]" "}") (string-match "[a-z]" "(") (string-match "[a-z]" ")") (string-match "[a-z]" "&") (string-match "[a-z]" "~") (string-match "[a-z]" "-") (string-match "[a-z]" "|") (string-match "[a-z]" "\\") (string-match "[a-z]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[[:alpha:]]" "a") (string-match "[[:alpha:]]" "b") (string-match "[[:alpha:]]" "c") (string-match "[[:alpha:]]" "z") (string-match "[[:alpha:]]" "A") (string-match "[[:alpha:]]" "0") (string-match "[[:alpha:]]" "_") (string-match "[[:alpha:]]" "[") (string-match "[[:alpha:]]" "]") (string-match "[[:alpha:]]" "{") (string-match "[[:alpha:]]" "}") (string-match "[[:alpha:]]" "(") (string-match "[[:alpha:]]" ")") (string-match "[[:alpha:]]" "&") (string-match "[[:alpha:]]" "~") (string-match "[[:alpha:]]" "-") (string-match "[[:alpha:]]" "|") (string-match "[[:alpha:]]" "\\") (string-match "[[:alpha:]]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[[:digit:]_]" "a") (string-match "[[:digit:]_]" "b") (string-match "[[:digit:]_]" "c") (string-match "[[:digit:]_]" "z") (string-match "[[:digit:]_]" "A") (string-match "[[:digit:]_]" "0") (string-match "[[:digit:]_]" "_") (string-match "[[:digit:]_]" "[") (string-match "[[:digit:]_]" "]") (string-match "[[:digit:]_]" "{") (string-match "[[:digit:]_]" "}") (string-match "[[:digit:]_]" "(") (string-match "[[:digit:]_]" ")") (string-match "[[:digit:]_]" "&") (string-match "[[:digit:]_]" "~") (string-match "[[:digit:]_]" "-") (string-match "[[:digit:]_]" "|") (string-match "[[:digit:]_]" "\\") (string-match "[[:digit:]_]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[\\]]" "a") (string-match "[\\]]" "b") (string-match "[\\]]" "c") (string-match "[\\]]" "z") (string-match "[\\]]" "A") (string-match "[\\]]" "0") (string-match "[\\]]" "_") (string-match "[\\]]" "[") (string-match "[\\]]" "]") (string-match "[\\]]" "{") (string-match "[\\]]" "}") (string-match "[\\]]" "(") (string-match "[\\]]" ")") (string-match "[\\]]" "&") (string-match "[\\]]" "~") (string-match "[\\]]" "-") (string-match "[\\]]" "|") (string-match "[\\]]" "\\") (string-match "[\\]]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[\\[]" "a") (string-match "[\\[]" "b") (string-match "[\\[]" "c") (string-match "[\\[]" "z") (string-match "[\\[]" "A") (string-match "[\\[]" "0") (string-match "[\\[]" "_") (string-match "[\\[]" "[") (string-match "[\\[]" "]") (string-match "[\\[]" "{") (string-match "[\\[]" "}") (string-match "[\\[]" "(") (string-match "[\\[]" ")") (string-match "[\\[]" "&") (string-match "[\\[]" "~") (string-match "[\\[]" "-") (string-match "[\\[]" "|") (string-match "[\\[]" "\\") (string-match "[\\[]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[a\\-c]" "a") (string-match "[a\\-c]" "b") (string-match "[a\\-c]" "c") (string-match "[a\\-c]" "z") (string-match "[a\\-c]" "A") (string-match "[a\\-c]" "0") (string-match "[a\\-c]" "_") (string-match "[a\\-c]" "[") (string-match "[a\\-c]" "]") (string-match "[a\\-c]" "{") (string-match "[a\\-c]" "}") (string-match "[a\\-c]" "(") (string-match "[a\\-c]" ")") (string-match "[a\\-c]" "&") (string-match "[a\\-c]" "~") (string-match "[a\\-c]" "-") (string-match "[a\\-c]" "|") (string-match "[a\\-c]" "\\") (string-match "[a\\-c]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[{}()]" "a") (string-match "[{}()]" "b") (string-match "[{}()]" "c") (string-match "[{}()]" "z") (string-match "[{}()]" "A") (string-match "[{}()]" "0") (string-match "[{}()]" "_") (string-match "[{}()]" "[") (string-match "[{}()]" "]") (string-match "[{}()]" "{") (string-match "[{}()]" "}") (string-match "[{}()]" "(") (string-match "[{}()]" ")") (string-match "[{}()]" "&") (string-match "[{}()]" "~") (string-match "[{}()]" "-") (string-match "[{}()]" "|") (string-match "[{}()]" "\\") (string-match "[{}()]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[^[]" "a") (string-match "[^[]" "b") (string-match "[^[]" "c") (string-match "[^[]" "z") (string-match "[^[]" "A") (string-match "[^[]" "0") (string-match "[^[]" "_") (string-match "[^[]" "[") (string-match "[^[]" "]") (string-match "[^[]" "{") (string-match "[^[]" "}") (string-match "[^[]" "(") (string-match "[^[]" ")") (string-match "[^[]" "&") (string-match "[^[]" "~") (string-match "[^[]" "-") (string-match "[^[]" "|") (string-match "[^[]" "\\") (string-match "[^[]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[a||b]" "a") (string-match "[a||b]" "b") (string-match "[a||b]" "c") (string-match "[a||b]" "z") (string-match "[a||b]" "A") (string-match "[a||b]" "0") (string-match "[a||b]" "_") (string-match "[a||b]" "[") (string-match "[a||b]" "]") (string-match "[a||b]" "{") (string-match "[a||b]" "}") (string-match "[a||b]" "(") (string-match "[a||b]" ")") (string-match "[a||b]" "&") (string-match "[a||b]" "~") (string-match "[a||b]" "-") (string-match "[a||b]" "|") (string-match "[a||b]" "\\") (string-match "[a||b]" "^")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "\\\\[{[]" "\\[foo]") (string-match "\\\\[{[]" "\\{foo}") (string-match "\\\\[{[]" "[foo]")))"###,
+            r###"(let ((case-fold-search nil)) (list (string-match "[\377]" "x\377") (string-match "[\200-\377]" "x\377") (string-match "[^\377]" "\377a")))"###,
+        ] {crate::assert_elprop!("{}",form);}
+    }
+
+    #[test]
+    fn bracket_translation_budgets_are_inclusive_and_stop_on_failure() {
+        for (size,allowed) in [(16384,true),(16385,false)] {
+            let pattern=format!("[{}]","a".repeat(size));
+            let mut chars=pattern.char_indices().peekable();chars.next();
+            assert_eq!(emacs_class(&mut chars,&pattern,false).is_some(),allowed);
+        }
+        assert!(class_name_within_budget(&"x".repeat(128)));
+        assert!(!class_name_within_budget(&"x".repeat(129)));
+        assert!(RegexBuilder::new(&lisp_regex_to_rust(&"a".repeat(1024*1024+1))).build().is_err());
+        assert!(RegexBuilder::new(&lisp_regex_to_rust(&"[[:".repeat(20000))).build().is_err());
+        assert!(RegexBuilder::new(&lisp_regex_to_rust("[[:alpha:]-z]")).build().is_err());
+        for form in [r#"(let ((case-fold-search nil)) (list (string-match "[z-a]" "a") (string-match "[^z-a]" "a")))"#,r#"(let ((case-fold-search nil)) (condition-case nil (progn (string-match "[[:bogus:]]" "a") 'accepted) (error 'rejected)))"#] {crate::assert_elprop!("{}",form);}
     }
 
     #[test]
