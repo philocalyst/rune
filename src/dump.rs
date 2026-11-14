@@ -75,6 +75,7 @@ struct DumpState {
     objects: Vec<DumpedObject>,
     symbols: Vec<DumpedSymbol>,
     env: Vec<DumpedBinding>,
+    unsupported_overlay: bool,
 }
 
 impl Display for DumpedObject {
@@ -146,7 +147,13 @@ fn fmt_id_list(f: &mut fmt::Formatter<'_>, ids: &[ObjId]) -> fmt::Result {
 
 impl DumpState {
     fn new() -> Self {
-        Self { seen: HashMap::new(), objects: Vec::new(), symbols: Vec::new(), env: Vec::new() }
+        Self {
+            seen: HashMap::new(),
+            objects: Vec::new(),
+            symbols: Vec::new(),
+            env: Vec::new(),
+            unsupported_overlay: false,
+        }
     }
 
     /// Serialize an object and return its id. If already visited (cycle or
@@ -221,6 +228,12 @@ impl DumpState {
             ObjectType::ChannelReceiver(_) => DumpedObject::ChannelReceiver,
             ObjectType::Process(_) => DumpedObject::Nil,
             ObjectType::Frame(_) => DumpedObject::Nil,
+            ObjectType::Overlay(_) => {
+                // Internal cycle-building placeholder only. into_output rejects
+                // the entire image before any file is created or overwritten.
+                self.unsupported_overlay = true;
+                DumpedObject::Nil
+            }
         };
 
         // Overwrite the Nil placeholder with the real object
@@ -263,7 +276,13 @@ impl DumpState {
         }
     }
 
-    fn into_output(self) -> std::string::String {
+    fn into_output(self) -> std::io::Result<std::string::String> {
+        if self.unsupported_overlay {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Overlay persistence is unsupported",
+            ));
+        }
         let mut out = std::string::String::new();
         writeln!(out, ".HEADER").unwrap();
         writeln!(out, "  version 1").unwrap();
@@ -291,7 +310,7 @@ impl DumpState {
         for b in &self.env {
             writeln!(out, "  @{} = @{}", b.sym_id, b.val_id).unwrap();
         }
-        out
+        Ok(out)
     }
 }
 
@@ -315,7 +334,7 @@ pub(crate) fn dump_to_file(path: &Path, env: &Rt<Env>, cx: &Context) -> Result<(
     let mut state = DumpState::new();
     state.dump_symbols(cx);
     state.dump_env(env, cx);
-    let output = state.into_output();
+    let output = state.into_output()?;
     std::fs::write(path, output)
 }
 
@@ -716,7 +735,8 @@ pub(crate) fn load_dump(path: &Path, env: &mut Rt<Env>, cx: &mut Context) -> Res
             DumpedObject::HashTable(entries) => {
                 if let ObjectType::HashTable(ht) = table[id].untag() {
                     for (k_id, v_id) in entries {
-                        ht.insert(table[*k_id as usize], table[*v_id as usize]).map_err(|e| e.to_string())?;
+                        ht.insert(table[*k_id as usize], table[*v_id as usize])
+                            .map_err(|e| e.to_string())?;
                     }
                 }
             }
@@ -1128,7 +1148,7 @@ mod tests {
             .push(DumpedSymbol { name: "f".into(), sym_id: 2, func_id: Some(3) });
         state.env.push(DumpedBinding { sym_id: 1, val_id: 0 });
 
-        let output = state.into_output();
+        let output = state.into_output().unwrap();
         let dump = parse_dump(&output).unwrap();
 
         assert_eq!(dump.objects.len(), 4);
@@ -1201,5 +1221,36 @@ mod tests {
         assert_eq!(dump.env.len(), 1);
         assert_eq!(dump.env[0].sym_id, 2);
         assert_eq!(dump.env[0].val_id, 4);
+    }
+}
+
+#[cfg(test)]
+mod overlay_persistence_tests {
+    use super::*;
+    use crate::core::{gc::RootSet, object::LispOverlay};
+    use rune_core::macros::root;
+    #[test]
+    fn overlay_dump_rejection_precedes_output_file_overwrite() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        crate::core::env::sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        let overlay = LispOverlay::new(cx, false, false);
+        env.set_var(crate::lread::intern("rune-overlay-dump", cx), overlay.into())
+            .unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "rune-overlay-dump-{}-{}",
+            std::process::id(),
+            cx.domain_id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("existing.dump");
+        std::fs::write(&path, b"existing image").unwrap();
+        let result = dump_to_file(&path, env, cx);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(bytes, b"existing image");
     }
 }

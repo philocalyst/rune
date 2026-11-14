@@ -664,6 +664,7 @@ fn type_of(object: Object) -> Object {
         ObjectType::ChannelReceiver(_) => sym::CHANNEL_RECEIVER.into(),
         ObjectType::Process(_) => sym::PROCESS.into(),
         ObjectType::Frame(_) => sym::FRAME.into(),
+        ObjectType::Overlay(_) => sym::OVERLAY.into(),
     }
 }
 
@@ -1357,6 +1358,7 @@ defsym!(HASH_TABLE);
 defsym!(BUFFER);
 defsym!(PROCESS);
 defsym!(FRAME);
+defsym!(OVERLAY);
 defsym!(SUBR);
 defsym!(CHAR_TABLE);
 defsym!(BIG_INT);

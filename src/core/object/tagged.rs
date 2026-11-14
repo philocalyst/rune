@@ -5,7 +5,7 @@ use super::{
         gc::Block,
     },
     ByteFnPrototype, ByteString, ChannelReceiver, ChannelSender, CharTableInner, GcString,
-    LispBigInt, LispBuffer, LispFrame, LispProcess,
+    LispBigInt, LispBuffer, LispFrame, LispOverlay, LispProcess,
 };
 use super::{
     ByteFn, CharTable, HashTable, LispFloat, LispHashTable, LispString, LispVec, Record,
@@ -311,6 +311,7 @@ object_trait_impls!(ChannelSender);
 object_trait_impls!(ChannelReceiver);
 object_trait_impls!(LispProcess);
 object_trait_impls!(LispFrame);
+object_trait_impls!(LispOverlay);
 
 /// Trait for types that can be managed by the GC. This trait is implemented for
 /// as many types as possible, even for types that are already Gc managed, Like
@@ -623,6 +624,21 @@ impl IntoObject for LispFrame {
     }
 }
 
+impl IntoObject for LispOverlay {
+    type Out<'ob> = &'ob LispOverlay;
+    fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
+        let LispOverlay(heap) = self;
+        let ptr = block.objects.alloc(LispOverlay(heap.for_block::<C>()));
+        unsafe {
+            block.record_copy_allocation(crate::core::gc::CopyAllocation::Overlay(ptr));
+        }
+        if !C {
+            block.lisp_overlays.borrow_mut().push(ptr);
+        }
+        unsafe { <&LispOverlay>::tag_ptr(ptr) }
+    }
+}
+
 mod private {
     use super::{Gc, WithLifetime};
 
@@ -647,6 +663,7 @@ mod private {
         ChannelReceiver,
         Process,
         Frame,
+        Overlay,
     }
 
     /// Trait for tagged pointers. Anything that can be stored and passed around
@@ -763,6 +780,7 @@ impl<'a> TaggedPtr for ObjectType<'a> {
                 }
                 Tag::Process => ObjectType::Process(<&LispProcess>::from_obj_ptr(ptr)),
                 Tag::Frame => ObjectType::Frame(<&LispFrame>::from_obj_ptr(ptr)),
+                Tag::Overlay => ObjectType::Overlay(<&LispOverlay>::from_obj_ptr(ptr)),
             }
         }
     }
@@ -787,6 +805,7 @@ impl<'a> TaggedPtr for ObjectType<'a> {
             ObjectType::ChannelReceiver(x) => TaggedPtr::tag(x).into(),
             ObjectType::Process(x) => TaggedPtr::tag(x).into(),
             ObjectType::Frame(x) => TaggedPtr::tag(x).into(),
+            ObjectType::Overlay(x) => TaggedPtr::tag(x).into(),
         }
     }
 }
@@ -1112,6 +1131,16 @@ impl TaggedPtr for &LispFrame {
         self as *const Self::Ptr
     }
 }
+impl TaggedPtr for &LispOverlay {
+    type Ptr = LispOverlay;
+    const TAG: Tag = Tag::Overlay;
+    unsafe fn from_obj_ptr(ptr: *const u8) -> Self {
+        &*ptr.cast::<Self::Ptr>()
+    }
+    fn get_ptr(self) -> *const Self::Ptr {
+        self as *const Self::Ptr
+    }
+}
 
 impl<T> TracePtr for Gc<T> {
     fn trace_ptr(&self, state: &mut GcState) {
@@ -1133,6 +1162,7 @@ impl<T> TracePtr for Gc<T> {
             ObjectType::ChannelReceiver(x) => x.0.trace(state),
             ObjectType::Process(x) => x.0.trace(state),
             ObjectType::Frame(x) => x.0.trace(state),
+            ObjectType::Overlay(x) => x.0.trace(state),
         }
     }
 }
@@ -1260,6 +1290,7 @@ pub(crate) enum ObjectType<'ob> {
     ChannelReceiver(&'ob ChannelReceiver) = Tag::ChannelReceiver as u8,
     Process(&'ob LispProcess) = Tag::Process as u8,
     Frame(&'ob LispFrame) = Tag::Frame as u8,
+    Overlay(&'ob LispOverlay) = Tag::Overlay as u8,
 }
 
 /// The Object defintion that contains all other possible lisp objects. This
@@ -1286,7 +1317,8 @@ cast_gc!(ObjectType<'ob> => NumberType<'ob>,
          &'ob ChannelSender,
          &'ob ChannelReceiver,
          &'ob LispProcess,
-         &'ob LispFrame
+         &'ob LispFrame,
+         &'ob LispOverlay
 );
 
 impl ObjectType<'_> {
@@ -1312,6 +1344,7 @@ impl ObjectType<'_> {
             ObjectType::ChannelReceiver(_) => Type::ChannelReceiver,
             ObjectType::Process(_) => Type::Process,
             ObjectType::Frame(_) => Type::Frame,
+            ObjectType::Overlay(_) => Type::Overlay,
         }
     }
 }
@@ -1653,6 +1686,22 @@ impl<'ob> std::ops::Deref for Gc<&'ob LispFrame> {
     }
 }
 
+impl<'ob> TryFrom<Object<'ob>> for Gc<&'ob LispOverlay> {
+    type Error = TypeError;
+    fn try_from(value: Object<'ob>) -> Result<Self, Self::Error> {
+        match value.get_tag() {
+            Tag::Overlay => unsafe { Ok(cast_gc(value)) },
+            _ => Err(TypeError::new(Type::Overlay, value)),
+        }
+    }
+}
+impl<'ob> std::ops::Deref for Gc<&'ob LispOverlay> {
+    type Target = LispOverlay;
+    fn deref(&self) -> &'ob Self::Target {
+        self.untag()
+    }
+}
+
 pub(crate) trait CloneIn<'new, T>
 where
     T: 'new,
@@ -1688,6 +1737,7 @@ where
             ObjectType::ChannelReceiver(x) => x.clone_in(bk)?.into(),
             ObjectType::Process(x) => x.clone_in(bk)?.into(),
             ObjectType::Frame(x) => x.clone_in(bk)?.into(),
+            ObjectType::Overlay(x) => x.clone_in(bk)?.into(),
         };
         let Ok(x) = Gc::<U>::try_from(obj) else { unreachable!() };
         Ok(x)
@@ -1733,6 +1783,7 @@ impl GcMoveable for Object<'_> {
             ObjectType::ChannelReceiver(x) => cast_pair(x.move_value(to_space)?),
             ObjectType::Process(x) => cast_pair(x.move_value(to_space)?),
             ObjectType::Frame(x) => cast_pair(x.move_value(to_space)?),
+            ObjectType::Overlay(x) => cast_pair(x.move_value(to_space)?),
         };
 
         let tag = self.get_tag();
@@ -1955,6 +2006,7 @@ impl ObjectType<'_> {
             ObjectType::ChannelReceiver(x) => D::fmt(x, f),
             ObjectType::Process(x) => D::fmt(x, f),
             ObjectType::Frame(x) => D::fmt(x, f),
+            ObjectType::Overlay(x) => D::fmt(x, f),
         }
     }
 }

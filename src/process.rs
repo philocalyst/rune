@@ -575,13 +575,13 @@ mod tests {
     fn asynchronous_child_uses_same_owner_environment_snapshot() {
         assert_lisp(
             r#"(let ((process-environment '("ASYNC_OWNER=first" "ASYNC_OWNER=later"))
-                     (p nil) (attempts 0))
+                     (p nil) (attempts 0) (done nil))
                 (set-buffer (get-buffer-create "rune-async-child-env"))
                 (setq p (start-process "rune-async-child-env" (current-buffer) "/usr/bin/env"))
-                (set-process-sentinel p #'(lambda (process event) nil))
+                (set-process-sentinel p #'(lambda (process event) (setq done t)))
                 (unwind-protect
                     (progn
-                      (while (and (process-live-p p) (< attempts 200))
+                      (while (and (null done) (< attempts 200))
                         (setq attempts (+ attempts 1)) (accept-process-output p 0.01))
                       (accept-process-output p 0)
                       (list (process-exit-status p)

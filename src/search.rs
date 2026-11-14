@@ -144,12 +144,37 @@ fn compile_buffer_regex(pattern: &str, fold: bool, env: &mut Rt<Env>, cx: &Conte
     })
 }
 
+fn buffer_search_type_error(value: Object, predicate: &str, env: &mut Rt<Env>, cx: &Context) -> anyhow::Error {
+    env.initialize_condition_metadata(cx);
+    let predicate = crate::core::env::intern(predicate, cx);
+    let data = crate::core::cons::Cons::new(predicate, crate::core::cons::Cons::new1(value, cx), cx).into();
+    crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into()
+}
+
 /// Buffer character positions are one-based; regex offsets remain UTF8 bytes.
 #[defun]
 fn re_search_backward<'ob>(
-    regexp: &str, bound: Option<i64>, noerror: Option<Object>, count: Option<i64>,
+    regexp: Object, bound: Option<Object>, noerror: Option<Object>, count: Option<Object>,
     env: &mut Rt<Env>, cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    // GNU validates COUNT, regexp storage, BOUND, then regexp syntax.
+    let count: i64 = match count.filter(|value| !value.is_nil()) {
+        None => 1,
+        Some(value) if matches!(value.untag(), ObjectType::Int(_)) => value.try_into()?,
+        Some(value) => return Err(buffer_search_type_error(value, "fixnump", env, cx)),
+    };
+    let regexp_object = regexp;
+    let regexp: &str = match regexp.untag() {
+        ObjectType::String(text) => text,
+        ObjectType::ByteString(bytes) if bytes.is_ascii() => std::str::from_utf8(bytes)?,
+        ObjectType::ByteString(_) => bail!("Non-ASCII byte regexp patterns in Unicode buffers are not implemented"),
+        _ => return Err(buffer_search_type_error(regexp_object, "stringp", env, cx)),
+    };
+    let bound: Option<i64> = match bound.filter(|value| !value.is_nil()) {
+        None => None,
+        Some(value) if matches!(value.untag(), ObjectType::Int(_)) => Some(value.try_into()?),
+        Some(value) => return Err(buffer_search_type_error(value, "integer-or-marker-p", env, cx)),
+    };
     let read = env.buffer_read(cx)?;
     ensure!(read.document.text().len_bytes() <= 4 * 1024 * 1024, "Buffer regexp search exceeds 4 MiB limit");
     let text = read.document.text().to_string();
@@ -157,7 +182,6 @@ fn re_search_backward<'ob>(
     offsets.push(text.len());
     let length = offsets.len() - 1;
     let original = read.point;
-    let count = count.unwrap_or(1);
     ensure!(count.unsigned_abs() <= 10_000, "Buffer regexp repeat limit exceeded");
     let backward = count >= 0;
     let limit = match bound {
@@ -209,7 +233,7 @@ fn re_search_backward<'ob>(
             if noerror.is_nil() {
                 env.initialize_condition_metadata(cx);
                 let condition = sym::SEARCH_FAILED;
-                let data = crate::core::cons::Cons::new1(cx.add(regexp), cx).into();
+                let data = crate::core::cons::Cons::new1(regexp_object, cx).into();
                 return Err(crate::eval::EvalError::signal(condition.into(), data, cx).into());
             }
             return Ok(NIL);
@@ -631,6 +655,24 @@ mod backward_buffer_tests {
         for (length, character) in [(4_194_305, 97), (1_048_577, 0x1f642)] {
             assert_lisp(&format!(r#"(progn (set-buffer (get-buffer-create "oversized-regexp-buffer")) (insert (make-string {length} {character} t)) (goto-char 2) (set-match-data '(9 10)) (list (condition-case nil (re-search-backward "" nil t) (error 'bounded)) (point) (match-beginning 0) (match-end 0)))"#), "(bounded 2 9 10)");
         }
+    }
+
+    #[test]
+    fn backward_operand_validation_order_matches_gnu() {
+        for source in [
+            r#"(condition-case e (re-search-backward 17 'bad t 'bad2) (error e))"#,
+            r#"(condition-case e (re-search-backward "a" 'bad t 'bad2) (error e))"#,
+            r#"(condition-case e (re-search-backward 17 'bad t 1) (error e))"#,
+            r#"(condition-case e (re-search-backward "a" 'bad t 1) (error e))"#,
+            r#"(condition-case e (re-search-backward "[" 'bad t 1) (error e))"#,
+            r#"(condition-case e (re-search-backward 17 nil t 0) (error e))"#,
+        ] { crate::assert_elprop!("{}", source); }
+    }
+
+    #[test]
+    fn backward_ascii_byte_pattern_preserves_storage_in_failure_payload() {
+        crate::assert_elprop!("{}", r#"(progn (erase-buffer) (setq case-fold-search nil) (insert "λ\n🙂") (goto-char 4) (let ((nl (substring "\377\012" 1))) (list (multibyte-string-p nl) (re-search-backward nl nil t) (point) (match-beginning 0) (match-end 0))))"#);
+        assert_lisp(r#"(progn (set-buffer (get-buffer-create "byte-pattern-failure")) (insert "abc") (goto-char 4) (condition-case e (re-search-backward (substring "\377\012" 1)) (search-failed (list (car e) (multibyte-string-p (car (cdr e)))))))"#, "(search-failed nil)");
     }
 
     #[test]

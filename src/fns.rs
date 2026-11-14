@@ -155,7 +155,68 @@ fn string_to_multibyte(string: &LispString) -> &LispString {
     string
 }
 
-#[defun]
+#[defun(name = "string-search")]
+fn string_search_value(needle: Object, haystack: Object, start_pos: Option<Object>, env: &mut Rt<Env>, cx: &Context) -> Result<Option<usize>> {
+    // All three inputs remain Objects until ordered validation is complete.
+    // Generated argument conversion must not reject START before either string.
+    for value in [needle, haystack] {
+        if !matches!(value.untag(), ObjectType::String(_) | ObjectType::ByteString(_)) {
+            env.initialize_condition_metadata(cx);
+            let data = list!(sym::STRINGP, value; cx);
+            return Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into());
+        }
+    }
+    let start_pos: Option<usize> = match start_pos.filter(|value| !value.is_nil()) {
+        None => None,
+        Some(value) if matches!(value.untag(), ObjectType::Int(_)) => Some(value.try_into()?),
+        Some(value) => {
+            env.initialize_condition_metadata(cx);
+            let predicate = crate::core::env::intern("fixnump", cx);
+            let data = list!(predicate, value; cx);
+            return Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into());
+        }
+    };
+    let start = start_pos.unwrap_or(0);
+    match (needle.untag(), haystack.untag()) {
+        (ObjectType::String(needle), ObjectType::String(haystack)) => string_search(needle, haystack, start_pos),
+        (ObjectType::ByteString(needle), ObjectType::ByteString(haystack)) => byte_string_search(needle, haystack, start),
+        (ObjectType::ByteString(needle), ObjectType::String(haystack)) => {
+            ensure!(start <= haystack.chars().count(), "string-search start out of range");
+            if !needle.is_ascii() { return Ok(None); }
+            string_search(std::str::from_utf8(needle)?, haystack, start_pos)
+        }
+        (ObjectType::String(needle), ObjectType::ByteString(haystack)) => {
+            ensure!(start <= haystack.len(), "string-search start out of range");
+            if !needle.is_ascii() { return Ok(None); }
+            byte_string_search(needle.as_bytes(), haystack, start)
+        }
+        (other, _) if !matches!(other, ObjectType::String(_) | ObjectType::ByteString(_)) => Err(TypeError::new(Type::String, other).into()),
+        (_, other) => Err(TypeError::new(Type::String, other).into()),
+    }
+}
+fn byte_string_search(needle: &[u8], haystack: &[u8], start: usize) -> Result<Option<usize>> {
+    ensure!(start <= haystack.len(), "string-search start out of range");
+    if needle.is_empty() { return Ok(Some(start)); }
+    if needle.len() > haystack.len() - start { return Ok(None); }
+    // Prefix fallback keeps repeated-prefix byte inputs linear without decoding.
+    let mut prefix = Vec::new();
+    prefix.try_reserve_exact(needle.len())?;
+    prefix.resize(needle.len(), 0usize);
+    for index in 1..needle.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && needle[index] != needle[matched] { matched = prefix[matched - 1]; }
+        if needle[index] == needle[matched] { matched += 1; }
+        prefix[index] = matched;
+    }
+    let mut matched = 0;
+    for (offset, byte) in haystack[start..].iter().copied().enumerate() {
+        while matched > 0 && byte != needle[matched] { matched = prefix[matched - 1]; }
+        if byte == needle[matched] { matched += 1; }
+        if matched == needle.len() { return Ok(Some(start + offset + 1 - needle.len())); }
+    }
+    Ok(None)
+}
+
 fn string_search(needle: &str, haystack: &str, start_pos: Option<usize>) -> Result<Option<usize>> {
     let start = start_pos.unwrap_or(0);
     let char_len = haystack.chars().count();
@@ -1504,6 +1565,46 @@ mod test {
         assert_eq!(string_search("z", "aé🦀z", Some(4)).unwrap(), None);
         assert_eq!(string_search("", "", None).unwrap(), Some(0));
         assert_eq!(string_search("x", "", None).unwrap(), None);
+    }
+
+    #[test]
+    fn byte_string_search_matches_reference_without_decoding() {
+        let mut state = 0x51a7_u64;
+        for case in 0..10_000usize {
+            let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); (state >> 32) as u8 };
+            let haystack: Vec<u8> = (0..case % 65).map(|_| next() % 4).collect();
+            let needle: Vec<u8> = (0..case % 17).map(|_| next() % 4).collect();
+            let start = case % (haystack.len() + 1);
+            let expected = if needle.is_empty() { Some(start) } else {
+                haystack[start..].windows(needle.len()).position(|part| part == needle).map(|offset| start + offset)
+            };
+            assert_eq!(super::byte_string_search(&needle, &haystack, start).unwrap(), expected);
+        }
+        let haystack = vec![b'a'; 1024 * 1024];
+        let mut needle = vec![b'a'; 4096]; needle.push(b'b');
+        assert_eq!(super::byte_string_search(&needle, &haystack, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn string_search_validates_strings_before_start_like_gnu() {
+        for source in [
+            r#"(condition-case e (string-search 17 18 'bad) (error e))"#,
+            r#"(condition-case e (string-search "a" 18 'bad) (error e))"#,
+            r#"(condition-case e (string-search "a" "a" 'bad) (error e))"#,
+            r#"(condition-case e (string-search nil 18 'bad) (error e))"#,
+        ] { crate::assert_elprop!("{}", source); }
+    }
+
+    #[test]
+    fn string_search_storage_boundaries_match_gnu() {
+        for needle in [r#""""#, r#""a""#, r#""\012""#, r#""\377""#, r#""é""#, r#""\303\251""#] {
+            for haystack in [r#""""#, r#""a\nb""#, r#""λa🙂""#, r#""\377a\376""#, r#""é""#, r#""\303\251""#] {
+                for start in [0, 1, 2, 5] {
+                    crate::assert_elprop!("{}", format!("(condition-case e (string-search {needle} {haystack} {start}) (error 'caught))"));
+                }
+            }
+        }
+        crate::interpreter::assert_lisp(r#"(let ((nl (substring "\377\012" 1))) (list (multibyte-string-p nl) (string-search nl "λ\n🙂") (string-search "a" "\377a\376") (string-search "\377" "\377a\376")))"#, "(nil 1 1 0)");
     }
 
     #[test]

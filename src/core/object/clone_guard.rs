@@ -120,6 +120,7 @@ fn clone_children(object: Object<'_>, limit: usize) -> Result<(Vec<Object<'_>>, 
         ObjectType::Symbol(value) => (value.name().len(), false),
         ObjectType::Float(_) => (8, false),
         ObjectType::Int(_) | ObjectType::SubrFn(_) => (0, false),
+        ObjectType::Overlay(_) => anyhow::bail!("Overlay cannot be published in a global function"),
         // These wrappers contain native handles, not recursively cloned Lisp
         // fields. Process callbacks belong to the Context registry, not here.
         ObjectType::Buffer(_)

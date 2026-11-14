@@ -4,7 +4,7 @@ use crate::core::object::GcString;
 use crate::core::object::WeakBufferPropertyRoot;
 use crate::core::object::{
     ByteFn, ChannelReceiver, ChannelSender, CharTable, FrameRegistry, LispBigInt, LispFrame,
-    LispHashTable, LispProcess, ProcessRegistry,
+    LispHashTable, LispOverlay, LispProcess, OverlayRegistry, ProcessRegistry,
 };
 use crate::core::object::{Gc, IntoObject, Object, UninternedSymbolMap, WithLifetime};
 use bumpalo::collections::Vec as GcVec;
@@ -61,6 +61,7 @@ pub(crate) struct Block<const CONST: bool> {
     // Assigned only by the audited fresh manager-arena constructor. Ordinary
     // owner/global arenas are external relative to every channel manager.
     channel_manager: Option<crate::channel_manager::ChannelManagerIdentity>,
+    owner_domain: Option<u64>,
     copy_allocations: RefCell<Option<Vec<CopyAllocation>>>,
     #[cfg(test)]
     copy_failure_after: Cell<Option<usize>>,
@@ -79,6 +80,7 @@ pub(crate) struct Block<const CONST: bool> {
     pub(in crate::core) lisp_chartables: RefCell<Vec<*const CharTable>>,
     pub(in crate::core) lisp_senders: RefCell<Vec<*const ChannelSender>>,
     pub(in crate::core) lisp_receivers: RefCell<Vec<*const ChannelReceiver>>,
+    pub(in crate::core) lisp_overlays: RefCell<Vec<*const LispOverlay>>,
     pub(in crate::core) lisp_frames: RefCell<Vec<*const LispFrame>>,
     pub(in crate::core) lisp_processes: RefCell<Vec<*const LispProcess>>,
     pub(in crate::core) uninterned_symbol_map: UninternedSymbolMap,
@@ -95,6 +97,7 @@ pub(crate) struct DeferredEndpointFinalizers {
     receivers: Vec<ChannelReceiver>,
     processes: Vec<LispProcess>,
     frames: Vec<LispFrame>,
+    overlays: Vec<LispOverlay>,
     copy_tables: Vec<LispHashTable>,
     copy_chartables: Vec<CharTable>,
     copy_integers: Vec<LispBigInt>,
@@ -108,6 +111,7 @@ pub(in crate::core) enum CopyAllocation {
     Receiver(*const ChannelReceiver),
     Process(*const LispProcess),
     Frame(*const LispFrame),
+    Overlay(*const LispOverlay),
     Table(*const LispHashTable),
     CharTable(*const CharTable),
     Integer(*const LispBigInt),
@@ -127,7 +131,7 @@ impl<const C: bool> Drop for CopyFailureScope<'_, C> {
 pub(crate) struct CopyTransaction<'a, const C: bool> {
     block: &'a Block<C>,
     deferred: &'a mut DeferredEndpointFinalizers,
-    lengths: [usize; 7],
+    lengths: [usize; 8],
     committed: bool,
 }
 impl<const C: bool> CopyTransaction<'_, C> {
@@ -150,6 +154,7 @@ impl<const C: bool> Drop for CopyTransaction<'_, C> {
         self.block.lisp_receivers.borrow_mut().truncate(self.lengths[1]);
         self.block.lisp_processes.borrow_mut().truncate(self.lengths[2]);
         self.block.lisp_frames.borrow_mut().truncate(self.lengths[3]);
+        self.block.lisp_overlays.borrow_mut().truncate(self.lengths[7]);
         self.block.lisp_hashtables.borrow_mut().truncate(self.lengths[4]);
         self.block.lisp_chartables.borrow_mut().truncate(self.lengths[5]);
         self.deferred
@@ -165,6 +170,7 @@ impl<const C: bool> Drop for CopyTransaction<'_, C> {
                     CopyAllocation::Receiver(p) => self.deferred.receivers.push(std::ptr::read(p)),
                     CopyAllocation::Process(p) => self.deferred.processes.push(std::ptr::read(p)),
                     CopyAllocation::Frame(p) => self.deferred.frames.push(std::ptr::read(p)),
+                    CopyAllocation::Overlay(p) => self.deferred.overlays.push(std::ptr::read(p)),
                     CopyAllocation::Table(p) => self.deferred.copy_tables.push(std::ptr::read(p)),
                     CopyAllocation::CharTable(p) => {
                         self.deferred.copy_chartables.push(std::ptr::read(p))
@@ -215,6 +221,15 @@ fn collect_endpoint_finalizers(block: &Block<false>, deferred: &mut DeferredEndp
             false
         }
     });
+    block.lisp_overlays.borrow_mut().retain_mut(|pointer| {
+        if let Some(new) = unsafe { &**pointer }.forwarding_ptr() {
+            *pointer = new.as_ptr().cast();
+            true
+        } else {
+            deferred.overlays.push(unsafe { std::ptr::read(*pointer) });
+            false
+        }
+    });
 }
 
 /// Owns all allocations and creates objects. All objects have
@@ -229,6 +244,7 @@ pub(crate) struct Context<'rt> {
     buffer_properties: RefCell<Vec<WeakBufferPropertyRoot>>,
     // One owner-local Session for all Envs and native hosts in this Context.
     editor_gateway: OnceCell<crate::editor_document::RuntimeEditorGateway>,
+    pub(in crate::core) overlay_registry: RefCell<OverlayRegistry>,
     pub(in crate::core) frame_registry: RefCell<FrameRegistry>,
     pub(in crate::core) process_registry: RefCell<ProcessRegistry>,
 }
@@ -236,6 +252,7 @@ pub(crate) struct Context<'rt> {
 impl Drop for Context<'_> {
     fn drop(&mut self) {
         self.owner_liveness.0.store(false, Ordering::Release);
+        self.overlay_registry.get_mut().shutdown();
         self.frame_registry.get_mut().shutdown();
         self.process_registry.get_mut().shutdown();
         // Global buffer handles outlive the local heap: retire their Lisp
@@ -311,6 +328,7 @@ impl<const CONST: bool> Block<CONST> {
     fn empty() -> Self {
         Self {
             channel_manager: None,
+            owner_domain: None,
             copy_allocations: RefCell::new(None),
             #[cfg(test)]
             copy_failure_after: Cell::new(None),
@@ -322,6 +340,7 @@ impl<const CONST: bool> Block<CONST> {
             lisp_receivers: RefCell::default(),
             lisp_processes: RefCell::default(),
             lisp_frames: RefCell::default(),
+            lisp_overlays: RefCell::default(),
             uninterned_symbol_map: UninternedSymbolMap::default(),
         }
     }
@@ -364,6 +383,11 @@ impl<const CONST: bool> Block<CONST> {
         Ok(())
     }
 
+    /// Private factory brand, never inferred from caller objects or raw addresses.
+    pub(in crate::core) fn belongs_to_owner(&self, owner: u64) -> bool {
+        !CONST && self.owner_domain == Some(owner)
+    }
+
     /// Begin an unpublished graph-copy transaction.
     ///
     /// SAFETY: Caller excludes collection and concurrent target allocation;
@@ -383,6 +407,7 @@ impl<const CONST: bool> Block<CONST> {
             self.lisp_hashtables.borrow().len(),
             self.lisp_chartables.borrow().len(),
             self.drop_stack.borrow().len(),
+            self.lisp_overlays.borrow().len(),
         ];
         let mut active = self.copy_allocations.borrow_mut();
         assert!(active.is_none(), "nested native copy transaction");
@@ -448,10 +473,11 @@ impl<'ob, 'rt> Context<'rt> {
         Self::with_domain(block, roots)
     }
 
-    fn with_domain(block: Block<false>, roots: &'rt RootSet) -> Self {
+    fn with_domain(mut block: Block<false>, roots: &'rt RootSet) -> Self {
         let domain_id = NEXT_DOMAIN
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("Heap domain identifiers exhausted");
+        block.owner_domain = Some(domain_id);
         Self {
             block,
             root_set: roots,
@@ -462,6 +488,7 @@ impl<'ob, 'rt> Context<'rt> {
             editor_gateway: OnceCell::new(),
             process_registry: RefCell::new(ProcessRegistry::default()),
             frame_registry: RefCell::new(FrameRegistry::default()),
+            overlay_registry: RefCell::new(OverlayRegistry::default()),
         }
     }
 
@@ -506,6 +533,7 @@ impl<'ob, 'rt> Context<'rt> {
     }
 
     pub(crate) fn garbage_collect(&mut self, force: bool) {
+        self.overlay_registry.get_mut().prune_dead();
         let bytes = self.block.objects.allocated_bytes();
         if cfg!(not(test)) && !force && bytes < self.next_limit {
             return;
