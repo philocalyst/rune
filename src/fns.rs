@@ -1406,7 +1406,7 @@ fn substring_object<'a>(string: Object<'a>, from: Option<i64>, to: Option<i64>, 
     unsafe { copy_string_with_properties(output, &runs, cx) }
 }
 #[defun(name = "substring")]
-fn substring_lisp<'a>(string: Object<'a>, from: Option<i64>, to: Option<i64>, cx: &'a Context) -> Result<Object<'a>> {
+pub(crate) fn substring_lisp<'a>(string: Object<'a>, from: Option<i64>, to: Option<i64>, cx: &'a Context) -> Result<Object<'a>> {
     substring_object(string, from, to, true, cx)
 }
 #[defun]
