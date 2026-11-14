@@ -637,11 +637,15 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Concat4 => self.concatenate(4, cx)?,
                 op::Sub1 => {
                     let top = self.env.stack.top();
-                    top.set(cx.add(arith::sub_one(top.bind_as(cx)?)));
+                    let value = arith::sub_one_value(top.bind_as(cx)?);
+                    let value = arith::finish_arithmetic(value, self.env, cx)?;
+                    self.env.stack.top().set(cx.add(value));
                 }
                 op::Add1 => {
                     let top = self.env.stack.top();
-                    top.set(cx.add(arith::add_one(top.bind_as(cx)?)));
+                    let value = arith::add_one_value(top.bind_as(cx)?);
+                    let value = arith::finish_arithmetic(value, self.env, cx)?;
+                    self.env.stack.top().set(cx.add(value));
                 }
                 op::EqlSign => {
                     let rhs = self.env.stack.pop(cx);
@@ -671,19 +675,23 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Diff => {
                     let right = self.env.stack[0].bind_as(cx)?;
                     let left = self.env.stack[1].bind_as(cx)?;
-                    let result = arith::sub(Some(left), &[right]);
+                    let result = arith::sub(Some(left), &[right], self.env, cx)?;
                     self.env.stack.pop(cx);
                     self.env.stack.top().set(cx.add(result));
                 }
                 op::Negate => {
                     let top = self.env.stack.top();
-                    top.set(cx.add(arith::sub(top.bind_as(cx)?, &[])));
+                    let value = arith::sub_value(top.bind_as(cx)?, &[]);
+                    let value = arith::finish_arithmetic(value, self.env, cx)?;
+                    self.env.stack.top().set(cx.add(value));
                 }
                 op::Plus => {
                     let arg1 = self.env.stack.pop(cx);
                     let top = self.env.stack.top();
                     let args = &[top.bind_as(cx)?, arg1.try_into()?];
-                    top.set(cx.add(arith::add(args)));
+                    let value = arith::add_value(args);
+                    let value = arith::finish_arithmetic(value, self.env, cx)?;
+                    self.env.stack.top().set(cx.add(value));
                 }
                 op::Max => {
                     let arg1 = self.env.stack.pop(cx);
@@ -701,7 +709,9 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let arg1 = self.env.stack.pop(cx);
                     let top = self.env.stack.top();
                     let args = &[top.bind_as(cx)?, arg1.try_into()?];
-                    top.set(cx.add(arith::mul(args)));
+                    let value = arith::mul_value(args);
+                    let value = arith::finish_arithmetic(value, self.env, cx)?;
+                    self.env.stack.top().set(cx.add(value));
                 }
                 op::Point => return Err(self.unsupported_opcode(op, cx)),
                 op::GotoChar => return Err(self.unsupported_opcode(op, cx)),
@@ -885,7 +895,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let right = self.env.stack[0].bind_as(cx)?;
                     let left = self.env.stack[1].bind_as(cx)?;
                     let result = if op == op::Quo {
-                        arith::div(left, &[right])?
+                        arith::div(left, &[right], self.env, cx)?
                     } else {
                         arith::remainder(left, right)?
                     };
@@ -1482,6 +1492,39 @@ mod test {
         frame.finalize_arguments().unwrap();
         assert!(call(bytecode, 0, "bad-catch-target", &mut frame, cx).is_err());
         assert!(frame.catch_stack.is_empty());
+    }
+
+    #[test]
+    fn arithmetic_opcodes_apply_dynamic_final_integer_width() {
+        use OpCode as O;
+        use num_bigint::BigInt;
+        let big = BigInt::from(1_u8) << 200_usize;
+        for (opcode, rhs) in [
+            (O::Plus, big.clone()),
+            (O::Multiply, big.clone()),
+            (O::Diff, -big.clone()),
+            (O::Quo, BigInt::from(1_u8)),
+            (O::Negate, big.clone()),
+            (O::Add1, big.clone()),
+            (O::Sub1, big.clone()),
+        ] {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            sym::init_symbols();
+            make_bytecode!(
+                bytecode,
+                0,
+                [O::Constant0, O::Constant1, opcode, O::Return],
+                [big.clone(), rhs],
+                cx
+            );
+            root!(env, new(Env), cx);
+            env.set_var(sym::INTEGER_WIDTH, cx.add(128_i64)).unwrap();
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let error = call(bytecode, 0, "arithmetic-width", frame, cx).unwrap_err();
+            assert!(error.to_string().contains("integer width"), "{opcode:?}: {error}");
+        }
     }
 
     #[test]

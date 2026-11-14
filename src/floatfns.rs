@@ -3,7 +3,8 @@ use std::ops::{AddAssign, BitAnd, Div, Rem, SubAssign};
 
 use crate::core::{
     cons::Cons,
-    gc::Context,
+    env::Env,
+    gc::{Context, Rt},
     object::{LispFloat, Number, NumberType, NumberValue, Object},
 };
 use anyhow::Result;
@@ -162,68 +163,84 @@ where
 }
 
 #[defun]
-fn floor<'ob>(num: Number<'ob>, divisor: Option<Number>, cx: &'ob Context) -> Result<Object<'ob>> {
+fn floor<'ob>(
+    num: Number<'ob>,
+    divisor: Option<Number>,
+    env: &Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
     if divisor.is_none() && !num.is_float() {
         return Ok(num.as_obj_copy());
     }
-    Ok(cx.add(rounding_driver(
+    let value = rounding_driver(
         num.val(),
         divisor.map(|d| d.val()),
         |f| f.floor(),
         |n, d| num_integer::Integer::div_floor(&n, &d),
         |n, d| n.div_floor(&d),
-    )?))
+    )?;
+    Ok(cx.add(crate::arith::finish_arithmetic(value, env, cx)?))
 }
 
 #[defun]
 fn ceiling<'ob>(
     num: Number<'ob>,
     divisor: Option<Number>,
+    env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     if divisor.is_none() && !num.is_float() {
         return Ok(num.as_obj_copy());
     }
-    Ok(cx.add(rounding_driver(
+    let value = rounding_driver(
         num.val(),
         divisor.map(|d| d.val()),
         |f| f.ceil(),
         |n, d| num_integer::Integer::div_ceil(&n, &d),
         |n, d| n.div_ceil(&d),
-    )?))
+    )?;
+    Ok(cx.add(crate::arith::finish_arithmetic(value, env, cx)?))
 }
 
 #[defun]
-fn round<'ob>(num: Number<'ob>, divisor: Option<Number>, cx: &'ob Context) -> Result<Object<'ob>> {
+fn round<'ob>(
+    num: Number<'ob>,
+    divisor: Option<Number>,
+    env: &Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
     if divisor.is_none() && !num.is_float() {
         return Ok(num.as_obj_copy());
     }
-    Ok(cx.add(rounding_driver(
+    let value = rounding_driver(
         num.val(),
         divisor.map(|d| d.val()), //
         // Use the same even-midpoint policy as the exact divisor path.
         |f| f.round_ties_even(),
         round2,
         round2,
-    )?))
+    )?;
+    Ok(cx.add(crate::arith::finish_arithmetic(value, env, cx)?))
 }
 
 #[defun]
 fn truncate<'ob>(
     num: Number<'ob>,
     divisor: Option<Number>,
+    env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     if divisor.is_none() && !num.is_float() {
         return Ok(num.as_obj_copy());
     }
-    Ok(cx.add(rounding_driver(
+    let value = rounding_driver(
         num.val(),
         divisor.map(|d| d.val()), //
         |f| f,
         |n, d| n.div(&d),
         |n, d| n.div(&d),
-    )?))
+    )?;
+    Ok(cx.add(crate::arith::finish_arithmetic(value, env, cx)?))
 }
 
 #[defun]
@@ -329,15 +346,19 @@ fn sqrt(arg: Number) -> f64 {
 }
 
 #[defun]
-fn abs<'ob>(arg: Number<'ob>, cx: &'ob Context) -> Object<'ob> {
+fn abs<'ob>(arg: Number<'ob>, env: &Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
     // GNU returns the original heap number when its sign needs no change.
     // Besides avoiding allocation, this is observable through Lisp `eq`.
-    match arg.untag() {
-        NumberType::Int(i) if i < 0 => cx.add(NumberValue::Int(-i)),
+    Ok(match arg.untag() {
+        NumberType::Int(i) if i < 0 => {
+            cx.add(crate::arith::finish_arithmetic(NumberValue::Int(-i), env, cx)?)
+        }
         NumberType::Float(f) if f.is_sign_negative() => cx.add(-**f),
-        NumberType::Big(b) if b.is_negative() => cx.add(NumberValue::Big(-(**b).clone())),
+        NumberType::Big(b) if b.is_negative() => {
+            cx.add(crate::arith::finish_arithmetic(NumberValue::Big(-(**b).clone()), env, cx)?)
+        }
         _ => arg.as_obj_copy(),
-    }
+    })
 }
 
 #[defun]
@@ -388,6 +409,38 @@ fn frexp_f(f: f64) -> (f64, i64) {
 mod m0_rounding_regressions {
     use super::*;
     use crate::interpreter::assert_lisp;
+
+    #[test]
+    fn allocating_rounding_and_absolute_value_obey_integer_width() {
+        for operation in ["floor", "ceiling", "round", "truncate"] {
+            for (args, expected) in [
+                ("x 1", "caught"),
+                ("nx 1", "caught"),
+                ("x x", "1"),
+                ("1.0e+100", "caught"),
+                ("1.0e+100 1.0e+100", "1"),
+            ] {
+                assert_lisp(
+                    &format!(
+                        "(let ((x (ash 1 200)) (nx (- (ash 1 200)))) (let ((integer-width 128)) (condition-case nil ({operation} {args}) (error 'caught))))"
+                    ),
+                    expected,
+                );
+            }
+            assert_lisp(
+                &format!(
+                    "(let ((x (ash 1 200))) (let ((integer-width 128)) (eq x ({operation} x))))"
+                ),
+                "t",
+            );
+        }
+        assert_lisp("(let ((x (ash 1 200))) (let ((integer-width 128)) (eq x (abs x))))", "t");
+        assert_lisp(
+            "(let ((x (- (ash 1 200)))) (let ((integer-width 128)) (condition-case nil (abs x) (error 'caught))))",
+            "caught",
+        );
+        assert_lisp("(let ((integer-width 128)) (abs -1.0e+100))", "1e+100");
+    }
 
     #[test]
     fn unary_integer_rounding_preserves_existing_bignum_objects() {
@@ -559,26 +612,32 @@ mod m0_nonfinite_rounding_regressions {
 
     #[test]
     fn integer_rounding_rejects_nonfinite_values_without_panicking() {
-        let roots = RootSet::default();
-        let cx = Context::new(&roots);
-        for operation in [floor, ceiling, round, truncate] {
-            for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
-                let value = cx.add_as(value);
-                assert!(operation(value, None, &cx).is_err());
-                assert!(operation(value, Some(1_i64.into()), &cx).is_err());
-                if matches!(value.untag(), NumberType::Float(f) if f.is_nan()) {
-                    assert!(operation(1_i64.into(), Some(value), &cx).is_err());
+        {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            let context = &cx;
+            rune_core::macros::root!(env, new(Env), context);
+            for operation in [floor, ceiling, round, truncate] {
+                for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                    let value = cx.add_as(value);
+                    assert!(operation(value, None, env, &cx).is_err());
+                    assert!(operation(value, Some(1_i64.into()), env, &cx).is_err());
+                    if matches!(value.untag(), NumberType::Float(f) if f.is_nan()) {
+                        assert!(operation(1_i64.into(), Some(value), env, &cx).is_err());
+                    }
+                }
+                for infinity in [f64::INFINITY, f64::NEG_INFINITY] {
+                    assert_eq!(
+                        operation(5_i64.into(), Some(cx.add_as(infinity)), env, &cx).unwrap(),
+                        Object::from(0_i64)
+                    );
+                    assert!(
+                        operation(cx.add_as(infinity), Some(cx.add_as(infinity)), env, &cx)
+                            .is_err()
+                    );
                 }
             }
-            for infinity in [f64::INFINITY, f64::NEG_INFINITY] {
-                assert_eq!(
-                    operation(5_i64.into(), Some(cx.add_as(infinity)), &cx).unwrap(),
-                    Object::from(0_i64)
-                );
-                assert!(operation(cx.add_as(infinity), Some(cx.add_as(infinity)), &cx).is_err());
-            }
         }
-        drop(cx);
         assert_lisp("(condition-case nil (floor 1.0e+INF) (error 'caught))", "caught");
         assert_lisp("(condition-case nil (truncate 1.0e+INF 1) (error 'caught))", "caught");
         assert_lisp("(floor 5 1.0e+INF)", "0");

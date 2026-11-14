@@ -273,7 +273,11 @@ impl NumberValue {
                 Some(distance) => value >> distance,
                 None => BigInt::from(if value.sign() == Sign::Minus { -1 } else { 0 }),
             };
-            return Ok(Self::integer(value));
+            let result = Self::integer(value);
+            // Right shifts can still allocate an oversized result when the
+            // input predates a smaller dynamically bound integer-width.
+            result.check_integer_width(integer_width.max(128))?;
+            return Ok(result);
         }
         // GNU ignores integer-width for small machine-sized results. Check
         // the exact prospective magnitude before allocating a shifted bignum.
@@ -771,6 +775,45 @@ mod tests {
                 .bit_and(NumberValue::Big(BigInt::from(1_u8) << 100_usize))
                 .unwrap(),
             NumberValue::Big(BigInt::from(1_u8) << 100_usize)
+        );
+    }
+
+    #[test]
+    fn right_shift_enforces_result_width_but_zero_count_is_unchanged() {
+        let power = BigInt::from(1_u8) << 200_usize;
+        for value in [power.clone(), -power.clone(), &power - 1_u8, -(&power - 1_u8)] {
+            let number = NumberValue::Big(value.clone());
+            assert_eq!(number.clone().arithmetic_shift(NumberValue::Int(0), 128).unwrap(), number);
+            let expected = &value >> 72_usize;
+            let actual = number.clone().arithmetic_shift(NumberValue::Int(-72), 128);
+            if expected.bits() > 128 {
+                assert!(actual.is_err());
+            } else {
+                assert_eq!(actual.unwrap().into_integer().unwrap(), expected);
+            }
+            let result = number.clone().arithmetic_shift(NumberValue::Int(-73), 128).unwrap();
+            assert_eq!(result.into_integer().unwrap(), &value >> 73_usize);
+            for distance in 0_usize..203 {
+                let expected = &value >> distance;
+                for width in [0, 127, 128, 129, 200] {
+                    let actual = number
+                        .clone()
+                        .arithmetic_shift(NumberValue::Int(-(distance as i64)), width);
+                    if distance != 0 && expected.bits() > width.max(128) {
+                        assert!(actual.is_err());
+                    } else {
+                        assert_eq!(actual.unwrap().into_integer().unwrap(), expected);
+                    }
+                }
+            }
+        }
+        assert_lisp(
+            "(let ((x (ash 1 200))) (let ((integer-width 128)) (condition-case nil (ash x -1) (error 'caught))))",
+            "caught",
+        );
+        assert_lisp(
+            "(let ((x (ash 1 200))) (let ((integer-width 128)) (= (ash x -73) 170141183460469231731687303715884105728)))",
+            "t",
         );
     }
 

@@ -1,18 +1,37 @@
 //! Lisp arithmetic adapters over the owned numeric model.
 pub(crate) use crate::core::object::{MAX_FIXNUM, MIN_FIXNUM, NumberValue};
-use crate::core::object::{Number, Object};
+use crate::core::{
+    env::Env,
+    gc::{Context, Rt},
+    object::{Number, Object},
+};
 use anyhow::Result;
 #[cfg(test)]
 use num_bigint::BigInt;
 use rune_macros::defun;
 
-#[defun(name = "+")]
-pub(crate) fn add(vars: &[Number]) -> NumberValue {
+pub(crate) fn add_value(vars: &[Number]) -> NumberValue {
+    // No arithmetic for one operand: adding a synthetic zero loses -0.0.
+    if let [one] = vars {
+        return one.val();
+    }
     vars.iter().fold(NumberValue::Int(0), |acc, x| acc + x.val())
 }
 
-#[defun(name = "-")]
-pub(crate) fn sub(number: Option<Number>, numbers: &[Number]) -> NumberValue {
+#[defun(name = "+")]
+pub(crate) fn add<'ob>(
+    vars: &[Number<'ob>],
+    env: &Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    if let [one] = vars {
+        Ok(one.as_obj_copy())
+    } else {
+        Ok(cx.add(finish_arithmetic(add_value(vars), env, cx)?))
+    }
+}
+
+pub(crate) fn sub_value(number: Option<Number>, numbers: &[Number]) -> NumberValue {
     match number {
         Some(num) => {
             let num = num.val();
@@ -26,13 +45,27 @@ pub(crate) fn sub(number: Option<Number>, numbers: &[Number]) -> NumberValue {
     }
 }
 
-#[defun(name = "*")]
-pub(crate) fn mul(numbers: &[Number]) -> NumberValue {
+pub(crate) fn mul_value(numbers: &[Number]) -> NumberValue {
+    if let [one] = numbers {
+        return one.val();
+    }
     numbers.iter().fold(NumberValue::Int(1), |acc, x| acc * x.val())
 }
 
-#[defun(name = "/")]
-pub(crate) fn div(number: Number, divisors: &[Number]) -> Result<NumberValue> {
+#[defun(name = "*")]
+pub(crate) fn mul<'ob>(
+    numbers: &[Number<'ob>],
+    env: &Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    if let [one] = numbers {
+        Ok(one.as_obj_copy())
+    } else {
+        Ok(cx.add(finish_arithmetic(mul_value(numbers), env, cx)?))
+    }
+}
+
+pub(crate) fn div_value(number: Number, divisors: &[Number]) -> Result<NumberValue> {
     // Preserve the source-verified whole-expression floating selection. The
     // kernel handles IEEE floats and fallible exact integer operations.
     let floating = number.is_float() || divisors.iter().any(Number::is_float);
@@ -47,14 +80,55 @@ pub(crate) fn div(number: Number, divisors: &[Number]) -> Result<NumberValue> {
     })?)
 }
 
-#[defun(name = "1+")]
-pub(crate) fn add_one(number: Number) -> NumberValue {
+pub(crate) fn add_one_value(number: Number) -> NumberValue {
     number.val() + NumberValue::Int(1)
 }
 
-#[defun(name = "1-")]
-pub(crate) fn sub_one(number: Number) -> NumberValue {
+pub(crate) fn sub_one_value(number: Number) -> NumberValue {
     number.val() - NumberValue::Int(1)
+}
+
+/// Check only the final published arithmetic result. GNU permits temporary
+/// over-width intermediates that cancel back into range in variadic folds.
+/// This is not an allocation preflight: input/intermediate limb allocation is
+/// still owned by num-bigint and may exceed the eventual result's policy.
+pub(crate) fn finish_arithmetic(
+    value: NumberValue,
+    env: &Rt<Env>,
+    cx: &Context,
+) -> Result<NumberValue> {
+    value.check_integer_width(crate::data::integer_width(env, cx)?.max(128))?;
+    Ok(value)
+}
+
+#[defun(name = "-")]
+pub(crate) fn sub(
+    number: Option<Number>,
+    numbers: &[Number],
+    env: &Rt<Env>,
+    cx: &Context,
+) -> Result<NumberValue> {
+    finish_arithmetic(sub_value(number, numbers), env, cx)
+}
+
+#[defun(name = "/")]
+pub(crate) fn div(
+    number: Number,
+    divisors: &[Number],
+    env: &Rt<Env>,
+    cx: &Context,
+) -> Result<NumberValue> {
+    finish_arithmetic(div_value(number, divisors)?, env, cx)
+}
+
+#[defun(name = "1+")]
+pub(crate) fn add_one(number: Number, env: &Rt<Env>, cx: &Context) -> Result<NumberValue> {
+    finish_arithmetic(add_one_value(number), env, cx)
+}
+
+#[defun(name = "1-")]
+pub(crate) fn sub_one(number: Number, env: &Rt<Env>, cx: &Context) -> Result<NumberValue> {
+    finish_arithmetic(sub_one_value(number), env, cx)
 }
 
 pub(crate) fn num_eq(number: Number, numbers: &[Number]) -> bool {
@@ -146,30 +220,62 @@ fn greater_than_or_eq_lisp(number: Number, numbers: &[Object]) -> Result<bool> {
 // Convert operands one at a time: a later non-number must not mask an
 // earlier float rejected by the integer operation. Lisp argument expressions
 // have already all evaluated before this adapter is called.
-#[defun]
-pub(crate) fn logior(ints_or_markers: &[Object]) -> Result<NumberValue> {
+pub(crate) fn logior_value(ints_or_markers: &[Object]) -> Result<NumberValue> {
     Ok(ints_or_markers.iter().try_fold(NumberValue::Int(0), |value, next| {
         value.bit_or(Number::try_from(*next)?.val()).map_err(anyhow::Error::from)
     })?)
 }
 
-#[defun]
-fn logand(int_or_markers: &[Object]) -> Result<NumberValue> {
+fn logand_value(int_or_markers: &[Object]) -> Result<NumberValue> {
     Ok(int_or_markers.iter().try_fold(NumberValue::Int(-1), |value, next| {
         value.bit_and(Number::try_from(*next)?.val()).map_err(anyhow::Error::from)
     })?)
 }
 
-#[defun]
-fn logxor(integers: &[Object]) -> Result<NumberValue> {
+fn logxor_value(integers: &[Object]) -> Result<NumberValue> {
     Ok(integers.iter().try_fold(NumberValue::Int(0), |value, next| {
         value.bit_xor(Number::try_from(*next)?.val()).map_err(anyhow::Error::from)
     })?)
 }
 
+fn bitwise_object<'ob>(
+    integers: &[Object<'ob>],
+    operation: fn(&[Object]) -> Result<NumberValue>,
+    env: &Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    if let [one] = integers {
+        let one = Number::try_from(*one)?;
+        if one.is_float() {
+            return Err(crate::core::object::NumericError::ExpectedInteger.into());
+        }
+        return Ok(one.as_obj_copy());
+    }
+    Ok(cx.add(finish_arithmetic(operation(integers)?, env, cx)?))
+}
+
 #[defun]
-fn lognot(integer: Number) -> Result<NumberValue> {
-    Ok(integer.val().bit_not()?)
+pub(crate) fn logior<'ob>(
+    integers: &[Object<'ob>],
+    env: &Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    bitwise_object(integers, logior_value, env, cx)
+}
+
+#[defun]
+fn logand<'ob>(integers: &[Object<'ob>], env: &Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    bitwise_object(integers, logand_value, env, cx)
+}
+
+#[defun]
+fn logxor<'ob>(integers: &[Object<'ob>], env: &Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    bitwise_object(integers, logxor_value, env, cx)
+}
+
+#[defun]
+fn lognot(integer: Number, env: &Rt<Env>, cx: &Context) -> Result<NumberValue> {
+    finish_arithmetic(integer.val().bit_not()?, env, cx)
 }
 
 #[defun]
@@ -202,24 +308,42 @@ pub(crate) fn remainder(x: Number, y: Number) -> Result<NumberValue> {
     remainder_driver(x, y, false)
 }
 
-#[expect(clippy::trivially_copy_pass_by_ref)]
-fn max_val(x: NumberValue, y: &Number) -> NumberValue {
-    x.maximum(y.val())
-}
-
-#[expect(clippy::trivially_copy_pass_by_ref)]
-fn min_val(x: NumberValue, y: &Number) -> NumberValue {
-    x.minimum(y.val())
+// Extrema select an existing operand. Keep the borrowed identity rather than
+// cloning its value and allocating a different float or bignum at the boundary.
+fn extreme<'ob>(
+    first: Number<'ob>,
+    rest: &[Number<'ob>],
+    preferred: std::cmp::Ordering,
+) -> Number<'ob> {
+    rest.iter()
+        .copied()
+        .fold(first, |selected, next| match selected.numeric_cmp(next) {
+            Some(order) if order == preferred || order == std::cmp::Ordering::Equal => selected,
+            Some(_) => next,
+            None => {
+                if matches!(next.untag(), crate::core::object::NumberType::Float(f) if f.is_nan()) {
+                    next
+                } else {
+                    selected
+                }
+            }
+        })
 }
 
 #[defun]
-pub(crate) fn max(number_or_marker: Number, number_or_markers: &[Number]) -> NumberValue {
-    number_or_markers.iter().fold(number_or_marker.val(), max_val)
+pub(crate) fn max<'ob>(
+    number_or_marker: Number<'ob>,
+    number_or_markers: &[Number<'ob>],
+) -> Number<'ob> {
+    extreme(number_or_marker, number_or_markers, std::cmp::Ordering::Greater)
 }
 
 #[defun]
-pub(crate) fn min(number_or_marker: Number, number_or_markers: &[Number]) -> NumberValue {
-    number_or_markers.iter().fold(number_or_marker.val(), min_val)
+pub(crate) fn min<'ob>(
+    number_or_marker: Number<'ob>,
+    number_or_markers: &[Number<'ob>],
+) -> Number<'ob> {
+    extreme(number_or_marker, number_or_markers, std::cmp::Ordering::Less)
 }
 
 #[cfg(test)]
@@ -234,10 +358,10 @@ mod test {
     fn test_add() {
         let roots = &RootSet::default();
         let cx = &Context::new(roots);
-        assert_eq!(add(&[]), NumberValue::Int(0));
-        assert_eq!(add(&[7.into(), 13.into()]), NumberValue::Int(20));
-        assert_eq!(add(&[1.into(), cx.add_as(2.5)]), NumberValue::Float(3.5));
-        assert_eq!(add(&[0.into(), (-1).into()]), NumberValue::Int(-1));
+        assert_eq!(add_value(&[]), NumberValue::Int(0));
+        assert_eq!(add_value(&[7.into(), 13.into()]), NumberValue::Int(20));
+        assert_eq!(add_value(&[1.into(), cx.add_as(2.5)]), NumberValue::Float(3.5));
+        assert_eq!(add_value(&[0.into(), (-1).into()]), NumberValue::Int(-1));
     }
 
     #[test]
@@ -314,17 +438,17 @@ mod test {
 
     #[test]
     fn test_sub() {
-        assert_eq!(sub(None, &[]), NumberValue::Int(0));
-        assert_eq!(sub(Some(7.into()), &[]), NumberValue::Int(-7));
-        assert_eq!(sub(Some(7.into()), &[13.into()]), NumberValue::Int(-6));
-        assert_eq!(sub(Some(0.into()), &[(-1).into()]), NumberValue::Int(1));
+        assert_eq!(sub_value(None, &[]), NumberValue::Int(0));
+        assert_eq!(sub_value(Some(7.into()), &[]), NumberValue::Int(-7));
+        assert_eq!(sub_value(Some(7.into()), &[13.into()]), NumberValue::Int(-6));
+        assert_eq!(sub_value(Some(0.into()), &[(-1).into()]), NumberValue::Int(1));
     }
 
     #[test]
     fn test_mul() {
-        assert_eq!(mul(&[]), NumberValue::Int(1));
-        assert_eq!(mul(&[7.into(), 13.into()]), NumberValue::Int(91));
-        assert_eq!(mul(&[(-1).into(), 1.into()]), NumberValue::Int(-1));
+        assert_eq!(mul_value(&[]), NumberValue::Int(1));
+        assert_eq!(mul_value(&[7.into(), 13.into()]), NumberValue::Int(91));
+        assert_eq!(mul_value(&[(-1).into(), 1.into()]), NumberValue::Int(-1));
     }
 
     #[test]
@@ -332,8 +456,8 @@ mod test {
         let roots = &RootSet::default();
         let cx = &Context::new(roots);
 
-        assert_eq!(div(cx.add_as(12.0), &[]).unwrap(), NumberValue::Float(1.0 / 12.0));
-        assert_eq!(div(12.into(), &[5.into(), 2.into()]).unwrap(), NumberValue::Int(1));
+        assert_eq!(div_value(cx.add_as(12.0), &[]).unwrap(), NumberValue::Float(1.0 / 12.0));
+        assert_eq!(div_value(12.into(), &[5.into(), 2.into()]).unwrap(), NumberValue::Int(1));
     }
 
     #[test]
@@ -343,27 +467,27 @@ mod test {
         let zero = cx.add_as(BigInt::from(0));
         for dividend in [Number::from(-1073741824_i64), cx.add_as(BigInt::from(i64::MAX) + 1_u8)] {
             for denominator in [Number::from(0_i64), zero] {
-                assert!(div(dividend, &[denominator]).is_err());
+                assert!(div_value(dividend, &[denominator]).is_err());
             }
         }
-        assert!(div(0_i64.into(), &[]).is_err());
-        assert_eq!(div(2_i64.into(), &[]).unwrap(), NumberValue::Int(0));
-        assert_eq!(div((-1_i64).into(), &[]).unwrap(), NumberValue::Int(-1));
+        assert!(div_value(0_i64.into(), &[]).is_err());
+        assert_eq!(div_value(2_i64.into(), &[]).unwrap(), NumberValue::Int(0));
+        assert_eq!(div_value((-1_i64).into(), &[]).unwrap(), NumberValue::Int(-1));
         assert_eq!(
-            div(MIN_FIXNUM.into(), &[(-1_i64).into()]).unwrap(),
+            div_value(MIN_FIXNUM.into(), &[(-1_i64).into()]).unwrap(),
             NumberValue::Big(-BigInt::from(MIN_FIXNUM))
         );
         assert_eq!(
-            div(10_i64.into(), &[3_i64.into(), cx.add_as(2.0)]).unwrap(),
+            div_value(10_i64.into(), &[3_i64.into(), cx.add_as(2.0)]).unwrap(),
             NumberValue::Float(10.0 / 3.0 / 2.0)
         );
         let NumberValue::Float(infinity) =
-            div(2_i64.into(), &[0_i64.into(), cx.add_as(2.0)]).unwrap()
+            div_value(2_i64.into(), &[0_i64.into(), cx.add_as(2.0)]).unwrap()
         else {
             panic!("any float operand must select floating division");
         };
         assert!(infinity.is_infinite());
-        let NumberValue::Float(nan) = div(cx.add_as(0.0), &[0_i64.into()]).unwrap() else {
+        let NumberValue::Float(nan) = div_value(cx.add_as(0.0), &[0_i64.into()]).unwrap() else {
             panic!("float zero division must remain floating");
         };
         assert!(nan.is_nan());
@@ -597,15 +721,126 @@ mod test {
     }
 
     #[test]
+    fn bitwise_width_is_final_and_singletons_retain_identity() {
+        for (expression, expected) in [
+            ("(logand x x)", "caught"),
+            ("(logior x 0)", "caught"),
+            ("(logxor x 0)", "caught"),
+            ("(lognot x)", "caught"),
+            ("(logand x x 0)", "0"),
+            ("(logior x nx -1)", "-1"),
+            ("(logxor x x)", "0"),
+            ("(logxor x 0 x)", "0"),
+            ("(eq x (logand x))", "t"),
+            ("(eq x (logior x))", "t"),
+            ("(eq x (logxor x))", "t"),
+            ("(logand)", "-1"),
+            ("(logior)", "0"),
+            ("(logxor)", "0"),
+            ("(logand 1.0)", "caught"),
+            ("(logior 1.0)", "caught"),
+            ("(logxor 1.0)", "caught"),
+        ] {
+            crate::interpreter::assert_lisp(
+                &format!(
+                    "(let ((x (ash 1 200)) (nx (- (ash 1 200)))) (let ((integer-width 128)) (condition-case nil {expression} (error 'caught))))"
+                ),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_width_applies_to_final_results_not_temporary_fold_values() {
+        for (expression, expected) in [
+            ("(+ x 0)", "caught"),
+            ("(+ x nx)", "0"),
+            ("(+ y y ny)", "170141183460469231731687303715884105728"),
+            ("(- x)", "caught"),
+            ("(- x x)", "0"),
+            ("(- x nx)", "caught"),
+            ("(- y ny y)", "170141183460469231731687303715884105728"),
+            ("(* x 1)", "caught"),
+            ("(* x 0)", "0"),
+            ("(* y y 0)", "0"),
+            ("(/ x 1)", "caught"),
+            ("(/ x x)", "1"),
+            ("(1+ x)", "caught"),
+            ("(1- x)", "caught"),
+            ("(1+ nx)", "caught"),
+            ("(1- nx)", "caught"),
+            ("(floatp (+ x 0.0))", "t"),
+            ("(floatp (* x 1.0))", "t"),
+            ("(floatp (/ x 1.0))", "t"),
+            ("(eq x (+ x))", "t"),
+            ("(eq x (* x))", "t"),
+        ] {
+            crate::interpreter::assert_lisp(
+                &format!(
+                    "(let ((x (ash 1 200)) (nx (- (ash 1 200))) (y (ash 1 127)) (ny (- (ash 1 127)))) (let ((integer-width 128)) (condition-case nil {expression} (error 'caught))))"
+                ),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn singleton_sum_and_product_preserve_operand_identity_and_signed_zero() {
+        for operation in ["+", "*"] {
+            for value in ["1.5", "-0.0", "18446744073709551616", "0.0e+NaN", "-0.0e+NaN"] {
+                crate::interpreter::assert_lisp(
+                    &format!(
+                        "(let ((x {value})) (let ((y ({operation} x))) (garbage-collect) (eq x y)))"
+                    ),
+                    "t",
+                );
+            }
+        }
+        crate::interpreter::assert_lisp("(copysign 1.0 (+ -0.0))", "-1.0");
+        crate::interpreter::assert_lisp("(+)", "0");
+        crate::interpreter::assert_lisp("(*)", "1");
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for operation in [add_value, mul_value] {
+            let NumberValue::Float(value) = operation(&[cx.add_as(-0.0)]) else {
+                panic!("float expected")
+            };
+            assert_eq!(value.to_bits(), (-0.0_f64).to_bits());
+        }
+    }
+
+    #[test]
+    fn extrema_retain_the_selected_heap_operand() {
+        for operation in ["max", "min"] {
+            for value in ["1.5", "18446744073709551616", "0.0e+NaN", "-0.0e+NaN"] {
+                crate::interpreter::assert_lisp(
+                    &format!(
+                        "(let ((x {value})) (let ((y ({operation} x))) (garbage-collect) (eq x y)))"
+                    ),
+                    "t",
+                );
+                crate::interpreter::assert_lisp(
+                    &format!("(let ((x {value}) (y {value})) (eq x ({operation} x y)))"),
+                    if value.contains("NaN") { "nil" } else { "t" },
+                );
+            }
+            crate::interpreter::assert_lisp(
+                &format!("(let ((x 0.0) (y -0.0)) (eq x ({operation} x y)))"),
+                "t",
+            );
+        }
+    }
+
+    #[test]
     fn test_max_min() {
         let roots = &RootSet::default();
         let cx = &Context::new(roots);
         assert_eq!(
-            max(cx.add_as(1.0), &[cx.add_as(2.1), cx.add_as(1.1), cx.add_as(1.0)]),
+            max(cx.add_as(1.0), &[cx.add_as(2.1), cx.add_as(1.1), cx.add_as(1.0)]).val(),
             NumberValue::Float(2.1)
         );
         assert_eq!(
-            min(cx.add_as(1.1), &[cx.add_as(1.0), cx.add_as(2.1), cx.add_as(1.0)]),
+            min(cx.add_as(1.1), &[cx.add_as(1.0), cx.add_as(2.1), cx.add_as(1.0)]).val(),
             NumberValue::Float(1.0)
         );
     }
@@ -617,7 +852,7 @@ mod test {
             let cx = Context::new(&roots);
             let float = cx.add(1.0);
             let symbol = crate::sym::NIL.into();
-            for operation in [logand, logior, logxor] {
+            for operation in [logand_value, logior_value, logxor_value] {
                 let error = operation(&[float, symbol]).unwrap_err();
                 assert!(matches!(
                     error.downcast_ref::<crate::core::object::NumericError>(),
@@ -641,6 +876,6 @@ mod test {
     fn test_other() {
         let roots = &RootSet::default();
         let cx = &Context::new(roots);
-        assert_eq!(logand(&[258_i64.into(), 255_i64.into()]).unwrap(), NumberValue::Int(2));
+        assert_eq!(logand_value(&[258_i64.into(), 255_i64.into()]).unwrap(), NumberValue::Int(2));
     }
 }
