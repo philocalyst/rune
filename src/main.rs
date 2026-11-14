@@ -79,9 +79,16 @@ struct Args {
     dump: bool,
     #[arg(long, value_name = "FILE")]
     load_dump: Option<String>,
-    /// Launch the opt-in native editor with a minimal, unbootstrapped runtime.
+    /// Check the real native owner bootstrap without opening a graphical application.
+    #[arg(long, conflicts_with_all = ["native", "native_bootstrap", "native_eval", "native_file", "no_bootstrap", "load", "repl", "eval_stdin", "dump", "load_dump"])]
+    check_native_bootstrap: bool,
+    /// Launch the opt-in native editor (minimal runtime unless --native-bootstrap).
     #[arg(long, conflicts_with_all = ["load", "repl", "eval_stdin", "dump", "load_dump"])]
     native: bool,
+    /// Run the normal Lisp bootstrap inside the persistent native owner before input.
+    /// Additional bindings/frame/startup source restoration is not implied.
+    #[arg(long, requires = "native", conflicts_with = "no_bootstrap")]
+    native_bootstrap: bool,
     /// Evaluate startup source on the native owner, in input order.
     #[arg(long, requires = "native", value_name = "SOURCE")]
     native_eval: Vec<String>,
@@ -92,6 +99,11 @@ struct Args {
 
 fn main() -> Result<(), ()> {
     let args = Args::parse();
+    if args.check_native_bootstrap {
+        return editor_document::check_native_bootstrap()
+            .map(|()| println!("Native owner bootstrap check passed (same owner, active keymap, persistent Env; no window)"))
+            .map_err(|error| eprintln!("Native owner bootstrap check failed: {error}"));
+    }
     if args.native {
         if args.repl
             || args.eval_stdin
@@ -105,7 +117,7 @@ fn main() -> Result<(), ()> {
             return Err(());
         }
         #[cfg(feature = "native")]
-        return native::run(args.native_eval, args.native_file);
+        return native::run(args.native_eval, args.native_file, args.native_bootstrap);
         #[cfg(not(feature = "native"))]
         {
             eprintln!("--native requires building with --features native");
@@ -443,6 +455,15 @@ mod command_line_load_tests {
 #[cfg(test)]
 mod native_cli_args_tests {
     use super::*;
+    #[test]
+    fn native_bootstrap_is_explicit_and_conflicting_modes_reject() {
+        assert!(Args::try_parse_from(["rune", "--native-bootstrap"]).is_err());
+        assert!(Args::try_parse_from(["rune", "--check-native-bootstrap"]).unwrap().check_native_bootstrap);
+        assert!(Args::try_parse_from(["rune", "--check-native-bootstrap", "--native"]).is_err());
+        assert!(Args::try_parse_from(["rune", "--native", "--native-bootstrap", "--no-bootstrap"]).is_err());
+        assert!(!Args::try_parse_from(["rune", "--native"]).unwrap().native_bootstrap);
+        assert!(Args::try_parse_from(["rune", "--native", "--native-bootstrap"]).unwrap().native_bootstrap);
+    }
     #[test]
     fn native_eval_requires_native_and_rejects_other_runtime_modes() {
         assert!(Args::try_parse_from(["rune", "--native-eval", "(insert \"x\")"]).is_err());

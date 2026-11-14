@@ -192,3 +192,27 @@ it with an ordinary function uses the normal global publication path again. This
 owner-local/cross-Env distinction is narrower than GNU's single global function
 namespace. Failed normal publication preserves the prior owner map. It is not a
 general function-shadowing mechanism.
+
+### Opt-in normal Lisp bootstrap
+
+`--native --native-bootstrap` runs the same normal product Lisp bootstrap on
+that native owner, before opening `--native-file`, publishing the first frame,
+or consuming queued startup evaluation/input. The default native mode remains
+minimal. `--no-bootstrap` conflicts with this opt-in. Bootstrap failures abort
+startup and return queued, unprocessed requests without fabricated outcomes.
+The normal bootstrap currently depends on running with the repository's Lisp
+assets available through its normal load-path; it can take substantial time.
+
+This is not full Doom/Org/mu4e startup. Commented-out bindings, faces, frame and
+startup source loads are not restored by this flag. Explicit genuine source
+loads still require separately qualified prerequisites. The GPUI renderer does
+not yet receive resolved Lisp face spans. No window/keyboard/paint validation is
+implied by the headless same-owner bootstrap test.
+
+`--check-native-bootstrap` is a separate non-GUI diagnostic, available without
+GPUI enabled. It executes that same owner factory and bootstrap method, verifies
+an active real keymap, persistent Env across GC, and a native Unicode edit/Undo
+observed by Lisp, then exits. It cannot be combined with other runtime modes.
+It does not create a graphical application or window. Run with a time limit if
+using it as a readiness check; the explicitly ignored debug-test bootstrap is
+much slower because test builds force interpreter/VM tracing.

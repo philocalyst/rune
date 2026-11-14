@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-pub(crate) fn run(sources: Vec<String>, native_file: Option<std::path::PathBuf>) -> Result<(), ()> {
+pub(crate) fn run(sources: Vec<String>, native_file: Option<std::path::PathBuf>, bootstrap: bool) -> Result<(), ()> {
     if sources.len() > 64 || sources.iter().any(|s| s.len() > 65_536) {
         eprintln!("native startup permits at most 64 sources of at most 65536 bytes each");
         return Err(());
@@ -70,6 +70,7 @@ pub(crate) fn run(sources: Vec<String>, native_file: Option<std::path::PathBuf>)
             let mut unbound = Some(owner);
             let result = (|| -> Result<(), (String, Vec<OwnerEvent>)> {
                 with_lisp_runtime_owner(80, 24, |mut host| {
+                    if bootstrap { host.bootstrap_runtime().map_err(anyhow::Error::msg)?; }
                     prepare_explicit_file(&mut host, native_file.as_deref())
                         .map_err(anyhow::Error::msg)?;
                     let bridge = EditorBridge::new(host, metrics, bounds)
@@ -476,8 +477,8 @@ mod joined_owner_tests {
     }
     #[test]
     fn startup_source_caps_reject_before_application_or_window_creation() {
-        assert!(run(vec![String::new(); 65], None).is_err());
-        assert!(run(vec!["x".repeat(65_537)], None).is_err());
+        assert!(run(vec![String::new(); 65], None, false).is_err());
+        assert!(run(vec!["x".repeat(65_537)], None, false).is_err());
     }
     struct OwnedStartupDirectory(std::path::PathBuf);
     impl OwnedStartupDirectory {

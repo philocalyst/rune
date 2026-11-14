@@ -2297,3 +2297,6 @@ mod overlay_handle_owner_stamp_tests {
         assert!(!old_handle.belongs_to(&cx));
     }
 }
+
+mod native_startup;
+pub(crate) use native_startup::check_native_bootstrap;
