@@ -94,7 +94,7 @@ the same explicit inputs to regenerate Org fixtures. No upload or send occurs.
 Batch boot does not prove native window/OS keyboard behavior or interactive
 responsiveness. GNU successes are reference results only, never Rune results.
 
-## Current measured status and next blockers
+## Recorded checkpoints and next blockers (fresh reports are authoritative)
 
 These are separate checkpoints, not interchangeable scores:
 - Raw-core prerequisite smoke improved Rune **1/9 -> 3/9 -> 4/9** with actual
@@ -109,11 +109,14 @@ These are separate checkpoints, not interchangeable scores:
 - Earlier descriptor-only GNU "boot" passes were explicitly withdrawn and old
   JSON reports annotated. They are not full startup evidence.
 - Rune's real bootstrap passes with faithful native minibuffer-map initialization.
-  The actual Doom first gate remains **0/1**. After the working-directory fix
-  cleared the empty-path error, official `early-init.el` reports
-  `(void-function getenv-internal)`. This is a real package prerequisite, not
-  an installer pass or a raw-core macro failure. Later workflows are not run
-  until that genuine first gate progresses.
+  The last completed actual Doom first gate is **0/1** on the recorded pre-alias
+  candidate (`command-switch-alist` was unbound). Subsequent alias V2 component
+  qualification reached **47/48** exact GNU matches, with intrinsic fixnum width
+  the only difference; this is not a Doom pass. Whole unchanged startup.el still
+  needs genuine frame context setup. The ordered bindings/frame/startup source
+  replay is currently blocked in bindings.el by missing `propertize`, which needs
+  real string-property authority, not an identity helper. No full prerequisite
+  completion or new Doom startup pass is claimed from these component checks.
 - Standalone **actual GNU mu4e** navigation/body/read-only tests passed, with all
   synthetic mail unchanged. This is a reference only, never Rune or Doom success.
 
@@ -125,3 +128,26 @@ short timeout. A runtime excluded by `--runtime` is `not-run`, not a failed run.
 Fresh reports and named conditions drive the next fix. End-to-end Doom+mu4e
 success by a next-day deadline remains unestablished until the actual gates pass.
 Batch results still do not establish native OS key/window behavior.
+
+## Explicit genuine-source prerequisite experiments
+
+Normal bootstrap remains the default and no extra helper is silently loaded.
+When qualifying a runtime that has not restored the complete GNU loadup path,
+`--rune-preload /ORIGINAL/bindings.el --rune-preload /ORIGINAL/frame.el
+--rune-preload /ORIGINAL/startup.el` requests those genuine complete source files
+on Rune only, in order, after normal bootstrap and before the benchmark prelude.
+Use this only after the whole unchanged prerequisite path is independently
+qualified; do not treat a partial load as readiness. No GNU CLI/UI entry function
+is invoked by the transport wrapper. Missing C primitives remain real failures.
+
+At most eight regular files, each at most 8 MiB, are admitted. Their order,
+basenames and content hashes are recorded before/after, separately from local
+input paths. NOSUFFIX pins each load to its exact fingerprinted path. Mutation or
+capture failure invalidates Rune observations, not an unrelated GNU reference.
+When preloads are requested, the exact preloads-complete phase marker is also
+mandatory for a Rune gate to pass; exit 0 plus a workflow marker without it fails.
+That phase marker alone is NOT a Doom pass: the final workflow
+assertions, full startup/finalize, unchanged sources and normal exit are still
+required. This opt-in result must be labelled normal bootstrap PLUS genuine
+source preloads, not out-of-the-box product startup. Supplied sources are trusted
+executable dependencies; these checks are not a hostile-filesystem sandbox.

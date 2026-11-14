@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import sys
 import subprocess
+import stat
 import tempfile
 import uuid
 from run_stdin_differential import literal
@@ -27,6 +28,38 @@ def sha(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             result.update(chunk)
     return result.hexdigest()
+
+
+def preload_fingerprints(paths):
+    """Content/order identity only; local paths are recorded separately."""
+    if len(paths) > 8:
+        raise ValueError('At most eight explicit Rune source preloads are supported')
+    rows = []
+    for index, path in enumerate(paths):
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 8 * 1024 * 1024:
+            raise ValueError('Rune preloads must be regular source files of at most 8 MiB')
+        digest = hashlib.sha256()
+        consumed = 0
+        with path.open('rb') as stream:
+            for chunk in iter(lambda:stream.read(1024 * 1024), b''):
+                consumed += len(chunk)
+                if consumed > 8 * 1024 * 1024:
+                    raise ValueError('Rune preload grew beyond 8 MiB while hashing')
+                digest.update(chunk)
+        rows.append({'order':index, 'name':path.name, 'sha256':digest.hexdigest()})
+    return rows
+
+
+def preload_wrapper(paths, marker, failure_handler):
+    # Source bodies remain untouched. This wrapper reports failures and does not
+    # invoke GNU CLI/UI entry or invent any missing definitions/features.
+    # NOSUFFIX pins the actual loaded bytes to the exact fingerprinted path.
+    # This seam is for the now-qualified load-flags runtime, not older cores.
+    loads = ''.join('(load ' + literal(str(path)) + ' nil nil t)\n' for path in paths)
+    return ('(condition-case rune-benchmark-error (progn\n' + loads +
+            '(let ((inhibit-message nil)) (message ' + literal(marker+':preloads-complete') +
+            ')))\n' + failure_handler + ')\n')
 
 
 def sources(marker, org_path, mu_driver, mu_home, mu_binary, mu_lisp):
@@ -89,6 +122,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('doom-root', 'doom-config', 'doom-local', 'gnu', 'rune', 'mu-driver', 'mu-home', 'mu-binary', 'mu-lisp', 'workspace', 'maildir', 'mail-manifest', 'package-manifest', 'output'):
         p.add_argument('--' + name, required=True, type=Path)
+    p.add_argument('--rune-preload', action='append', type=Path, default=[],
+                   help='Explicit genuine source file loaded on Rune only before benchmark prelude; repeat in dependency order')
     p.add_argument('--revision', required=True)
     p.add_argument('--timeout', type=float, default=300)
     p.add_argument('--runtime', action='append', choices=['rune','gnu'], default=[])
@@ -100,6 +135,13 @@ def main():
     for name, path in vars(a).items():
         if isinstance(path, Path):
             setattr(a, name, path.resolve())
+    if len(a.rune_preload) > 8:
+        p.error('At most eight explicit Rune source preloads are supported')
+    a.rune_preload = [path.resolve() for path in a.rune_preload]
+    try:
+        rune_preloads_before = preload_fingerprints(a.rune_preload)
+    except (OSError, ValueError) as error:
+        p.error(str(error))
     expected_packages = json.loads(a.package_manifest.read_text(encoding='utf-8'))
     package_sources_before = capture_package_sources(a.doom_local/'straight/repos', {'@doom':a.doom_root}, {'@mu4e':a.mu_lisp})
     if package_sources_before != expected_packages:
@@ -132,6 +174,8 @@ def main():
         prelude, gates = sources(marker, temp/'synthetic.org', a.mu_driver, a.mu_home, a.mu_binary, a.mu_lisp)
         (temp/'prelude.el').write_text(prelude, encoding='utf-8')
         failure_handler = '(t (let ((inhibit-message nil)) (message ' + literal(marker + ':failure %S') + ' rune-benchmark-error)) (signal (car rune-benchmark-error) (cdr rune-benchmark-error)))'
+        if a.rune_preload:
+            (temp/'rune-preloads.el').write_text(preload_wrapper(a.rune_preload,marker,failure_handler), encoding='utf-8')
         (temp/'early-wrapper.el').write_text('(condition-case rune-benchmark-error (load ' + literal(str(a.doom_root/'early-init.el')) + ' nil nil) ' + failure_handler + ')\n', encoding='utf-8')
         for gate, form in gates:
             if a.gate and gate not in a.gate:
@@ -152,12 +196,19 @@ def main():
                 if runtime == 'gnu':
                     command = base + ['-Q', '--batch', '--load', str(temp/'prelude.el'), '--load', str(temp/'early-wrapper.el'), '--load', str(script)]
                 else:
-                    command = base + ['--load', str(temp/'prelude.el'), '--load', str(temp/'early-wrapper.el'), '--load', str(script)]
+                    preload_command = ['--load', str(temp/'rune-preloads.el')] if a.rune_preload else []
+                    command = base + preload_command + ['--load', str(temp/'prelude.el'), '--load', str(temp/'early-wrapper.el'), '--load', str(script)]
                 output, code, forced = capture(command, str(a.workspace), a.timeout)
-                passed = forced is None and code == 0 and any(line in (marker+':passed', 'MESSAGE: '+marker+':passed') for line in output.splitlines())
+                preloads_required = runtime == 'rune' and bool(a.rune_preload)
+                preloads_completed = preloads_required and any(line in (marker+':preloads-complete','MESSAGE: '+marker+':preloads-complete') for line in output.splitlines())
+                passed = (forced is None and code == 0
+                          and any(line in (marker+':passed', 'MESSAGE: '+marker+':passed') for line in output.splitlines())
+                          and (not preloads_required or preloads_completed))
                 structured = [line for line in output.splitlines() if line.startswith(marker+':failure ') or line.startswith('MESSAGE: '+marker+':failure ')]
                 errors = structured or [line for line in output.splitlines() if re.search(r'Error:|error:|Debugger entered|void-function|file-missing|Cannot open', line)]
-                records[runtime] = {'passed': passed and mail_hashes() == before_mail and versions_match, 'mail_sources_unchanged': mail_hashes() == before_mail, 'returncode': code, 'forced': forced, 'first_error': errors[0] if errors else None, 'output': output, 'command_template': command}
+                if not errors and forced is None and code == 0 and preloads_required and not preloads_completed:
+                    errors = ['Required Rune source preload completion marker missing']
+                records[runtime] = {'passed': passed and mail_hashes() == before_mail and versions_match, 'mail_sources_unchanged': mail_hashes() == before_mail, 'returncode': code, 'forced': forced, 'first_error': errors[0] if errors else None, 'output': output, 'command_template': command, 'rune_preloads_required': preloads_required, 'rune_preloads_completed': preloads_completed}
             rows.append({'id': gate, 'runtimes': records})
     emacs_version, _, _ = capture([str(a.gnu), '--version'], str(a.workspace), 5)
     try:
@@ -179,6 +230,16 @@ def main():
     except Exception as error:
         profile_sources_after = {'capture_error':str(error)[:512]}
     profile_sources_unchanged = profile_sources_before == profile_sources_after
+    try:
+        rune_preloads_after = preload_fingerprints(a.rune_preload)
+    except (OSError, ValueError) as error:
+        rune_preloads_after = {'capture_error':str(error)[:512]}
+    rune_preloads_unchanged = rune_preloads_before == rune_preloads_after
+    if not rune_preloads_unchanged:
+        for row in rows:
+            if row['runtimes']['rune'].get('status') != 'not-run':
+                row['runtimes']['rune']['passed'] = False
+                row['runtimes']['rune']['first_error'] = 'Explicit Rune source preload changed during benchmark; observations unqualified'
     package_sources_unchanged = package_sources_before == package_sources_after
     if binaries_before != binaries_after or not package_sources_unchanged or not profile_sources_unchanged or fixture_sources_before != fixture_sources_after:
         for row in rows:
@@ -187,7 +248,7 @@ def main():
                     row['runtimes'][runtime]['passed'] = False
                     row['runtimes'][runtime]['first_error'] = 'Executable or installed package source changed during benchmark; observations unqualified'
     report = {'schema_version':2, 'startup_contract':'official doom-startup and doom-finalize before all assertions', 'measurement':'actual-doom-mu4e-synthetic-workflow', 'revision_label':a.revision,
-              'fixture_sources_before':fixture_sources_before, 'fixture_sources_after':fixture_sources_after, 'fixture_sources_unchanged':fixture_sources_before==fixture_sources_after, 'profile_sources_before':profile_sources_before, 'profile_sources_after':profile_sources_after, 'profile_sources_unchanged':profile_sources_unchanged, 'package_manifest_sha256':fixture_sources_before['package_manifest'], 'package_sources_before':package_sources_before, 'package_sources_after':package_sources_after, 'package_sources_unchanged':package_sources_unchanged, 'doom_commit':commit, 'doom_modules_commit':modules_commit, 'gnu_emacs_version_output':emacs_version, 'mu4e_config_sha256':fixture_sources_before['mu4e_config'], 'mu_driver_sha256':fixture_sources_before['mu_driver'], 'mail_manifest_sha256':fixture_sources_before['mail_manifest'], 'mail_versions': {'mu':mu_version,'mu4e_source':mu4e_version,'matched':versions_match,'version_command_output':version_output}, 'mail_sources_before':before_mail,'mail_sources_after':mail_hashes(), 'doom_profile_sha256':profile_sources_before['init.el'], 'doom_config_sha256':profile_sources_before['config.el'], 'doom_packages_sha256':profile_sources_before['packages.el'],
+              'rune_preload_paths': [str(path) for path in a.rune_preload], 'rune_preloads_before':rune_preloads_before, 'rune_preloads_after':rune_preloads_after, 'rune_preloads_unchanged':rune_preloads_unchanged, 'rune_startup_path':'normal bootstrap plus explicit genuine source preloads' if a.rune_preload else 'normal bootstrap only', 'fixture_sources_before':fixture_sources_before, 'fixture_sources_after':fixture_sources_after, 'fixture_sources_unchanged':fixture_sources_before==fixture_sources_after, 'profile_sources_before':profile_sources_before, 'profile_sources_after':profile_sources_after, 'profile_sources_unchanged':profile_sources_unchanged, 'package_manifest_sha256':fixture_sources_before['package_manifest'], 'package_sources_before':package_sources_before, 'package_sources_after':package_sources_after, 'package_sources_unchanged':package_sources_unchanged, 'doom_commit':commit, 'doom_modules_commit':modules_commit, 'gnu_emacs_version_output':emacs_version, 'mu4e_config_sha256':fixture_sources_before['mu4e_config'], 'mu_driver_sha256':fixture_sources_before['mu_driver'], 'mail_manifest_sha256':fixture_sources_before['mail_manifest'], 'mail_versions': {'mu':mu_version,'mu4e_source':mu4e_version,'matched':versions_match,'version_command_output':version_output}, 'mail_sources_before':before_mail,'mail_sources_after':mail_hashes(), 'doom_profile_sha256':profile_sources_before['init.el'], 'doom_config_sha256':profile_sources_before['config.el'], 'doom_packages_sha256':profile_sources_before['packages.el'],
               'binary_sha256':binaries_before, 'binary_sha256_after':binaries_after, 'executables_unchanged':binaries_before==binaries_after,
               'gates':rows, 'summary':summarize(rows),
               'limitations':['Requires a genuinely installed pinned Doom profile; CLI help is not boot success.',
