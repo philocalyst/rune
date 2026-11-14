@@ -1911,3 +1911,18 @@ mod scoped_scroll_owner_tests {
   }).unwrap();
  }
 }
+
+impl RuntimeEditorGateway {
+    pub(crate) fn insert_preserving_point(&self,handle:OwnerBufferHandle,epoch:u64,at:usize,text:&str,cx:&Context)->anyhow::Result<()> {
+        self.check(cx)?;let mut owner=self.inner.try_borrow_mut()?;let id=owner.validate_handle(handle,cx)?;
+        owner.session.insert_buffer_preserving_point(id,epoch,at,text)?;Ok(())
+    }
+}
+
+#[cfg(test)]
+impl RuntimeEditorGateway {
+    pub(crate) fn set_read_only(&self,handle:OwnerBufferHandle,value:bool,cx:&Context)->anyhow::Result<()> {
+        self.check(cx)?;let mut owner=self.inner.try_borrow_mut()?;let id=owner.validate_handle(handle,cx)?;
+        owner.session.set_read_only(id,value)?;Ok(())
+    }
+}

@@ -251,6 +251,50 @@ fn test_case_sensative_call() {
     let _ = file_name_case_insensitive_p("/");
 }
 
+const INSERT_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Bounded strict-UTF8 import. This does not visit, replace or detect coding.
+#[defun]
+#[expect(clippy::too_many_arguments)]
+fn insert_file_contents<'ob>(
+    filename: &str, visit: OptionalFlag, begin: Option<i64>, end: Option<i64>,
+    replace: OptionalFlag, env: &Rt<Env>, cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    use std::io::Read;
+    use rune_core::macros::list;
+    ensure!(visit.is_none(), "insert-file-contents VISIT is not implemented");
+    ensure!(begin.is_none() && end.is_none(), "insert-file-contents byte slicing is not implemented");
+    ensure!(replace.is_none(), "insert-file-contents REPLACE is not implemented");
+    let path = if Path::new(filename).is_absolute() {
+        Path::new(filename).to_owned()
+    } else {
+        let directory = symbol_value(sym::DEFAULT_DIRECTORY, env, cx)
+            .ok_or_else(|| anyhow::anyhow!("default-directory is unbound"))?;
+        let ObjectType::String(directory) = directory.untag() else {
+            return Err(TypeError::new(Type::String, directory).into());
+        };
+        Path::new(&**directory).join(filename)
+    };
+    let path = std::path::absolute(path)?;
+    ensure!(path.is_absolute(), "Import path could not be made absolute");
+    let returned_name = path.to_str().ok_or_else(|| anyhow::anyhow!("Non-UTF8 import paths cannot be represented by Lisp strings"))?.to_owned();
+    let before = env.buffer_read(cx)?;
+    let metadata = std::fs::metadata(&path)?;
+    ensure!(metadata.is_file(), "Import source must be a regular file");
+    ensure!(metadata.len() <= INSERT_FILE_MAX_BYTES as u64, "Import exceeds 16MiB byte limit");
+    let file = std::fs::File::open(&path)?;
+    ensure!(file.metadata()?.is_file(), "Import source is no longer a regular file");
+    let mut bytes = Vec::new();
+    file.take(INSERT_FILE_MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= INSERT_FILE_MAX_BYTES, "Import exceeds 16MiB byte limit");
+    let text = String::from_utf8(bytes)?;
+    let count = text.chars().count();
+    let result = list![returned_name, count; cx];
+    if !text.is_empty() {
+        env.editor_gateway().insert_preserving_point(before.handle, before.epoch, before.point, &text, cx)?;
+    }
+    Ok(result)
+}
+
 // Deliberately bounded, UTF-8 visited-only save surface. No interactive chooser.
 const SAVE_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
 #[defun]
@@ -873,6 +917,76 @@ mod write_region_source_form_tests {
         let winners: Vec<_> = outcomes.iter().filter(|(won, _)| *won).collect();
         assert_eq!(winners.len(), 1);
         assert_eq!(std::fs::read(&path)?, winners[0].1.as_bytes());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bounded_insert_file_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+    use rune_editor::{Command, EditorHost};
+    struct Directory(std::path::PathBuf);
+    impl Directory { fn new() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("rune-import-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&path)?; Ok(Self(path))
+    }}
+    impl Drop for Directory { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    #[test]
+    fn actual_lisp_import_counts_scalars_keeps_point_and_is_one_undo() -> Result<()> {
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots); sym::init_symbols();
+        root!(env, init(Env::new(cx)?), cx);
+        let g = env.editor_gateway(); let empty = env.buffer_read(cx)?;
+        g.splice(empty.handle, empty.epoch, 0..0, "AB", cx)?;
+        g.set_point(empty.handle, 1, cx)?; g.set_modified(empty.handle, false, cx)?;
+        let before = env.buffer_read(cx)?;
+        let dir = Directory::new()?; let path = dir.0.join("synthetic.org");
+        std::fs::write(&path, "aé🙂\n")?;
+        crate::lread::load_internal(&format!(r#"(setq imported (insert-file-contents {:?}))
+          (if (and (equal (car imported) {:?}) (= (car (cdr imported)) 4)
+                   (= (length imported) 2) (= (point) 2)
+                   (equal (buffer-substring-no-properties 1 (point-max)) "Aaé🙂\nB"))
+              nil (error "wrong import result"))"#, path.to_str().unwrap(), path.to_str().unwrap()), cx, env)?;
+        assert_eq!(env.buffer_read(cx)?.epoch, before.epoch + 1);
+        assert!(g.modified(before.handle, cx)?); assert_eq!(g.file_name(before.handle, cx)?, None);
+        g.host(cx)?.execute(Command::Undo)?;
+        assert_eq!(env.buffer_read(cx)?.document.text().to_string(), "AB");
+        assert_eq!(std::fs::read(&path)?, "aé🙂\n".as_bytes());
+        Ok(())
+    }
+    #[test]
+    fn failed_reads_modes_and_readonly_imports_are_nonmutating() -> Result<()> {
+        let roots = RootSet::default(); let cx = &Context::new(&roots);
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let g = env.editor_gateway(); let before = env.buffer_read(cx)?;
+        let dir = Directory::new()?; let valid = dir.0.join("valid"); let invalid = dir.0.join("invalid"); let huge = dir.0.join("huge");
+        std::fs::write(&valid, "λ🙂")?; std::fs::write(&invalid, [0xff])?;
+        std::fs::File::create(&huge)?.set_len(INSERT_FILE_MAX_BYTES as u64 + 1)?;
+        for path in [&invalid, &huge, &dir.0, &dir.0.join("missing")] {
+            assert!(insert_file_contents(path.to_str().unwrap(), None, None, None, None, env, cx).is_err());
+        }
+        for (visit, begin, end, replace) in [(Some(()), None, None, None), (None, Some(0), None, None), (None, None, Some(1), None), (None, None, None, Some(()))] {
+            assert!(insert_file_contents(valid.to_str().unwrap(), visit, begin, end, replace, env, cx).is_err());
+        }
+        g.set_read_only(before.handle, true, cx)?;
+        assert!(insert_file_contents(valid.to_str().unwrap(), None, None, None, None, env, cx).is_err());
+        assert_eq!(env.buffer_read(cx)?.epoch, before.epoch); assert_eq!(env.buffer_read(cx)?.point, before.point);
+        assert_eq!(env.buffer_read(cx)?.document.text().to_string(), "");
+        Ok(())
+    }
+    #[test]
+    fn relative_names_use_default_directory_and_empty_file_is_noop() -> Result<()> {
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots); sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let dir = Directory::new()?; let path = dir.0.join("relative.org"); std::fs::write(&path, "")?;
+        env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.0.to_str().unwrap()))?;
+        let before = env.buffer_read(cx)?;
+        crate::lread::load_internal(&format!(r#"(setq imported (insert-file-contents "relative.org"))
+          (if (and (equal (car imported) {:?}) (= (car (cdr imported)) 0) (= (point) 1))
+              nil (error "wrong empty import"))"#, path.to_str().unwrap()), cx, env)?;
+        assert_eq!(env.buffer_read(cx)?.epoch, before.epoch);
+        assert!(!env.editor_gateway().modified(before.handle, cx)?);
         Ok(())
     }
 }

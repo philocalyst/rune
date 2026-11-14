@@ -1350,6 +1350,19 @@ impl<D: Document> Session<D> {
             self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.publication_epoch;
         self.replace_buffer(id, epoch, range, text)
     }
+    /// File import inserts at current target point, but point stays before the
+    /// imported contents. Restore is infallible within the same owner call and
+    /// consumes no second sequence allocation after the committed edit.
+    pub fn insert_buffer_preserving_point(&mut self,id:BufferId,expected_epoch:u64,at:usize,text:&str)->Result<CommandOutcome> {
+        if self.buffer_point(id)?!=at {return Err(EditorError::StaleInput);}
+        let outcome=self.replace_buffer(id,expected_epoch,at..at,text)?;
+        self.state.buffers.get_mut(&id).expect("validated live buffer").saved_point=at;
+        let selected=self.selected_window();
+        if self.state.windows.view(selected).expect("live selected view").buffer==id {
+            self.state.windows.view_mut(selected).expect("live selected view").point=at;
+        }
+        Ok(outcome)
+    }
     pub fn replace_buffer(
         &mut self,
         id: BufferId,
