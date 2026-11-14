@@ -1,7 +1,7 @@
 # Arithmetic integer-width qualification
 
 The runtime's arithmetic result gate applies `max(integer-width, 128)` magnitude
-bits to `+`, `-`, `*`, `/`, `1+` and `1-`, both at Lisp native boundaries and the
+bits to `+`, `-`, `*`, `/`, `%`, `mod`, `1+` and `1-`, both at Lisp native boundaries and the
 corresponding VM arithmetic instructions. The same final-result gate covers
 `logand`, `logior`, `logxor` and `lognot` at their native Lisp boundaries,
 as well as allocating `floor`, `ceiling`, `round`, `truncate` and integer `abs`.
@@ -31,6 +31,6 @@ qualification. Width values are validated when an operation consumes them, not
 when binding/assignment occurs. Named GNU overflow conditions are also incomplete.
 
 Qualification includes a 21-form GNU batch oracle for final-result, cancellation,
-float-selection and singleton exemptions, matching Rune Lisp regressions; seven
+float-selection and singleton exemptions, matching Rune Lisp regressions; eight
 VM opcode groups validate width overflow independently. The oracle is bounded to
 small (at most a few hundred-bit) values and does not stress resource exhaustion.

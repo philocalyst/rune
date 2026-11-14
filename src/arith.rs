@@ -298,14 +298,14 @@ fn remainder_driver(x: Number, y: Number, modulo: bool) -> Result<NumberValue> {
 }
 
 #[defun(name = "mod")]
-pub(crate) fn modulo(x: Number, y: Number) -> Result<NumberValue> {
-    remainder_driver(x, y, true)
+pub(crate) fn modulo(x: Number, y: Number, env: &Rt<Env>, cx: &Context) -> Result<NumberValue> {
+    finish_arithmetic(remainder_driver(x, y, true)?, env, cx)
 }
 
 #[defun(name = "%")]
-pub(crate) fn remainder(x: Number, y: Number) -> Result<NumberValue> {
+pub(crate) fn remainder(x: Number, y: Number, env: &Rt<Env>, cx: &Context) -> Result<NumberValue> {
     // TODO: Handle markers
-    remainder_driver(x, y, false)
+    finish_arithmetic(remainder_driver(x, y, false)?, env, cx)
 }
 
 // Extrema select an existing operand. Keep the borrowed identity rather than
@@ -528,15 +528,16 @@ mod test {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
         let zero = cx.add_as(BigInt::from(0));
-        for operation in [remainder, modulo] {
+        for modulo in [false, true] {
             for numerator in [Number::from(5_i64), cx.add_as(BigInt::from(i64::MAX) + 1_u8)] {
-                assert!(operation(numerator, zero).is_err());
+                assert!(remainder_driver(numerator, zero, modulo).is_err());
             }
         }
         for (numerator, denominator) in
             [(cx.add_as(5.0), Number::from(0_i64)), (5_i64.into(), cx.add_as(-0.0))]
         {
-            let NumberValue::Float(value) = modulo(numerator, denominator).unwrap() else {
+            let NumberValue::Float(value) = remainder_driver(numerator, denominator, true).unwrap()
+            else {
                 panic!("floating modulo must return a float");
             };
             assert!(value.is_nan());
@@ -717,6 +718,27 @@ mod test {
             ("(condition-case nil (/= 1 2 2) (error 'caught))", "caught"),
         ] {
             crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn remainder_and_modulo_validate_allocating_integer_results() {
+        for (expression, expected) in [
+            ("(% x d)", "caught"),
+            ("(mod x d)", "caught"),
+            ("(% nx d)", "caught"),
+            ("(mod nx d)", "1"),
+            ("(% x 3)", "1"),
+            ("(mod x nx)", "0"),
+            ("(% x x)", "0"),
+            ("(mod x 1.0)", "0.0"),
+        ] {
+            crate::interpreter::assert_lisp(
+                &format!(
+                    "(let ((x (ash 1 200)) (nx (- (ash 1 200))) (d (1+ (ash 1 200)))) (let ((integer-width 128)) (condition-case nil {expression} (error 'caught))))"
+                ),
+                expected,
+            );
         }
     }
 

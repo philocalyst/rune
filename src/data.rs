@@ -401,7 +401,7 @@ defvar!(MOST_NEGATIVE_FIXNUM, crate::core::object::MIN_FIXNUM);
 
 pub(crate) fn integer_width(env: &Rt<Env>, cx: &Context) -> Result<u64> {
     match env.vars.get(sym::INTEGER_WIDTH) {
-        Some(value) => Ok(Number::try_from(value.bind(cx))?.val().into_integer_width()?),
+        Some(value) => Ok(Number::try_from(value.bind(cx))?.integer_width()?),
         None => Ok(65_536),
     }
 }

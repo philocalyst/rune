@@ -897,7 +897,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let result = if op == op::Quo {
                         arith::div(left, &[right], self.env, cx)?
                     } else {
-                        arith::remainder(left, right)?
+                        arith::remainder(left, right, self.env, cx)?
                     };
                     self.env.stack.pop(cx);
                     self.env.stack.top().set(cx.add(result));
@@ -1504,6 +1504,7 @@ mod test {
             (O::Multiply, big.clone()),
             (O::Diff, -big.clone()),
             (O::Quo, BigInt::from(1_u8)),
+            (O::Rem, &big + 1_u8),
             (O::Negate, big.clone()),
             (O::Add1, big.clone()),
             (O::Sub1, big.clone()),

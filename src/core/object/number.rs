@@ -91,6 +91,18 @@ impl<'ob> Number<'ob> {
             NumericRef::Big(value) => bigint_float(value),
         }
     }
+    /// Decode the forwarded policy value without cloning a potentially huge
+    /// BigInt only to discover that it cannot fit the signed machine domain.
+    pub(crate) fn integer_width(self) -> Result<u64, NumericError> {
+        match self.numeric_ref() {
+            NumericRef::Int(value) => Ok(value as u64),
+            NumericRef::Big(value) => value
+                .to_i64()
+                .map(|value| value as u64)
+                .ok_or(NumericError::IntegerWidthOutOfRange),
+            NumericRef::Float(_) => Err(NumericError::ExpectedInteger),
+        }
+    }
     pub(crate) fn val(self) -> NumberValue {
         match self.untag() {
             NumberType::Int(value) => NumberValue::Int(value),
@@ -776,6 +788,26 @@ mod tests {
                 .unwrap(),
             NumberValue::Big(BigInt::from(1_u8) << 100_usize)
         );
+    }
+
+    #[test]
+    fn borrowed_integer_width_decoding_uses_exact_signed_machine_bounds() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for value in [i64::MIN, -1, 0, 128, i64::MAX] {
+            let number = Number::try_from(cx.make_integer(value)).unwrap();
+            assert_eq!(number.integer_width().unwrap(), value as u64);
+        }
+        for value in [
+            BigInt::from(i64::MIN) - 1_u8,
+            BigInt::from(i64::MAX) + 1_u8,
+            BigInt::from(1_u8) << 100_000_usize,
+        ] {
+            let number: Number = cx.add_as(value);
+            assert_eq!(number.integer_width(), Err(NumericError::IntegerWidthOutOfRange));
+        }
+        let float: Number = cx.add_as(1.0);
+        assert_eq!(float.integer_width(), Err(NumericError::ExpectedInteger));
     }
 
     #[test]
