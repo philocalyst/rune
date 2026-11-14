@@ -8,6 +8,7 @@ use crate::core::{
 use crate::process_transport::{ProcessStatus, ProcessTransport, SpawnSpec};
 use anyhow::{Result, bail};
 use rune_macros::defun;
+use rune_core::macros::list;
 use std::ffi::OsString;
 
 // GNU resolves bare program names through owner `exec-path`, not the child
@@ -18,6 +19,25 @@ fn absolute_program(program: &str) -> Result<OsString> {
         bail!("Subprocess program must be an absolute path; owner exec-path search is not implemented");
     }
     Ok(program.into())
+}
+
+// Copy owner variable storage before starting workers; never mutate host cwd.
+fn owner_working_directory(env: &Rt<Env>, cx: &Context) -> Result<std::path::PathBuf> {
+    let value=crate::data::symbol_value(crate::sym::DEFAULT_DIRECTORY,env,cx)?;
+    let bytes: &[u8]=match value.untag() {
+        ObjectType::String(s)=>s.as_bytes(),
+        ObjectType::ByteString(s)=>&s,
+        _=>return Err(crate::eval::EvalError::signal(crate::sym::WRONG_TYPE_ARGUMENT.into(),rune_core::macros::list!(crate::sym::STRINGP,value;cx),cx).into()),
+    };
+    anyhow::ensure!(bytes.len()<=65536,"Subprocess working directory exceeds 64 KiB limit");
+    anyhow::ensure!(!bytes.contains(&0),"Subprocess working directory contains NUL");
+    #[cfg(unix)]
+    let path={use std::os::unix::ffi::OsStrExt;std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))};
+    #[cfg(not(unix))]
+    let path=std::path::PathBuf::from(std::str::from_utf8(bytes)?);
+    anyhow::ensure!(path.is_absolute(),"Subprocess working directory must be absolute");
+    anyhow::ensure!(std::fs::metadata(&path)?.is_dir(),"Subprocess working directory is not a directory");
+    Ok(path)
 }
 
 fn argument(object: Object) -> Result<OsString> {
@@ -81,6 +101,7 @@ fn start_process<'ob>(
     env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let cwd=owner_working_directory(env,cx)?;
     let buffer = if buffer.is_nil() {
         NIL
     } else {
@@ -98,7 +119,7 @@ fn start_process<'ob>(
     let native = ProcessTransport::spawn_exact_environment(SpawnSpec {
         program: absolute_program(program)?,
         args,
-        cwd: None,
+        cwd: Some(cwd),
         env: crate::emacs::process_environment_snapshot(env, cx)?,
     })?;
     // SAFETY: buffer came from the current Context's editor gateway or NIL;
@@ -449,6 +470,7 @@ fn call_process<'ob>(
     if infile.is_some_and(|value| !value.is_nil()) {
         bail!("call-process input files are not implemented; stdin must be nil");
     }
+    let cwd=owner_working_directory(env,cx)?;
     let destination = destination.unwrap_or(NIL);
     // Validate destination before starting a real executable.
     let output_buffer = match destination.untag() {
@@ -469,7 +491,7 @@ fn call_process<'ob>(
     let native = ProcessTransport::spawn_merged_exact_environment(SpawnSpec {
         program: absolute_program(program)?,
         args,
-        cwd: None,
+        cwd: Some(cwd),
         env: crate::emacs::process_environment_snapshot(env, cx)?,
     })?;
     native.close_stdin();
@@ -751,5 +773,48 @@ mod tests {
         let signal = crate::core::env::intern("SIGKILL", &cx).into();
         // Empty owner registry means no OS signal can be dispatched.
         assert!(super::signal_process(target, signal, &cx).is_err());
+    }
+}
+
+#[cfg(all(test,unix))]
+mod owner_cwd_tests {
+    #[test]
+    fn owner_directory_snapshot_is_bounded_and_raw_bytes_survive_gc() {
+        use crate::core::{env::{Env,sym},gc::{Context,RootSet}};
+        use rune_core::macros::root;
+        use std::os::unix::ffi::{OsStrExt,OsStringExt};
+        static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+        let directory=loop {
+            let n=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+            let p=std::env::temp_dir().join(format!("rune-cwd-snapshot-{}-{n}",std::process::id()));
+            match std::fs::create_dir(&p) { Ok(())=>break p,Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>continue,Err(e)=>panic!("Exclusive fixture directory failed: {e}") }
+        };
+        struct Cleanup(std::path::PathBuf);impl Drop for Cleanup {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+        let _cleanup=Cleanup(directory.clone());
+        let raw=directory.join(std::ffi::OsString::from_vec(vec![0xff,0xfe]));std::fs::create_dir(&raw).unwrap();
+        let roots=RootSet::default();let cx=&mut Context::new(&roots);
+        root!(env,init(Env::new(cx).unwrap()),cx);
+        crate::core::env::init_variables(cx,env);
+        env.set_var_context(sym::DEFAULT_DIRECTORY,cx.add(raw.as_os_str().as_bytes().to_vec()),cx).unwrap();
+        let copied=super::owner_working_directory(env,cx).unwrap();
+        cx.garbage_collect(true);assert_eq!(copied,raw);
+        env.set_var_context(sym::DEFAULT_DIRECTORY,cx.add(vec![b'x';65537]),cx).unwrap();assert!(super::owner_working_directory(env,cx).is_err());
+        env.set_var_context(sym::DEFAULT_DIRECTORY,cx.add(vec![b'/',0]),cx).unwrap();assert!(super::owner_working_directory(env,cx).is_err());
+    }
+
+    #[test]
+    fn synchronous_owner_directory_matches_gnu_without_host_chdir() {
+        let original=std::env::current_dir().unwrap();
+        crate::assert_elprop!(r#"(progn (erase-buffer) (let ((default-directory "/tmp/") (process-environment nil)) (list (call-process "/bin/pwd" nil t) (equal (buffer-substring-no-properties 1 (point-max)) "/tmp\n") default-directory)))"#);
+        assert_eq!(std::env::current_dir().unwrap(),original);
+    }
+    #[test]
+    fn invalid_owner_directory_has_no_process_or_output_buffer_side_effect() {
+        crate::interpreter::assert_lisp(r#"(let ((default-directory "relative")) (list (condition-case nil (start-process "cwd-no-process" "cwd-no-buffer" "/bin/true") (error 'caught)) (get-process "cwd-no-process") (get-buffer "cwd-no-buffer") (condition-case nil (call-process "/bin/true" nil "cwd-no-sync-buffer") (error 'caught)) (get-buffer "cwd-no-sync-buffer")))"#,"(caught nil nil caught nil)");
+        crate::interpreter::assert_lisp(r#"(let ((v (vector nil))) (aset v 0 v) (condition-case e (let ((default-directory v)) (call-process "/bin/true")) (wrong-type-argument (list (car e) (car (cdr e)) (eq v (car (cdr (cdr e))))))))"#, "(wrong-type-argument stringp t)");
+    }
+    #[test]
+    fn asynchronous_owner_directory_reaches_real_child() {
+        crate::interpreter::assert_lisp(r#"(progn (erase-buffer) (let ((default-directory "/tmp/") (process-environment nil) (done nil) (p nil) (attempts 0)) (setq p (start-process "cwd-async" (current-buffer) "/bin/pwd")) (set-process-sentinel p #'(lambda (process event) (setq done t))) (unwind-protect (progn (while (and (null done) (< attempts 200)) (setq attempts (+ attempts 1)) (accept-process-output p 0.01)) (list done (process-exit-status p) (buffer-substring-no-properties 1 (point-max)))) (delete-process p))))"#,"(t 0 \"/tmp\\n\")");
     }
 }

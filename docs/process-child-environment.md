@@ -17,7 +17,9 @@ silently searching an inherited or child-supplied `PATH`. Explicit shell command
 are still possible only by naming an absolute shell executable and passing its
 arguments; no shell is introduced by the wrappers.
 
-The native working directory is still inherited, not taken from the current
-buffer's `default-directory`. These changes do not claim full process parity.
+Subprocess working directories are now copied from the owner `default-directory`
+by the scoped local-directory snapshot described in `process-owner-directory.md`.
+Automatic buffer-local directory forwarding and full process parity remain
+separate obligations.
 The official synthetic mu fixture uses an absolute wrapper and explicit isolated
 HOME/XDG/muhome paths, so it does not depend on either unsupported behavior.
