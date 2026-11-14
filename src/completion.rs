@@ -235,8 +235,103 @@ fn try_completion<'a>(
     };
     best.prefix(prefix_end, cx)
 }
+/// Callback-free list slice used by the original regexp-opt partition step.
+#[defun]
+fn all_completions<'a>(
+    string: Object<'a>,
+    collection: Object<'a>,
+    predicate: Option<Object>,
+    hide_spaces: Option<Object>,
+    env: &mut Rt<Env>,
+    cx: &'a Context,
+) -> Result<Object<'a>> {
+    if !matches!(string.untag(), ObjectType::String(_) | ObjectType::ByteString(_)) {
+        env.initialize_condition_metadata(cx);
+        let data = crate::core::cons::Cons::new(
+            sym::STRINGP,
+            crate::core::cons::Cons::new1(string, cx),
+            cx,
+        )
+        .into();
+        return Err(
+            crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into()
+        );
+    }
+    let input = string_name(string, true)?;
+    ensure!(predicate.is_none_or(|v| v.is_nil()), "Completion predicates are unsupported");
+    ensure!(
+        crate::data::symbol_value(sym::COMPLETION_REGEXP_LIST, env, cx)?.is_nil(),
+        "Completion regexp filters are unsupported"
+    );
+    let fold = !crate::data::symbol_value(sym::COMPLETION_IGNORE_CASE, env, cx)?.is_nil();
+    ensure!(
+        !fold || input.case_supported(),
+        "Non-ASCII Unicode case-folded completion is unsupported"
+    );
+    ensure!(
+        matches!(collection.untag(), ObjectType::Cons(_)) || collection.is_nil(),
+        "Only list completion collections are supported"
+    );
+    let hide = hide_spaces.is_some_and(|v| !v.is_nil()) && input.units().next() != Some(32);
+    let mut seen = std::collections::HashSet::new();
+    let mut bytes = 0usize;
+    let mut tail = collection;
+    // Shared Context access permits allocation, but neither callbacks nor GC.
+    // All original candidate Objects remain reachable from the caller's collection.
+    let mut matches = Vec::new();
+    while let ObjectType::Cons(pair) = tail.untag() {
+        ensure!(seen.len() < MAX_ENTRIES, "Completion collection exceeds entry budget");
+        seen.try_reserve(1)?;
+        ensure!(
+            seen.insert(tail.into_raw().addr()),
+            "Cyclic completion collection is unsupported"
+        );
+        if let Some(candidate) = text(pair.car())? {
+            bytes = bytes
+                .checked_add(candidate.bytes())
+                .ok_or_else(|| anyhow::anyhow!("Completion byte budget overflow"))?;
+            ensure!(bytes <= MAX_BYTES, "Completion collection exceeds byte budget");
+            ensure!(
+                !fold || candidate.case_supported(),
+                "Non-ASCII Unicode case-folded completion is unsupported"
+            );
+            if candidate.starts(input, fold) && !(hide && candidate.units().next() == Some(32)) {
+                matches.try_reserve(1)?;
+                // GNU returns the original string, including its properties and
+                // raw representation; symbols require a name string instead.
+                matches.push(match candidate.source {
+                    Some(source) => source,
+                    None => candidate.prefix(candidate.length, cx)?,
+                });
+            }
+        }
+        tail = pair.cdr();
+    }
+    Ok(crate::fns::slice_into_list(&matches, None, cx))
+}
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn all_completion_lists_match_gnu() {
+        for form in [
+            r#"(all-completions "a" '("abd" "abc" "abd" "a"))"#,
+            r#"(all-completions "n" '(nil nope))"#,
+            r#"(all-completions "a" '(("abc" . 1) (abc . 2) 42 . ignored))"#,
+            r#"(all-completions "" '(" a" "a" "  b") nil t)"#,
+            r#"(all-completions " " '(" a" "a" "  b") nil t)"#,
+            r#"(all-completions "λ" '("λ🙂a" "λb" "x"))"#,
+            r#"(let* ((s (propertize (unibyte-string 255 97) 'p 7)) (r (all-completions (unibyte-string 255) (list s s "ÿa")))) (list (length r) (eq s (car r)) (eq s (car (cdr r))) (multibyte-string-p (car r)) (get-text-property 0 'p (car r))))"#,
+            r#"(progn (set-match-data '(1 2)) (let ((old (match-data))) (all-completions "a" '("abc")) (equal old (match-data))))"#,
+        ] {
+            crate::assert_elprop!(
+                "(let ((completion-ignore-case nil) (completion-regexp-list nil)) {})",
+                form
+            );
+        }
+        crate::assert_elprop!(
+            r#"(let ((completion-ignore-case t) (completion-regexp-list nil)) (all-completions "a" '("AB" "abC" "Ax")))"#
+        );
+    }
     #[test]
     fn literal_list_completion_matches_gnu() {
         for form in [

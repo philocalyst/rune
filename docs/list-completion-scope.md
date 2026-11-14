@@ -34,3 +34,12 @@ callback, case-table, total allocation, OOM or hard wall-clock guarantees.
 
 Symbol-name candidates do not retain their original string-storage representation;
 returned prefix storage may differ from GNU Emacs for symbol candidates.
+
+`all-completions` uses the same callback-free literal-list matching and budgets.
+It preserves order and duplicates. Matching String/ByteString names are returned
+as the original objects, retaining storage, property spines and identity; symbol
+names have the representation limitation above. A non-nil HIDE-SPACES suppresses
+names beginning with ASCII space only when the input does not itself begin with
+space. Invalid entries/improper tails are ignored, cycles reject, and predicates,
+regexp filters and non-list tables remain explicitly unsupported. This supports
+the unchanged `regexp-opt` list partition, not arbitrary completion tables.
