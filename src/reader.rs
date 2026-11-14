@@ -31,6 +31,7 @@ pub(crate) enum Error {
     InvalidRecord(usize),
     UnsupportedHashTableRecord(usize),
     EmptyStream,
+    ResourceLimit,
 }
 
 impl Display for Error {
@@ -49,6 +50,7 @@ impl Display for Error {
                 write!(f, "Hash-table record reader syntax is not implemented: at {i}")
             }
             Error::EmptyStream => write!(f, "Empty Stream"),
+            Error::ResourceLimit => write!(f, "Reader nesting limit exceeded"),
             Error::ExtraItemInCdr(i) => write!(f, "Extra item in cdr: at {i}"),
             Error::MissingQuotedItem(i) => write!(f, "Missing element after quote: at {i}"),
             Error::ParseInt(radix, i) => {
@@ -80,7 +82,7 @@ impl Error {
             | Error::MissingQuotedItem(i)
             | Error::UnknownMacroCharacter(_, i)
             | Error::ParseInt(_, i) => Some(i),
-            Error::EmptyStream => None,
+            Error::EmptyStream | Error::ResourceLimit => None,
         }
     }
 
@@ -595,6 +597,7 @@ fn escaped(escaped: &mut bool, chr: char) -> bool {
 
 /// State of the reader.
 struct Reader<'a, 'ob> {
+    depth: usize,
     /// The iterator over the tokens in the current slice.
     tokens: Tokenizer<'a>,
     /// New objects are allocated in the context.
@@ -784,7 +787,9 @@ impl<'a, 'ob> Reader<'a, 'ob> {
     }
 
     fn read_sexp(&mut self, token: Token<'a>) -> Result<Object<'ob>> {
-        match token {
+        if self.depth >= 128 { return Err(Error::ResourceLimit); }
+        self.depth += 1;
+        let result = match token {
             Token::OpenParen(i) => self.read_list(i),
             Token::CloseParen(i) => Err(Error::ExtraCloseParen(i)),
             Token::OpenBracket(i) => self.read_vec(i),
@@ -798,14 +803,16 @@ impl<'a, 'ob> Reader<'a, 'ob> {
             Token::QuestionMark(_, c) => Ok((c as i64).into()),
             Token::Ident(x) => Ok(parse_symbol(x, self.cx)),
             Token::String(x) => unescape_string(x, self.tokens.relative_pos(token), self.cx),
-        }
+        };
+        self.depth -= 1;
+        result
     }
 }
 
 /// read a lisp object from `slice`. Return the object and index of next
 /// remaining character in the slice.
 pub(crate) fn read<'ob>(slice: &str, cx: &'ob Context) -> Result<(Object<'ob>, usize)> {
-    let mut reader = Reader { tokens: Tokenizer::new(slice), cx };
+    let mut reader = Reader { tokens: Tokenizer::new(slice), cx, depth: 0 };
     match reader.tokens.next() {
         Some(Ok(t)) => reader.read_sexp(t).map(|x| (x, reader.tokens.cur_pos())),
         Some(Err(e)) => Err(e),

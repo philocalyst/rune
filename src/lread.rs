@@ -56,6 +56,54 @@ pub(crate) fn read_from_string<'ob>(
     Ok(Cons::new(obj, final_index as i64, cx).into())
 }
 
+defsym!(END_OF_FILE);
+defsym!(INVALID_READ_SYNTAX);
+defvar!(STANDARD_INPUT, true);
+
+/// String inputs restart at zero on every call. Other reader streams are not
+/// implemented by this entry point; no terminal or buffer cursor is fabricated.
+#[defun(name = "read")]
+fn read_lisp<'ob>(stream: Option<Object<'ob>>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    let input = match stream {
+        Some(value) if !value.is_nil() => value,
+        _ => env.variable_value(sym::STANDARD_INPUT, cx)?.unwrap_or(TRUE),
+    };
+    let text = match input.untag() {
+        ObjectType::String(value) => value.as_ref(),
+        ObjectType::ByteString(value) => {
+            ensure!(value.len() <= 1024 * 1024, "read: input exceeds 1 MiB limit");
+            ensure!(value.is_ascii(), "read: non-ASCII unibyte input is not implemented");
+            std::str::from_utf8(value).expect("ASCII checked")
+        }
+        _ => bail!("read: only string input streams are implemented"),
+    };
+    ensure!(text.len() <= 1024 * 1024, "read: input exceeds 1 MiB limit");
+    match reader::read(text, cx) {
+        Ok((value, _)) => Ok(value),
+        Err(error) => {
+            env.initialize_condition_metadata(cx);
+            let eof = matches!(error, reader::Error::EmptyStream | reader::Error::MissingCloseParen(_) | reader::Error::MissingCloseBracket(_) | reader::Error::MissingStringDel(_) | reader::Error::MissingQuotedItem(_));
+            if matches!(error, reader::Error::ResourceLimit) { bail!(error); }
+            let data = if eof {
+                match env.variable_value(sym::LOAD_FILE_NAME, cx)? {
+                    Some(file) if !file.is_nil() => Cons::new(file, NIL, cx).into(),
+                    _ => NIL,
+                }
+            } else {
+                let detail = match error {
+                    reader::Error::ExtraCloseParen(_) => ")".to_owned(),
+                    reader::Error::ExtraCloseBracket(_) => "]".to_owned(),
+                    reader::Error::UnexpectedChar('.', _) => ".".to_owned(),
+                    _ => error.to_string(),
+                };
+                Cons::new(cx.add(detail), NIL, cx).into()
+            };
+            let condition = if eof { sym::END_OF_FILE } else { sym::INVALID_READ_SYNTAX };
+            Err(crate::eval::EvalError::signal(condition.into(), data, cx).into())
+        }
+    }
+}
+
 /// Default diagnostics expose only a bounded call identifier/type and byte
 /// range, never literal values, comments, argument graphs or full source text.
 fn load_error_excerpt<'a>(
@@ -711,5 +759,38 @@ mod bounded_load_error_tests {
         assert!(excerpt.len() < 600);
         assert!(excerpt.is_ascii());
         assert_eq!(load_error_excerpt(source, form.into(), 0, true), source);
+    }
+}
+
+#[cfg(test)]
+mod read_string_entry_tests {
+    #[test]
+    fn reads_first_form_and_restarts_string_input() {
+        crate::interpreter::assert_lisp(r#"(list (read "42 )") (read "λ🙂 tail") (read "[?\\C-0 ?\\C-9]") (let ((standard-input "17")) (list (read) (read))))"#, "(42 λ🙂 [67108912 67108921] (17 17))");
+    }
+    #[test]
+    fn eof_and_syntax_conditions_are_structured() {
+        crate::interpreter::assert_lisp(r#"(let ((load-file-name nil)) (list (condition-case e (read "") (end-of-file e)) (condition-case e (read "(") (end-of-file e)) (condition-case e (read ")") (invalid-read-syntax e)) (condition-case e (read ".") (invalid-read-syntax e))))"#, r#"((end-of-file) (end-of-file) (invalid-read-syntax ")") (invalid-read-syntax "."))"#);
+    }
+    #[test]
+    fn read_byte_length_limit_precedes_ascii_scan() {
+        use super::*;
+        let roots = crate::core::gc::RootSet::default();
+        let cx = &Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        let oversized = cx.add(vec![255_u8; 1024 * 1024 + 1]);
+        let error = read_lisp(Some(oversized), env, cx).unwrap_err();
+        assert_eq!(error.to_string(), "read: input exceeds 1 MiB limit");
+        let unsupported = cx.add(vec![255_u8]);
+        assert!(read_lisp(Some(unsupported), env, cx).unwrap_err().to_string().contains("non-ASCII"));
+    }
+    #[test]
+    fn read_nesting_budget_fails_without_stack_overflow() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = crate::core::gc::Context::new(&roots);
+        let source = format!("{}0{}", "(".repeat(10000), ")".repeat(10000));
+        assert_eq!(crate::reader::read(&source, &cx).unwrap_err(), crate::reader::Error::ResourceLimit);
+        assert!(crate::reader::read("42", &cx).is_ok());
     }
 }

@@ -138,6 +138,8 @@ impl<'a> RootedEnv<'a> {
             sym::WRONG_NUMBER_OF_ARGUMENTS,
             sym::ARGS_OUT_OF_RANGE,
             sym::SEARCH_FAILED,
+            sym::END_OF_FILE,
+            sym::INVALID_READ_SYNTAX,
             sym::INVALID_REGEXP,
             sym::WRONG_TYPE_ARGUMENT,
             sym::VOID_VARIABLE,
