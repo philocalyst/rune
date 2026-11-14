@@ -5,7 +5,7 @@ use super::{
         gc::Block,
     },
     ByteFnPrototype, ByteString, ChannelReceiver, ChannelSender, CharTableInner, GcString,
-    LispBigInt, LispBuffer, LispFrame, LispOverlay, LispProcess,
+    LispBigInt, LispBuffer, LispFrame, LispOverlay, LispMarker, LispProcess,
 };
 use super::{
     ByteFn, CharTable, HashTable, LispFloat, LispHashTable, LispString, LispVec, Record,
@@ -312,6 +312,7 @@ object_trait_impls!(ChannelReceiver);
 object_trait_impls!(LispProcess);
 object_trait_impls!(LispFrame);
 object_trait_impls!(LispOverlay);
+object_trait_impls!(LispMarker);
 
 /// Trait for types that can be managed by the GC. This trait is implemented for
 /// as many types as possible, even for types that are already Gc managed, Like
@@ -638,6 +639,20 @@ impl IntoObject for LispOverlay {
         unsafe { <&LispOverlay>::tag_ptr(ptr) }
     }
 }
+impl IntoObject for LispMarker {
+    type Out<'ob> = &'ob LispMarker;
+    fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
+        let LispMarker(heap) = self;
+        let ptr = block.objects.alloc(LispMarker(heap.for_block::<C>()));
+        unsafe {
+            block.record_copy_allocation(crate::core::gc::CopyAllocation::Marker(ptr));
+        }
+        if !C {
+            block.lisp_markers.borrow_mut().push(ptr);
+        }
+        unsafe { <&LispMarker>::tag_ptr(ptr) }
+    }
+}
 
 mod private {
     use super::{Gc, WithLifetime};
@@ -664,6 +679,7 @@ mod private {
         Process,
         Frame,
         Overlay,
+        Marker,
     }
 
     /// Trait for tagged pointers. Anything that can be stored and passed around
@@ -781,6 +797,7 @@ impl<'a> TaggedPtr for ObjectType<'a> {
                 Tag::Process => ObjectType::Process(<&LispProcess>::from_obj_ptr(ptr)),
                 Tag::Frame => ObjectType::Frame(<&LispFrame>::from_obj_ptr(ptr)),
                 Tag::Overlay => ObjectType::Overlay(<&LispOverlay>::from_obj_ptr(ptr)),
+                Tag::Marker => ObjectType::Marker(<&LispMarker>::from_obj_ptr(ptr)),
             }
         }
     }
@@ -806,6 +823,7 @@ impl<'a> TaggedPtr for ObjectType<'a> {
             ObjectType::Process(x) => TaggedPtr::tag(x).into(),
             ObjectType::Frame(x) => TaggedPtr::tag(x).into(),
             ObjectType::Overlay(x) => TaggedPtr::tag(x).into(),
+            ObjectType::Marker(x) => TaggedPtr::tag(x).into(),
         }
     }
 }
@@ -1141,6 +1159,16 @@ impl TaggedPtr for &LispOverlay {
         self as *const Self::Ptr
     }
 }
+impl TaggedPtr for &LispMarker {
+    type Ptr = LispMarker;
+    const TAG: Tag = Tag::Marker;
+    unsafe fn from_obj_ptr(ptr: *const u8) -> Self {
+        &*ptr.cast::<Self::Ptr>()
+    }
+    fn get_ptr(self) -> *const Self::Ptr {
+        self as *const Self::Ptr
+    }
+}
 
 impl<T> TracePtr for Gc<T> {
     fn trace_ptr(&self, state: &mut GcState) {
@@ -1163,6 +1191,7 @@ impl<T> TracePtr for Gc<T> {
             ObjectType::Process(x) => x.0.trace(state),
             ObjectType::Frame(x) => x.0.trace(state),
             ObjectType::Overlay(x) => x.0.trace(state),
+            ObjectType::Marker(x) => x.0.trace(state),
         }
     }
 }
@@ -1291,6 +1320,7 @@ pub(crate) enum ObjectType<'ob> {
     Process(&'ob LispProcess) = Tag::Process as u8,
     Frame(&'ob LispFrame) = Tag::Frame as u8,
     Overlay(&'ob LispOverlay) = Tag::Overlay as u8,
+    Marker(&'ob LispMarker) = Tag::Marker as u8,
 }
 
 /// The Object defintion that contains all other possible lisp objects. This
@@ -1318,7 +1348,8 @@ cast_gc!(ObjectType<'ob> => NumberType<'ob>,
          &'ob ChannelReceiver,
          &'ob LispProcess,
          &'ob LispFrame,
-         &'ob LispOverlay
+         &'ob LispOverlay,
+         &'ob LispMarker
 );
 
 impl ObjectType<'_> {
@@ -1345,6 +1376,7 @@ impl ObjectType<'_> {
             ObjectType::Process(_) => Type::Process,
             ObjectType::Frame(_) => Type::Frame,
             ObjectType::Overlay(_) => Type::Overlay,
+            ObjectType::Marker(_) => Type::Marker,
         }
     }
 }
@@ -1701,6 +1733,21 @@ impl<'ob> std::ops::Deref for Gc<&'ob LispOverlay> {
         self.untag()
     }
 }
+impl<'ob> TryFrom<Object<'ob>> for Gc<&'ob LispMarker> {
+    type Error = TypeError;
+    fn try_from(value: Object<'ob>) -> Result<Self, Self::Error> {
+        match value.get_tag() {
+            Tag::Marker => unsafe { Ok(cast_gc(value)) },
+            _ => Err(TypeError::new(Type::Marker, value)),
+        }
+    }
+}
+impl<'ob> std::ops::Deref for Gc<&'ob LispMarker> {
+    type Target = LispMarker;
+    fn deref(&self) -> &'ob Self::Target {
+        self.untag()
+    }
+}
 
 pub(crate) trait CloneIn<'new, T>
 where
@@ -1739,6 +1786,7 @@ where
             ObjectType::Process(x) => x.clone_in(bk)?.into(),
             ObjectType::Frame(x) => x.clone_in(bk)?.into(),
             ObjectType::Overlay(x) => x.clone_in(bk)?.into(),
+            ObjectType::Marker(x) => x.clone_in(bk)?.into(),
         };
         let Ok(x) = Gc::<U>::try_from(obj) else { unreachable!() };
         Ok(x)
@@ -1785,6 +1833,7 @@ impl GcMoveable for Object<'_> {
             ObjectType::Process(x) => cast_pair(x.move_value(to_space)?),
             ObjectType::Frame(x) => cast_pair(x.move_value(to_space)?),
             ObjectType::Overlay(x) => cast_pair(x.move_value(to_space)?),
+            ObjectType::Marker(x) => cast_pair(x.move_value(to_space)?),
         };
 
         let tag = self.get_tag();
@@ -2008,6 +2057,7 @@ impl ObjectType<'_> {
             ObjectType::Process(x) => D::fmt(x, f),
             ObjectType::Frame(x) => D::fmt(x, f),
             ObjectType::Overlay(x) => D::fmt(x, f),
+            ObjectType::Marker(x) => D::fmt(x, f),
         }
     }
 }

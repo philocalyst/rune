@@ -26,6 +26,7 @@ pub(crate) enum Type {
     Process,
     Frame,
     Overlay,
+    Marker,
 }
 
 /// Error provided if object was the wrong type

@@ -76,6 +76,7 @@ struct DumpState {
     symbols: Vec<DumpedSymbol>,
     env: Vec<DumpedBinding>,
     unsupported_overlay: bool,
+    unsupported_marker: bool,
     unsupported_string_properties: bool,
 }
 
@@ -154,6 +155,7 @@ impl DumpState {
             symbols: Vec::new(),
             env: Vec::new(),
             unsupported_overlay: false,
+            unsupported_marker: false,
             unsupported_string_properties: false,
         }
     }
@@ -240,6 +242,7 @@ impl DumpState {
             ObjectType::ChannelReceiver(_) => DumpedObject::ChannelReceiver,
             ObjectType::Process(_) => DumpedObject::Nil,
             ObjectType::Frame(_) => DumpedObject::Nil,
+            ObjectType::Marker(_) => { self.unsupported_marker=true; DumpedObject::Nil }
             ObjectType::Overlay(_) => {
                 // Internal cycle-building placeholder only. into_output rejects
                 // the entire image before any file is created or overwritten.
@@ -289,6 +292,9 @@ impl DumpState {
     }
 
     fn into_output(self) -> std::io::Result<std::string::String> {
+        if self.unsupported_marker {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"Marker persistence is unsupported"));
+        }
         if self.unsupported_overlay {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -1270,5 +1276,26 @@ mod overlay_persistence_tests {
         std::fs::remove_dir(&directory).unwrap();
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Unsupported);
         assert_eq!(bytes, b"existing image");
+    }
+}
+
+#[cfg(test)]
+mod marker_persistence_tests {
+    use super::*;
+    use crate::core::{gc::RootSet,object::LispMarker};
+    use rune_core::macros::root;
+    #[test]
+    fn marker_rejection_precedes_output_overwrite() {
+        let roots=RootSet::default();let cx=&Context::new(&roots);
+        crate::core::env::sym::init_symbols();
+        root!(env,init(Env::new_isolated(cx).unwrap()),cx);
+        let marker=LispMarker::new(cx).unwrap();
+        env.set_var(crate::lread::intern("rune-marker-dump",cx),marker.into()).unwrap();
+        let directory=std::env::temp_dir().join(format!("rune-marker-dump-{}-{}",std::process::id(),cx.domain_id()));
+        std::fs::create_dir(&directory).unwrap();let path=directory.join("existing.dump");
+        std::fs::write(&path,b"existing image").unwrap();
+        let result=dump_to_file(&path,env,cx);let bytes=std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();std::fs::remove_dir(&directory).unwrap();
+        assert_eq!(result.unwrap_err().kind(),std::io::ErrorKind::Unsupported);assert_eq!(bytes,b"existing image");
     }
 }

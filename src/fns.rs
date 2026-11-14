@@ -56,9 +56,12 @@ pub(crate) fn eq(obj1: Object, obj2: Object) -> bool {
     obj1.ptr_eq(obj2)
 }
 
-#[defun]
-pub(crate) fn equal<'ob>(obj1: Object<'ob>, obj2: Object<'ob>) -> bool {
-    obj1 == obj2
+// Native identity/structural helper is not the Lisp contextual comparator.
+pub(crate) fn equal<'ob>(obj1: Object<'ob>, obj2: Object<'ob>) -> bool { obj1 == obj2 }
+defsym!(EQUAL);
+#[defun(name = "equal")]
+fn equal_lisp(obj1: Object, obj2: Object, cx: &Context) -> Result<bool> {
+    crate::contextual_equal::equal(obj1, obj2, cx)
 }
 
 #[defun]
@@ -75,9 +78,13 @@ pub(crate) fn eql<'ob>(obj1: Object<'ob>, obj2: Object<'ob>) -> bool {
 }
 
 #[defun]
-fn equal_including_properties<'ob>(o1: Object<'ob>, o2: Object<'ob>) -> bool {
-    // TODO: implement text properties
-    equal(o1, o2)
+fn equal_including_properties(o1: Object, o2: Object, cx: &Context) -> Result<bool> {
+    // Property-aware structural equality is a separate unsupported operation;
+    // do not silently ignore newly stored string property spans.
+    { let _guard = crate::core::env::INTERNED_SYMBOLS.lock().unwrap();
+      crate::property_guard::reject_property_strings(o1)?;
+      crate::property_guard::reject_property_strings(o2)?; }
+    crate::contextual_equal::equal(o1, o2, cx)
 }
 
 #[defun]
@@ -497,10 +504,10 @@ fn rassq<'ob>(key: Object<'ob>, alist: List<'ob>) -> Result<Object<'ob>> {
 
 /// Return the first alist entry whose complete cdr is equal to KEY.
 #[defun]
-fn rassoc<'ob>(key: Object<'ob>, alist: List<'ob>) -> Result<Object<'ob>> {
+fn rassoc<'ob>(key: Object<'ob>, alist: List<'ob>, cx: &Context) -> Result<Object<'ob>> {
     for element in alist {
         if let Some(entry) = element?.cons()
-            && (eq(key, entry.cdr()) || equal(key, entry.cdr()))
+            && (eq(key, entry.cdr()) || crate::contextual_equal::equal(key, entry.cdr(), cx)?)
         {
             return Ok(entry.into());
         }
@@ -537,7 +544,7 @@ pub(crate) fn assoc<'ob>(
             let key = key.bind(cx);
             for elem in alist {
                 if let Some(cons) = elem?.cons()
-                    && equal(key, cons.car())
+                    && crate::contextual_equal::equal(key, cons.car(), cx)?
                 {
                     return Ok(cons.into());
                 }
@@ -547,7 +554,6 @@ pub(crate) fn assoc<'ob>(
     Ok(NIL)
 }
 
-type EqFunc = for<'ob> fn(Object<'ob>, Object<'ob>) -> bool;
 
 #[defun]
 fn copy_alist<'ob>(alist: List<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
@@ -576,12 +582,12 @@ fn copy_alist_elem<'ob>(elem: Object<'ob>, cx: &'ob Context) -> Object<'ob> {
     }
 }
 
-fn delete_from_list<'ob>(elt: Object<'ob>, list: List<'ob>, eq_fn: EqFunc) -> Result<Object<'ob>> {
+fn delete_from_list<'ob>(elt: Object<'ob>, list: List<'ob>, mut eq_fn: impl FnMut(Object<'ob>, Object<'ob>) -> Result<bool>) -> Result<Object<'ob>> {
     let mut head = list.into();
     let mut prev: Option<&'ob Cons> = None;
     for tail in list.conses() {
         let tail = tail?;
-        if eq_fn(tail.car(), elt) {
+        if eq_fn(tail.car(), elt)? {
             if let Some(prev_tail) = &mut prev {
                 prev_tail.set_cdr(tail.cdr())?;
             } else {
@@ -595,36 +601,36 @@ fn delete_from_list<'ob>(elt: Object<'ob>, list: List<'ob>, eq_fn: EqFunc) -> Re
 }
 
 #[defun]
-pub(crate) fn delete<'ob>(elt: Object<'ob>, list: List<'ob>) -> Result<Object<'ob>> {
-    delete_from_list(elt, list, equal)
+pub(crate) fn delete<'ob>(elt: Object<'ob>, list: List<'ob>, cx: &Context) -> Result<Object<'ob>> {
+    delete_from_list(elt, list, |a,b| crate::contextual_equal::equal(a,b,cx))
 }
 
 #[defun]
 pub(crate) fn delq<'ob>(elt: Object<'ob>, list: List<'ob>) -> Result<Object<'ob>> {
-    delete_from_list(elt, list, eq)
+    delete_from_list(elt, list, |a,b| Ok(eq(a,b)))
 }
 
-fn member_of_list<'ob>(elt: Object<'ob>, list: List<'ob>, eq_fn: EqFunc) -> Result<Object<'ob>> {
-    let val = list.conses().fallible().find(|x| Ok(eq_fn(x.car(), elt)))?;
-    match val {
-        Some(elem) => Ok(elem.into()),
-        None => Ok(NIL),
+fn member_of_list<'ob>(elt: Object<'ob>, list: List<'ob>, mut eq_fn: impl FnMut(Object<'ob>, Object<'ob>) -> Result<bool>) -> Result<Object<'ob>> {
+    for tail in list.conses() {
+        let tail = tail?;
+        if eq_fn(tail.car(), elt)? { return Ok(tail.into()); }
     }
+    Ok(NIL)
 }
 
 #[defun]
 pub(crate) fn memq<'ob>(elt: Object<'ob>, list: List<'ob>) -> Result<Object<'ob>> {
-    member_of_list(elt, list, eq)
+    member_of_list(elt, list, |a,b| Ok(eq(a,b)))
 }
 
 #[defun]
 pub(crate) fn memql<'ob>(elt: Object<'ob>, list: List<'ob>) -> Result<Object<'ob>> {
-    member_of_list(elt, list, eql)
+    member_of_list(elt, list, |a,b| Ok(eql(a,b)))
 }
 
 #[defun]
-pub(crate) fn member<'ob>(elt: Object<'ob>, list: List<'ob>) -> Result<Object<'ob>> {
-    member_of_list(elt, list, equal)
+pub(crate) fn member<'ob>(elt: Object<'ob>, list: List<'ob>, cx: &Context) -> Result<Object<'ob>> {
+    member_of_list(elt, list, |a,b| crate::contextual_equal::equal(a,b,cx))
 }
 
 // TODO: Handle sorting vectors
@@ -731,7 +737,7 @@ pub(crate) fn featurep(
         return Ok(true);
     };
     let subfeatures = crate::data::get(feature, sym::SUBFEATURES, env, cx);
-    Ok(!member(subfeature, subfeatures.try_into()?)?.is_nil())
+    Ok(!member(subfeature, subfeatures.try_into()?, cx)?.is_nil())
 }
 
 #[defun]
@@ -1277,7 +1283,11 @@ pub(crate) fn hash_table_p(obj: Object) -> bool {
     matches!(obj.untag(), ObjectType::HashTable(_))
 }
 
-#[defun]
+#[defun(name = "gethash")]
+fn gethash_lisp<'a>(key: Object<'a>, table: &'a LispHashTable, dflt: Option<Object<'a>>) -> Result<Option<Object<'a>>> {
+    crate::contextual_equal::reject_marker_hash_key(key)?;
+    Ok(gethash(key,table,dflt))
+}
 pub(crate) fn gethash<'ob>(
     key: Object<'ob>,
     table: &'ob LispHashTable,
@@ -1289,7 +1299,11 @@ pub(crate) fn gethash<'ob>(
     }
 }
 
-#[defun]
+#[defun(name = "puthash")]
+fn puthash_lisp<'a>(key: Object<'a>, value: Object<'a>, table: &'a LispHashTable) -> Result<Object<'a>> {
+    crate::contextual_equal::reject_marker_hash_key(key)?;
+    puthash(key,value,table)
+}
 pub(crate) fn puthash<'ob>(
     key: Object<'ob>,
     value: Object<'ob>,
@@ -1301,6 +1315,7 @@ pub(crate) fn puthash<'ob>(
 
 #[defun]
 fn remhash(key: Object, table: &LispHashTable) -> Result<()> {
+    crate::contextual_equal::reject_marker_hash_key(key)?;
     let Some(idx) = table.get_index_of(key) else { return Ok(()) };
     // If the removed element is before our iterator, then we need to shift the
     // iterator back one because the whole map get's shifted when something is
@@ -1759,10 +1774,10 @@ mod test {
         let roots = &crate::core::gc::RootSet::default();
         let cx = &crate::core::gc::Context::new(roots);
         let dotted = crate::core::cons::Cons::new(1i64, 2i64, cx);
-        assert!(super::rassoc(42i64.into(), dotted.into()).is_err());
+        assert!(super::rassoc(42i64.into(), dotted.into(), cx).is_err());
         let circular = crate::core::cons::Cons::new(1i64, NIL, cx);
         circular.set_cdr(circular.into()).unwrap();
-        assert!(super::rassoc(42i64.into(), circular.into()).is_err());
+        assert!(super::rassoc(42i64.into(), circular.into(), cx).is_err());
     }
 
     #[test]

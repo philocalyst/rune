@@ -211,8 +211,8 @@ pub(crate) fn point_min() -> usize {
     1
 }
 #[defun]
-pub(crate) fn point_marker(env: &Rt<Env>, cx: &Context) -> Result<usize> {
-    point(env, cx)
+pub(crate) fn point_marker<'a>(env: &Rt<Env>, cx: &'a Context) -> Result<crate::core::object::Gc<&'a crate::core::object::LispMarker>> {
+    crate::marker::point_marker(env, cx)
 }
 #[defun]
 fn delete_region(start: usize, end: usize, env: &Rt<Env>, cx: &Context) -> Result<()> {
@@ -576,7 +576,7 @@ mod recovered_point_tests {
         {
             assert_eq!(goto_char(requested, env, cx)?, requested);
             assert_eq!(point(env, cx)?, expected);
-            assert_eq!(point_marker(env, cx)?, expected)
+            assert_eq!(crate::marker::marker_position(point_marker(env, cx)?.into(), cx)?, Some(expected))
         }
         goto_char(1, env, cx)?;
         assert!(bolp(env, cx)?);

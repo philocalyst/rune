@@ -46,6 +46,8 @@ mod keyboard_state;
 mod library;
 mod lisp;
 mod lread;
+mod marker;
+mod contextual_equal;
 mod overlay;
 #[cfg(feature = "native")]
 mod native;

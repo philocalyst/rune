@@ -666,6 +666,7 @@ pub(crate) struct BufferRead {
 pub(crate) struct RuntimeEditorGateway {
     owner: u64,
     inner: std::rc::Rc<std::cell::RefCell<RuntimeEditor>>,
+    marker_retirements: std::rc::Rc<std::cell::RefCell<Vec<std::rc::Rc<MarkerRetirementNode>>>>,
     abandoned_markers:
         std::rc::Rc<std::cell::RefCell<Vec<(OwnerBufferHandle, rune_editor::MarkerId)>>>,
 }
@@ -673,6 +674,7 @@ impl RuntimeEditorGateway {
     pub(crate) fn new(cx: &Context, width: u32, height: u32) -> anyhow::Result<Self> {
         Ok(Self {
             owner: cx.domain_id(),
+            marker_retirements: Default::default(),
             abandoned_markers: Default::default(),
             inner: std::rc::Rc::new(std::cell::RefCell::new(RuntimeEditor::new(
                 cx, width, height,
@@ -681,6 +683,20 @@ impl RuntimeEditorGateway {
     }
     fn check(&self, cx: &Context) -> anyhow::Result<()> {
         anyhow::ensure!(self.owner == cx.domain_id(), "Foreign editor gateway");
+        if self.marker_retirements.borrow().iter().any(|n|n.retired.get()) {
+            let mut owner=self.inner.try_borrow_mut()?;
+            let mut nodes=self.marker_retirements.borrow_mut();
+            for node in nodes.iter().filter(|n|n.retired.get()) {
+                if let Some(handle)=node.current.get() {
+                    owner.session.modified(handle.buffer)?;
+                    if owner.session.buffer_live(handle.buffer) {
+                        owner.validate_handle(handle,cx)?;
+                        owner.session.remove_marker(handle.buffer,node.marker)?;
+                    }
+                }
+            }
+            nodes.retain(|n|!n.retired.get());
+        }
         if !self.abandoned_markers.borrow().is_empty() {
             // Acquire owner before taking queue, so busy-owner errors retain all
             // cleanup records for the next entry rather than losing them.
@@ -2449,5 +2465,139 @@ mod multibyte_storage_capability_tests {
         assert!(g.is_multibyte(handle,&cx).is_err());
         drop(cx);let next_roots=RootSet::default();let next=Context::new(&next_roots);
         assert!(g.is_multibyte(handle,&next).is_err());
+    }
+}
+
+struct MarkerRetirementNode {
+    owner:u64, marker:rune_editor::MarkerId,
+    current:std::cell::Cell<Option<OwnerBufferHandle>>, retired:std::cell::Cell<bool>,
+}
+/// ONE non-clone duty for the logical marker's entire lifetime. Drop only
+/// marks a pre-registered Cell; no allocation, RefCell or editor/GC access.
+pub(crate) struct MarkerLifetime {node:std::rc::Rc<MarkerRetirementNode>}
+impl Drop for MarkerLifetime {fn drop(&mut self){self.node.retired.set(true);}}
+/// Copyable native location observation, not identity or retirement authority.
+pub(crate) struct RegisteredMarker {
+    pub(crate) buffer:OwnerBufferHandle,
+    pub(crate) id:rune_editor::MarkerId,
+    pub(crate) liveness:rune_editor::BufferLiveness,
+}
+impl RuntimeEditorGateway {
+    pub(crate) fn new_marker_lifetime(&self,cx:&Context)->anyhow::Result<MarkerLifetime> {
+        self.check(cx)?;
+        let marker=self.inner.try_borrow_mut()?.session.reserve_marker_identity()?;
+        let node=std::rc::Rc::new(MarkerRetirementNode{owner:self.owner,marker,
+            current:std::cell::Cell::new(None),retired:std::cell::Cell::new(false)});
+        let mut queue=self.marker_retirements.try_borrow_mut()?;
+        queue.try_reserve(1)?;queue.push(node.clone());
+        Ok(MarkerLifetime{node})
+    }
+    fn validate_marker_lifetime(&self,lifetime:&MarkerLifetime,cx:&Context)->anyhow::Result<()> {
+        self.check(cx)?;
+        anyhow::ensure!(lifetime.node.owner==self.owner && !lifetime.node.retired.get(),"Invalid marker lifetime");
+        anyhow::ensure!(self.marker_retirements.try_borrow()?.iter().any(|n|std::rc::Rc::ptr_eq(n,&lifetime.node)),"Foreign marker lifetime registry");
+        Ok(())
+    }
+    pub(crate) fn replace_marker_attachment(&self,lifetime:&MarkerLifetime,
+        target:OwnerBufferHandle,at:usize,bias:Bias,cx:&Context)->anyhow::Result<RegisteredMarker> {
+        self.validate_marker_lifetime(lifetime,cx)?;
+        let mut owner=self.inner.try_borrow_mut()?;
+        let target_id=owner.validate_handle(target,cx)?;
+        let source=if let Some(handle)=lifetime.node.current.get() {
+            owner.session.modified(handle.buffer)?; // authenticate live/tombstone membership
+            if owner.session.buffer_live(handle.buffer) {Some(owner.validate_handle(handle,cx)?)} else {None}
+        } else {None};
+        let prepared=owner.session.prepare_marker_change(lifetime.node.marker,source,target_id,at,bias)?;
+        let attachment=RegisteredMarker{buffer:target,id:prepared.marker(),liveness:prepared.liveness()};
+        prepared.commit();
+        lifetime.node.current.set(Some(target));
+        Ok(attachment)
+    }
+    pub(crate) fn detach_marker(&self,lifetime:&MarkerLifetime,cx:&Context)->anyhow::Result<()> {
+        self.validate_marker_lifetime(lifetime,cx)?;
+        let mut owner=self.inner.try_borrow_mut()?;
+        if let Some(handle)=lifetime.node.current.get() {
+            owner.session.modified(handle.buffer)?;
+            if owner.session.buffer_live(handle.buffer) {
+                let id=owner.validate_handle(handle,cx)?;
+                owner.session.remove_marker(id,lifetime.node.marker)?;
+            }
+        }
+        lifetime.node.current.set(None);
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod single_marker_transaction_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn stable_marker_lifetime_retains_identity_through_detach_and_transfer() {
+        let roots=RootSet::default();let cx=Context::new(&roots);let g=cx.editor_gateway().unwrap();
+        let a=g.create("stable-a","abcde",&cx).unwrap();let b=g.create("stable-b","other",&cx).unwrap();
+        let lifetime=g.new_marker_lifetime(&cx).unwrap();
+        let first=g.replace_marker_attachment(&lifetime,a,2,Bias::Left,&cx).unwrap();
+        g.replace_marker_attachment(&lifetime,a,1,Bias::Right,&cx).unwrap();
+        g.detach_marker(&lifetime,&cx).unwrap();
+        assert_eq!(g.replace_marker_attachment(&lifetime,b,1,Bias::Left,&cx).unwrap().id,first.id);
+        assert_eq!(g.replace_marker_attachment(&lifetime,a,2,Bias::Left,&cx).unwrap().id,first.id);
+        let owner=g.inner.borrow_mut();let queue=g.marker_retirements.borrow_mut();
+        drop(lifetime); // only Cell write, even while both structures borrowed
+        drop(queue);drop(owner);g.check(&cx).unwrap();
+        assert!(g.marker_retirements.borrow().is_empty());
+        assert!(g.inner.borrow().session.marker_position(a.buffer,first.id).unwrap().is_none());
+    }
+    #[test]
+    fn lifetime_authentication_and_detached_retirement_are_exact() {
+        let roots=RootSet::default();let cx=Context::new(&roots);let g=cx.editor_gateway().unwrap();
+        let other=RuntimeEditorGateway::new(&cx,80,24).unwrap();
+        let lifetime=g.new_marker_lifetime(&cx).unwrap();
+        let target=other.scratch(&cx).unwrap();
+        assert!(other.replace_marker_attachment(&lifetime,target,0,Bias::Left,&cx).is_err());
+        assert!(other.detach_marker(&lifetime,&cx).is_err());
+        let target=g.scratch(&cx).unwrap();
+        let first=g.replace_marker_attachment(&lifetime,target,0,Bias::Left,&cx).unwrap();
+        g.detach_marker(&lifetime,&cx).unwrap();
+        assert!(g.inner.borrow().session.marker_position(target.buffer,first.id).unwrap().is_none());
+        drop(lifetime);g.check(&cx).unwrap();assert!(g.marker_retirements.borrow().is_empty());
+    }
+    #[test]
+    fn failed_relocation_keeps_identity_and_current_registration() {
+        let roots=RootSet::default();let cx=Context::new(&roots);let g=cx.editor_gateway().unwrap();
+        let a=g.create("stable-source","abc",&cx).unwrap();let b=g.create("stable-target","x",&cx).unwrap();
+        let lifetime=g.new_marker_lifetime(&cx).unwrap();
+        let first=g.replace_marker_attachment(&lifetime,a,2,Bias::Left,&cx).unwrap();
+        assert!(g.replace_marker_attachment(&lifetime,b,99,Bias::Right,&cx).is_err());
+        assert_eq!(lifetime.node.current.get(),Some(a));
+        assert_eq!(g.inner.borrow().session.marker_position(a.buffer,first.id).unwrap(),Some(2));
+        g.kill(a,true,&cx).unwrap();
+        assert_eq!(g.replace_marker_attachment(&lifetime,b,0,Bias::Left,&cx).unwrap().id,first.id);
+    }
+}
+
+impl RuntimeEditorGateway {
+    /// False only for this authenticated Session's known killed-buffer tombstone.
+    /// Foreign, unknown, retired-owner and busy-owner failures are not detachment.
+    pub(crate) fn buffer_is_live(&self,handle:OwnerBufferHandle,cx:&Context)->anyhow::Result<bool> {
+        self.check(cx)?;
+        let owner=self.inner.try_borrow()?;
+        owner.properties.empty(cx)?;
+        anyhow::ensure!(handle.owner==cx.domain_id(),"Foreign editor owner");
+        owner.session.modified(handle.buffer)?; // authenticates live OR exact tombstone membership
+        Ok(owner.session.buffer_live(handle.buffer))
+    }
+}
+#[cfg(test)]
+mod marker_buffer_live_tests {
+    use super::*;use crate::core::gc::RootSet;
+    #[test]
+    fn dead_query_never_conflates_foreign_unknown_or_busy_errors() {
+        let roots=RootSet::default();let cx=Context::new(&roots);
+        let g=RuntimeEditorGateway::new(&cx,80,24).unwrap();let other=RuntimeEditorGateway::new(&cx,80,24).unwrap();
+        let h=g.create("dead-query","",&cx).unwrap();assert!(g.buffer_is_live(h,&cx).unwrap());
+        assert!(other.buffer_is_live(h,&cx).is_err());
+        {let _busy=g.inner.borrow_mut();assert!(g.buffer_is_live(h,&cx).is_err());}
+        g.kill(h,true,&cx).unwrap();assert!(!g.buffer_is_live(h,&cx).unwrap());
+        assert!(other.buffer_is_live(h,&cx).is_err());
     }
 }

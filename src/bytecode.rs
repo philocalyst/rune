@@ -842,7 +842,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Equal => {
                     let rhs = self.env.stack.pop(cx);
                     let top = self.env.stack.top();
-                    top.set(fns::equal(top.bind(cx), rhs));
+                    top.set(crate::contextual_equal::equal(top.bind(cx), rhs, cx)?);
                 }
                 op::Nthcdr => {
                     let list = self.env.stack.pop(cx);
@@ -857,7 +857,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Member => {
                     let list = self.env.stack.pop(cx);
                     let top = self.env.stack.top();
-                    top.set(fns::member(top.bind(cx), list.try_into()?)?);
+                    top.set(fns::member(top.bind(cx), list.try_into()?, cx)?);
                 }
                 op::Assq => {
                     let alist = self.env.stack.pop(cx);

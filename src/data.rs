@@ -304,9 +304,8 @@ pub(crate) fn numberp(object: Object) -> bool {
 }
 
 #[defun]
-pub(crate) fn markerp(_: Object) -> bool {
-    // TODO: implement
-    false
+pub(crate) fn markerp(value: Object) -> bool {
+    matches!(value.untag(), ObjectType::Marker(_))
 }
 
 #[defun]
@@ -671,6 +670,7 @@ fn type_of(object: Object) -> Object {
         ObjectType::Process(_) => sym::PROCESS.into(),
         ObjectType::Frame(_) => sym::FRAME.into(),
         ObjectType::Overlay(_) => sym::OVERLAY.into(),
+        ObjectType::Marker(_) => sym::MARKER.into(),
     }
 }
 
@@ -1502,3 +1502,5 @@ mod binary_numeric_cookie_tests {
 }
 
 defsym!(CYCLIC_FUNCTION_INDIRECTION);
+
+defsym!(MARKER);

@@ -1947,3 +1947,44 @@ mod prepared_insert_failure_tests {
         assert_eq!(s.buffer_snapshot(id).unwrap().document.to_text(),"ab");
     }
 }
+
+/// Sealed marker metadata transaction. The exclusive Session borrow prevents
+/// intervening marker edits; dropping the token publishes nothing.
+pub struct PreparedMarkerChange<'a,D:Document> {
+    session:&'a mut Session<D>, source:Option<(BufferId,D)>, target:BufferId,
+    document:D, marker:crate::MarkerId, liveness:BufferLiveness,
+}
+impl<D:Document> PreparedMarkerChange<'_,D> {
+    pub fn marker(&self)->crate::MarkerId {self.marker}
+    pub fn liveness(&self)->BufferLiveness {self.liveness.clone()}
+    /// All validation, allocation and document derivation preceded this point.
+    pub fn commit(self) {
+        if let Some((id,doc))=self.source {self.session.state.buffers.get_mut(&id).expect("exclusive validated source").document=doc;}
+        self.session.state.buffers.get_mut(&self.target).expect("exclusive validated target").document=self.document;
+    }
+}
+impl<D:crate::MarkerDocument> Session<D> {
+    /// Reserve a globally nonreused identity; does not register a position.
+    /// The owner bridge must authenticate the lifetime reservation on reuse.
+    pub fn reserve_marker_identity(&mut self)->Result<crate::MarkerId> {
+        Ok(crate::MarkerId(crate::allocate_id()?))
+    }
+    /// Trusted owner bridge: marker must be a uniquely reserved lifetime ID.
+    /// Session validates locations, not the cross-crate lifetime capability.
+    pub fn prepare_marker_change(&mut self, marker:crate::MarkerId, source:Option<BufferId>,
+        target:BufferId,at:usize,bias:Bias)->Result<PreparedMarkerChange<'_,D>> {
+        let target_doc=self.document(target)?;
+        if at>target_doc.len_chars(){return Err(EditorError::InvalidPosition);}
+        if source != Some(target) && target_doc.marker_position(marker.as_u64()).is_some(){return Err(EditorError::InvalidRange);}
+        let mut base=target_doc.clone();
+        let old=if let Some(id)=source {
+            let doc=self.document(id)?;
+            if doc.marker_position(marker.as_u64()).is_none(){return Err(EditorError::InvalidRange);}
+            let removed=doc.remove_live_marker(marker.as_u64());
+            if id==target {base=removed;None}else{Some((id,removed))}
+        }else{None};
+        let document=base.set_live_marker(marker.as_u64(),at,bias).map_err(|e|EditorError::Backend(e.to_string()))?;
+        let liveness=self.buffer_liveness(target)?;
+        Ok(PreparedMarkerChange{session:self,source:old,target,document,marker,liveness})
+    }
+}
