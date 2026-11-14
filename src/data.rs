@@ -164,7 +164,7 @@ pub(crate) fn default_value<'ob>(
     env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    if env.indirect_variable(symbol,cx)? == sym::BUFFER_READ_ONLY {
+    if [sym::BUFFER_READ_ONLY, sym::ENABLE_MULTIBYTE_CHARACTERS].contains(&env.indirect_variable(symbol,cx)?) {
         return env.toplevel_value(symbol, cx)?.ok_or_else(|| {
             crate::eval::EvalError::signal(
                 sym::VOID_VARIABLE.into(),

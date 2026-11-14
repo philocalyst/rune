@@ -122,6 +122,7 @@ impl<'a> Symbol<'a> {
     /// Ordinary Lisp defconst declarations do not make runtime writes illegal.
     pub(crate) fn is_builtin_value_constant(self) -> bool {
         self == crate::sym::MOST_POSITIVE_FIXNUM || self == crate::sym::MOST_NEGATIVE_FIXNUM
+            || self == crate::sym::ENABLE_MULTIBYTE_CHARACTERS
     }
 }
 

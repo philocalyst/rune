@@ -2415,3 +2415,39 @@ mod annotated_insertion_tests {
         let after=g.read(h,&cx).unwrap();assert_eq!(after.epoch,before.epoch);assert_eq!(after.document.to_text(),"ab");
     }
 }
+
+impl RuntimeEditorGateway {
+    /// Authenticated storage capability, not an independently mutable mode bit.
+    /// Every live RuntimeDocument currently stores a Unicode rune_text::Rope.
+    /// Unibyte buffer representation/conversion is not implemented.
+    pub(crate) fn is_multibyte(&self, handle: OwnerBufferHandle, cx: &Context) -> anyhow::Result<bool> {
+        self.check(cx)?;
+        let owner=self.inner.try_borrow()?;
+        let id=owner.validate_handle(handle,cx)?;
+        owner.session.buffer_snapshot(id)?;
+        Ok(true)
+    }
+}
+#[cfg(test)]
+mod multibyte_storage_capability_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn unicode_capability_requires_live_authenticated_owner_buffer() {
+        let roots=RootSet::default();let cx=Context::new(&roots);
+        let g=RuntimeEditorGateway::new(&cx,80,24).unwrap();
+        let other=RuntimeEditorGateway::new(&cx,80,24).unwrap();
+        let handle=g.create("Unicode capability","λ🙂",&cx).unwrap();
+        let before=g.read(handle,&cx).unwrap();
+        let sequence=g.inner.borrow().session.snapshot().sequence;
+        assert!(g.is_multibyte(handle,&cx).unwrap());
+        assert_eq!(g.inner.borrow().session.snapshot().sequence,sequence);
+        let after=g.read(handle,&cx).unwrap();
+        assert_eq!(before.epoch,after.epoch);assert_eq!(before.document.to_text(),after.document.to_text());
+        assert!(other.is_multibyte(handle,&cx).is_err());
+        g.kill(handle,true,&cx).unwrap();
+        assert!(g.is_multibyte(handle,&cx).is_err());
+        drop(cx);let next_roots=RootSet::default();let next=Context::new(&next_roots);
+        assert!(g.is_multibyte(handle,&next).is_err());
+    }
+}

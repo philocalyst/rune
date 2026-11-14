@@ -13,6 +13,7 @@ mod debug;
 mod alloc;
 mod arith;
 mod buffer;
+mod buffer_coding;
 mod bytecode;
 mod casefiddle;
 mod channel_manager;

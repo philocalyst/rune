@@ -236,6 +236,9 @@ impl<'a> RootedEnv<'a> {
     ) -> Result<Option<Object<'cx>>> {
         let symbol = self.indirect_variable(symbol, cx)?;
         if symbol.is_const() { return Ok(Some(symbol.into())); }
+        if symbol == crate::sym::ENABLE_MULTIBYTE_CHARACTERS {
+            return self.editor_gateway.is_multibyte(self.current_buffer, cx).map(|value| Some(value.into()));
+        }
         if symbol == crate::sym::BUFFER_READ_ONLY {
             return self.editor_gateway.read_only_value(self.current_buffer, cx).map(Some);
         }
@@ -366,6 +369,11 @@ impl<'a> RootedEnv<'a> {
         let var = self.indirect_variable(var, cx)?;
         if var.is_const() {
             return Ok(Some(var.into()));
+        }
+        if var == crate::sym::ENABLE_MULTIBYTE_CHARACTERS {
+            // The only supported buffer representation and its default are
+            // Unicode. Authenticate the owner instead of reading a shadow var.
+            return self.editor_gateway.is_multibyte(self.current_buffer, cx).map(|value| Some(value.into()));
         }
         for ((symbol, saved), target) in
             self.binding_stack.bind_ref(cx).iter().zip(&self.binding_targets)
