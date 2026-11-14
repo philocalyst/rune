@@ -198,3 +198,19 @@ Checked-call validation: six new count/staging regressions pass, including
 reuse, malformed tail atomicity, caller-prefix protection, and unchanged
 metadata on failed finalization. Full bytecode 57/57, interpreter 20/20, and eval
 10/10 pass in the isolated target. No integration tree was modified.
+
+
+## Fallible decoder storage follow-up
+
+Program construction now checks boundary and instruction-vector reservations,
+and the per-VM cache checks map/key reservations before publishing a new entry.
+Allocation failures are explicit DecodeError::Allocation values; existing cache
+entries remain valid. Metadata retains Vec storage rather than introducing an
+infallible shrink-to-box operation. Cache keys remain owned code bytes, and
+malformed/truncated instructions remain lazy error entries, not eager failures.
+
+This is not complete OOM recovery: Arc allocation and other runtime producers
+still use infallible allocations, diagnostics themselves may allocate, and no
+total code/cache budget or allocation-policy cap has been added. Failed cache
+reservation/decode does not publish a new entry; invalid cursor targets still
+follow the pre-existing decode/cache-then-validate order.

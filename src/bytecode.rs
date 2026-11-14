@@ -1046,7 +1046,7 @@ fn byte_code<'ob>(
 /// This checks instruction encoding and static target boundaries only, not
 /// operand types, stack joins, dynamic switch tables or opcode availability.
 pub(crate) fn validate_bytecode(function: &ByteFn) -> Result<()> {
-    decoder::Program::decode(function.codes()).validate()?;
+    decoder::Program::decode(function.codes())?.validate()?;
     Ok(())
 }
 

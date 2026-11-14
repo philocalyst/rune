@@ -13,11 +13,13 @@ pub(super) enum DecodeError {
     NotInstruction { offset: usize },
     InvalidTarget { offset: usize },
     MissingOperand { offset: usize },
+    Allocation { resource: &'static str },
 }
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Allocation { resource } => write!(f, "Cannot reserve bytecode {resource}"),
             Self::UnknownOpcode { offset, byte } => {
                 write!(f, "Invalid Bytecode: opcode {byte} at offset {offset}")
             }
@@ -37,6 +39,14 @@ impl fmt::Display for DecodeError {
     }
 }
 impl std::error::Error for DecodeError {}
+
+fn reserve_metadata<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    resource: &'static str,
+) -> Result<(), DecodeError> {
+    values.try_reserve(additional).map_err(|_| DecodeError::Allocation { resource })
+}
 
 /// Owned scalar metadata, never pointers into the moving Lisp heap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,16 +234,19 @@ fn operand_bytes(opcode: OpCode) -> usize {
 pub(super) struct Program {
     len: usize,
     // Zero denotes an operand byte; other values are instruction index + 1.
-    boundaries: Box<[usize]>,
-    entries: Box<[Result<Instruction, DecodeError>]>,
+    boundaries: Vec<usize>,
+    entries: Vec<Result<Instruction, DecodeError>>,
 }
 
 impl Program {
-    pub fn decode(bytes: &[u8]) -> Self {
-        let mut boundaries = vec![0; bytes.len()];
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut boundaries = Vec::new();
+        reserve_metadata(&mut boundaries, bytes.len(), "boundary metadata")?;
+        boundaries.resize(bytes.len(), 0);
         let mut entries = Vec::new();
         let mut offset = 0;
         while offset < bytes.len() {
+            reserve_metadata(&mut entries, 1, "instruction metadata")?;
             boundaries[offset] = entries.len() + 1;
             let opcode = match OpCode::try_from(bytes[offset]) {
                 Ok(opcode) => opcode,
@@ -258,11 +271,9 @@ impl Program {
             entries.push(Ok(Instruction { opcode, offset, next, operand }));
             offset = next;
         }
-        Self {
-            len: bytes.len(),
-            boundaries: boundaries.into_boxed_slice(),
-            entries: entries.into_boxed_slice(),
-        }
+        // Keep reserved Vec storage: converting to boxed slices can perform
+        // an additional infallible shrink/reallocation on this error path.
+        Ok(Self { len: bytes.len(), boundaries, entries })
     }
 
     pub fn instruction(&self, offset: usize) -> Result<Instruction, DecodeError> {
@@ -313,7 +324,7 @@ pub(super) struct ProgramCounter {
 impl ProgramCounter {
     #[cfg(test)]
     pub fn new(bytes: &[u8]) -> Self {
-        Self { program: Arc::new(Program::decode(bytes)), offset: 0 }
+        Self { program: Arc::new(Program::decode(bytes).unwrap()), offset: 0 }
     }
 
     pub fn as_offset(&self) -> usize {
@@ -340,15 +351,27 @@ impl ProgramCounter {
 /// Per-VM cache keyed by immutable code bytes, not movable function addresses.
 /// Re-entering a compiled function needs no code copy or decoding on a hit.
 #[derive(Default, Debug)]
-pub(super) struct ProgramCache(HashMap<Box<[u8]>, Arc<Program>>);
+pub(super) struct ProgramCache(HashMap<Vec<u8>, Arc<Program>>);
 
 impl ProgramCache {
+    fn reserve_programs(&mut self, additional: usize) -> Result<(), DecodeError> {
+        self.0
+            .try_reserve(additional)
+            .map_err(|_| DecodeError::Allocation { resource: "program cache" })
+    }
+
     pub fn cursor(&mut self, bytes: &[u8], offset: usize) -> Result<ProgramCounter, DecodeError> {
         let program = if let Some(program) = self.0.get(bytes) {
             program.clone()
         } else {
-            let program = Arc::new(Program::decode(bytes));
-            self.0.insert(bytes.into(), program.clone());
+            // Reserve every variable-size cache allocation before publishing
+            // the entry. A failed decode leaves existing cached programs valid.
+            self.reserve_programs(1)?;
+            let mut key = Vec::new();
+            reserve_metadata(&mut key, bytes.len(), "cache key")?;
+            key.extend_from_slice(bytes);
+            let program = Arc::new(Program::decode(bytes)?);
+            self.0.insert(key, program.clone());
             program
         };
         // A saved return offset may be exactly EOF. The subsequent fetch then
@@ -366,6 +389,43 @@ mod tests {
     use OpCode as O;
 
     #[test]
+    fn decoder_reservation_overflow_is_checked_without_mutating_existing_values() {
+        let mut metadata = vec![7usize, 9];
+        let error = reserve_metadata(&mut metadata, usize::MAX, "test metadata").unwrap_err();
+        assert_eq!(error, DecodeError::Allocation { resource: "test metadata" });
+        assert_eq!(metadata, [7, 9]);
+        assert_eq!(error.to_string(), "Cannot reserve bytecode test metadata");
+    }
+
+    #[test]
+    fn failed_cache_reservation_keeps_cached_cursor_valid() {
+        let mut cache = ProgramCache::default();
+        let first = cache.cursor(&[O::Constant0 as u8, O::Return as u8], 0).unwrap();
+        assert_eq!(
+            cache.reserve_programs(usize::MAX),
+            Err(DecodeError::Allocation { resource: "program cache" })
+        );
+        assert_eq!(cache.0.len(), 1);
+        let mut second = cache.cursor(&[O::Constant0 as u8, O::Return as u8], 0).unwrap();
+        assert!(Arc::ptr_eq(&first.program, &second.program));
+        assert_eq!(second.fetch().unwrap().opcode, O::Constant0);
+    }
+
+    #[test]
+    fn fallible_decoder_grows_instruction_storage_and_retains_lazy_error_entries() {
+        let mut bytes = vec![O::Constant0 as u8; 8192];
+        bytes.extend([51, O::ConstantN2 as u8, 0]);
+        let program = Program::decode(&bytes).unwrap();
+        assert_eq!(program.instruction(8191).unwrap().opcode, O::Constant0);
+        assert_eq!(
+            program.instruction(8192),
+            Err(DecodeError::UnknownOpcode { offset: 8192, byte: 51 })
+        );
+        assert_eq!(program.instruction(8193), Err(DecodeError::Truncated { offset: 8193 }));
+        assert_eq!(program.instruction(8194), Err(DecodeError::NotInstruction { offset: 8194 }));
+    }
+
+    #[test]
     fn every_opcode_family_has_checked_operand_widths() {
         for byte in 0..=u8::MAX {
             let Ok(opcode) = O::try_from(byte) else {
@@ -374,7 +434,7 @@ mod tests {
             let width = operand_bytes(opcode);
             let mut bytes = vec![byte];
             bytes.extend([0x34, 0x12].into_iter().take(width));
-            let instruction = Program::decode(&bytes).instruction(0).unwrap();
+            let instruction = Program::decode(&bytes).unwrap().instruction(0).unwrap();
             assert_eq!(instruction.next, 1 + width);
             assert_eq!(
                 instruction.operand,
@@ -386,7 +446,7 @@ mod tests {
             );
             for short in 1..=width {
                 assert!(matches!(
-                    Program::decode(&bytes[..short]).instruction(0),
+                    Program::decode(&bytes[..short]).unwrap().instruction(0),
                     Err(DecodeError::Truncated { offset: 0 })
                 ));
             }
@@ -397,10 +457,10 @@ mod tests {
     fn branches_must_target_instruction_starts_not_operands_or_eof() {
         for target in [1_u16, 2, 4, u16::MAX] {
             let [low, high] = target.to_le_bytes();
-            let program = Program::decode(&[O::Goto as u8, low, high, O::Return as u8]);
+            let program = Program::decode(&[O::Goto as u8, low, high, O::Return as u8]).unwrap();
             assert!(program.validate().is_err(), "target {target}");
         }
-        let program = Program::decode(&[O::Goto as u8, 3, 0, O::Return as u8]);
+        let program = Program::decode(&[O::Goto as u8, 3, 0, O::Return as u8]).unwrap();
         program.validate().unwrap();
         assert!(program.instruction(1).is_err());
     }
@@ -441,6 +501,6 @@ mod tests {
         ));
         cursor.goto(2).unwrap();
         assert_eq!(cursor.fetch().unwrap().opcode, O::Return);
-        assert!(Program::decode(&[O::PushCondtionCase as u8, 1, 0]).validate().is_err());
+        assert!(Program::decode(&[O::PushCondtionCase as u8, 1, 0]).unwrap().validate().is_err());
     }
 }
