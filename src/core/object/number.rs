@@ -206,20 +206,36 @@ impl NumberValue {
         }
     }
     pub(crate) fn bit_and(self, rhs: Self) -> Result<Self, NumericError> {
+        if let (Self::Int(left), Self::Int(right)) = (&self, &rhs) {
+            return Ok(Self::Int(left & right).normalize());
+        }
         Ok(Self::integer(self.into_integer()? & rhs.into_integer()?))
     }
     pub(crate) fn bit_or(self, rhs: Self) -> Result<Self, NumericError> {
+        if let (Self::Int(left), Self::Int(right)) = (&self, &rhs) {
+            return Ok(Self::Int(left | right).normalize());
+        }
         Ok(Self::integer(self.into_integer()? | rhs.into_integer()?))
     }
     pub(crate) fn bit_xor(self, rhs: Self) -> Result<Self, NumericError> {
+        if let (Self::Int(left), Self::Int(right)) = (&self, &rhs) {
+            return Ok(Self::Int(left ^ right).normalize());
+        }
         Ok(Self::integer(self.into_integer()? ^ rhs.into_integer()?))
     }
     pub(crate) fn bit_not(self) -> Result<Self, NumericError> {
+        if let Self::Int(value) = self {
+            return Ok(Self::Int(!value).normalize());
+        }
         Ok(Self::integer(!self.into_integer()?))
     }
     /// Count one bits for nonnegative values and zero bits for negative values
     /// in their infinite two's-complement representation.
     pub(crate) fn bit_count(self) -> Result<Self, NumericError> {
+        if let Self::Int(value) = self {
+            let magnitude = if value < 0 { !value } else { value };
+            return Ok(Self::Int(i64::from(magnitude.count_ones())));
+        }
         let value = self.into_integer()?;
         let value = if value.sign() == Sign::Minus { !value } else { value };
         let count: u64 = value
@@ -304,6 +320,17 @@ impl NumberValue {
         Ok(Self::integer(value << distance))
     }
     pub(crate) fn checked_div(self, rhs: Self) -> Result<Self, NumericError> {
+        if let (Self::Int(numerator), Self::Int(denominator)) = (&self, &rhs) {
+            if *denominator == 0 {
+                return Err(NumericError::DivisionByZero);
+            }
+            // The sole overflowing machine quotient is MIN / -1. Promote
+            // exactly that case; normal tagged-integer division allocates no BigInt.
+            return Ok(match numerator.checked_div(*denominator) {
+                Some(value) => Self::Int(value).normalize(),
+                None => Self::Big(BigInt::from(1_u8) << 63_usize),
+            });
+        }
         if matches!(self, Self::Float(_)) || matches!(rhs, Self::Float(_)) {
             return Ok(Self::Float(self.to_float() / rhs.to_float()));
         }
@@ -314,6 +341,20 @@ impl NumberValue {
         Ok(Self::integer(self.into_integer()? / denominator))
     }
     pub(crate) fn checked_rem(self, rhs: Self, modulo: bool) -> Result<Self, NumericError> {
+        if let (Self::Int(numerator), Self::Int(denominator)) = (&self, &rhs) {
+            if *denominator == 0 {
+                return Err(NumericError::DivisionByZero);
+            }
+            // MIN % -1 is mathematically zero, although Rust's primitive
+            // operation reports the paired division overflow.
+            let mut value = numerator.checked_rem(*denominator).unwrap_or(0);
+            if modulo && value != 0 && (value < 0) != (*denominator < 0) {
+                // Opposite signs and |value| < |denominator| guarantee this
+                // addition remains inside the denominator's signed domain.
+                value += denominator;
+            }
+            return Ok(Self::Int(value).normalize());
+        }
         if matches!(self, Self::Float(_)) || matches!(rhs, Self::Float(_)) {
             if !modulo {
                 return Err(NumericError::ExpectedInteger);
@@ -502,6 +543,91 @@ mod tests {
     use super::*;
     use crate::{core::gc::RootSet, interpreter::assert_lisp};
     use proptest::prelude::*;
+
+    #[test]
+    fn machine_bitwise_owned_extremes_normalize_results() {
+        for left in [i64::MIN, i64::MAX, MIN_FIXNUM, MAX_FIXNUM, -1, 0, 1] {
+            assert_eq!(NumberValue::Int(left).bit_not().unwrap().into_integer().unwrap(), !BigInt::from(left));
+            for right in [i64::MIN, i64::MAX, MIN_FIXNUM, MAX_FIXNUM, -1, 0, 1] {
+                let x = BigInt::from(left);
+                let y = BigInt::from(right);
+                for (actual, expected) in [
+                    (NumberValue::Int(left).bit_and(NumberValue::Int(right)).unwrap(), &x & &y),
+                    (NumberValue::Int(left).bit_or(NumberValue::Int(right)).unwrap(), &x | &y),
+                    (NumberValue::Int(left).bit_xor(NumberValue::Int(right)).unwrap(), &x ^ &y),
+                ] {
+                    assert_eq!(matches!(actual, NumberValue::Int(_)), expected.to_i64().and_then(Fixnum::new).is_some());
+                    assert_eq!(actual.into_integer().unwrap(), expected);
+                }
+            }
+        }
+        assert_eq!(NumberValue::Int(i64::MIN).bit_count().unwrap(), NumberValue::Int(63));
+        assert_eq!(NumberValue::Int(i64::MAX).bit_count().unwrap(), NumberValue::Int(63));
+        assert_eq!(NumberValue::Int(-1).bit_count().unwrap(), NumberValue::Int(0));
+    }
+
+    #[test]
+    fn machine_bitwise_boundary_matrix_matches_gnu() {
+        let values = [i64::MIN, i64::MIN + 1, MIN_FIXNUM - 1, MIN_FIXNUM,
+            -7, -1, 0, 1, 7, MAX_FIXNUM, MAX_FIXNUM + 1, i64::MAX - 1, i64::MAX];
+        for left in values {
+            let mut form = format!("(list (lognot {left}) (logcount {left})");
+            for right in values {
+                for operation in ["logand", "logior", "logxor"] {
+                    form.push_str(&format!(" ({operation} {left} {right})"));
+                }
+            }
+            form.push(')');
+            crate::assert_elprop!("{}", form);
+        }
+    }
+
+    #[test]
+    fn machine_divrem_lisp_boundary_matrix_matches_gnu() {
+        let values = [i64::MIN, i64::MIN + 1, MIN_FIXNUM - 1, MIN_FIXNUM,
+            -7, -1, 0, 1, 7, MAX_FIXNUM, MAX_FIXNUM + 1, i64::MAX - 1, i64::MAX];
+        for left in values {
+            let mut form = String::from("(list");
+            for right in values {
+                for operation in ["/", "%", "mod"] {
+                    form.push_str(&format!(" (condition-case nil ({operation} {left} {right}) (error 'caught))"));
+                }
+            }
+            form.push(')');
+            crate::assert_elprop!("{}", form);
+        }
+    }
+
+    #[test]
+    fn machine_division_and_remainder_cover_full_i64_domain() {
+        let values = [i64::MIN, i64::MIN + 1, MIN_FIXNUM - 1, MIN_FIXNUM,
+            -7, -1, 0, 1, 7, MAX_FIXNUM, MAX_FIXNUM + 1, i64::MAX - 1, i64::MAX];
+        for left in values {
+            for right in values {
+                let x = BigInt::from(left);
+                let y = BigInt::from(right);
+                if right == 0 {
+                    assert_eq!(NumberValue::Int(left).checked_div(NumberValue::Int(right)), Err(NumericError::DivisionByZero));
+                    for modulo in [false, true] {
+                        assert_eq!(NumberValue::Int(left).checked_rem(NumberValue::Int(right), modulo), Err(NumericError::DivisionByZero));
+                    }
+                    continue;
+                }
+                let quotient = NumberValue::Int(left).checked_div(NumberValue::Int(right)).unwrap();
+                assert_eq!(quotient.clone().into_integer().unwrap(), &x / &y);
+                assert!(matches!(quotient, NumberValue::Int(_)) == (&x / &y).to_i64().and_then(Fixnum::new).is_some());
+                for modulo in [false, true] {
+                    let mut expected = &x % &y;
+                    if modulo && !expected.is_zero() && expected.sign() != y.sign() {
+                        expected += &y;
+                    }
+                    let actual = NumberValue::Int(left).checked_rem(NumberValue::Int(right), modulo).unwrap();
+                    assert_eq!(actual.clone().into_integer().unwrap(), expected);
+                    assert!(matches!(actual, NumberValue::Int(_)) == expected.to_i64().and_then(Fixnum::new).is_some());
+                }
+            }
+        }
+    }
 
     #[test]
     fn exact_comparison_preserves_integer_information_and_ieee_classes() {
@@ -875,6 +1001,43 @@ mod tests {
     }
 
     proptest! {
+        #[test]
+        fn machine_bitwise_matches_bigint(left in any::<i64>(), right in any::<i64>()) {
+            let x = BigInt::from(left);
+            let y = BigInt::from(right);
+            for (actual, expected) in [
+                (NumberValue::Int(left).bit_and(NumberValue::Int(right)).unwrap(), &x & &y),
+                (NumberValue::Int(left).bit_or(NumberValue::Int(right)).unwrap(), &x | &y),
+                (NumberValue::Int(left).bit_xor(NumberValue::Int(right)).unwrap(), &x ^ &y),
+                (NumberValue::Int(left).bit_not().unwrap(), !&x),
+            ] {
+                prop_assert_eq!(matches!(actual, NumberValue::Int(_)), expected.to_i64().and_then(Fixnum::new).is_some());
+                prop_assert_eq!(actual.into_integer().unwrap(), expected);
+            }
+            let magnitude = if left < 0 { !x } else { x };
+            let expected: u64 = magnitude.magnitude().iter_u64_digits().map(|limb| u64::from(limb.count_ones())).sum();
+            let actual = NumberValue::Int(left).bit_count().unwrap();
+            prop_assert_eq!(actual.into_integer().unwrap(), BigInt::from(expected));
+        }
+
+        #[test]
+        fn machine_divrem_matches_bigint(left in any::<i64>(), right in any::<i64>()) {
+            if right != 0 {
+                let x = BigInt::from(left);
+                let y = BigInt::from(right);
+                let quotient = NumberValue::Int(left).checked_div(NumberValue::Int(right)).unwrap();
+                prop_assert_eq!(quotient.into_integer().unwrap(), &x / &y);
+                for modulo in [false, true] {
+                    let mut expected = &x % &y;
+                    if modulo && !expected.is_zero() && expected.sign() != y.sign() {
+                        expected += &y;
+                    }
+                    let actual = NumberValue::Int(left).checked_rem(NumberValue::Int(right), modulo).unwrap();
+                    prop_assert_eq!(actual.into_integer().unwrap(), expected);
+                }
+            }
+        }
+
         #[test]
         fn make_integer_round_trips_every_i64(value in any::<i64>()) {
             let roots = RootSet::default();
