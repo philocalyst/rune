@@ -3,6 +3,7 @@
 mod macros;
 mod process_transport;
 mod process;
+mod readonly;
 mod shell_startup;
 mod process_events;
 #[macro_use]
