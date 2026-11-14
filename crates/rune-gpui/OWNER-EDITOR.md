@@ -59,11 +59,13 @@ startup rejection, edit-success/render-failure and FIFO/backpressure tests. Thes
 are not native window tests. The exact recovered GPUI editor feature and original
 first-light plus editor_first_light sources pass cargo check with the pinned lock.
 
-No platform InputHandler is registered. There is no real preedit rendering,
-platform selection/range geometry, or consumed-key/platform-text suppression
-policy. A future handler must explicitly invalidate composition on every
-focus/window/buffer/document/caret/selection transition, including ABA, and use
-matching prepared layout/epoch for geometry. Full complex shaping and runtime
+The opt-in platform adapter is now implemented and compiler-checked; see
+PLATFORM-IME.md for its floating UI-only preedit, exact UTF-16 callbacks, paint-time
+registration and fixed command policy. Native behavior remains unverified. It
+invalidates composition on observed focus/window/buffer/document/caret/selection
+transitions and validates the owner sequence before captured replacement, including
+coalesced ABA covered by owner sequencing. It uses matching prepared layout/epoch
+for geometry. Direct owner setters must participate in that sequencing contract. Full complex shaping and runtime
 resolved-style/property-domain handling are not reconstructed here; paint uses
 plain default faces. No live Lisp current-buffer gateway is connected.
 
@@ -90,11 +92,47 @@ conversions. bind_ime_initialized can prepare a bounded plain context from the
 same owned epoch/caret as its frame, validate index roundtrips, and publish them
 atomically in a native metadata mailbox before its normal UI wake. An edit
 invalidates old writable context before any frame retry. This owner-side provider
-is checked, but the platform EntityInputHandler/UI preedit adapter is still under
-implementation and is NOT registered by this checkpoint.
+is checked. The later opt-in EntityInputHandler/UI preedit adapter is described
+in PLATFORM-IME.md; it registers during paint only for a new_ime view.
 
 Ordinary committed text has an ordered current-point event distinct from a
 captured-range composition: queued plain typing does not wait for a single IME
 ack slot or reuse stale scalar ranges. Explicit commands are likewise ordered.
 These are protocol primitives; platform command-consumption and callbacks must
 still choose exactly one insertion source before activation.
+
+
+## Production evaluator owner integration seam
+
+The IME example remains a pure Session fixture. A production root application
+must use its shared evaluator factory instead, on the dedicated owner thread:
+
+```text
+with_evaluator_runtime_owner(width, height, |host| {
+    let bridge = EditorBridge::new(host, metrics, bounds)?;
+    let worker = pending_owner.bind_ime_initialized(bridge, platform_publisher)?;
+    worker.run()?;
+    Ok(())
+})
+```
+
+This is an integration sketch, not an additional compiled example: root error
+adapters must preserve `InitializationFailure.error` and `.undelivered` rather
+than discard them through `?`. Retain an `Option<NativeEditorOwner>` until bind;
+on earlier factory/bridge failure, call `reject_unbound`, report the original
+queued events and terminate first-frame waiting. The root factory flattens its
+callback Result and must not ignore either startup or owner-loop failure.
+
+The current root factory accepts a scoped `MutableGatewayEditorHost`, obtains the
+same `Context::editor_gateway` as evaluator operations, and constructs no second
+Session. The host, Context and gateway never cross to the UI or escape the
+callback. `with_context` may call the evaluator/GC only outside an editor borrow;
+the present renderer loop does not itself dispatch Lisp commands. Adding a live
+Lisp command path requires a root owner-loop extension, not a UI Context handle.
+
+All direct mutations of selected text/caret/view or readonly policy must advance
+the checked owner sequence on successful changes. The supplemental owner fixes
+cover direct point, viewport start, readonly transitions and configuration restore;
+renderer regressions reject old captured compositions after each. Evaluator-local
+current-buffer bindings, save status and marker metadata are not selected-view
+composition transitions. This contract does not claim native OS verification.

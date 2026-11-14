@@ -108,6 +108,7 @@ where
         window_id: view.id.as_u64(),
         buffer_id: buffer.id.as_u64(),
         publication_epoch: epoch,
+        owner_sequence: snapshot.sequence,
     };
     if !frame.windows.iter().any(|w| {
         w.window_id == identity.window_id

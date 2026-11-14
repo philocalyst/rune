@@ -62,3 +62,11 @@ acknowledgment transport, prepared UTF-16 context and `editor_first_light` examp
 See OWNER-EDITOR.md for freshly checked scope, recovery staging paths and the
 remaining platform/runtime gates. This does not install an IME InputHandler or
 turn the fixture's historical native-link evidence into a GUI test.
+
+
+## Opt-in platform IME adapter
+
+`ime_first_light` uses the real EntityInputHandler adapter and UI-only floating
+preedit through `FrameView::new_ime`. See PLATFORM-IME.md for exact bounded scope,
+key policy, ownership and unverified native gates. This adapter is compiler/test
+checked only; it has not been run in a native window here.

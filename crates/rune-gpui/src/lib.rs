@@ -137,6 +137,8 @@ pub struct FrameView {
     focus: FocusHandle,
     input: FrameInput,
     resize: ResizeTracker,
+    #[cfg(feature = "editor")]
+    ime: Option<platform_handler::ImeBinding>,
 }
 impl FrameView {
     pub fn new(
@@ -162,6 +164,8 @@ impl FrameView {
                 quit,
             }))),
             resize: ResizeTracker::default(),
+            #[cfg(feature = "editor")]
+            ime: None,
         }
     }
     /// Editor-host constructor. Ordinary input and captured composition requests
@@ -187,6 +191,8 @@ impl FrameView {
                 sender, replies, quit, rejected, outcome,
             )),
             resize: ResizeTracker::default(),
+            #[cfg(feature = "editor")]
+            ime: None,
         }
     }
     /// Consume explicit composition outcomes before retrying the owner FIFO.
@@ -281,6 +287,10 @@ impl FrameView {
         }
     }
     pub fn shutdown_input(&mut self) {
+        #[cfg(feature = "editor")]
+        if let Some(ime) = &self.ime {
+            ime.state.borrow_mut().active(false);
+        }
         let input = match &self.input {
             FrameInput::Legacy(input) => input,
             #[cfg(feature = "editor")]
@@ -341,9 +351,15 @@ impl FrameView {
                         if update.input_capacity {
                             let _ = view.retry_input();
                         }
-                        if let Some(frame) = update.frame {
-                            if let Err(error) = view.present(frame, cx) {
-                                eprintln!("Rune frame rejected: {error}");
+                        #[cfg(feature = "editor")]
+                        let platform_handled = view.sync_platform(cx);
+                        #[cfg(not(feature = "editor"))]
+                        let platform_handled = false;
+                        if !platform_handled {
+                            if let Some(frame) = update.frame {
+                                if let Err(error) = view.present(frame, cx) {
+                                    eprintln!("Rune frame rejected: {error}");
+                                }
                             }
                         }
                     })
@@ -380,11 +396,27 @@ impl Render for FrameView {
         let metrics = self.font.metrics();
         let font = self.font.clone();
         let input = self.input.clone();
+        #[cfg(feature = "editor")]
+        let ime_for_key = self.ime.clone();
+        #[cfg(feature = "editor")]
+        let ime_for_pointer = self.ime.clone();
+        #[cfg(feature = "editor")]
+        let ime_for_paint = self.ime.clone();
+        #[cfg(feature = "editor")]
+        let input_entity = _cx.entity();
+        #[cfg(feature = "editor")]
+        let paint_focus = self.focus.clone();
         div()
             .id("rune-frame")
             .size_full()
             .track_focus(&self.focus)
-            .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+            .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                #[cfg(feature = "editor")]
+                if let Some(ime) = &ime_for_key {
+                    platform_handler::keydown(ime, &input, event, window, cx);
+                    return;
+                }
+                let _ = window;
                 let key = &event.keystroke;
                 FrameInput::submit(
                     &input,
@@ -408,6 +440,14 @@ impl Render for FrameView {
                         MouseButton::Right => 3,
                         _ => return,
                     };
+                    #[cfg(feature = "editor")]
+                    if let Some(ime) = &ime_for_pointer {
+                        if button == 1 {
+                            ime.state.borrow_mut().invalidate(true);
+                        } else {
+                            ime.state.borrow_mut().cancel_preedit();
+                        }
+                    }
                     FrameInput::submit(&pointer_input, InputEvent::PointerHit { hit, button });
                     window.focus(&pointer_focus);
                     cx.stop_propagation();
@@ -425,6 +465,37 @@ impl Render for FrameView {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, cx| {
+                        #[cfg(feature = "editor")]
+                        let overlay = ime_for_paint.as_ref().and_then(|ime| {
+                            ime.bounds.set(Some(bounds));
+                            // A transient unavailable selection is reported as None
+                            // by callbacks, not by removing the handler and silently
+                            // dropping ordinary platform text between owner frames.
+                            window.handle_input(
+                                &paint_focus,
+                                gpui::ElementInputHandler::new(bounds, input_entity.clone()),
+                                cx,
+                            );
+                            ime.state.borrow().overlay()
+                        });
+                        #[cfg(feature = "editor")]
+                        let painted_frame = if let Some(overlay) = &overlay {
+                            let mut base = (*frame).clone();
+                            for w in &mut base.windows {
+                                if overlay.windows.iter().any(|p| {
+                                    p.window_id == w.window_id
+                                        && p.buffer_id == w.buffer_id
+                                        && p.revision == w.revision
+                                }) {
+                                    w.cursor = None;
+                                }
+                            }
+                            Arc::new(base)
+                        } else {
+                            frame.clone()
+                        };
+                        #[cfg(not(feature = "editor"))]
+                        let painted_frame = frame.clone();
                         let mut target = GpuiTarget {
                             window,
                             cx,
@@ -433,7 +504,28 @@ impl Render for FrameView {
                             font: font.clone(),
                             paint_failed: false,
                         };
-                        rune_display::paint_frame(&frame, metrics, &mut target);
+                        rune_display::paint_frame(&painted_frame, metrics, &mut target);
+                        #[cfg(feature = "editor")]
+                        if let Some(overlay) = overlay {
+                            rune_display::paint_frame(&overlay, metrics, &mut target);
+                            target.push_clip(overlay.bounds);
+                            for window in &overlay.windows {
+                                for row in &window.rows {
+                                    for cluster in &row.clusters {
+                                        target.fill(
+                                            Rect {
+                                                x: cluster.bounds.x,
+                                                y: row.baseline + 1.,
+                                                width: cluster.bounds.width,
+                                                height: 1.,
+                                            },
+                                            Color(240, 210, 120, 255),
+                                        );
+                                    }
+                                }
+                            }
+                            target.pop_clip();
+                        }
                     },
                 )
                 .size_full(),
@@ -528,3 +620,10 @@ pub mod owner_input;
 
 #[cfg(feature = "editor")]
 pub mod platform_context;
+
+#[cfg(feature = "editor")]
+mod ime_keys;
+#[cfg(feature = "editor")]
+pub mod platform_handler;
+#[cfg(feature = "editor")]
+pub mod platform_state;

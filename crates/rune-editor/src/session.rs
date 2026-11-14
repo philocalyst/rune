@@ -310,17 +310,7 @@ impl<D: Document> Session<D> {
         }
     }
     pub fn set_current_point(&mut self, position: usize) -> Result<()> {
-        let id = self.state.current;
-        if position > self.document(id)?.len_chars() {
-            return Err(EditorError::InvalidPosition);
-        }
-        if self.state.windows.view(self.selected_window())?.buffer == id {
-            self.move_point(position)
-        } else {
-            self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?.saved_point =
-                position;
-            Ok(())
-        }
+        self.set_buffer_point(self.state.current, position)
     }
     pub fn buffer_point(&self, id: BufferId) -> Result<usize> {
         let view = self.state.windows.view(self.selected_window())?;
@@ -334,12 +324,19 @@ impl<D: Document> Session<D> {
         if point > self.document(id)?.len_chars() {
             return Err(EditorError::InvalidPosition);
         }
+        if self.buffer_point(id)? == point {
+            return Ok(());
+        }
+        // Direct Lisp/gateway motion is not Session::execute, but must still
+        // invalidate captured native scope, including away-and-back ABA.
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
         if self.state.windows.view(self.selected_window())?.buffer == id {
-            self.move_point(point)
+            self.move_point(point)?;
         } else {
             self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?.saved_point = point;
-            Ok(())
         }
+        self.state.sequence = sequence;
+        Ok(())
     }
     pub fn last_command(&self) -> Option<CommandKind> {
         self.state.last_command
@@ -443,7 +440,13 @@ impl<D: Document> Session<D> {
         Ok(())
     }
     pub fn set_read_only(&mut self, id: BufferId, read_only: bool) -> Result<()> {
+        let old = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.read_only;
+        if old == read_only {
+            return Ok(());
+        }
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
         self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?.read_only = read_only;
+        self.state.sequence = sequence;
         Ok(())
     }
     pub fn mark_saved(&mut self, id: BufferId) -> Result<()> {
@@ -460,7 +463,12 @@ impl<D: Document> Session<D> {
         if start > self.document(buffer)?.len_chars() {
             return Err(EditorError::InvalidPosition);
         }
+        if self.state.windows.view(id)?.start == start {
+            return Ok(());
+        }
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
         self.state.windows.view_mut(id)?.start = start;
+        self.state.sequence = sequence;
         Ok(())
     }
     fn remember(&mut self, id: BufferId) {
@@ -1216,12 +1224,14 @@ impl<D: Document> Session<D> {
             view.start = view.start.min(length);
         }
         windows.check_invariants()?;
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
         self.state.windows = windows;
         self.state.current = if self.buffer_live(configuration.current) {
             configuration.current
         } else {
             fallback
         };
+        self.state.sequence = sequence;
         Ok(())
     }
     pub fn snapshot(&self) -> SessionSnapshot<D> {
@@ -1318,5 +1328,25 @@ mod publication_tests {
             assert_eq!(session.document(id).unwrap().to_text(), "a");
             assert_eq!(session.state.buffers[&id].version, 1);
         }
+    }
+}
+#[cfg(test)]
+mod direct_scope_sequence_tests {
+    use super::*;
+    use crate::StringDocument;
+    #[test]
+    fn exhausted_scope_sequence_rejects_direct_ui_mutations_before_change() {
+        let mut s = Session::new(StringDocument::from("abc"), 80, 24).unwrap();
+        let b = s.current_buffer();
+        let w = s.selected_window();
+        let config = s.window_configuration();
+        s.state.sequence = u64::MAX;
+        assert_eq!(s.set_buffer_point(b, 1), Err(EditorError::IdExhausted));
+        assert_eq!(s.set_window_start(w, 1), Err(EditorError::IdExhausted));
+        assert_eq!(s.set_read_only(b, true), Err(EditorError::IdExhausted));
+        assert_eq!(s.restore_window_configuration(&config), Err(EditorError::IdExhausted));
+        let view = s.state.windows.view(w).unwrap();
+        assert_eq!((view.point, view.start), (0, 0));
+        assert!(!s.state.buffers.get(&b).unwrap().read_only);
     }
 }

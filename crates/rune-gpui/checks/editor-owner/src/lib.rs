@@ -19,3 +19,9 @@ mod font_geometry;
 
 #[path = "../../../src/platform_context.rs"]
 pub mod platform_context;
+
+#[path = "../../../src/platform_state.rs"]
+pub mod platform_state;
+#[allow(dead_code)]
+#[path = "../../../src/ime_keys.rs"]
+mod ime_keys;

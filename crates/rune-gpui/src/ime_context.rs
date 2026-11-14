@@ -7,6 +7,7 @@ pub struct ImeIdentity {
     pub window_id: u64,
     pub buffer_id: u64,
     pub publication_epoch: u64,
+    pub owner_sequence: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContextError {
@@ -109,6 +110,7 @@ impl PreparedImeContext {
             window_id: identity.window_id,
             buffer_id: identity.buffer_id,
             publication_epoch: identity.publication_epoch,
+            owner_sequence: identity.owner_sequence,
             replacement: self.exact_scalar_range(identity, range)?,
         })
     }
@@ -148,7 +150,7 @@ impl PreparedImeContext {
 mod tests {
     use super::*;
     fn id() -> ImeIdentity {
-        ImeIdentity { window_id: 1, buffer_id: 2, publication_epoch: 3 }
+        ImeIdentity { window_id: 1, buffer_id: 2, publication_epoch: 3, owner_sequence: 4 }
     }
     #[test]
     fn emoji_replacement_exact_and_read_adjusted_are_distinct() {

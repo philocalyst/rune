@@ -228,6 +228,7 @@ mod tests {
             window_id: v.id.as_u64(),
             buffer_id: d.id.as_u64(),
             publication_epoch: d.display_snapshot().revision(),
+            owner_sequence: s.sequence,
             replacement: v.view.point..v.view.point,
         }))
         .unwrap();

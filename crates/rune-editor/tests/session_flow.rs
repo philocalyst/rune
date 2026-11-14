@@ -455,3 +455,44 @@ fn pointer_prefix_cancellation_is_success_only_in_owner_transaction() {
     assert_eq!(s.snapshot().views.len(), 2);
     assert_eq!(s.document(b).unwrap().to_text(), "2x");
 }
+#[test]
+fn direct_runtime_point_motion_advances_scope_sequence_through_aba() {
+    let mut s = Session::new(StringDocument::from("ab"), 80, 24).unwrap();
+    let b = s.current_buffer();
+    let initial = s.snapshot();
+    s.set_buffer_point(b, 1).unwrap();
+    s.set_buffer_point(b, 0).unwrap();
+    let now = s.snapshot();
+    assert_eq!(now.views[0].view.point, initial.views[0].view.point);
+    assert_eq!(now.buffers[0].version, initial.buffers[0].version);
+    assert!(now.sequence > initial.sequence);
+    let before = now.sequence;
+    assert!(s.set_buffer_point(b, 99).is_err());
+    assert_eq!(s.snapshot().sequence, before);
+}
+#[test]
+fn direct_visible_scope_and_policy_setters_invalidate_aba_but_private_current_does_not() {
+    let mut s = Session::new(StringDocument::from("abc"), 80, 24).unwrap();
+    let b = s.current_buffer();
+    let w = s.selected_window();
+    let original = s.window_configuration();
+    let mut seq = s.snapshot().sequence;
+    s.set_window_start(w, 1).unwrap();
+    s.set_window_start(w, 0).unwrap();
+    assert!(s.snapshot().sequence > seq);
+    seq = s.snapshot().sequence;
+    s.set_read_only(b, true).unwrap();
+    s.set_read_only(b, false).unwrap();
+    assert!(s.snapshot().sequence > seq);
+    seq = s.snapshot().sequence;
+    s.restore_window_configuration(&original).unwrap();
+    assert!(s.snapshot().sequence > seq);
+    seq = s.snapshot().sequence;
+    let background = s.create_buffer("runtime-private", StringDocument::empty()).unwrap();
+    s.set_current_buffer(background).unwrap();
+    s.set_current_buffer(b).unwrap();
+    assert_eq!(s.snapshot().sequence, seq);
+    assert_eq!(s.selected_window(), w);
+    assert!(s.set_window_start(w, 99).is_err());
+    assert_eq!(s.snapshot().sequence, seq);
+}

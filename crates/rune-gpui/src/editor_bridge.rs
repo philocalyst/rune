@@ -97,6 +97,7 @@ where
             window_id,
             buffer_id,
             publication_epoch: buffer.display_snapshot().revision(),
+            owner_sequence: snapshot.sequence,
             replacement: view.view.point..view.view.point,
         };
         self.commit_composition(CommittedText { context, text })
@@ -117,7 +118,8 @@ where
             .iter()
             .find(|b| b.id == view.view.buffer)
             .ok_or(EditorError::StaleInput)?;
-        if buffer.id.as_u64() != c.buffer_id
+        if snapshot.sequence != c.owner_sequence
+            || buffer.id.as_u64() != c.buffer_id
             || buffer.display_snapshot().revision() != c.publication_epoch
             || (c.replacement.is_empty() && view.view.point != c.replacement.start)
         {
@@ -404,6 +406,7 @@ mod tests {
             window_id: v.id.as_u64(),
             buffer_id: buffer.id.as_u64(),
             publication_epoch: buffer.display_snapshot().revision(),
+            owner_sequence: s.sequence,
             replacement: 0..0,
         };
         b.commit_text(c.window_id, c.buffer_id, "first".into()).unwrap();
@@ -412,5 +415,152 @@ mod tests {
             Err(BridgeError::Editor(EditorError::StaleInput))
         ));
         assert_eq!(b.snapshot().unwrap().buffers[0].document.to_text(), "first");
+    }
+    #[test]
+    fn captured_composition_rejects_coalesced_buffer_aba_even_when_ids_and_text_epoch_match() {
+        let mut session = Session::new(RopeDocument::empty(), 80, 24).unwrap();
+        let original = session.current_buffer();
+        let other = session.create_buffer("other", RopeDocument::empty()).unwrap();
+        let mut b = EditorBridge::new(session, FixedMetrics::default(), bounds())
+            .unwrap()
+            .with_text_source(TextSource::CommittedText)
+            .unwrap();
+        let s = b.snapshot().unwrap();
+        let view = s.views.iter().find(|v| v.id == s.selected_window).unwrap();
+        let buffer = s.buffers.iter().find(|x| x.id == original).unwrap();
+        let context = CompositionContext {
+            window_id: view.id.as_u64(),
+            buffer_id: original.as_u64(),
+            publication_epoch: buffer.display_snapshot().revision(),
+            owner_sequence: s.sequence,
+            replacement: 0..0,
+        };
+        b.host.execute(Command::SwitchBuffer(other)).unwrap();
+        b.host.execute(Command::SwitchBuffer(original)).unwrap();
+        let now = b.snapshot().unwrap();
+        assert_eq!(now.current_buffer, original);
+        assert!(now.sequence > s.sequence);
+        assert!(matches!(
+            b.commit_composition(CommittedText { context, text: "late".into() }),
+            Err(BridgeError::Editor(EditorError::StaleInput))
+        ));
+        assert_eq!(
+            b.snapshot()
+                .unwrap()
+                .buffers
+                .iter()
+                .find(|b| b.id == original)
+                .unwrap()
+                .document
+                .to_text(),
+            ""
+        );
+    }
+    #[test]
+    fn captured_composition_rejects_direct_point_aba_without_text_change() {
+        let mut session = Session::new(RopeDocument::empty(), 80, 24).unwrap();
+        session.execute(Command::Insert("ab".into())).unwrap();
+        let original = session.current_buffer();
+        let mut b = EditorBridge::new(session, FixedMetrics::default(), bounds())
+            .unwrap()
+            .with_text_source(TextSource::CommittedText)
+            .unwrap();
+        let s = b.snapshot().unwrap();
+        let view = s.views.iter().find(|v| v.id == s.selected_window).unwrap();
+        let buffer = s.buffers.iter().find(|x| x.id == original).unwrap();
+        let point = view.view.point;
+        let context = CompositionContext {
+            window_id: view.id.as_u64(),
+            buffer_id: original.as_u64(),
+            publication_epoch: buffer.display_snapshot().revision(),
+            owner_sequence: s.sequence,
+            replacement: point..point,
+        };
+        b.host.set_buffer_point(original, if point == 0 { 1 } else { 0 }).unwrap();
+        b.host.set_buffer_point(original, point).unwrap();
+        let now = b.snapshot().unwrap();
+        assert!(now.sequence > s.sequence);
+        assert_eq!(
+            now.views.iter().find(|v| v.id == now.selected_window).unwrap().view.point,
+            point
+        );
+        assert_eq!(
+            now.buffers
+                .iter()
+                .find(|x| x.id == original)
+                .unwrap()
+                .display_snapshot()
+                .revision(),
+            context.publication_epoch
+        );
+        assert!(matches!(
+            b.commit_composition(CommittedText { context, text: "late".into() }),
+            Err(BridgeError::Editor(EditorError::StaleInput))
+        ));
+        assert_eq!(
+            b.snapshot()
+                .unwrap()
+                .buffers
+                .iter()
+                .find(|x| x.id == original)
+                .unwrap()
+                .document
+                .to_text(),
+            "ab"
+        );
+    }
+    #[test]
+    fn captured_composition_rejects_direct_visible_scope_and_policy_transitions() {
+        for operation in 0..3 {
+            let mut session = Session::new(RopeDocument::empty(), 80, 24).unwrap();
+            session.execute(Command::Insert("ab".into())).unwrap();
+            let mut b = EditorBridge::new(session, FixedMetrics::default(), bounds())
+                .unwrap()
+                .with_text_source(TextSource::CommittedText)
+                .unwrap();
+            let s = b.snapshot().unwrap();
+            let view = s.views.iter().find(|v| v.id == s.selected_window).unwrap();
+            let buffer = s.buffers.iter().find(|x| x.id == view.view.buffer).unwrap();
+            let context = CompositionContext {
+                window_id: view.id.as_u64(),
+                buffer_id: buffer.id.as_u64(),
+                publication_epoch: buffer.display_snapshot().revision(),
+                owner_sequence: s.sequence,
+                replacement: view.view.point..view.view.point,
+            };
+            match operation {
+                0 => {
+                    b.host.set_window_start(view.id, 1).unwrap();
+                    b.host.set_window_start(view.id, view.view.start).unwrap();
+                }
+                1 => {
+                    b.host.set_read_only(buffer.id, true).unwrap();
+                    b.host.set_read_only(buffer.id, false).unwrap();
+                }
+                _ => {
+                    let configuration = b.host.window_configuration();
+                    b.host.restore_window_configuration(&configuration).unwrap();
+                }
+            }
+            assert!(b.snapshot().unwrap().sequence > s.sequence, "operation {operation}");
+            assert!(
+                matches!(
+                    b.commit_composition(CommittedText { context, text: "late".into() }),
+                    Err(BridgeError::Editor(EditorError::StaleInput))
+                ),
+                "operation {operation}"
+            );
+            assert_eq!(
+                b.snapshot()
+                    .unwrap()
+                    .buffers
+                    .iter()
+                    .find(|x| x.id == buffer.id)
+                    .unwrap()
+                    .document
+                    .to_text(),
+                "ab"
+            );
+        }
     }
 }

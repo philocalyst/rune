@@ -16,6 +16,7 @@ pub struct CompositionContext {
     pub window_id: u64,
     pub buffer_id: u64,
     pub publication_epoch: u64,
+    pub owner_sequence: u64,
     /// Exact Unicode scalar boundaries, converted by the owner-prepared UTF-16
     /// context. Never round a surrogate interior or substitute current point.
     pub replacement: Range<usize>,
@@ -108,6 +109,24 @@ impl CompositionState {
         p.preedit = text;
         Ok(())
     }
+    /// A UI-local virtual edit may expand its original replacement while the
+    /// same captured owner scope/epoch remains active. Never amend after emission.
+    pub fn amend_replacement(
+        &mut self,
+        token: CompositionToken,
+        replacement: Range<usize>,
+    ) -> Result<(), CompositionError> {
+        if replacement.start > replacement.end {
+            return Err(CompositionError::InvalidRange);
+        }
+        let pending = self
+            .pending
+            .as_mut()
+            .filter(|p| p.token == token && !p.emitted)
+            .ok_or(CompositionError::StaleToken)?;
+        pending.context.replacement = replacement;
+        Ok(())
+    }
     pub fn commit(
         &mut self,
         token: CompositionToken,
@@ -146,7 +165,13 @@ impl CompositionState {
 mod tests {
     use super::*;
     fn context() -> CompositionContext {
-        CompositionContext { window_id: 1, buffer_id: 2, publication_epoch: 3, replacement: 1..2 }
+        CompositionContext {
+            window_id: 1,
+            buffer_id: 2,
+            publication_epoch: 3,
+            owner_sequence: 4,
+            replacement: 1..2,
+        }
     }
     #[test]
     fn emitted_commit_is_not_resubmitted_and_rejection_stays_pending() {
