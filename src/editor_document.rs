@@ -1745,3 +1745,17 @@ mod lisp_native_entry_sync_tests {
         }).unwrap();
     }
 }
+
+#[cfg(test)]
+mod persistent_env_gc_tests {
+    use super::*;use rune_editor::{EditorHost,Document};
+    #[test]
+    fn persistent_rooted_env_survives_gc_between_owner_requests(){
+        with_lisp_runtime_owner(80,24,|mut host|{
+            host.evaluate_source("(setq owner-persistent-state (list \"survives-owner-gc\"))").map_err(anyhow::Error::msg)?;
+            host.owner.with_context(|cx,_|{cx.garbage_collect(true);Ok(())})?;
+            host.evaluate_source("(if (equal (car owner-persistent-state) \"survives-owner-gc\") (insert \"rooted\") (error \"lost rooted env\"))").map_err(anyhow::Error::msg)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(),"rooted");Ok(())
+        }).unwrap();
+    }
+}

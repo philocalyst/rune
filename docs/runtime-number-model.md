@@ -146,10 +146,14 @@ regressions are included in the latest unit run described above:
 * `most-positive-fixnum` and `most-negative-fixnum` initialize the actual current
   56-bit storage bounds required by bundled `subr.el`. `natnump` accepts
   nonnegative machine or arbitrary-precision integers and rejects floats.
-* GNU documents its bound variables as read-only. This implementation initializes
-  ordinary variables and does **not** yet enforce immutable value bindings.
-  Separate variable-constant metadata is needed; the existing `is_const` flag
-  also constrains function cells and cannot safely stand in for that metadata.
+* The two builtin bound symbols have a separate identity-based read-only value
+  policy. User assignment and dynamic binding reject writes before mutation;
+  generated startup initialization remains privileged. Their function cells
+  remain writable, and an uninterned symbol with the same name is not read-only.
+  Ordinary Lisp `defconst` declarations do not make later runtime writes illegal.
+  This policy does not constrain lexical lambda/handler slots shadowing these
+  names, matching GNU lexical-mode behavior. Existing function-cell `is_const`
+  is deliberately unchanged; named `setting-constant` conditions remain pending.
 * Property-test fixnum strategies use the canonical bounds and direct ranges
   instead of filtering arbitrary i64 values with very low acceptance rates.
 * Runtime floats and property-test fixtures share a formatter for Lisp's

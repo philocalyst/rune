@@ -105,6 +105,9 @@ impl<'a> RootedEnv<'a> {
     }
 
     pub(crate) fn validate_variable_value(var: Symbol, value: Object) -> Result<()> {
+        if var.is_builtin_value_constant() {
+            return Err(anyhow!("Attempt to set a constant symbol: {var}"));
+        }
         if var == crate::sym::INTEGER_WIDTH {
             Number::try_from(value)?.integer_width()?;
         }
@@ -347,5 +350,67 @@ mod feature_ownership_tests {
             let fresh = Symbol::new_uninterned("local-feature", &cx.block);
             assert!(!env.has_feature(fresh, cx));
         }
+    }
+}
+
+#[cfg(test)]
+mod builtin_value_constant_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::{rebind, root};
+
+    #[test]
+    fn numeric_bounds_are_readonly_values_not_readonly_function_cells() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx)?), cx);
+        // Startup is privileged: generated initializers insert the builtin
+        // values directly rather than using user assignment/binding APIs.
+        init_variables(cx, env);
+        for var in [sym::MOST_POSITIVE_FIXNUM, sym::MOST_NEGATIVE_FIXNUM] {
+            let before = env.vars.get(var).unwrap().bind(cx);
+            root!(before, cx);
+            let depth = env.binding_depth();
+            assert!(var.is_builtin_value_constant());
+            assert!(!var.is_const(), "value policy must not constrain function cells");
+            assert!(env.set_var(var, cx.add(1_i64)).is_err());
+            assert!(env.varbind(var, cx.add(1_i64), cx).is_err());
+            assert_eq!(env.binding_depth(), depth);
+            assert_eq!(env.vars.get(var).unwrap().bind(cx), before.bind(cx));
+            // Function namespace stays writable; restore any original slot
+            // before asserting so the global test table is not left changed.
+            let original = var.func(cx).map(|f| f.as_obj_copy()).unwrap_or(crate::sym::NIL.into());
+            let assigned = crate::data::fset(var, cx.add(sym::IDENTITY));
+            let restored = crate::data::fset(var, original);
+            assert!(assigned.is_ok());
+            assert!(restored.is_ok());
+        }
+        let same_name = Symbol::new_uninterned("most-positive-fixnum", &cx.block);
+        assert!(!same_name.is_builtin_value_constant());
+        env.set_var(same_name, cx.add(1_i64))?;
+        for source in [
+            "(condition-case nil (setq most-positive-fixnum 1) (error 'caught))",
+            "(condition-case nil (set 'most-negative-fixnum 0) (error 'caught))",
+            "(condition-case nil (let ((most-positive-fixnum 1)) 1) (error 'caught))",
+            "(condition-case nil (setq most-positive-fixnum most-positive-fixnum) (error 'caught))",
+        ] {
+            let form = crate::reader::read(source, cx)?.0;
+            root!(form, cx);
+            let result = rebind!(crate::interpreter::eval(form, None, env, cx)?, cx);
+            assert_eq!(result, intern("caught", cx));
+        }
+        // Lexical lambda/handler slots may shadow these names, as in GNU's
+        // lexical mode. The gate applies to actual global/dynamic writes.
+        for source in [
+            "(funcall (function (lambda (most-positive-fixnum) (setq most-positive-fixnum 2))) 1)",
+            "(condition-case most-positive-fixnum (if) (error (setq most-positive-fixnum 2)))",
+        ] {
+            let form = crate::reader::read(source, cx)?.0;
+            root!(form, cx);
+            let result = rebind!(crate::interpreter::eval(form, None, env, cx)?, cx);
+            assert_eq!(result, Object::from(2_i64));
+        }
+        Ok(())
     }
 }

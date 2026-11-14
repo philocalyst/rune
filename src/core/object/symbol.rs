@@ -103,6 +103,12 @@ impl<'a> Symbol<'a> {
     pub(crate) fn is_special(self) -> bool {
         self.0.special.load(Ordering::Acquire)
     }
+
+    /// Builtin read-only value bindings, independent of function-cell policy.
+    /// Ordinary Lisp defconst declarations do not make runtime writes illegal.
+    pub(crate) fn is_builtin_value_constant(self) -> bool {
+        self == crate::sym::MOST_POSITIVE_FIXNUM || self == crate::sym::MOST_NEGATIVE_FIXNUM
+    }
 }
 
 // Symbols can be uninterned and heap-local. Do not transfer the borrowed
