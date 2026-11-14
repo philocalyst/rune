@@ -9,6 +9,9 @@ use anyhow::{Result, anyhow, ensure};
 use rune_macros::defun;
 defsym!(FACE);
 defsym!(UNSPECIFIED);
+// GNU Emacs src/emacs.c initializes the X-resource policy switch to false.
+// Terminal frame capability, not a forced true flag, avoids X resource calls.
+defvar_bool!(INHIBIT_X_RESOURCES, false);
 defvar!(FACE__NEW_FRAME_DEFAULTS, crate::face_attributes::new_table(cx));
 const VECTOR_SIZE: usize = 20;
 pub(crate) fn new_table<'a>(cx: &'a Context) -> Object<'a> {
@@ -346,6 +349,17 @@ fn internal_set_lisp_face_attribute<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn x_resource_policy_has_real_native_false_default_and_remains_settable() {
+        use crate::core::gc::RootSet;use rune_core::macros::root;use super::*;
+        let roots=RootSet::default();let cx=&mut Context::new(&roots);sym::init_symbols();root!(env,init(Env::new_isolated(cx).unwrap()),cx);
+        crate::core::env::init_variables(cx,env);
+        assert!(crate::data::symbol_value(sym::INHIBIT_X_RESOURCES,env,cx).unwrap().is_nil());
+        crate::lread::load_internal("(setq inhibit-x-resources t)",cx,env).unwrap();
+        assert_eq!(crate::data::symbol_value(sym::INHIBIT_X_RESOURCES,env,cx).unwrap(),TRUE);
+        crate::lread::load_internal("(setq inhibit-x-resources nil)",cx,env).unwrap();
+        assert!(crate::data::symbol_value(sym::INHIBIT_X_RESOURCES,env,cx).unwrap().is_nil());
+    }
     #[test]
     fn alias_first_local_creation_preserves_observed_gnu_lookup_quirk() {
         // GNU 30.1 resolves lookup but inserts the original alias key for a
