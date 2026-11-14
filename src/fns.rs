@@ -2384,7 +2384,7 @@ mod string_property_transform_tests {
         assert_eq!((runs[0].start,runs[0].end),(0,1));
     }
     #[test]
-    fn property_bearing_insert_rejects_before_owner_edit() {
+    fn property_bearing_insert_preserves_properties_in_one_owner_edit() {
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
@@ -2392,11 +2392,12 @@ mod string_property_transform_tests {
         let input = unsafe { copy_string_with_properties(cx.add("abc"), &[StringPropertyRun{start:0,end:3,plist}],cx) }.unwrap();
         env.stack.push(input);
         let before = env.buffer_read(cx).unwrap();
-        assert!(crate::editfns::insert(crate::core::env::ArgSlice::new(1),env,cx).is_err());
+        crate::editfns::insert(crate::core::env::ArgSlice::new(1),env,cx).unwrap();
         let after = env.buffer_read(cx).unwrap();
-        assert_eq!(before.epoch,after.epoch);
-        assert_eq!(before.point,after.point);
-        assert_eq!(after.document.text().to_string(), "");
+        assert_eq!(after.epoch,before.epoch+1);
+        assert_eq!(after.point,before.point+3);
+        assert_eq!(after.document.text().to_string(), "abc");
+        assert_eq!(crate::textprops::get_text_property(1,42.into(),None,env,cx).unwrap(),Object::from(true));
     }
 
 }

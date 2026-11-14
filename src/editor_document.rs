@@ -2331,3 +2331,87 @@ mod overlay_handle_owner_stamp_tests {
 
 mod native_startup;
 pub(crate) use native_startup::check_native_bootstrap;
+
+impl RuntimeEditorGateway {
+    /// Atomic text plus property insertion. Spans are relative scalar ranges,
+    /// sorted and non-overlapping; gaps receive nil properties. Handles must be
+    /// minted by this owner's registry before entry; no Lisp callbacks run here.
+    pub(crate) fn insert_with_properties(
+        &self, handle: OwnerBufferHandle, expected_epoch: u64, at: usize, text: &str,
+        spans: impl IntoIterator<Item=(Range<CharPos>, PropertySetHandle)>, cx: &Context,
+    ) -> anyhow::Result<()> {
+        self.check(cx)?;
+        let spans: Vec<_> = spans.into_iter().take(4097).collect();
+        anyhow::ensure!(spans.len() <= 4096, "Inserted property span limit exceeded");
+        let inserted = text.chars().count();
+        let mut end = 0;
+        for (range, _) in &spans {
+            anyhow::ensure!(range.start.0 >= end && range.start < range.end && range.end.0 <= inserted,
+                "Invalid or overlapping inserted property spans");
+            end=range.end.0;
+        }
+        let mut owner=self.inner.try_borrow_mut()?;
+        let id=owner.validate_handle(handle,cx)?;
+        let captured=owner.session.buffer_snapshot(id)?;
+        anyhow::ensure!(captured.version == expected_epoch, "Stale annotated insertion");
+        let mut prepared=captured.document.replace(at..at,text)?;
+        let nil=owner.properties.empty(cx)?;
+        if inserted>0 {
+            prepared=prepared.set_properties(CharPos(at)..CharPos(at.checked_add(inserted).ok_or_else(||anyhow::anyhow!("Insertion offset overflow"))?),&nil,&owner.properties,cx)?;
+        }
+        for (range, property) in spans {
+            let start=at.checked_add(range.start.0).ok_or_else(||anyhow::anyhow!("Insertion offset overflow"))?;
+            let end=at.checked_add(range.end.0).ok_or_else(||anyhow::anyhow!("Insertion offset overflow"))?;
+            prepared=prepared.set_properties(CharPos(start)..CharPos(end),&property,&owner.properties,cx)?;
+        }
+        owner.session.insert_buffer_prepared(id,expected_epoch,at,text,prepared)?;
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod annotated_insertion_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_editor::Command;
+    #[test]
+    fn annotated_insert_is_one_history_epoch_and_retains_roots_through_undo_redo() {
+        let roots=RootSet::default(); let mut cx=Context::new(&roots);
+        let g=RuntimeEditorGateway::new(&cx,80,24).unwrap();
+        let h=g.create("annotated","ab",&cx).unwrap();
+        let id=g.inner.borrow().validate_handle(h,&cx).unwrap();
+        g.inner.borrow_mut().session.execute(Command::SwitchBuffer(id)).unwrap();
+        let old=g.read(h,&cx).unwrap();
+        let marker=g.register_marker(h,1,Bias::Right,&cx).unwrap();
+        let property=unsafe{g.intern_property(cx.add("face"),&cx)}.unwrap(); let property_id=property.id();
+        g.insert_with_properties(h,old.epoch,1,"λ🙂",[(CharPos(0)..CharPos(2),property)],&cx).unwrap();
+        let now=g.read(h,&cx).unwrap();
+        assert_eq!(now.document.to_text(),"aλ🙂b"); assert_eq!(now.epoch,old.epoch+1);
+        assert_eq!(now.document.properties().at(CharPos(1)),Some(PropSetId(property_id)));
+        assert_eq!(g.marker_position(h,marker,&cx).unwrap(),Some(3));
+        drop(now);
+        g.inner.borrow_mut().session.execute(Command::Undo).unwrap();
+        assert_eq!(g.read(h,&cx).unwrap().document.to_text(),"ab");
+        cx.garbage_collect(true);
+        g.inner.borrow_mut().session.execute(Command::Redo).unwrap();
+        let now=g.read(h,&cx).unwrap();
+        assert_eq!(now.document.resolve(property_id,&cx).unwrap(),"face");
+        assert_eq!(now.document.to_text(),"aλ🙂b");
+    }
+    #[test]
+    fn invalid_foreign_and_stale_annotations_leave_text_and_epoch_unchanged() {
+        let roots=RootSet::default();let cx=Context::new(&roots);
+        let g=RuntimeEditorGateway::new(&cx,80,24).unwrap();let other=RuntimeEditorGateway::new(&cx,80,24).unwrap();
+        let h=g.create("reject","ab",&cx).unwrap();let before=g.read(h,&cx).unwrap();
+        let foreign=unsafe{other.intern_property(cx.add("foreign"),&cx)}.unwrap();
+        assert!(g.insert_with_properties(h,before.epoch,1,"x",[(CharPos(0)..CharPos(1),foreign)],&cx).is_err());
+        let p=unsafe{g.intern_property(cx.add("local"),&cx)}.unwrap();
+        let local=p.clone();let foreign=unsafe{other.intern_property(cx.add("second-stage"),&cx)}.unwrap();
+        // The first span successfully derives a private root; the foreign second
+        // span rejects before any of that staged text/property content publishes.
+        assert!(g.insert_with_properties(h,before.epoch,1,"xy",[(CharPos(0)..CharPos(1),local),(CharPos(1)..CharPos(2),foreign)],&cx).is_err());
+
+        assert!(g.insert_with_properties(h,before.epoch,1,"x",[(CharPos(0)..CharPos(2),p.clone())],&cx).is_err());
+        assert!(g.insert_with_properties(h,before.epoch+1,1,"x",[(CharPos(0)..CharPos(1),p)],&cx).is_err());
+        let after=g.read(h,&cx).unwrap();assert_eq!(after.epoch,before.epoch);assert_eq!(after.document.to_text(),"ab");
+    }
+}

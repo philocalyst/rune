@@ -875,6 +875,12 @@ impl<D: Document> Session<D> {
         preserve: bool,
         before_markers: bool,
     ) -> Result<BufferId> {
+        self.edit_buffer_prepared(id, range, text, preserve, before_markers, None)
+    }
+    fn edit_buffer_prepared(
+        &mut self, id: BufferId, range: Range<usize>, text: &str,
+        preserve: bool, before_markers: bool, prepared: Option<D>,
+    ) -> Result<BufferId> {
         let buffer = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
         if buffer.read_only {
             return Err(EditorError::ReadOnly);
@@ -902,7 +908,14 @@ impl<D: Document> Session<D> {
         } else {
             None
         };
-        let document = if before_markers {
+        let document = if let Some(prepared) = prepared {
+            let expected = buffer.document.len_chars().checked_sub(range.end-range.start)
+                .and_then(|n| n.checked_add(inserted)).ok_or(EditorError::InvalidRange)?;
+            if prepared.len_chars() != expected { return Err(EditorError::InvalidRange); }
+            // Restore only prepared content; temporary marker registrations made
+            // since preparation remain CURRENT and transform through this splice.
+            buffer.document.restore_history(&prepared, Some(splice), None)
+        } else if before_markers {
             buffer.document.insert_before_markers(range.start, text)
         } else if preserve {
             buffer.document.replace_preserving_properties(range, text)
@@ -1486,6 +1499,22 @@ impl<D: Document> Session<D> {
         preserve: bool,
         before_markers: bool,
     ) -> Result<CommandOutcome> {
+        self.replace_buffer_prepared_policy(id, expected_epoch, range, text, preserve, before_markers, None)
+    }
+    /// Commit owner-prepared content in one normal insertion/history transaction.
+    /// INTERNAL CROSS-CRATE OWNER BRIDGE: not a validation API for untrusted
+    /// documents. Caller must prove prepared is exactly current text with `text`
+    /// inserted at `at`, and authenticate every property ID/registry. Only length
+    /// and epoch are checked here; arbitrary same-length content is not accepted
+    /// as a capability. Public visibility is needed by the runtime binary crate.
+    #[doc(hidden)]
+    pub fn insert_buffer_prepared(&mut self, id: BufferId, expected_epoch: u64,
+        at: usize, text: &str, prepared: D) -> Result<CommandOutcome> {
+        self.replace_buffer_prepared_policy(id, expected_epoch, at..at, text, false, false, Some(prepared))
+    }
+    fn replace_buffer_prepared_policy(&mut self, id: BufferId, expected_epoch: u64,
+        range: Range<usize>, text: &str, preserve: bool, before_markers: bool,
+        prepared: Option<D>) -> Result<CommandOutcome> {
         if self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.publication_epoch
             != expected_epoch
         {
@@ -1494,7 +1523,7 @@ impl<D: Document> Session<D> {
         let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
         let backup = self.state.clone();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            self.edit_buffer(id, range, text, preserve, before_markers)
+            self.edit_buffer_prepared(id, range, text, preserve, before_markers, prepared)
         }));
         match result {
             Ok(Ok(id)) => {
@@ -1897,5 +1926,24 @@ mod overlay_liveness_commit_tests {
         session.state.sequence=0;
         session.execute(Command::KillBuffer{buffer,force:true}).unwrap();
         assert!(!token.is_live());
+    }
+}
+
+#[cfg(test)]
+mod prepared_insert_failure_tests {
+    use super::*;
+    use crate::StringDocument;
+    #[test]
+    fn annotated_prepared_insert_exhaustion_and_readonly_leave_state_unchanged() {
+        let mut s=Session::new(StringDocument::from("ab"),80,24).unwrap();
+        let id=s.current_buffer();let epoch=s.buffer_snapshot(id).unwrap().version;
+        s.state.sequence=u64::MAX;
+        assert_eq!(s.insert_buffer_prepared(id,epoch,1,"x",StringDocument::from("axb")),Err(EditorError::IdExhausted));
+        assert_eq!(s.buffer_snapshot(id).unwrap().document.to_text(),"ab");
+        assert_eq!(s.buffer_snapshot(id).unwrap().version,epoch);
+        s.state.sequence=0;s.set_read_only(id,true).unwrap();let sequence=s.snapshot().sequence;
+        assert_eq!(s.insert_buffer_prepared(id,epoch,1,"x",StringDocument::from("axb")),Err(EditorError::ReadOnly));
+        assert_eq!(s.snapshot().sequence,sequence);assert_eq!(s.buffer_snapshot(id).unwrap().version,epoch);
+        assert_eq!(s.buffer_snapshot(id).unwrap().document.to_text(),"ab");
     }
 }

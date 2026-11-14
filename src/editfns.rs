@@ -86,11 +86,9 @@ pub(crate) fn insert(args: ArgSlice, env: &mut Rt<Env>, cx: &Context) -> Result<
         let mut encoded = [0u8; 4];
         let text = match arg.untag() {
             ObjectType::String(text) => {
-                ensure!(!text.has_properties(), "Property-bearing string insertion is unsupported");
                 &**text
             },
             ObjectType::ByteString(bytes) => {
-                ensure!(!bytes.has_properties(), "Property-bearing string insertion is unsupported");
                 ensure!(bytes.is_ascii(), "Non-ASCII unibyte insertion into Unicode buffers is unsupported");
                 // ASCII has identical byte/scalar meaning. Do not decode arbitrary
                 // raw bytes as UTF-8 or silently turn them into Latin-1 characters.
@@ -108,8 +106,34 @@ pub(crate) fn insert(args: ArgSlice, env: &mut Rt<Env>, cx: &Context) -> Result<
             }
         };
         let read = env.buffer_read(cx)?;
-        env.editor_gateway()
-            .splice(read.handle, read.epoch, read.point..read.point, text, cx)?;
+        let gateway = env.editor_gateway();
+        let runs = match arg.untag() {
+            ObjectType::String(_) | ObjectType::ByteString(_) =>
+                crate::core::object::string_property_runs(*arg)?,
+            _ => Vec::new(),
+        };
+        if runs.is_empty() {
+            gateway.splice(read.handle, read.epoch, read.point..read.point, text, cx)?;
+        } else {
+            let mut spans = Vec::new();
+            spans.try_reserve_exact(runs.len())?;
+            for run in runs {
+                let mut cells = Vec::new();
+                for cell in run.plist.as_list()? {
+                    ensure!(cells.len() < 8192, "Inserted string property plist exceeds limit");
+                    cells.push(cell?);
+                }
+                ensure!(cells.len() % 2 == 0, "Odd inserted string property plist");
+                let copied = crate::fns::slice_into_list(&cells, None, cx);
+                // SAFETY: the source argument is rooted on this Env's stack;
+                // its reachable values belong to cx/audited globals. New plist
+                // spines use cx, retain shallow values, and no callback or GC
+                // occurs while shared cx stages the authenticated handles.
+                let handle = unsafe { gateway.intern_property(copied, cx)? };
+                spans.push((rune_text::CharPos(run.start)..rune_text::CharPos(run.end), handle));
+            }
+            gateway.insert_with_properties(read.handle, read.epoch, read.point, text, spans, cx)?;
+        }
     }
     Ok(())
 }
@@ -497,6 +521,25 @@ mod test {
         assert_eq!(after.document.text().to_string(), "");
     }
 
+    #[test]
+    fn annotated_unicode_insert_matches_gnu_with_plain_gaps() {
+        crate::assert_elprop!(r#"(let* ((value (list 42))
+          (s (concat "a" (propertize "λ🙂" 'face value) "z")))
+          (erase-buffer) (insert "pre") (goto-char 2) (insert s)
+          (list (equal (buffer-substring-no-properties 1 (point-max)) "paλ🙂zre")
+                (point) (get-text-property 2 'face)
+                (eq (get-text-property 3 'face) value)
+                (eq (get-text-property 4 'face) value)
+                (get-text-property 5 'face)))"#);
+    }
+    #[test]
+    fn annotated_ascii_unibyte_insert_matches_gnu() {
+        crate::assert_elprop!(r#"(let ((value (list 42)))
+          (erase-buffer) (insert (propertize (make-string 2 10) 'face value))
+          (list (equal (buffer-substring-no-properties 1 (point-max)) "\n\n")
+                (point) (eq (get-text-property 1 'face) value)
+                (eq (get-text-property 2 'face) value)))"#);
+    }
     #[test]
     fn test_delete_region() {
         let roots = &RootSet::default();
