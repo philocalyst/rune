@@ -272,14 +272,15 @@ fn commit_alternatives<'a>(
         .checked_add(1)
         .ok_or_else(|| anyhow!("font selection generation exhausted"))?;
     env.vars.try_reserve(1)?;
-    env.vars.insert(
+    env.set_var_context(
         if families {
             sym::FACE_ALTERNATIVE_FONT_FAMILY_ALIST
         } else {
             sym::FACE_ALTERNATIVE_FONT_REGISTRY_ALIST
         },
         normalized,
-    );
+        cx,
+    )?;
     env.font_selection.generation = generation;
     env.font_selection.cached = None;
     Ok(normalized)
@@ -323,9 +324,7 @@ pub(crate) fn resolve_family(
         return Ok(Some(requested.to_owned()));
     }
     let mut tail = env
-        .vars
-        .get(sym::FACE_ALTERNATIVE_FONT_FAMILY_ALIST)
-        .map(|v| v.bind(cx))
+        .variable_value(sym::FACE_ALTERNATIVE_FONT_FAMILY_ALIST, cx)?
         .unwrap_or(NIL);
     let mut seen = std::collections::HashSet::new();
     while !tail.is_nil() {

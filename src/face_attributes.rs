@@ -21,11 +21,11 @@ pub(crate) fn new_table<'a>(cx: &'a Context) -> Object<'a> {
     crate::fns::make_hash_table(&[], cx).expect("empty hash-table options are valid")
 }
 fn global_table<'a>(env: &mut Rt<Env>, cx: &'a Context) -> Result<&'a LispHashTable> {
-    let value = if let Some(value) = env.vars.get(sym::FACE__NEW_FRAME_DEFAULTS) {
-        value.bind(cx)
+    let value = if let Some(value) = env.variable_value(sym::FACE__NEW_FRAME_DEFAULTS, cx)? {
+        value
     } else {
         let table = new_table(cx);
-        env.vars.insert(sym::FACE__NEW_FRAME_DEFAULTS, table);
+        env.set_var_context(sym::FACE__NEW_FRAME_DEFAULTS, table, cx)?;
         table
     };
     value.try_into().map_err(Into::into)
