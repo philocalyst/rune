@@ -340,6 +340,14 @@ fn parse_symbol<'a>(slice: &str, cx: &'a Context) -> Object<'a> {
     }
 }
 
+/// Whether an unquoted symbol name would be read as a decimal number.
+pub(crate) fn numeric_symbol_name(name: &str) -> bool {
+    let integer = name.strip_suffix('.').unwrap_or(name);
+    let digits = integer.strip_prefix(['+', '-']).unwrap_or(integer);
+    (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        || lisp_float(name).is_some()
+}
+
 /// Recognise Lisp's decimal spelling before asking Rust to convert its value.
 /// In particular, Rust's bare `inf`, `nan` and `infinity` are Lisp symbols.
 fn lisp_float(slice: &str) -> Option<f64> {

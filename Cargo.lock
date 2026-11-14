@@ -4991,6 +4991,7 @@ dependencies = [
  "streaming-iterator",
  "syn 2.0.119",
  "text-buffer",
+ "unicode-width",
  "users",
 ]
 

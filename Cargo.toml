@@ -71,6 +71,7 @@ libc = "=0.2.182"
 base64 = "0.22.1"
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
+unicode-width = "=0.2.2"
 num-integer = "0.1.46"
 libm = "0.2.11"
 interval-tree = { workspace = true }
