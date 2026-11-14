@@ -62,6 +62,9 @@ impl SymbolMap {
     }
 
     pub(crate) fn set_func(&self, symbol: Symbol, func: Function) -> Result<()> {
+        // INTERNED_SYMBOLS is held by callers throughout validation and copy;
+        // this excludes global hash-table insertion changing the source graph.
+        crate::core::object::validate_function_clone(func.into())?;
         let _clone_session = self.block.clone_session();
         let new_func = func.clone_in(&self.block);
         // SAFETY: The object is marked read-only, we have cloned in the map's

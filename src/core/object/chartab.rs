@@ -92,6 +92,25 @@ impl<'new> CloneIn<'new, &'new Self> for CharTable {
 }
 
 impl CharTable {
+    /// Borrowed clone edges only. Caller must not collect/evaluate while these
+    /// objects are retained; no lock escapes into recursive graph traversal.
+    pub(crate) fn clone_children_snapshot(&self, limit: usize) -> Result<Vec<Object<'_>>> {
+        let parent = lock(&self.0.parent);
+        let data = lock(&self.0.data);
+        let count = data
+            .len()
+            .checked_add(1 + usize::from(parent.is_some()))
+            .ok_or_else(|| anyhow::anyhow!("char-table clone edge count overflow"))?;
+        ensure!(count <= limit, "char-table clone edge budget exceeded");
+        let mut children = Vec::new();
+        children.try_reserve_exact(count)?;
+        if let Some(parent) = parent.as_ref() {
+            children.push(Object::from(**parent));
+        }
+        children.push(*self.0.init);
+        children.extend(data.values().map(|value| **value));
+        Ok(children)
+    }
     pub(in crate::core) unsafe fn new(table: CharTableInner<'_>, constant: bool) -> Self {
         // transmute lifetime to static
         let table =

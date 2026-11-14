@@ -35,6 +35,23 @@ impl Display for LispHashTable {
 }
 
 impl LispHashTable {
+    /// Snapshot exact recursive clone edges under one table guard. The caller
+    /// must exclude collection/callbacks while retaining the borrowed objects.
+    pub(crate) fn clone_children_snapshot(&self, limit: usize) -> anyhow::Result<Vec<Object<'_>>> {
+        self.0.with(|table| {
+            let count = table
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| anyhow::anyhow!("hash-table clone edge count overflow"))?;
+            anyhow::ensure!(count <= limit, "hash-table clone edge budget exceeded");
+            let mut children = Vec::new();
+            children.try_reserve_exact(count)?;
+            for (key, value) in table.iter() {
+                children.extend([*key, *value]);
+            }
+            Ok(children)
+        })
+    }
     pub(in crate::core) unsafe fn new(table: HashTable, constant: bool) -> Self {
         Self(GcHeap::new(HashTableCore::new(table, constant), constant))
     }
