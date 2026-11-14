@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use rune_macros::defun;
 
 defsym!(KEYMAP);
+defsym!(MENU_ITEM);
 defsym!(GLOBAL_MAP);
 defsym!(UNDEFINED);
 // GNU keyboard.c::syms_of_keyboard: real global sparse special-event authority.
@@ -924,4 +925,11 @@ mod special_event_tests {
             Ok(())
         }).unwrap();
     }
+}
+
+mod copying;
+#[defun]
+fn copy_keymap<'a>(map:Object<'a>,env:&mut Rt<Env>,cx:&'a Context)->Result<Object<'a>> {
+    env.initialize_condition_metadata(cx);
+    copying::copy(map,env,cx)
 }
