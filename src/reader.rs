@@ -29,6 +29,7 @@ pub(crate) enum Error {
     MalformedUnicdoe(usize),
     InvalidEscape(usize),
     InvalidRecord(usize),
+    InvalidPropertyString(usize),
     UnsupportedHashTableRecord(usize),
     EmptyStream,
     ResourceLimit,
@@ -45,6 +46,7 @@ impl Display for Error {
             Error::UnexpectedChar(chr, i) => write!(f, "Unexpected character {chr}: at {i}"),
             Error::MalformedUnicdoe(i) => write!(f, "Malformed unicode: at {i}"),
             Error::InvalidEscape(i) => write!(f, "Invalid or unsupported character escape: at {i}"),
+            Error::InvalidPropertyString(i) => write!(f, "Invalid or unsupported property string syntax: at {i}"),
             Error::InvalidRecord(i) => write!(f, "Invalid record reader syntax: at {i}"),
             Error::UnsupportedHashTableRecord(i) => {
                 write!(f, "Hash-table record reader syntax is not implemented: at {i}")
@@ -74,6 +76,7 @@ impl Error {
             | Error::UnexpectedChar(_, i)
             | Error::MalformedUnicdoe(i)
             | Error::InvalidEscape(i)
+            | Error::InvalidPropertyString(i)
             | Error::InvalidRecord(i)
             | Error::UnsupportedHashTableRecord(i)
             | Error::ExtraItemInCdr(i)
@@ -738,6 +741,70 @@ impl<'a, 'ob> Reader<'a, 'ob> {
         Err(Error::MissingCloseParen(open))
     }
 
+    /// Literal property strings contain data, never evaluated forms. Native
+    /// snapshots remain under shared Context access with no callbacks or GC.
+    fn read_property_string(&mut self, pos: usize) -> Result<Object<'ob>> {
+        use crate::core::object::{ObjectType, StringPropertyRun};
+        let mut fields = Vec::new();
+        loop {
+            let token = self.tokens.next().ok_or(Error::MissingCloseParen(pos))??;
+            if matches!(token, Token::CloseParen(_)) { break; }
+            if fields.len() >= 1 + 3 * 4096 { return Err(Error::ResourceLimit); }
+            fields.try_reserve(1).map_err(|_| Error::ResourceLimit)?;
+            fields.push(self.read_sexp(token)?);
+        }
+        if fields.is_empty() || (fields.len()-1) % 3 != 0 {
+            return Err(Error::InvalidPropertyString(pos));
+        }
+        let string = fields[0];
+        let length = match string.untag() {
+            ObjectType::String(value) => {
+                if value.as_bytes().len() > 1024*1024 || value.has_properties() { return Err(Error::InvalidPropertyString(pos)); }
+                value.len()
+            },
+            ObjectType::ByteString(value) => {
+                if value.len() > 1024*1024 || value.has_properties() { return Err(Error::InvalidPropertyString(pos)); }
+                value.len()
+            },
+            _ => return Err(Error::InvalidPropertyString(pos)),
+        };
+        let mut runs = Vec::new();
+        runs.try_reserve_exact((fields.len()-1)/3).map_err(|_| Error::ResourceLimit)?;
+        let mut previous = 0usize;
+        let mut work = 0usize;
+        for triple in fields[1..].chunks_exact(3) {
+            let (ObjectType::Int(start), ObjectType::Int(end)) = (triple[0].untag(), triple[1].untag()) else {
+                return Err(Error::InvalidPropertyString(pos));
+            };
+            if start < 0 || end < start || end as u64 > length as u64 || (start as usize) < previous {
+                return Err(Error::InvalidPropertyString(pos));
+            }
+            let mut tail = triple[2];
+            let mut cells = 0usize;
+            while !tail.is_nil() {
+                if work >= 65536 { return Err(Error::ResourceLimit); }
+                work += 1; cells += 1;
+                let ObjectType::Cons(pair) = tail.untag() else { return Err(Error::InvalidPropertyString(pos)); };
+                tail = pair.cdr();
+            }
+            if cells % 2 != 0 { return Err(Error::InvalidPropertyString(pos)); }
+            if start != end {
+                runs.push(StringPropertyRun { start: start as usize, end: end as usize, plist: triple[2] });
+                previous = end as usize;
+            }
+        }
+        // SAFETY: this string and every parsed plist/value were freshly read in
+        // this owner Context (or immutable interned globals). No evaluation or
+        // collection intervenes, and all intervals/plists were prevalidated.
+        let result = match string.untag() {
+            ObjectType::String(value) => unsafe { value.set_property_runs(&runs, self.cx) },
+            ObjectType::ByteString(value) => unsafe { value.set_property_runs(&runs, self.cx) },
+            _ => unreachable!(),
+        };
+        result.map_err(|_| Error::InvalidPropertyString(pos))?;
+        Ok(string)
+    }
+
     /// read a sharp quoted character. This could be used for reader macro's in
     /// the future, but right now it just handles the special cases from elisp.
     fn read_sharp(&mut self, pos: usize) -> Result<Object<'ob>> {
@@ -753,6 +820,7 @@ impl<'a, 'ob> Reader<'a, 'ob> {
                 }
                 None => Err(Error::MissingQuotedItem(pos)),
             },
+            Some('(') => self.read_property_string(pos),
             Some('s') => self.read_record(pos),
             Some('b' | 'B') => self.read_radix(pos, 2),
             Some('o' | 'O') => self.read_radix(pos, 8),
@@ -1497,5 +1565,28 @@ mod octet_escape_tests {
         // Rune's UTF8 text model cannot represent mixed Unicode/raw-byte strings.
         assert!(read(r#""é\376""#, cx).is_err());
         assert!(read(r#""\376é""#, cx).is_err());
+    }
+}
+
+#[cfg(test)]
+mod property_string_tests {
+    #[test]
+    fn literal_property_string_values_match_gnu() {
+        for form in [
+            r##"(let ((s #(" " 0 1 (invisible t)))) (list (length s) (get-text-property 0 'invisible s)))"##,
+            r##"(let ((s #("abc" 0 1 (p 7) 1 3 (q 8)))) (list (get-text-property 0 'p s) (get-text-property 1 'p s) (get-text-property 2 'q s)))"##,
+            r##"(let ((s #("λ🙂" 1 2 (p value)))) (list (length s) (aref s 1) (get-text-property 0 'p s) (get-text-property 1 'p s)))"##,
+            r##"(let ((s #("\377x" 0 1 (p 9)))) (list (multibyte-string-p s) (aref s 0) (get-text-property 0 'p s)))"##,
+            r##"(let ((s #("abc" 1 1 (p 7) 1 2 nil))) (list (length s) (get-text-property 1 'p s)))"##,
+            r##"(let ((s #("abc" 0 3 (p (a b))))) (garbage-collect) (list (length s) (get-text-property 2 'p s)))"##,
+        ] { crate::assert_elprop!("{}",form); }
+    }
+    #[test]
+    fn malformed_and_unsupported_property_strings_reject_without_formatting() {
+        use super::*;
+        let roots=crate::core::gc::RootSet::default();let cx=Context::new(&roots);
+        for source in [r##"#(42 0 1 nil)"##,r##"#("x" 0)"##,r##"#("x" 0 2 nil)"##,r##"#("x" 0 1 (p))"##,r##"#("abc" 0 2 (p 1) 1 3 (q 2))"##,r##"#("abc" 2 1 nil)"##] {
+            assert!(matches!(read(source,&cx),Err(Error::InvalidPropertyString(_))),"{source}");
+        }
     }
 }
