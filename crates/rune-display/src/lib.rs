@@ -22,3 +22,6 @@ pub mod first_light_host;
 
 mod font_capabilities;
 pub use font_capabilities::{MeasuredFontCapabilities, MeasuredFontVariant};
+
+mod frame_font_plan;
+pub use frame_font_plan::{FrameFontAssignment, FrameFontPlan};

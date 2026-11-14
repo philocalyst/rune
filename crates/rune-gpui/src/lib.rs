@@ -20,6 +20,8 @@ use std::{
 
 mod font_geometry;
 mod font_bank_identity;
+mod frame_fonts;
+pub use frame_fonts::NativeFrameFontPlan;
 mod font_variants;
 pub use font_variants::NativeFontVariantBank;
 pub use rune_display::{MeasuredFontCapabilities as NativeFontCapabilities, MeasuredFontVariant as NativeFontVariant};
@@ -143,6 +145,7 @@ impl FrameInput {
     }
 }
 pub struct FrameView {
+    font_plan: Option<Rc<NativeFrameFontPlan>>,
     frame: Arc<FrameDisplay>,
     font: NativeFont,
     focus: FocusHandle,
@@ -167,6 +170,7 @@ impl FrameView {
         // No strong entity is captured and no subscription cycle is introduced.
         cx.on_release(|view, _| view.shutdown_input()).detach();
         Self {
+            font_plan: None,
             frame,
             font,
             focus: cx.focus_handle(),
@@ -199,6 +203,7 @@ impl FrameView {
     ) -> Self {
         cx.on_release(|view, _| view.shutdown_input()).detach();
         Self {
+            font_plan: None,
             frame,
             font,
             focus: cx.focus_handle(),
@@ -387,6 +392,22 @@ impl FrameView {
             return Ok(false);
         }
         self.frame = frame;
+        self.font_plan = None;
+        cx.notify();
+        Ok(true)
+    }
+
+    /// Opt-in diagnostic/integration path. The exact paired immutable frame and
+    /// all requested variants must be admitted before any view state changes.
+    /// Existing present paths remain normal-only; no GNU weight mapping exists.
+    pub fn present_font_plan(&mut self,plan:Rc<NativeFrameFontPlan>,cx:&mut Context<Self>)->Result<bool,&'static str>{
+        #[cfg(feature="editor")]
+        if self.ime.is_some(){return Err("font plans are not enabled for platform IME views")}
+        if plan.frame().protocol_version!=rune_display::DISPLAY_PROTOCOL_VERSION{return Err("incompatible display protocol")}
+        if plan.frame().generation<=self.frame.generation{return Ok(false)}
+        plan.validate_for_base(&self.font,cx)?;
+        self.frame=plan.frame().clone();
+        self.font_plan=Some(plan);
         cx.notify();
         Ok(true)
     }
@@ -477,6 +498,7 @@ impl Render for FrameView {
         let wheel_bounds = painted_bounds.clone();
         let metrics = self.font.metrics();
         let font = self.font.clone();
+        let font_plan = self.font_plan.clone();
         let input = self.input.clone();
         #[cfg(feature = "editor")]
         let ime_for_key = self.ime.clone();
@@ -635,6 +657,7 @@ impl Render for FrameView {
                             origin: bounds.origin,
                             clips: Vec::new(),
                             font: font.clone(),
+                            font_plan: font_plan.clone(),
                             paint_failed: false,
                         };
                         rune_display::paint_frame(&painted_frame, metrics, &mut target);
@@ -666,6 +689,7 @@ impl Render for FrameView {
     }
 }
 struct GpuiTarget<'a> {
+    font_plan: Option<Rc<NativeFrameFontPlan>>,
     window: &'a mut Window,
     cx: &'a mut App,
     origin: Point<Pixels>,
@@ -703,9 +727,20 @@ impl PaintTarget for GpuiTarget<'_> {
             .with_content_mask(mask, |window| window.paint_quad(fill(bounds, native_color(color))));
     }
     fn text(&mut self, text: &str, origin: rune_display::Point, face: Face, metrics: FontMetrics) {
+        let descriptor=match &self.font_plan {
+            Some(plan)=>match plan.font_for_face(face.id,self.cx){
+                Ok(font)=>font.clone(),
+                Err(error)=>{
+                    if !self.paint_failed{eprintln!("Rune font-plan paint rejected: {error}");}
+                    self.paint_failed=true;
+                    return;
+                }
+            },
+            None=>self.font.font.clone(),
+        };
         let run = TextRun {
             len: text.len(),
-            font: self.font.font.clone(),
+            font: descriptor,
             color: native_color(face.foreground),
             background_color: None,
             underline: None,

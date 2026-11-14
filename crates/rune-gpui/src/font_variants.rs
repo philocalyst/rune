@@ -88,6 +88,22 @@ impl NativeFontVariantBank {
         }
         Ok(bank)
     }
+    pub(crate) fn validate_baseline(
+        &self,
+        base: &NativeFont,
+        cx: &App,
+    ) -> Result<(), &'static str> {
+        self.validate_context(cx)?;
+        let normal = self.fonts[0].as_ref().ok_or("normal font unavailable")?;
+        if normal.font != base.font
+            || normal.size != base.size
+            || normal.metrics != base.metrics
+            || normal.measured_advances != base.measured_advances
+        {
+            return Err("font bank baseline differs from view font");
+        }
+        Ok(())
+    }
     fn validate_context(&self, cx: &App) -> Result<(), &'static str> {
         let system = self
             .system
