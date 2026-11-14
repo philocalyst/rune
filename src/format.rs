@@ -524,6 +524,9 @@ fn format_character(object: Object) -> Result<char> {
 }
 
 pub(super) fn format(string: &str, objects: &[Object]) -> Result<String> {
+    // No Lisp callbacks or collection occur in this formatter. The guard also
+    // excludes global hash insertions until property checks/rendering complete.
+    let _symbols = crate::core::env::INTERNED_SYMBOLS.lock().unwrap();
     let mut output = String::new();
     let mut next_argument = 0_usize;
     let mut input = string.chars().peekable();
@@ -574,6 +577,7 @@ pub(super) fn format(string: &str, objects: &[Object]) -> Result<String> {
             }
             'c' => text_field(&mut output, format_character(argument)?.to_string(), &field)?,
             's' | 'S' => {
+                crate::property_guard::reject_property_strings(argument)?;
                 let text = if matches!(argument.untag(), ObjectType::Cons(_) | ObjectType::Vec(_)) {
                     nested_object(argument, field.conversion == 'S')?
                 } else if field.conversion == 's' {

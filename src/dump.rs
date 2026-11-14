@@ -76,6 +76,7 @@ struct DumpState {
     symbols: Vec<DumpedSymbol>,
     env: Vec<DumpedBinding>,
     unsupported_overlay: bool,
+    unsupported_string_properties: bool,
 }
 
 impl Display for DumpedObject {
@@ -153,6 +154,7 @@ impl DumpState {
             symbols: Vec::new(),
             env: Vec::new(),
             unsupported_overlay: false,
+            unsupported_string_properties: false,
         }
     }
 
@@ -184,8 +186,18 @@ impl DumpState {
         let dumped = match obj.untag() {
             ObjectType::Int(x) => DumpedObject::Int(x),
             ObjectType::Float(x) => DumpedObject::Float(**x),
-            ObjectType::String(s) => DumpedObject::String(s.inner().to_owned()),
-            ObjectType::ByteString(s) => DumpedObject::ByteString(s.to_vec()),
+            ObjectType::String(s) => {
+                if s.has_properties() {
+                    self.unsupported_string_properties = true;
+                }
+                DumpedObject::String(s.inner().to_owned())
+            }
+            ObjectType::ByteString(s) => {
+                if s.has_properties() {
+                    self.unsupported_string_properties = true;
+                }
+                DumpedObject::ByteString(s.to_vec())
+            }
             ObjectType::Symbol(sym) => {
                 DumpedObject::Symbol { name: sym.name().to_owned(), interned: sym.interned() }
             }
@@ -281,6 +293,12 @@ impl DumpState {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "Overlay persistence is unsupported",
+            ));
+        }
+        if self.unsupported_string_properties {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Property-bearing string persistence is unsupported",
             ));
         }
         let mut out = std::string::String::new();

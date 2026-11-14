@@ -1,7 +1,7 @@
 use crate::{
     core::{
         cons::Cons,
-        env::Env,
+        env::{ArgSlice, Env, sym},
         error::{Type, TypeError},
         gc::{Context, Rt, Slot},
         object::{NIL, Object, ObjectType, TRUE},
@@ -12,6 +12,125 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use rune_core::macros::list;
 use rune_macros::defun;
+
+defsym!(ARGS_OUT_OF_RANGE);
+
+fn string_property_error(condition: crate::core::object::Symbol, data: Object, env: &mut Rt<Env>, cx: &Context) -> anyhow::Error {
+    env.initialize_condition_metadata(cx);
+    crate::eval::EvalError::signal(condition.into(), data, cx).into()
+}
+
+#[defun]
+fn propertize<'ob>(string: Object<'ob>, properties: ArgSlice, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    let mut values = Vec::new();
+    {
+        let properties = Rt::bind_slice(env.stack.arg_slice(properties), cx);
+        values.try_reserve_exact(properties.len())?;
+        values.extend_from_slice(properties);
+    }
+    // The argument stack remains rooted; no evaluation or collection occurs
+    // while this native snapshot is used under a shared Context borrow.
+    propertize_values(string, &values, env, cx)
+}
+fn propertize_values<'ob>(string: Object<'ob>, properties: &[Object<'ob>], env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    if properties.len() % 2 != 0 {
+        let data = list!(sym::PROPERTIZE, properties.len() + 1; cx);
+        return Err(string_property_error(sym::WRONG_NUMBER_OF_ARGUMENTS, data, env, cx));
+    }
+    let length = match string.untag() {
+        ObjectType::String(text) => text.len(),
+        ObjectType::ByteString(bytes) => bytes.len(),
+        _ => return Err(string_property_error(sym::WRONG_TYPE_ARGUMENT, list!(sym::STRINGP, string; cx), env, cx)),
+    };
+    anyhow::ensure!(properties.len() <= 8192, "propertize property argument limit exceeded");
+    if length == 0 { return Ok(string); }
+    let old = crate::core::object::string_property_runs(string)?;
+    anyhow::ensure!(old.len() <= 4096, "propertize source run limit exceeded");
+    let mut runs = Vec::new();
+    runs.try_reserve(old.len().checked_mul(2).and_then(|n| n.checked_add(1)).ok_or_else(|| anyhow!("String property span overflow"))?)?;
+    let mut cursor = 0;
+    let mut work = 0usize;
+    for run in old {
+        if cursor < run.start {
+            let plist = merge_propertize_properties(NIL, properties, &mut work, cx)?;
+            if !plist.is_nil() { runs.push(crate::core::object::StringPropertyRun { start: cursor, end: run.start, plist }); }
+        }
+        let plist = merge_propertize_properties(run.plist, properties, &mut work, cx)?;
+        if !plist.is_nil() { runs.push(crate::core::object::StringPropertyRun { start: run.start, end: run.end, plist }); }
+        cursor = run.end;
+    }
+    if cursor < length {
+        let plist = merge_propertize_properties(NIL, properties, &mut work, cx)?;
+        if !plist.is_nil() { runs.push(crate::core::object::StringPropertyRun { start: cursor, end: length, plist }); }
+    }
+    // SAFETY: every plist was built from current-Context arguments/traced
+    // source properties with no callback or GC. The helper publishes only a
+    // fresh same-owner header after validating the entire run vector.
+    unsafe { crate::core::object::copy_string_with_properties(string, &runs, cx) }
+
+}
+
+fn bounded_string_property_get<'ob>(mut plist: Object<'ob>, prop: Object<'ob>) -> Result<Object<'ob>> {
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..4096 {
+        if plist.is_nil() { return Ok(NIL); }
+        seen.try_reserve(2)?;
+        anyhow::ensure!(seen.insert(plist.into_raw().addr()), "Cyclic string property plist");
+        let ObjectType::Cons(key) = plist.untag() else { bail!("Malformed string property plist"); };
+        let key_value = key.car();
+        plist = key.cdr();
+        anyhow::ensure!(seen.insert(plist.into_raw().addr()), "Cyclic string property plist");
+        let ObjectType::Cons(value) = plist.untag() else { bail!("Odd string property plist"); };
+        if eq(key_value, prop) { return Ok(value.car()); }
+        plist = value.cdr();
+    }
+    bail!("String property lookup exceeds traversal limit")
+}
+
+fn propertize_has_key(pairs: &[(Object, Object)], key: Object, work: &mut usize) -> Result<bool> {
+    for (existing, _) in pairs {
+        anyhow::ensure!(*work < 1_000_000, "propertize property merge work limit exceeded");
+        *work += 1;
+        if eq(*existing, key) { return Ok(true); }
+    }
+    Ok(false)
+}
+
+/// Fresh plist for propertize: incoming first occurrences override inherited
+/// values. Property values retain identity; no existing Lisp list is mutated.
+fn merge_propertize_properties<'ob>(old: Object<'ob>, incoming: &[Object<'ob>], work: &mut usize, cx: &'ob Context) -> Result<Object<'ob>> {
+    anyhow::ensure!(incoming.len() % 2 == 0 && incoming.len() <= 8192, "Invalid or oversized propertize property list");
+    let mut pairs = Vec::new();
+    pairs.try_reserve(incoming.len() / 2)?;
+    for pair in incoming.chunks_exact(2) {
+        if !propertize_has_key(&pairs, pair[0], work)? { pairs.push((pair[0], pair[1])); }
+    }
+    let mut tail = old;
+    let mut seen = std::collections::HashSet::new();
+    let mut old_pairs = 0usize;
+    while !tail.is_nil() {
+        anyhow::ensure!(old_pairs < 4096, "String property plist exceeds traversal limit");
+        seen.try_reserve(2)?;
+        anyhow::ensure!(seen.insert(tail.into_raw().addr()), "Cyclic string property plist");
+        let ObjectType::Cons(key_cell) = tail.untag() else { bail!("Malformed string property plist"); };
+        let key = key_cell.car();
+        tail = key_cell.cdr();
+        anyhow::ensure!(seen.insert(tail.into_raw().addr()), "Cyclic string property plist");
+        let ObjectType::Cons(value_cell) = tail.untag() else { bail!("Odd string property plist"); };
+        let value = value_cell.car();
+        if !propertize_has_key(&pairs, key, work)? {
+            pairs.try_reserve(1)?;
+            pairs.push((key, value));
+        }
+        tail = value_cell.cdr();
+        old_pairs += 1;
+    }
+    let mut result = NIL;
+    for (key, value) in pairs.into_iter().rev() {
+        result = Cons::new(key, Cons::new(value, result, cx), cx).into();
+    }
+    Ok(result)
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -351,8 +470,17 @@ pub fn text_properties_at<'ob>(
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     let object = object.unwrap_or(NIL);
-    if matches!(object.untag(), ObjectType::String(_)) {
-        bail!("String text properties are not supported yet");
+    let string = match object.untag() {
+        ObjectType::String(text) => Some((text.len(), text.property_runs()?)),
+        ObjectType::ByteString(bytes) => Some((bytes.len(), bytes.property_runs()?)),
+        _ => None,
+    };
+    if let Some((length, runs)) = string {
+        if position > length {
+            return Err(string_property_error(sym::ARGS_OUT_OF_RANGE, list!(object, position; cx), env, cx));
+        }
+        if position == length { return Ok(NIL); }
+        return Ok(runs.into_iter().find(|run| run.start <= position && position < run.end).map_or(NIL, |run| run.plist));
     }
     modify_buffer_data(object, env, cx, |data| {
         let point_max = data.text.len_chars() + 1;
@@ -388,7 +516,9 @@ pub fn get_text_property<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let string_target = object.is_some_and(|value| matches!(value.untag(), ObjectType::String(_) | ObjectType::ByteString(_)));
     let props = text_properties_at(position, object, env, &cx)?;
+    if string_target { return bounded_string_property_get(props, prop); }
     // TODO see lookup_char_property, should also lookup
     // 1. category
     // 2. char_property_alias_alist
@@ -1681,7 +1811,7 @@ mod tests {
             "(nil)"
         );
         assert!(get_char_property(1, key, Some(cx.add(42)), env, &cx).is_err());
-        assert!(get_char_property(0, key, Some(cx.add("string")), env, &cx).is_err());
+        assert!(get_char_property(0, key, Some(cx.add("string")), env, &cx).unwrap().is_nil());
         Ok(())
     }
 
@@ -1855,7 +1985,7 @@ mod tests {
         env.editor_gateway().kill(deleted.buffer().unwrap().handle(), true, &cx)?;
         assert!(text_properties_at(1, Some(deleted), env, &cx).is_err());
         assert!(text_properties_at(1, Some(cx.add(123)), env, &cx).is_err());
-        assert!(text_properties_at(0, Some(cx.add("string")), env, &cx).is_err());
+        assert!(text_properties_at(0, Some(cx.add("string")), env, &cx).unwrap().is_nil());
         Ok(())
     }
 
@@ -1948,5 +2078,96 @@ mod owner_property_transaction_tests {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod propertize_string_tests {
+    #[test]
+    fn genuine_propertize_semantics_match_gnu() {
+        for source in [
+            r#"(let* ((s "abc") (p (propertize s))) (list (eq s p) (equal s p) (text-properties-at 0 p)))"#,
+            r#"(let ((s (copy-sequence ""))) (list (eq s (propertize s)) (eq s (propertize s 'p 1)) (text-properties-at 0 (propertize s 'p 1))))"#,
+            r#"(let ((s (propertize "abc" 'p 1 'q 2 'p 3))) (list (get-text-property 0 'p s) (get-text-property 0 'q s)))"#,
+            r#"(let* ((a (propertize "abc" 'p 1 'q 2)) (b (propertize a 'p 3 'r 4))) (list (get-text-property 0 'p a) (get-text-property 0 'p b) (get-text-property 0 'q b) (get-text-property 0 'r b) (eq a b)))"#,
+            r#"(let ((s (propertize "λ🙂x" 'p 7))) (list (length s) (get-text-property 0 'p s) (get-text-property 2 'p s) (text-properties-at 3 s) (condition-case e (text-properties-at 4 s) (error (car e)))))"#,
+            r#"(let ((s (propertize "\377a\376" 'p 7))) (list (multibyte-string-p s) (length s) (aref s 0) (get-text-property 2 'p s)))"#,
+            r#"(let ((s (propertize "x" 'p nil 17 8 nil 9))) (list (get-text-property 0 'p s) (get-text-property 0 17 s) (get-text-property 0 nil s) (length (text-properties-at 0 s))))"#,
+            r#"(let* ((v (list 1)) (s (propertize "x" 'p v))) (setcar v 2) (list (eq v (get-text-property 0 'p s)) (car (get-text-property 0 'p s))))"#,
+            r#"(condition-case e (propertize 17 'p) (error e))"#,
+            r#"(condition-case e (propertize 17 'p 1) (error e))"#,
+            r#"(condition-case e (propertize "" 'p) (error e))"#,
+        ] { crate::assert_elprop!("{}", source); }
+    }
+
+    #[test]
+    fn mutated_cyclic_string_plists_fail_closed() {
+        crate::interpreter::assert_lisp(
+            r#"(let* ((s (propertize "x" 'p 1)) (plist (text-properties-at 0 s)))
+              (setcdr (cdr plist) plist)
+              (list (condition-case nil (get-text-property 0 'missing s) (error 'bounded))
+                    (condition-case nil (propertize s 'q 2) (error 'bounded))))"#,
+            "(bounded bounded)",
+        );
+    }
+
+    #[test]
+    fn propertize_preserves_inherited_runs_and_covers_gaps() {
+        use super::*;
+        use crate::core::{env::{Env, intern}, gc::{Context, RootSet}, object::{StringPropertyRun, copy_string_with_properties}};
+        use rune_core::macros::{list, root};
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        let p = intern("rune-inherited-p", cx);
+        let q = intern("rune-inherited-q", cx);
+        let r = intern("rune-overlay-r", cx);
+        let plain = cx.add("λ🙂x");
+        let spans = [
+            StringPropertyRun { start: 0, end: 1, plist: list!(p, 1; cx) },
+            StringPropertyRun { start: 2, end: 3, plist: list!(q, 2; cx) },
+        ];
+        // SAFETY: all inputs are in this current Context; no callback or GC,
+        // and the constructor publishes only its new same-owner header.
+        let source = unsafe { copy_string_with_properties(plain, &spans, cx).unwrap() };
+        let result = propertize_values(source, &[r.into(), 3.into()], env, cx).unwrap();
+        for index in 0..3 {
+            assert_eq!(get_text_property(index, r.into(), Some(result), env, cx).unwrap(), 3);
+            assert!(get_text_property(index, r.into(), Some(source), env, cx).unwrap().is_nil());
+        }
+        assert_eq!(get_text_property(0, p.into(), Some(result), env, cx).unwrap(), 1);
+        assert!(get_text_property(1, p.into(), Some(result), env, cx).unwrap().is_nil());
+        assert_eq!(get_text_property(2, q.into(), Some(result), env, cx).unwrap(), 2);
+    }
+
+    #[test]
+    fn string_property_cycles_move_but_cannot_be_copied_into_functions() {
+        crate::interpreter::assert_lisp(
+            r#"(let* ((cell (cons nil nil)) (s (propertize "x" 'link cell)))
+                (setcar cell s) (garbage-collect) (garbage-collect)
+                (list (eq s (car (get-text-property 0 'link s)))
+                  (condition-case nil (fset 'rune-property-cycle #'(lambda () s)) (error 'blocked))
+                  (fboundp 'rune-property-cycle)))"#,
+            "(t blocked nil)",
+        );
+    }
+
+    #[test]
+    fn string_property_values_survive_gc_and_global_function_copy() {
+        crate::interpreter::assert_lisp(
+            r#"(let* ((v (list 1)) (s (propertize "λ🙂" 'payload v)))
+              (garbage-collect) (setcar v 2) (garbage-collect)
+              (list (eq v (get-text-property 1 'payload s))
+                    (car (get-text-property 0 'payload s)) (length s)))"#,
+            "(t 2 2)",
+        );
+        crate::interpreter::assert_lisp(
+            r#"(progn (let ((s (propertize "\377x" 'payload '(1 2))))
+                  (fset 'rune-property-global-copy #'(lambda () s)))
+              (garbage-collect)
+              (let ((s (funcall 'rune-property-global-copy)))
+                (list (multibyte-string-p s) (aref s 0) (get-text-property 0 'payload s))))"#,
+            "(nil 255 (1 2))",
+        );
     }
 }

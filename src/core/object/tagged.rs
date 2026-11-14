@@ -1718,6 +1718,7 @@ where
     fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> anyhow::Result<Gc<U>> {
         #[cfg(test)]
         bk.check_copy_failure()?;
+        let _visit = bk.enter_copy_node(self.as_obj().into_raw().addr())?;
         let obj = match self.as_obj().untag() {
             ObjectType::Int(x) => x.into(),
             ObjectType::Cons(x) => x.clone_in(bk)?.into(),

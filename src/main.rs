@@ -48,6 +48,7 @@ mod native_command_model;
 mod print;
 mod reader;
 mod search;
+mod property_guard;
 mod textprops;
 mod threads;
 mod timefns;

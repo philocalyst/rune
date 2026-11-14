@@ -7,7 +7,8 @@ use crate::{
         gc::{Context, Rt, Rto},
         object::{
             Function, Gc, HashTable, IntoObject, LispHashTable, LispString, LispVec, List,
-            ListType, NIL, Object, ObjectType, OptionalFlag, Symbol,
+            ListType, NIL, Object, ObjectType, OptionalFlag, Symbol, StringPropertyRun,
+            string_property_runs, copy_string_with_properties,
         },
     },
     data::aref,
@@ -145,8 +146,12 @@ fn plist_member<'ob>(
 }
 
 #[defun]
-pub(crate) fn prin1_to_string(object: Object, _noescape: Option<Object>) -> String {
-    format!("{object}")
+pub(crate) fn prin1_to_string(object: Object, _noescape: Option<Object>) -> Result<String> {
+    // Native rendering is callback-free. Keep mutable global hash insertion
+    // excluded from both validation and the following legacy printer walk.
+    let _symbols = crate::core::env::INTERNED_SYMBOLS.lock().unwrap();
+    crate::property_guard::reject_property_strings(object)?;
+    Ok(format!("{object}"))
 }
 
 #[defun]
@@ -325,11 +330,14 @@ pub(crate) fn mapconcat(
     for element in mapped.as_list()? {
         if !first {
             if let Some(separator) = separator {
+                reject_string_properties(separator.bind(cx))?;
                 append_character_sequence(&mut string, separator.bind(cx))?;
             }
         }
         first = false;
-        append_character_sequence(&mut string, element?)?;
+        let element = element?;
+        reject_string_properties(element)?;
+        append_character_sequence(&mut string, element)?;
     }
     Ok(string)
 }
@@ -367,6 +375,7 @@ pub(crate) fn nreverse(seq: Object) -> Result<Object> {
 
 #[defun]
 pub(crate) fn reverse<'ob>(seq: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
+    reject_string_properties(seq)?;
     match seq.untag() {
         ObjectType::NIL => Ok(NIL),
         ObjectType::Cons(cons) => {
@@ -748,10 +757,48 @@ pub(crate) fn require<'ob>(
     }
 }
 
+// Copy only plist spines: property values retain Lisp eq identity. Shared Context
+// access prevents collection/callbacks while these native descriptors are staged.
+fn copied_property_runs<'a>(source: Object<'a>, start: usize, end: usize, offset: usize, cx: &'a Context) -> Result<Vec<StringPropertyRun<'a>>> {
+    let mut result = Vec::new();
+    for run in string_property_runs(source)? {
+        let a = run.start.max(start);
+        let b = run.end.min(end);
+        if a >= b { continue; }
+        let mut values = Vec::new();
+        for value in run.plist.as_list()? {
+            ensure!(values.len() < 8192, "String property plist exceeds copy limit");
+            values.push(value?);
+        }
+        let plist = slice_into_list(&values, None, cx);
+        result.push(StringPropertyRun {
+            start: offset.checked_add(a - start).ok_or_else(|| anyhow!("String property offset overflow"))?,
+            end: offset.checked_add(b - start).ok_or_else(|| anyhow!("String property offset overflow"))?,
+            plist,
+        });
+    }
+    Ok(result)
+}
+fn concat_properties<'a>(output: Object<'a>, sequences: &[Object<'a>], cx: &'a Context) -> Result<Object<'a>> {
+    let mut runs = Vec::new();
+    let mut offset = 0usize;
+    for &sequence in sequences {
+        let count = length(sequence)?;
+        if matches!(sequence.untag(), ObjectType::String(_) | ObjectType::ByteString(_)) {
+            runs.extend(copied_property_runs(sequence, 0, count, offset, cx)?);
+        }
+        offset = offset.checked_add(count).ok_or_else(|| anyhow!("String length overflow"))?;
+    }
+    if runs.is_empty() { return Ok(output); }
+    // SAFETY: output and every shallow property value are from this owning
+    // Context's live arguments, with no callback or GC during preparation.
+    unsafe { copy_string_with_properties(output, &runs, cx) }
+}
+
 #[defun(name = "concat")]
-fn concat_lisp<'ob>(sequences: &[Object], cx: &'ob Context) -> Result<Object<'ob>> {
+pub(crate) fn concat_lisp<'ob>(sequences: &[Object<'ob>], cx: &'ob Context) -> Result<Object<'ob>> {
     let has_bytes = sequences.iter().any(|value| matches!(value.untag(), ObjectType::ByteString(_)));
-    if !has_bytes { return Ok(cx.add(concat(sequences)?)); }
+    if !has_bytes { return concat_properties(cx.add(concat_text(sequences)?), sequences, cx); }
     // An ASCII multibyte accumulator such as mu4e's initial empty string must
     // not reinterpret process bytes as Unicode. Mixed non-ASCII multibyte/raw
     // strings need Emacs's non-scalar character representation, not Latin-1.
@@ -773,10 +820,25 @@ fn concat_lisp<'ob>(sequences: &[Object], cx: &'ob Context) -> Result<Object<'ob
             }
         }
     }
-    Ok(cx.add(bytes))
+    concat_properties(cx.add(bytes), sequences, cx)
 }
 
 pub(crate) fn concat(sequences: &[Object]) -> Result<String> {
+    for &sequence in sequences {
+        reject_string_properties(sequence)?;
+    }
+    concat_text(sequences)
+}
+fn reject_string_properties(value: Object) -> Result<()> {
+    let bearing = match value.untag() {
+        ObjectType::String(text) => text.has_properties(),
+        ObjectType::ByteString(text) => text.has_properties(),
+        _ => false,
+    };
+    ensure!(!bearing, "This string transform does not yet preserve text properties");
+    Ok(())
+}
+fn concat_text(sequences: &[Object]) -> Result<String> {
     let mut result = String::new();
     for &sequence in sequences {
         append_character_sequence(&mut result, sequence)?;
@@ -1291,7 +1353,10 @@ fn copy_sequence<'ob>(arg: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>>
             slots.extend(record.iter().map(|cell| cell.get()));
             Ok(crate::core::object::RecordBuilder(slots).into_obj(cx).into())
         }
-        ObjectType::ByteString(string) => Ok(cx.add(string.to_vec())),
+        ObjectType::ByteString(string) => {
+            let runs = copied_property_runs(arg, 0, string.len(), 0, cx)?;
+            unsafe { copy_string_with_properties(arg, &runs, cx) }
+        },
         ObjectType::Cons(x) => {
             // TODO: remove this temp vector
             let mut elements = Vec::new();
@@ -1306,29 +1371,47 @@ fn copy_sequence<'ob>(arg: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>>
             Ok(slice_into_list(&elements, tail, cx))
         }
         // Calling to_owned on &LispString clones the reference, not its text.
-        ObjectType::String(x) => Ok(cx.add(String::from(&**x))),
+        ObjectType::String(x) => {
+            let runs = copied_property_runs(arg, 0, x.chars().count(), 0, cx)?;
+            unsafe { copy_string_with_properties(arg, &runs, cx) }
+        },
         ObjectType::NIL => Ok(NIL),
         _ => Err(TypeError::new(Type::Sequence, arg).into()),
     }
 }
 
+fn substring_object<'a>(string: Object<'a>, from: Option<i64>, to: Option<i64>, preserve: bool, cx: &'a Context) -> Result<Object<'a>> {
+    let count = match string.untag() {
+        ObjectType::String(text) => text.chars().count(),
+        ObjectType::ByteString(bytes) => bytes.len(),
+        _ => return Err(TypeError::new(Type::String, string).into()),
+    };
+    let normalize = |position: i64| -> Result<usize> {
+        let value = if position < 0 { count as i128 + i128::from(position) } else { i128::from(position) };
+        ensure!(value >= 0 && value <= count as i128, "substring args out of range");
+        Ok(value as usize)
+    };
+    let start = normalize(from.unwrap_or(0))?;
+    let end = to.map(normalize).transpose()?.unwrap_or(count);
+    ensure!(start <= end, "substring args out of range");
+    let output = match string.untag() {
+        ObjectType::String(text) => cx.add(text.chars().skip(start).take(end-start).collect::<String>()),
+        ObjectType::ByteString(bytes) => cx.add(bytes[start..end].to_vec()),
+        _ => unreachable!(),
+    };
+    if !preserve { return Ok(output); }
+    let runs = copied_property_runs(string, start, end, 0, cx)?;
+    // SAFETY: new text and copied property spines/values belong to this Context;
+    // no collection or callback can intervene through a shared Context borrow.
+    unsafe { copy_string_with_properties(output, &runs, cx) }
+}
 #[defun(name = "substring")]
-fn substring_lisp<'ob>(string: Object, from: Option<i64>, to: Option<i64>, cx: &'ob Context) -> Result<Object<'ob>> {
-    match string.untag() {
-        ObjectType::String(string) => Ok(cx.add(substring(string, from, to)?)),
-        ObjectType::ByteString(bytes) => {
-            let normalize = |position: i64| -> Result<usize> {
-                let position = if position < 0 { bytes.len() as i128 + i128::from(position) } else { i128::from(position) };
-                ensure!(position >= 0 && position <= bytes.len() as i128, "substring args out of range");
-                Ok(position as usize)
-            };
-            let start = normalize(from.unwrap_or(0))?;
-            let end = to.map(normalize).transpose()?.unwrap_or(bytes.len());
-            ensure!(start <= end, "substring args out of range");
-            Ok(cx.add(bytes[start..end].to_vec()))
-        }
-        _ => Err(TypeError::new(Type::String, string).into()),
-    }
+fn substring_lisp<'a>(string: Object<'a>, from: Option<i64>, to: Option<i64>, cx: &'a Context) -> Result<Object<'a>> {
+    substring_object(string, from, to, true, cx)
+}
+#[defun]
+fn substring_no_properties<'a>(string: Object<'a>, from: Option<i64>, to: Option<i64>, cx: &'a Context) -> Result<Object<'a>> {
+    substring_object(string, from, to, false, cx)
 }
 
 fn substring(string: &str, from: Option<i64>, to: Option<i64>) -> Result<String> {
@@ -2249,4 +2332,71 @@ mod binary_string_protocol_tests {
         assert!(concat_lisp(&[packet, cx.add("λ")], &cx).is_err());
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod string_property_transform_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn lisp_property_transforms_match_gnu() {
+        crate::assert_elprop!(r#"(let* ((value (list 42)) (s (propertize "λa🙂" 'face value))
+          (part (substring s 1)) (copied (copy-sequence s)) (joined (concat "x" s "y")))
+          (list (equal part "a🙂") (eq (get-text-property 0 'face part) value)
+                (eq s copied) (eq (get-text-property 1 'face copied) value)
+                (get-text-property 0 'face joined) (eq (get-text-property 1 'face joined) value)
+                (get-text-property 4 'face joined)
+                (text-properties-at 0 (substring-no-properties s))))"#);
+    }
+    #[test]
+    fn unicode_slice_concat_and_copy_preserve_spans_and_shallow_values() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let value: Object = list![42; cx];
+        let key = crate::core::env::intern("rune-property-transform", cx);
+        let plist = list![key, value; cx];
+        let input = unsafe { copy_string_with_properties(cx.add("aλ🙂z"), &[StringPropertyRun {start:1,end:3,plist}], cx) }.unwrap();
+        let slice = substring_lisp(input, Some(1), Some(-1), cx).unwrap();
+        let runs = string_property_runs(slice).unwrap();
+        assert_eq!((runs[0].start,runs[0].end),(0,2));
+        assert!(!eq(runs[0].plist, plist));
+        let values: Vec<_> = runs[0].plist.as_list().unwrap().into_iter().map(|v| v.unwrap()).collect();
+        assert_eq!(values[1], value);
+        let copied = copy_sequence(input,cx).unwrap();
+        assert!(!eq(copied,input));
+        assert_eq!(string_property_runs(copied).unwrap()[0].start,1);
+        let joined = concat_lisp(&[cx.add("x"),input,cx.add("y")],cx).unwrap();
+        let joined_runs = string_property_runs(joined).unwrap();
+        assert_eq!((joined_runs[0].start,joined_runs[0].end),(2,4));
+        let plain = substring_no_properties(input, Some(1),Some(3),cx).unwrap();
+        assert!(string_property_runs(plain).unwrap().is_empty());
+    }
+    #[test]
+    fn byte_slice_keeps_raw_octets_and_uses_byte_coordinates() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let plist = list![42, true; cx];
+        let input = unsafe { copy_string_with_properties(cx.add(vec![0xfe,b'x',0xff]), &[StringPropertyRun{start:0,end:2,plist}],cx) }.unwrap();
+        let slice = substring_lisp(input,Some(1),None,cx).unwrap();
+        let ObjectType::ByteString(bytes) = slice.untag() else {panic!("byte kind lost")};
+        assert_eq!(&**bytes,&[b'x',0xff]);
+        let runs = string_property_runs(slice).unwrap();
+        assert_eq!((runs[0].start,runs[0].end),(0,1));
+    }
+    #[test]
+    fn property_bearing_insert_rejects_before_owner_edit() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        let plist = list![42, true; cx];
+        let input = unsafe { copy_string_with_properties(cx.add("abc"), &[StringPropertyRun{start:0,end:3,plist}],cx) }.unwrap();
+        env.stack.push(input);
+        let before = env.buffer_read(cx).unwrap();
+        assert!(crate::editfns::insert(crate::core::env::ArgSlice::new(1),env,cx).is_err());
+        let after = env.buffer_read(cx).unwrap();
+        assert_eq!(before.epoch,after.epoch);
+        assert_eq!(before.point,after.point);
+        assert_eq!(after.document.text().to_string(), "");
+    }
+
 }

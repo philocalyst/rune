@@ -112,8 +112,22 @@ fn clone_children(object: Object<'_>, limit: usize) -> Result<(Vec<Object<'_>>, 
             children = table.clone_children_snapshot(limit)?;
             (children.len().saturating_mul(64), true)
         }
-        ObjectType::String(value) => (value.len(), false),
-        ObjectType::ByteString(value) => (value.len(), false),
+        ObjectType::String(value) => {
+            if value.has_properties() {
+                ensure!(limit >= 1, "Function clone property work budget exceeded");
+                children.try_reserve_exact(1)?;
+                children.push(value.property_root());
+            }
+            (value.inner().len(), value.has_properties())
+        }
+        ObjectType::ByteString(value) => {
+            if value.has_properties() {
+                ensure!(limit >= 1, "Function clone property work budget exceeded");
+                children.try_reserve_exact(1)?;
+                children.push(value.property_root());
+            }
+            (value.len(), value.has_properties())
+        }
         ObjectType::BigInt(value) => (usize::try_from(value.bits().div_ceil(8))?, false),
         // Symbols clone only their name/global function pointer, not the
         // function graph behind it. Alias cycles are a separate resolver check.

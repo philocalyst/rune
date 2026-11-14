@@ -63,6 +63,7 @@ pub(crate) struct Block<const CONST: bool> {
     channel_manager: Option<crate::channel_manager::ChannelManagerIdentity>,
     owner_domain: Option<u64>,
     copy_allocations: RefCell<Option<Vec<CopyAllocation>>>,
+    copy_walk: RefCell<CopyWalk>,
     #[cfg(test)]
     copy_failure_after: Cell<Option<usize>>,
     pub(in crate::core) objects: bumpalo::Bump,
@@ -104,6 +105,26 @@ pub(crate) struct DeferredEndpointFinalizers {
     copy_bytefns: Vec<ByteFn>,
     copy_storage: Vec<DropStackElem>,
 }
+#[derive(Default)]
+struct CopyWalk {
+    active: Vec<usize>,
+    work: usize,
+}
+pub(crate) struct CopyVisit<'a, const C: bool> {
+    block: &'a Block<C>,
+    key: usize,
+}
+impl<const C: bool> Drop for CopyVisit<'_, C> {
+    fn drop(&mut self) {
+        let mut walk = self.block.copy_walk.borrow_mut();
+        let popped = walk.active.pop();
+        debug_assert_eq!(popped, Some(self.key));
+        if walk.active.is_empty() {
+            walk.work = 0;
+        }
+    }
+}
+
 /// Owning native resources allocated during an unpublished graph copy. These
 /// are not roots and may only be consumed before any collection of the arena.
 pub(in crate::core) enum CopyAllocation {
@@ -330,6 +351,7 @@ impl<const CONST: bool> Block<CONST> {
             channel_manager: None,
             owner_domain: None,
             copy_allocations: RefCell::new(None),
+            copy_walk: RefCell::new(CopyWalk::default()),
             #[cfg(test)]
             copy_failure_after: Cell::new(None),
             objects: bumpalo::Bump::new(),
@@ -386,6 +408,22 @@ impl<const CONST: bool> Block<CONST> {
     /// Private factory brand, never inferred from caller objects or raw addresses.
     pub(in crate::core) fn belongs_to_owner(&self, owner: u64) -> bool {
         !CONST && self.owner_domain == Some(owner)
+    }
+
+    /// Intrinsic callback-free copy traversal, not a preflight snapshot. Source
+    /// addresses are identity numbers only and are discarded before GC is allowed.
+    pub(crate) fn enter_copy_node(&self, key: usize) -> anyhow::Result<CopyVisit<'_, CONST>> {
+        let mut walk = self.copy_walk.borrow_mut();
+        if walk.active.is_empty() {
+            walk.work = 0;
+        }
+        anyhow::ensure!(walk.work < 100_000, "Graph copy exceeds expanded work budget");
+        walk.work += 1;
+        anyhow::ensure!(walk.active.len() < 256, "Graph copy exceeds active depth budget");
+        anyhow::ensure!(!walk.active.contains(&key), "Cyclic graph copy is unsupported");
+        walk.active.try_reserve(1)?;
+        walk.active.push(key);
+        Ok(CopyVisit { block: self, key })
     }
 
     /// Begin an unpublished graph-copy transaction.

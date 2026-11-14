@@ -132,6 +132,7 @@ impl<'a> RootedEnv<'a> {
         let simple = [
             sym::CYCLIC_FUNCTION_INDIRECTION,
             sym::WRONG_NUMBER_OF_ARGUMENTS,
+            sym::ARGS_OUT_OF_RANGE,
             sym::SEARCH_FAILED,
             sym::INVALID_REGEXP,
             sym::WRONG_TYPE_ARGUMENT,

@@ -80,7 +80,14 @@ impl<'new> CloneIn<'new, &'new Self> for CharTable {
         let source_data: Vec<_> =
             lock(&self.0.data).iter().map(|(&key, value)| (key, **value)).collect();
         let parent_clone = source_parent
-            .map(|parent| Ok::<_, anyhow::Error>(Slot::new(parent.clone_in(bk)?.untag())))
+            .map(|parent| {
+                // Parent edges are raw typed references, not generic Slots. Route
+                // through Object so the intrinsic active-node guard also covers
+                // pure parent cycles before recursively copying another table.
+                let copied = Object::from(parent).clone_in(bk)?;
+                let super::ObjectType::CharTable(parent) = copied.untag() else { unreachable!() };
+                Ok::<_, anyhow::Error>(Slot::new(parent))
+            })
             .transpose()?;
         let parent = Mutex::new(parent_clone);
         let mut data = HashMap::default();
@@ -306,5 +313,27 @@ mod ownership_tests {
         let _data = lock(&table.0.data);
         let _parent = lock(&table.0.parent);
         assert!(format!("{table:?}").contains("CharTableInner"));
+    }
+}
+
+#[cfg(test)]
+mod parent_copy_guard_tests {
+    use super::*;
+    use crate::core::gc::{Context, RootSet};
+    use crate::core::object::make_channel_pair_for_test;
+    use crate::channel_manager::{ChannelManager, SendError, RecvError};
+    #[test]
+    fn self_parent_channel_copy_fails_and_following_plain_copy_succeeds() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let table = CharTableInner::new(None).into_obj(&cx.block);
+        table.untag().set_parent(Some(table.untag())).unwrap();
+        let manager = ChannelManager::isolated_for_test();
+        let (_, sender, receiver) = make_channel_pair_for_test(manager, 1);
+        assert_eq!(sender.try_send(table.into()), Err(SendError::CopyFailed));
+        assert!(matches!(receiver.try_recv(cx), Err(RecvError::Empty)));
+        sender.try_send(cx.add(42)).unwrap();
+        assert_eq!(receiver.try_recv(cx).unwrap(), cx.add(42));
+        sender.close(); receiver.close();
     }
 }

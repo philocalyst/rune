@@ -257,7 +257,26 @@ fn re_search_backward<'ob>(
     Ok((point + 1).into())
 }
 
-#[defun]
+fn plain_replacement_text<'ob>(object: Object<'ob>) -> Result<&'ob str> {
+    match object.untag() {
+        ObjectType::String(text) => {
+            ensure!(!text.has_properties(), "replace-match with property-bearing strings is unsupported");
+            Ok(text)
+        }
+        _ => bail!("replace-match requires Unicode text strings"),
+    }
+}
+#[defun(name = "replace-match")]
+fn replace_match_lisp(
+    newtext: Object, fixedcase: OptionalFlag, literal: OptionalFlag,
+    string: Option<Object>, subexp: Option<Object>, env: &Rt<Env>, cx: &Context,
+) -> Result<String> {
+    let newtext = plain_replacement_text(newtext)?;
+    let string = string.filter(|value| !value.is_nil()).map(plain_replacement_text).transpose()?;
+    let subexp = subexp.filter(|value| !value.is_nil()).map(usize::try_from).transpose()?;
+    replace_match(newtext, fixedcase, literal, string, subexp, env, cx)
+}
+
 fn replace_match(
     newtext: &str,
     _fixedcase: OptionalFlag,
@@ -294,7 +313,24 @@ fn replace_match(
     Ok(new_string)
 }
 
-#[defun]
+fn regexp_meta_byte(byte: u8) -> bool { matches!(byte, b'[' | b'*' | b'.' | b'\\' | b'?' | b'+' | b'^' | b'$') }
+#[defun(name = "regexp-quote")]
+fn regexp_quote_lisp<'ob>(string: Object<'ob>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    match string.untag() {
+        ObjectType::String(text) => {
+            if !text.as_bytes().iter().copied().any(regexp_meta_byte) { return Ok(string); }
+            Ok(cx.add(regexp_quote(text)))
+        }
+        ObjectType::ByteString(bytes) => {
+            if !bytes.iter().copied().any(regexp_meta_byte) { return Ok(string); }
+            let mut quoted = Vec::new();
+            quoted.try_reserve_exact(bytes.len().checked_mul(2).ok_or_else(|| anyhow::anyhow!("regexp-quote size overflow"))?)?;
+            for byte in bytes.iter().copied() { if regexp_meta_byte(byte) { quoted.push(b'\\'); } quoted.push(byte); }
+            Ok(cx.add(quoted))
+        }
+        _ => Err(buffer_search_type_error(string, "stringp", env, cx)),
+    }
+}
 fn regexp_quote(string: &str) -> String {
     let mut quoted = String::new();
     for ch in string.chars() {

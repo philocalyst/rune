@@ -140,7 +140,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
             ensure!(self.env.stack.can_push(), "Bytecode stack depth exceeded");
         }
         let arguments = Rt::bind_slice(&self.env.stack[..count], cx);
-        let result = cx.add(crate::fns::concat(arguments)?);
+        let result = crate::fns::concat_lisp(arguments, cx)?;
         let length = self.env.stack.len();
         self.env.stack.truncate(length - count);
         self.env.stack.push(result);

@@ -8,7 +8,19 @@ use crate::{Context, Env};
 use rune_macros::defun;
 use rune_text::{BytePos, CharPos, Rope};
 
-#[defun]
+fn plain_case_input(object: Object) -> Result<StringOrChar> {
+    match object.untag() {
+        crate::core::object::ObjectType::String(text) => anyhow::ensure!(!text.has_properties(), "Case conversion of property-bearing strings is unsupported"),
+        crate::core::object::ObjectType::ByteString(bytes) => anyhow::ensure!(!bytes.has_properties(), "Case conversion of property-bearing strings is unsupported"),
+        _ => {},
+    }
+    Ok(object.try_into()?)
+}
+
+#[defun(name = "capitalize")]
+fn capitalize_lisp<'ob>(object: Object<'ob>, cx: &'ob Context<'ob>) -> Result<Object<'ob>> {
+    Ok(capitalize(plain_case_input(object)?, cx))
+}
 fn capitalize<'ob>(string_or_char: StringOrChar<'ob>, cx: &'ob Context<'ob>) -> Object<'ob> {
     match string_or_char {
         StringOrChar::String(s) => cx.add(casify_string(s, CaseMode::Capitalize)),
@@ -16,7 +28,10 @@ fn capitalize<'ob>(string_or_char: StringOrChar<'ob>, cx: &'ob Context<'ob>) -> 
     }
 }
 
-#[defun]
+#[defun(name = "upcase")]
+fn upcase_lisp<'ob>(object: Object<'ob>, cx: &'ob Context<'ob>) -> Result<Object<'ob>> {
+    Ok(upcase(plain_case_input(object)?, cx))
+}
 fn upcase<'ob>(string_or_char: StringOrChar<'ob>, cx: &'ob Context<'ob>) -> Object<'ob> {
     match string_or_char {
         StringOrChar::String(s) => cx.add(casify_string(s, CaseMode::Upcase)),
@@ -24,7 +39,10 @@ fn upcase<'ob>(string_or_char: StringOrChar<'ob>, cx: &'ob Context<'ob>) -> Obje
     }
 }
 
-#[defun]
+#[defun(name = "downcase")]
+fn downcase_lisp<'ob>(object: Object<'ob>, cx: &'ob Context<'ob>) -> Result<Object<'ob>> {
+    Ok(downcase(plain_case_input(object)?, cx))
+}
 fn downcase<'ob>(string_or_char: StringOrChar<'ob>, cx: &'ob Context<'ob>) -> Object<'ob> {
     match string_or_char {
         StringOrChar::String(s) => cx.add(casify_string(s, CaseMode::Downcase)),
@@ -32,7 +50,10 @@ fn downcase<'ob>(string_or_char: StringOrChar<'ob>, cx: &'ob Context<'ob>) -> Ob
     }
 }
 
-#[defun]
+#[defun(name = "upcase-initials")]
+fn upcase_initials_lisp<'ob>(object: Object<'ob>, cx: &'ob Context<'ob>) -> Result<Object<'ob>> {
+    Ok(upcase_initials(plain_case_input(object)?, cx))
+}
 fn upcase_initials<'ob>(string_or_char: StringOrChar<'ob>, cx: &'ob Context<'ob>) -> Object<'ob> {
     match string_or_char {
         StringOrChar::String(s) => cx.add(casify_string(s, CaseMode::UpcaseInitials)),

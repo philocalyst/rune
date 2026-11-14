@@ -8,9 +8,24 @@ use anyhow::{Result, bail, ensure};
 use rune_macros::defun;
 use std::io::Write;
 
+fn plain_format_control<'ob>(object: Object<'ob>) -> Result<&'ob str> {
+    match object.untag() {
+        ObjectType::String(text) => {
+            ensure!(!text.has_properties(), "Property-bearing format controls are unsupported");
+            Ok(text)
+        }
+        ObjectType::ByteString(bytes) => {
+            ensure!(!bytes.has_properties(), "Property-bearing format controls are unsupported");
+            ensure!(bytes.is_ascii(), "Non-ASCII unibyte format controls are unsupported");
+            Ok(std::str::from_utf8(bytes)?)
+        }
+        _ => bail!("Format control must be a string"),
+    }
+}
+
 #[defun]
-fn message(format_string: &str, args: &[Object]) -> Result<String> {
-    let message = format(format_string, args)?;
+fn message(format_string: Object, args: &[Object]) -> Result<String> {
+    let message = format(plain_format_control(format_string)?, args)?;
     println!("MESSAGE: {message}");
     std::io::stdout().flush()?;
     Ok(message)
@@ -22,12 +37,18 @@ defvar!(MESSAGE_TYPE, "new message");
 #[path = "format.rs"]
 mod format_impl;
 
-#[defun]
+#[defun(name = "format")]
+fn format_lisp(string: Object, objects: &[Object]) -> Result<String> {
+    format(plain_format_control(string)?, objects)
+}
 fn format(string: &str, objects: &[Object]) -> Result<String> {
     format_impl::format(string, objects)
 }
 
-#[defun]
+#[defun(name = "format-message")]
+fn format_message_lisp(string: Object, objects: &[Object]) -> Result<String> {
+    format_message(plain_format_control(string)?, objects)
+}
 fn format_message(string: &str, objects: &[Object]) -> Result<String> {
     let formatted = format(string, objects)?;
     // TODO: implement support for `text-quoting-style`.
@@ -53,8 +74,12 @@ pub(crate) fn insert(args: ArgSlice, env: &mut Rt<Env>, cx: &Context) -> Result<
     for arg in args {
         let mut encoded = [0u8; 4];
         let text = match arg.untag() {
-            ObjectType::String(text) => &**text,
+            ObjectType::String(text) => {
+                ensure!(!text.has_properties(), "Property-bearing string insertion is unsupported");
+                &**text
+            },
             ObjectType::ByteString(bytes) => {
+                ensure!(!bytes.has_properties(), "Property-bearing string insertion is unsupported");
                 ensure!(bytes.is_ascii(), "Non-ASCII unibyte insertion into Unicode buffers is unsupported");
                 // ASCII has identical byte/scalar meaning. Do not decode arbitrary
                 // raw bytes as UTF-8 or silently turn them into Latin-1 characters.
