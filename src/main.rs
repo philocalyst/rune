@@ -21,6 +21,7 @@ mod channels;
 mod character;
 mod chartab;
 mod coding;
+mod completion;
 mod data;
 mod dired;
 mod dump;

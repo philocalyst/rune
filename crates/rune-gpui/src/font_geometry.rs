@@ -1,5 +1,12 @@
 //! Platform-independent guards around font measurements. Standalone-testable
 //! without downloading or linking GPUI; does not validate the native font API.
+/// Canonical below-baseline distance. GPUI's Linux CosmicText backend returns
+/// a signed negative descender; other backends may already return a distance.
+/// Reject nonfinite data before turning the signed convention into a magnitude.
+pub(crate) fn canonical_descent(raw:f32)->Result<f32,&'static str>{
+    if !raw.is_finite(){return Err("invalid native font descent")}
+    Ok(raw.abs())
+}
 pub(crate) fn validate(
     size: f32,
     advances: [f32; 3],
@@ -41,5 +48,22 @@ mod tests {
         }
         assert!(validate(17., [8.; 3], f32::MAX, f32::MAX, 0.).is_err());
         assert!(validate(17., [8.; 3], 13., -1., 3.).is_err());
+    }
+}
+
+#[cfg(test)]
+mod descent_tests {
+    use super::*;
+    #[test]
+    fn signed_linux_and_positive_backend_descents_share_canonical_geometry(){
+        assert_eq!(canonical_descent(-4.0092773),Ok(4.0092773));
+        assert_eq!(canonical_descent(4.0092773),Ok(4.0092773));
+        let descent=canonical_descent(-4.0092773).unwrap();
+        assert_eq!(validate(17.,[10.234863;3],15.779785,descent,3.),Ok(()));
+        assert_eq!(canonical_descent(-0.),Ok(0.));
+    }
+    #[test]
+    fn nonfinite_descents_never_reach_layout(){
+        for value in [f32::NAN,f32::INFINITY,f32::NEG_INFINITY]{assert!(canonical_descent(value).is_err());}
     }
 }

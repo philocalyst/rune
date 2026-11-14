@@ -105,7 +105,8 @@ impl NativeFont {
                 .into();
         }
         let ascent: f32 = system.ascent(id, px(size)).into();
-        let descent: f32 = system.descent(id, px(size)).into();
+        let raw_descent: f32 = system.descent(id, px(size)).into();
+        let descent = font_geometry::canonical_descent(raw_descent)?;
         font_geometry::validate(size, advances, ascent, descent, line_gap)?;
         Ok(Self {
             font,

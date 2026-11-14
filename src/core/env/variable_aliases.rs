@@ -58,6 +58,8 @@ impl RootedEnv<'_> {
             sym::FILL_COLUMN,
             sym::LOAD_PATH,
             sym::EXECUTING_KBD_MACRO,
+            sym::COMPLETION_IGNORE_CASE,
+            sym::COMPLETION_REGEXP_LIST,
             sym::CURRENT_TIME_LIST,
             sym::CASE_FOLD_SEARCH,
         ]
