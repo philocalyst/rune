@@ -626,3 +626,76 @@ mod visit_tests {
         assert!(!g.modified(h, &cx).unwrap());
     }
 }
+
+impl super::LispRuntimeHost<'_, '_, '_> {
+    /// Explicit native Save command. Only an already-associated selected UI
+    /// buffer is eligible; evaluator-local current-buffer is not consulted.
+    /// The caller must never replay this callback after an error or lost reply.
+    pub(crate) fn save_selected_visited(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<SaveOutcome, String> {
+        use rune_editor::EditorHost;
+        let snapshot = self.owner.snapshot().map_err(|e| e.to_string())?;
+        let buffer = snapshot
+            .views
+            .iter()
+            .find(|v| v.id == snapshot.selected_window)
+            .ok_or_else(|| "Missing selected editor view".to_owned())?
+            .view
+            .buffer;
+        drop(snapshot);
+        let gateway = &self.owner.gateway;
+        let handle = gateway
+            .inner
+            .try_borrow()
+            .map_err(|e| e.to_string())?
+            .buffer_handle(buffer, self.owner.cx)
+            .map_err(|e| e.to_string())?;
+        let read = gateway.read(handle, self.owner.cx).map_err(|e| e.to_string())?;
+        let pending = gateway
+            .prepare_visited_save(handle, read.epoch, max_bytes, self.owner.cx)
+            .map_err(|e| format!("Save not started: {e}"))?;
+        drop(read);
+        let written = pending
+            .write(SaveMode::ReplaceExisting)
+            .map_err(|e| format!("Save write failed: {e}"))?;
+        gateway.finish_save(written, self.owner.cx).map_err(|e| {
+            format!(
+                "File snapshot written, but buffer checkpoint not accepted: {e}; do not replay save"
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    #[test]
+    fn explicit_save_uses_selected_view_not_evaluator_binding_and_requires_path() {
+        super::super::with_lisp_runtime_owner(80, 24, |mut host| {
+            use rune_editor::EditorHost;
+            let snapshot = host.snapshot()?;
+            let buffer = snapshot.views.iter().find(|v| v.id == snapshot.selected_window).unwrap().view.buffer;
+            let gateway = host.owner.gateway.clone();
+            let handle = gateway.inner.borrow().buffer_handle(buffer, host.owner.cx)?;
+            assert!(host.save_selected_visited(64).unwrap_err().contains("Save not started"));
+            let dir = std::env::temp_dir().join(format!("rune-save-command-{}-{}",std::process::id(),NEXT_TEMP.fetch_add(1,Ordering::Relaxed)));
+            fs::create_dir(&dir)?;
+            let cleanup = TempPath(Some(dir.join("selected")));
+            gateway.set_file_association(handle, 0, Some(cleanup.0.as_ref().unwrap()), host.owner.cx)?;
+            host.evaluate_source(r#"(insert "selected") (set-buffer (get-buffer-create "other-save-target")) (insert "other")"#).unwrap();
+            fs::write(cleanup.0.as_ref().unwrap(), "unchanged")?;
+            assert!(host.save_selected_visited(0).unwrap_err().contains("Save not started"));
+            assert_eq!(fs::read_to_string(cleanup.0.as_ref().unwrap())?, "unchanged");
+            assert!(gateway.modified(handle, host.owner.cx)?);
+            let outcome = host.save_selected_visited(64).unwrap();
+            assert_eq!(fs::read_to_string(&outcome.path)?, "selected");
+            assert_eq!(outcome.bytes, 8);
+            assert!(!gateway.modified(handle,host.owner.cx)?);
+            drop(cleanup);
+            fs::remove_dir(dir)?;
+            Ok(())
+        }).unwrap();
+    }
+}
