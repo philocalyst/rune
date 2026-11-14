@@ -1748,14 +1748,37 @@ mod lisp_native_entry_sync_tests {
 
 #[cfg(test)]
 mod persistent_env_gc_tests {
-    use super::*;use rune_editor::{EditorHost,Document};
+    use super::*;
+    use rune_editor::{Document, EditorHost};
     #[test]
-    fn persistent_rooted_env_survives_gc_between_owner_requests(){
+    fn persistent_rooted_env_survives_gc_between_owner_requests() {
         with_lisp_runtime_owner(80,24,|mut host|{
             host.evaluate_source("(setq owner-persistent-state (list \"survives-owner-gc\"))").map_err(anyhow::Error::msg)?;
             host.owner.with_context(|cx,_|{cx.garbage_collect(true);Ok(())})?;
             host.evaluate_source("(if (equal (car owner-persistent-state) \"survives-owner-gc\") (insert \"rooted\") (error \"lost rooted env\"))").map_err(anyhow::Error::msg)?;
             assert_eq!(host.snapshot()?.buffers[0].document.to_text(),"rooted");Ok(())
         }).unwrap();
+    }
+}
+impl RuntimeEditorGateway {
+    pub(crate) fn modified(&self, handle: OwnerBufferHandle, cx: &Context) -> anyhow::Result<bool> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        owner.properties.empty(cx)?;
+        anyhow::ensure!(handle.owner == cx.domain_id(), "Foreign editor owner");
+        // Session authenticates membership in its live map or native tombstone
+        // map. Read/edit/rename/kill still require a live handle.
+        Ok(owner.session.modified(handle.buffer)?)
+    }
+    pub(crate) fn set_modified(
+        &self,
+        handle: OwnerBufferHandle,
+        value: bool,
+        cx: &Context,
+    ) -> anyhow::Result<()> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.set_modified(id, value)?)
     }
 }

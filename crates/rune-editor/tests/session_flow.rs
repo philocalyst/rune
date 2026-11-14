@@ -496,3 +496,57 @@ fn direct_visible_scope_and_policy_setters_invalidate_aba_but_private_current_do
     assert!(s.set_window_start(w, 99).is_err());
     assert_eq!(s.snapshot().sequence, seq);
 }
+#[test]
+fn explicit_dirty_metadata_does_not_fabricate_text_history_or_publication_revision() {
+    let mut s = Session::new(StringDocument::empty(), 80, 24).unwrap();
+    let b = s.current_buffer();
+    let before = s.buffer_snapshot(b).unwrap();
+    s.set_modified(b, true).unwrap();
+    assert!(s.modified(b).unwrap());
+    assert_eq!(s.buffer_snapshot(b).unwrap().version, before.version);
+    assert_eq!(s.execute(Command::Undo), Err(EditorError::NoUndo));
+    s.execute(Command::Insert("x".into())).unwrap();
+    s.execute(Command::Undo).unwrap();
+    assert!(s.modified(b).unwrap());
+    s.mark_saved(b).unwrap();
+    assert!(!s.modified(b).unwrap());
+    s.execute(Command::Redo).unwrap();
+    assert!(s.modified(b).unwrap());
+    s.set_modified(b, false).unwrap();
+    assert!(!s.modified(b).unwrap());
+    let seq = s.snapshot().sequence;
+    s.set_modified(b, false).unwrap();
+    assert_eq!(s.snapshot().sequence, seq);
+}
+
+#[test]
+fn forced_dirty_participates_in_kill_protection_and_is_allowed_on_read_only_text() {
+    let mut s = Session::new(StringDocument::empty(), 80, 24).unwrap();
+    let b = s.current_buffer();
+    s.set_read_only(b, true).unwrap();
+    s.set_modified(b, true).unwrap();
+    assert_eq!(
+        s.execute(Command::KillBuffer { buffer: b, force: false }),
+        Err(EditorError::ModifiedBuffer)
+    );
+    assert!(s.buffer_live(b));
+    s.set_modified(b, false).unwrap();
+    s.execute(Command::KillBuffer { buffer: b, force: false }).unwrap();
+    assert!(!s.buffer_live(b));
+}
+#[test]
+fn killed_buffer_retains_only_its_last_dirty_status_without_becoming_live() {
+    let mut s = Session::new(StringDocument::empty(), 80, 24).unwrap();
+    let clean = s.create_buffer("clean", StringDocument::empty()).unwrap();
+    let dirty = s.create_buffer("dirty", StringDocument::empty()).unwrap();
+    s.set_modified(dirty, true).unwrap();
+    s.execute(Command::KillBuffer { buffer: clean, force: true }).unwrap();
+    s.execute(Command::KillBuffer { buffer: dirty, force: true }).unwrap();
+    assert_eq!(s.modified(clean).unwrap(), false);
+    assert_eq!(s.modified(dirty).unwrap(), true);
+    assert!(!s.buffer_live(clean) && !s.buffer_live(dirty));
+    assert!(s.document(clean).is_err());
+    assert!(s.set_modified(dirty, false).is_err());
+    assert!(s.execute(Command::KillBuffer { buffer: dirty, force: true }).is_err());
+    assert_eq!(s.modified(dirty).unwrap(), true);
+}

@@ -168,6 +168,7 @@ struct Buffer<D: Document> {
     read_only: bool,
     version: u64,
     saved_version: u64,
+    forced_dirty: bool,
     next_version: u64,
     publication_epoch: u64,
     undo: Option<Arc<History<D>>>,
@@ -176,6 +177,9 @@ struct Buffer<D: Document> {
 #[derive(Clone)]
 struct State<D: Document> {
     buffers: BTreeMap<BufferId, Buffer<D>>,
+    // Killed shells retain only this native metadata bit, never text/history,
+    // property leases or any GC-owned value.
+    dead_modified: BTreeMap<BufferId, bool>,
     mru: Vec<BufferId>,
     current: BufferId,
     windows: WindowTree,
@@ -239,6 +243,7 @@ impl<D: Document> Session<D> {
             read_only: false,
             version: 0,
             saved_version: 0,
+            forced_dirty: false,
             next_version: 1,
             publication_epoch: 0,
             undo: None,
@@ -248,6 +253,7 @@ impl<D: Document> Session<D> {
             owner: crate::allocate_id()?,
             state: State {
                 buffers: [(id, buffer)].into(),
+                dead_modified: BTreeMap::new(),
                 mru: vec![id],
                 current: id,
                 windows,
@@ -361,7 +367,7 @@ impl<D: Document> Session<D> {
             name: b.name.clone(),
             document: b.document.clone(),
             version: b.publication_epoch,
-            modified: b.version != b.saved_version,
+            modified: b.forced_dirty || b.version != b.saved_version,
             read_only: b.read_only,
         })
     }
@@ -426,6 +432,7 @@ impl<D: Document> Session<D> {
                 read_only: false,
                 version: 0,
                 saved_version: 0,
+                forced_dirty: false,
                 next_version: 1,
                 publication_epoch: 0,
                 undo: None,
@@ -451,13 +458,31 @@ impl<D: Document> Session<D> {
         Ok(())
     }
     pub fn mark_saved(&mut self, id: BufferId) -> Result<()> {
-        let buffer = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
-        buffer.saved_version = buffer.version;
-        Ok(())
+        self.set_modified(id, false)
     }
     pub fn modified(&self, id: BufferId) -> Result<bool> {
-        let b = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
-        Ok(b.version != b.saved_version)
+        if let Some(b) = self.state.buffers.get(&id) {
+            return Ok(b.forced_dirty || b.version != b.saved_version);
+        }
+        self.state.dead_modified.get(&id).copied().ok_or(EditorError::InvalidBuffer)
+    }
+    /// Explicit dirty metadata never fabricates text versions or undo entries.
+    /// A forced clean baseline remains dirty through text history until saved.
+    pub fn set_modified(&mut self, id: BufferId, value: bool) -> Result<()> {
+        self.document(id)?; // Dead metadata may be queried, not mutated/adopted.
+        if self.modified(id)? == value {
+            return Ok(());
+        }
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let b = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
+        if value {
+            b.forced_dirty = true;
+        } else {
+            b.forced_dirty = false;
+            b.saved_version = b.version;
+        }
+        self.state.sequence = sequence;
+        Ok(())
     }
     pub fn set_window_start(&mut self, id: WindowId, start: usize) -> Result<()> {
         let buffer = self.state.windows.view(id)?.buffer;
@@ -698,7 +723,9 @@ impl<D: Document> Session<D> {
         Ok(())
     }
     fn kill(&mut self, id: BufferId, force: bool) -> Result<()> {
-        if self.modified(id)? && !force {
+        self.document(id)?;
+        let modified = self.modified(id)?;
+        if modified && !force {
             return Err(EditorError::ModifiedBuffer);
         }
         let fallback = self.state.mru.iter().copied().find(|other| {
@@ -729,6 +756,7 @@ impl<D: Document> Session<D> {
             }
         }
         self.state.buffers.remove(&id);
+        self.state.dead_modified.insert(id, modified);
         self.state.mru.retain(|old| *old != id);
         if self.state.current == id {
             self.state.current = fallback;
@@ -1278,7 +1306,7 @@ impl<D: Document> Session<D> {
                     name: b.name.clone(),
                     document: b.document.clone(),
                     version: b.publication_epoch,
-                    modified: b.version != b.saved_version,
+                    modified: b.forced_dirty || b.version != b.saved_version,
                     read_only: b.read_only,
                 })
                 .collect(),

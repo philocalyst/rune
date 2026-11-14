@@ -39,8 +39,13 @@ pub(crate) fn set_buffer<'ob>(
     Ok(cx.add(buffer))
 }
 #[defun]
-fn set_buffer_modified_p(flag: Object) -> Object {
-    flag
+fn set_buffer_modified_p(flag: Object, env: &Rt<Env>, cx: &Context) -> Result<()> {
+    env.editor_gateway().set_modified(env.current_buffer_handle(), !flag.is_nil(), cx)
+}
+#[defun]
+fn buffer_modified_p(buffer: Option<Gc<&LispBuffer>>, env: &Rt<Env>, cx: &Context) -> Result<bool> {
+    let handle = buffer.map_or_else(|| env.current_buffer_handle(), |buffer| buffer.untag().handle());
+    env.editor_gateway().modified(handle, cx)
 }
 #[defun]
 fn buffer_live_p(value: Object, cx: &Context) -> bool {
@@ -216,5 +221,66 @@ mod test {
         let cx = &mut Context::new(roots);
         let buffer = get_buffer_create(cx.add("test_create_buffer"), Some(NIL), cx).unwrap();
         assert!(matches!(buffer.untag(), ObjectType::Buffer(_)));
+    }
+}
+
+#[cfg(test)]
+mod owner_modified_primitive_tests {
+    #[test]
+    fn modified_flags_accept_nonnil_zero_and_retain_killed_buffer_state() {
+        crate::assert_elprop!(r#"(progn (set-buffer-modified-p nil)
+          (list (set-buffer-modified-p 0) (buffer-modified-p)
+                (set-buffer-modified-p 'anything) (buffer-modified-p)))"#);
+        crate::assert_elprop!(r#"(save-current-buffer
+          (let ((clean (get-buffer-create "modified-dead-clean"))
+                (dirty (get-buffer-create "modified-dead-dirty")))
+            (set-buffer clean) (set-buffer-modified-p nil)
+            (set-buffer dirty) (insert "é🙂") (set-buffer-modified-p t)
+            (kill-buffer clean) (kill-buffer dirty) (garbage-collect)
+            (let ((replacement (get-buffer-create "modified-dead-dirty")))
+              (set-buffer replacement) (set-buffer-modified-p nil)
+              (list (buffer-modified-p clean) (buffer-modified-p dirty)
+                    (buffer-live-p clean) (buffer-live-p dirty)
+                    (buffer-modified-p replacement) (buffer-modified-p dirty)))))"#);
+    }
+    #[test]
+    fn modified_flag_publication_does_not_create_text_revision_or_undo() -> anyhow::Result<()> {
+        use super::*;
+        use crate::core::gc::RootSet;
+        use rune_core::macros::root;
+        use rune_editor::{Command, EditorHost};
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new(cx)?), cx);
+        let g = env.editor_gateway();
+        let before = env.buffer_read(cx)?;
+        let mut native = g.host(cx)?;
+        let sequence = native.snapshot()?.sequence;
+        set_buffer_modified_p(crate::core::object::TRUE, env, cx)?;
+        assert!(buffer_modified_p(None, env, cx)?);
+        assert!(native.snapshot()?.sequence > sequence);
+        assert_eq!(env.buffer_read(cx)?.epoch, before.epoch);
+        let changed = native.snapshot()?.sequence;
+        set_buffer_modified_p(crate::core::object::TRUE, env, cx)?;
+        assert_eq!(native.snapshot()?.sequence, changed);
+        assert!(matches!(native.execute(Command::Undo), Err(rune_editor::EditorError::NoUndo)));
+        set_buffer_modified_p(NIL, env, cx)?;
+        assert!(!buffer_modified_p(None, env, cx)?);
+        assert_eq!(env.buffer_read(cx)?.epoch, before.epoch);
+        Ok(())
+    }
+    #[test]
+    fn modified_primitives_match_gnu_flags_returns_and_explicit_buffers() {
+        crate::assert_elprop!(r#"(progn (set-buffer-modified-p nil)
+          (list (buffer-modified-p) (set-buffer-modified-p t) (buffer-modified-p)
+                (set-buffer-modified-p nil) (buffer-modified-p)
+                (progn (insert "x") (buffer-modified-p))
+                (set-buffer-modified-p nil) (buffer-modified-p)))"#);
+        crate::assert_elprop!(r#"(save-current-buffer
+          (let ((a (get-buffer-create "modified-oracle-a"))
+                (b (get-buffer-create "modified-oracle-b")))
+            (set-buffer a) (set-buffer-modified-p t)
+            (set-buffer b) (set-buffer-modified-p nil)
+            (list (buffer-modified-p a) (buffer-modified-p b) (buffer-modified-p))))"#);
     }
 }
