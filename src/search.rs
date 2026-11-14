@@ -347,13 +347,14 @@ pub(crate) fn lisp_regex_to_rust(regexp: &str) -> String {
     let mut chars = regexp.char_indices();
     while let Some((idx, ch)) = chars.next() {
         match ch {
-            // Invert the escaping of parens. i.e. \( => ( and ( => \(
-            '(' | ')' | '{' | '}' => {
+            // Invert Emacs grouping/count/alternation escapes for Rust syntax.
+            // Pipes stay literal inside classes in either spelling (| or \|).
+            '(' | ')' | '{' | '}' | '|' => {
                 norm_regex.push('\\');
                 norm_regex.push(ch);
             }
             '\\' => match chars.next() {
-                Some((_, c @ '('..=')' | c @ '{' | c @ '}')) => norm_regex.push(c),
+                Some((_, c @ '('..=')' | c @ '{' | c @ '}' | c @ '|')) => norm_regex.push(c),
                 Some((_, '`')) => norm_regex += "\\A",
                 Some((_, '\'')) => norm_regex += "\\z",
                 Some((_, c)) => {
@@ -455,6 +456,8 @@ mod test {
     #[test]
     fn lisp_regex() {
         assert_eq!(lisp_regex_to_rust("foo"), "foo");
+        assert_eq!(lisp_regex_to_rust("a|b"), "a\\|b");
+        assert_eq!(lisp_regex_to_rust("a\\|b"), "a|b");
         assert_eq!(lisp_regex_to_rust("\\foo"), "\\foo");
         assert_eq!(lisp_regex_to_rust("\\(foo\\)"), "(foo)");
         assert_eq!(lisp_regex_to_rust("(foo)"), "\\(foo\\)");
@@ -462,6 +465,31 @@ mod test {
         assert_eq!(lisp_regex_to_rust("\\'"), "\\z");
         assert_eq!(lisp_regex_to_rust("[[:word:]]"), "[a-zA-Z]");
         assert_eq!(lisp_regex_to_rust("[[:word:]_]"), "[a-zA-Z_]");
+    }
+
+    #[test]
+    fn emacs_alternation_and_literal_pipe_match_gnu() {
+        for form in [
+            r#"(string-match "a\\|b" "b")"#,
+            r#"(string-match "a|b" "b")"#,
+            r#"(string-match "a|b" "xa|by")"#,
+            r#"(let ((s "TAB")) (string-match "\\`\\(NUL\\|RET\\|TAB\\|LFD\\|ESC\\|SPC\\|DEL\\)\\'" s) (list (match-beginning 0) (match-end 0) (match-beginning 1) (match-end 1)))"#,
+            r#"(let ((s "bc")) (string-match "\\(a\\|b\\)c" s) (list (match-beginning 0) (match-end 0) (match-beginning 1) (match-end 1)))"#,
+            r#"(string-match "[|]" "|")"#,
+            r#"(string-match "[a|b]+" "|ba")"#,
+            r#"(string-match "[]|]+" "]|")"#,
+            r#"(string-match "[^a|]+" "bb|aa")"#,
+            r#"(string-match "\\|b" "z")"#,
+            r#"(string-match "[\\|]" "|")"#,
+            r#"(string-match "a\\|" "z")"#,
+            r#"(string-match "a\\|bc" "bc")"#,
+            r#"(string-match "a\\\\|b" "a\\|b")"#,
+            r#"(string-match "\\(a|b\\)" "a|b")"#,
+            r#"(let ((s (make-string 1 98))) (string-match "a\\|b" s))"#,
+        ] {
+
+            crate::assert_elprop!("(let ((case-fold-search nil)) {})", form);
+        }
     }
 
     #[test]
