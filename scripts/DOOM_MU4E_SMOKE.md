@@ -33,6 +33,25 @@ record their checked-out revisions and installer exit status. CLI `--help`, an
 `early-init.el` load, a partial package cache, or a synthetic `provide` is **not**
 a full setup or boot pass. No source rewrites or feature mocks are permitted.
 
+After installation/rebuild, capture the exact installed working-tree source baseline:
+
+```
+python3 scripts/package_provenance.py --repos /BENCH/local/straight/repos \
+  --doom-root /DOOM --mu-lisp /TOOLS/share/mu4e --output /BENCH/package-source-manifest.json
+```
+
+The manifest is path-independent: repository/source-tree labels, exact HEAD revisions,
+relative tracked-file content/type fingerprints (including initialized submodule
+files), counts and bytes. It includes Doom's tracked sources, not just its commit.
+The supplied mu4e Lisp source directory is also content-hashed as a plain tree
+without inventing a Git revision. The benchmark requires an exact match before starting and checks sources and the
+three profile files again afterward. Any mismatch invalidates all observations.
+This is source provenance, not an atomic filesystem guarantee or a fingerprint of
+untracked/compiled build caches. Rebuild caches from these recorded sources when
+reproducing elsewhere. Hashing has package/file/byte caps; Git's tracked-name
+metadata is materialized before file-count validation. Supplied repositories are
+trusted benchmark dependencies, not arbitrary hostile inputs.
+
 Official mu/mu4e must be installed/extracted with matching versions. The separate
 synthetic Maildir driver must use an isolated mu database, disable retrieval,
 automatic read marking, HTML/images/remote content, and verify source hashes.
@@ -50,7 +69,8 @@ python3 scripts/doom_mu4e_smoke.py \
   --mu-driver /SYNTHETIC/gnu-mu4e-smoke.el --mu-home /SYNTHETIC/muhome \
   --mu-binary /TOOLS/bin/mu --mu-lisp /TOOLS/share/mu4e \
   --maildir /SYNTHETIC/maildir --mail-manifest /SYNTHETIC/manifest.json \
-  --workspace /RUNE_CHECKOUT --timeout 30 --output /tmp/doom-mu4e-status.json
+  --package-manifest /BENCH/package-source-manifest.json \
+  --workspace /RUNE_CHECKOUT --timeout 300 --output /tmp/doom-mu4e-status.json
 ```
 
 Every gate starts a fresh process with an isolated HOME and explicit EMACSDIR,
@@ -82,18 +102,18 @@ These are separate checkpoints, not interchangeable scores:
   Raw stdin bypasses bootstrap. Its source-mirrored package `defmacro` failure
   is NOT evidence that bootstrapped Rune lacks that macro.
 - Official Doom installation and rebuild completed exit 0. This alone proves no
-  workflow. Corrected **real `doom-startup`** reference tests reached GNU **3/4**:
-  profile startup, actual Evil dispatch, and Org edit/save/reopen passed; mu4e
-  exposed a missing Doom helper when no account context was configured. The
-  profile now uses Doom's documented synthetic context and is being requalified.
+  workflow. Corrected **real `doom-startup`** reference tests now pass GNU **4/4**:
+  profile startup, actual Evil dispatch, Org edit/save/reopen, and actual mu4e
+  navigation/body/read-only. The profile uses Doom's documented synthetic context,
+  with no credentials, retrieval or outgoing mail. Source mail hashes stayed unchanged.
 - Earlier descriptor-only GNU "boot" passes were explicitly withdrawn and old
   JSON reports annotated. They are not full startup evidence.
-- Real Rune bootstrap passed in the separate loader candidate (~128 seconds).
-  The current combined keymap candidate regressed during subr initialization
-  (`use-global-map nil`): native bound-nil initialization skipped real Lisp
-  keymap construction. Until repaired, no Doom gate is reached. The separate
-  pre-keymap loader candidate reached real Doom and failed at
-  `locate-file-internal`; its bounded implementation is now under qualification.
+- Rune's real bootstrap passes with faithful native minibuffer-map initialization.
+  The actual Doom first gate remains **0/1**. After the working-directory fix
+  cleared the empty-path error, official `early-init.el` reports
+  `(void-function getenv-internal)`. This is a real package prerequisite, not
+  an installer pass or a raw-core macro failure. Later workflows are not run
+  until that genuine first gate progresses.
 - Standalone **actual GNU mu4e** navigation/body/read-only tests passed, with all
   synthetic mail unchanged. This is a reference only, never Rune or Doom success.
 

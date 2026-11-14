@@ -6,10 +6,12 @@ import json
 from pathlib import Path
 import re
 import sys
+import subprocess
 import tempfile
 import uuid
 from run_stdin_differential import literal
 from run_upstream_ert import capture
+from package_provenance import capture as capture_package_sources
 
 LAUNCH = '''import os,sys
 home,config,local,mu_home,mu_binary,doom_root=sys.argv[1:7]
@@ -85,7 +87,7 @@ def summarize(rows):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    for name in ('doom-root', 'doom-config', 'doom-local', 'gnu', 'rune', 'mu-driver', 'mu-home', 'mu-binary', 'mu-lisp', 'workspace', 'maildir', 'mail-manifest', 'output'):
+    for name in ('doom-root', 'doom-config', 'doom-local', 'gnu', 'rune', 'mu-driver', 'mu-home', 'mu-binary', 'mu-lisp', 'workspace', 'maildir', 'mail-manifest', 'package-manifest', 'output'):
         p.add_argument('--' + name, required=True, type=Path)
     p.add_argument('--revision', required=True)
     p.add_argument('--timeout', type=float, default=300)
@@ -98,6 +100,10 @@ def main():
     for name, path in vars(a).items():
         if isinstance(path, Path):
             setattr(a, name, path.resolve())
+    expected_packages = json.loads(a.package_manifest.read_text(encoding='utf-8'))
+    package_sources_before = capture_package_sources(a.doom_local/'straight/repos', {'@doom':a.doom_root}, {'@mu4e':a.mu_lisp})
+    if package_sources_before != expected_packages:
+        p.error('installed package revisions/sources do not match supplied manifest')
     manifest = json.loads(a.mail_manifest.read_text(encoding='utf-8'))
     expected_mail = manifest.get('synthetic_message_sha256', {})
     if not expected_mail or len(expected_mail) > 100 or any(Path(name).is_absolute() or '..' in Path(name).parts for name in expected_mail):
@@ -113,6 +119,11 @@ def main():
     mu_version = mu_match[1] if mu_match else None
     mu4e_version = mu4e_match[1] if mu4e_match else None
     versions_match = version_code == 0 and mu_version is not None and mu_version == mu4e_version
+    profile_sources_before = {name:sha(a.doom_config/name) for name in ('init.el','config.el','packages.el')}
+    fixture_paths = {'mu4e_config':a.mu_lisp/'mu4e-config.el', 'mu_driver':a.mu_driver, 'mail_manifest':a.mail_manifest, 'package_manifest':a.package_manifest}
+    fixture_sources_before = {name:sha(path) for name,path in fixture_paths.items()}
+    modules_commit = subprocess.check_output(['git','-C',str(a.doom_root/'sources/doom+'),'rev-parse','HEAD'], text=True).strip()
+    commit = package_sources_before['packages']['@doom']['revision']
     binaries_before = {'rune':sha(a.rune),'gnu_launcher':sha(a.gnu),'mu_launcher':sha(a.mu_binary)}
     marker = 'RUNE-DOOM-MU4E-' + uuid.uuid4().hex
     rows = []
@@ -148,19 +159,35 @@ def main():
                 errors = structured or [line for line in output.splitlines() if re.search(r'Error:|error:|Debugger entered|void-function|file-missing|Cannot open', line)]
                 records[runtime] = {'passed': passed and mail_hashes() == before_mail and versions_match, 'mail_sources_unchanged': mail_hashes() == before_mail, 'returncode': code, 'forced': forced, 'first_error': errors[0] if errors else None, 'output': output, 'command_template': command}
             rows.append({'id': gate, 'runtimes': records})
-    import subprocess
     emacs_version, _, _ = capture([str(a.gnu), '--version'], str(a.workspace), 5)
-    modules_commit = subprocess.check_output(['git','-C',str(a.doom_root/'sources/doom+'),'rev-parse','HEAD'], text=True).strip()
-    commit = subprocess.check_output(['git','-C',str(a.doom_root),'rev-parse','HEAD'], text=True).strip()
-    binaries_after = {'rune':sha(a.rune),'gnu_launcher':sha(a.gnu),'mu_launcher':sha(a.mu_binary)}
-    if binaries_before != binaries_after:
+    try:
+        binaries_after = {'rune':sha(a.rune),'gnu_launcher':sha(a.gnu),'mu_launcher':sha(a.mu_binary)}
+    except Exception as error:
+        binaries_after = {'capture_error':str(error)[:512]}
+    try:
+        fixture_sources_after = {name:sha(path) for name,path in fixture_paths.items()}
+    except Exception as error:
+        fixture_sources_after = {'capture_error':str(error)[:512]}
+    try:
+        package_sources_after = capture_package_sources(a.doom_local/'straight/repos', {'@doom':a.doom_root}, {'@mu4e':a.mu_lisp})
+    except Exception as error:
+        # Preserve executed observations as explicitly invalid, even if a source
+        # was deleted/replaced rather than merely changed during the workflow.
+        package_sources_after = {'capture_error':str(error)[:512]}
+    try:
+        profile_sources_after = {name:sha(a.doom_config/name) for name in ('init.el','config.el','packages.el')}
+    except Exception as error:
+        profile_sources_after = {'capture_error':str(error)[:512]}
+    profile_sources_unchanged = profile_sources_before == profile_sources_after
+    package_sources_unchanged = package_sources_before == package_sources_after
+    if binaries_before != binaries_after or not package_sources_unchanged or not profile_sources_unchanged or fixture_sources_before != fixture_sources_after:
         for row in rows:
             for runtime in ('rune','gnu'):
                 if row['runtimes'][runtime].get('status') != 'not-run':
                     row['runtimes'][runtime]['passed'] = False
-                    row['runtimes'][runtime]['first_error'] = 'Executable/launcher changed during benchmark; observations unqualified'
+                    row['runtimes'][runtime]['first_error'] = 'Executable or installed package source changed during benchmark; observations unqualified'
     report = {'schema_version':2, 'startup_contract':'official doom-startup and doom-finalize before all assertions', 'measurement':'actual-doom-mu4e-synthetic-workflow', 'revision_label':a.revision,
-              'doom_commit':commit, 'doom_modules_commit':modules_commit, 'gnu_emacs_version_output':emacs_version, 'mu4e_config_sha256':sha(a.mu_lisp/'mu4e-config.el'), 'mu_driver_sha256':sha(a.mu_driver), 'mail_manifest_sha256':sha(a.mail_manifest), 'mail_versions': {'mu':mu_version,'mu4e_source':mu4e_version,'matched':versions_match,'version_command_output':version_output}, 'mail_sources_before':before_mail,'mail_sources_after':mail_hashes(), 'doom_profile_sha256':sha(a.doom_config/'init.el'), 'doom_config_sha256':sha(a.doom_config/'config.el'), 'doom_packages_sha256':sha(a.doom_config/'packages.el'),
+              'fixture_sources_before':fixture_sources_before, 'fixture_sources_after':fixture_sources_after, 'fixture_sources_unchanged':fixture_sources_before==fixture_sources_after, 'profile_sources_before':profile_sources_before, 'profile_sources_after':profile_sources_after, 'profile_sources_unchanged':profile_sources_unchanged, 'package_manifest_sha256':fixture_sources_before['package_manifest'], 'package_sources_before':package_sources_before, 'package_sources_after':package_sources_after, 'package_sources_unchanged':package_sources_unchanged, 'doom_commit':commit, 'doom_modules_commit':modules_commit, 'gnu_emacs_version_output':emacs_version, 'mu4e_config_sha256':fixture_sources_before['mu4e_config'], 'mu_driver_sha256':fixture_sources_before['mu_driver'], 'mail_manifest_sha256':fixture_sources_before['mail_manifest'], 'mail_versions': {'mu':mu_version,'mu4e_source':mu4e_version,'matched':versions_match,'version_command_output':version_output}, 'mail_sources_before':before_mail,'mail_sources_after':mail_hashes(), 'doom_profile_sha256':profile_sources_before['init.el'], 'doom_config_sha256':profile_sources_before['config.el'], 'doom_packages_sha256':profile_sources_before['packages.el'],
               'binary_sha256':binaries_before, 'binary_sha256_after':binaries_after, 'executables_unchanged':binaries_before==binaries_after,
               'gates':rows, 'summary':summarize(rows),
               'limitations':['Requires a genuinely installed pinned Doom profile; CLI help is not boot success.',
