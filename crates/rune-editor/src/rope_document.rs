@@ -88,6 +88,17 @@ impl Document for RopeDocument {
         }
         Ok(next)
     }
+    fn line_start_offset(&self, at: usize, delta: i64) -> Option<usize> {
+        let text = self.snapshot.text();
+        let line = text.char_to_line(CharPos(at)).ok()?.0;
+        let target = if delta >= 0 {
+            line.saturating_add(usize::try_from(delta).unwrap_or(usize::MAX))
+                .min(text.line_count() - 1)
+        } else {
+            line.saturating_sub(usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX))
+        };
+        text.line_to_char(rune_text::LinePos(target)).ok().map(|p| p.0)
+    }
     fn visit_chars(&self, start: usize, max: usize, visitor: &mut dyn FnMut(usize, char) -> bool) {
         if let Ok(chars) = self.snapshot.chars_from(CharPos(start)) {
             for (offset, ch) in chars.take(max).enumerate() {

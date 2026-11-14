@@ -179,6 +179,11 @@ impl Document for RuntimeDocument {
         }
         Ok(next)
     }
+    fn line_start_offset(&self, at:usize, delta:i64)->Option<usize> {
+        let text=self.snapshot.text();let line=text.char_to_line(CharPos(at)).ok()?.0;
+        let target=if delta>=0 {line.saturating_add(usize::try_from(delta).unwrap_or(usize::MAX)).min(text.line_count()-1)}else{line.saturating_sub(usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX))};
+        text.line_to_char(rune_text::LinePos(target)).ok().map(|p|p.0)
+    }
     fn visit_chars(&self, start: usize, max: usize, visitor: &mut dyn FnMut(usize, char) -> bool) {
         if let Ok(chars) = self.snapshot.chars_from(CharPos(start)) {
             for (i, c) in chars.take(max).enumerate() {
@@ -384,6 +389,9 @@ impl rune_editor::EditorHost for RuntimeEditorHost<'_, '_> {
             .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
         self.editor.session.cancel_prefix();
         Ok(())
+    }
+    fn scroll_window(&mut self,w:rune_editor::WindowId,b:rune_editor::BufferId,sequence:u64,lines:i64)->rune_editor::Result<bool> {
+        self.editor.properties.empty(self.cx).map_err(|e|rune_editor::EditorError::Backend(e.to_string()))?; self.editor.session.scroll_window(w,b,sequence,lines)
     }
     fn place_pointer(
         &mut self,
@@ -895,6 +903,9 @@ impl rune_editor::EditorHost for GatewayEditorHost<'_, '_> {
             Ok(())
         })
     }
+    fn scroll_window(&mut self,w:rune_editor::WindowId,b:rune_editor::BufferId,sequence:u64,lines:i64)->rune_editor::Result<bool> {
+        self.mutate(|owner|owner.session.scroll_window(w,b,sequence,lines))
+    }
     fn place_pointer(
         &mut self,
         w: rune_editor::WindowId,
@@ -1294,6 +1305,9 @@ impl rune_editor::EditorHost for MutableGatewayEditorHost<'_, '_> {
             .host(self.cx)
             .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?
             .cancel_prefix()
+    }
+    fn scroll_window(&mut self,w:rune_editor::WindowId,b:rune_editor::BufferId,sequence:u64,lines:i64)->rune_editor::Result<bool> {
+        use rune_editor::EditorHost; self.gateway.host(self.cx).map_err(|e|rune_editor::EditorError::Backend(e.to_string()))?.scroll_window(w,b,sequence,lines)
     }
     fn place_pointer(
         &mut self,
@@ -1709,6 +1723,9 @@ impl rune_editor::EditorHost for LispRuntimeHost<'_, '_, '_> {
         use rune_editor::EditorHost;
         self.owner.cancel_prefix()
     }
+    fn scroll_window(&mut self,w:rune_editor::WindowId,b:rune_editor::BufferId,sequence:u64,lines:i64)->rune_editor::Result<bool> {
+        rune_editor::EditorHost::scroll_window(&mut self.owner,w,b,sequence,lines)
+    }
     fn place_pointer(
         &mut self,
         w: rune_editor::WindowId,
@@ -1881,4 +1898,16 @@ mod insert_before_marker_owner_tests {
         host.execute(Command::Redo).unwrap();assert_eq!(g.marker_position(h,left,&cx).unwrap(),Some(3));assert_eq!(g.marker_position(h,right,&cx).unwrap(),Some(3));assert_eq!(g.marker_position(h,fresh,&cx).unwrap(),Some(1));assert_eq!(g.marker_position(h,removed,&cx).unwrap(),None);
         assert_eq!(g.read(h,&cx).unwrap().document.properties().at(CharPos(3)),Some(PropSetId(style.id())));
     }
+}
+
+#[cfg(test)]
+mod scoped_scroll_owner_tests {
+ use super::*;use rune_editor::{EditorHost,Command};
+ #[test]
+ fn actual_owner_scroll_is_read_only_safe_and_does_not_change_evaluator_point() {
+  with_lisp_runtime_owner(80,24,|mut host|{
+   host.evaluate_source("(insert \"first λ\\nsecond🙂\\nthird\\n\")").unwrap();let before=host.snapshot()?;let v=before.views.iter().find(|v|v.id==before.selected_window).unwrap();let point=v.view.point;let b=v.view.buffer;let w=v.id;
+   assert!(host.scroll_window(w,b,before.sequence,1)?);let after=host.snapshot()?;let v=after.views.iter().find(|v|v.id==w).unwrap();assert_eq!(v.view.start,8);assert_eq!(v.view.point,point);assert_eq!(before.buffers[0].version,after.buffers[0].version);assert!(host.scroll_window(w,b,before.sequence,1).is_err());host.execute(Command::Undo)?;assert_eq!(host.snapshot()?.buffers.iter().find(|b2|b2.id==b).unwrap().document.to_text(),"");Ok(())
+  }).unwrap();
+ }
 }

@@ -32,6 +32,28 @@ pub trait Document: Clone {
     }
     fn visit_chars(&self, start: usize, max: usize, visitor: &mut dyn FnMut(usize, char) -> bool);
 
+    /// Clamped line-start navigation. Reference backends may scan; persistent
+    /// production backends override using indexed newline summaries.
+    fn line_start_offset(&self, at: usize, delta: i64) -> Option<usize> {
+        if at > self.len_chars() {
+            return None;
+        }
+        let mut starts = vec![0];
+        self.visit_chars(0, self.len_chars(), &mut |i, c| {
+            if c == '\n' {
+                starts.push(i + 1);
+            }
+            true
+        });
+        let line = starts.partition_point(|p| *p <= at).checked_sub(1)?;
+        let target = if delta >= 0 {
+            line.saturating_add(usize::try_from(delta).unwrap_or(usize::MAX))
+                .min(starts.len() - 1)
+        } else {
+            line.saturating_sub(usize::try_from(delta.unsigned_abs()).unwrap_or(usize::MAX))
+        };
+        starts.get(target).copied()
+    }
     /// Explicit materialization for diagnostics/files, not the rendering path.
     fn to_text(&self) -> String {
         let mut out = String::new();

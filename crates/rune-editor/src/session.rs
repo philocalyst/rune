@@ -596,6 +596,36 @@ impl<D: Document> Session<D> {
         self.state.sequence = sequence;
         Ok(())
     }
+    /// Scoped wheel operation: never select/retarget and never move point.
+    pub fn scroll_window(
+        &mut self,
+        window: WindowId,
+        buffer: BufferId,
+        expected_sequence: u64,
+        lines: i64,
+    ) -> Result<bool> {
+        if self.state.sequence != expected_sequence || self.selected_window() != window {
+            return Err(EditorError::StaleInput);
+        }
+        let view = self.state.windows.view(window)?;
+        if view.buffer != buffer {
+            return Err(EditorError::StaleInput);
+        }
+        if lines == 0 {
+            return Ok(false);
+        }
+        let start = self
+            .document(buffer)?
+            .line_start_offset(view.start, lines)
+            .ok_or(EditorError::InvalidPosition)?;
+        if start == view.start {
+            return Ok(false);
+        }
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        self.state.windows.view_mut(window)?.start = start;
+        self.state.sequence = sequence;
+        Ok(true)
+    }
     pub fn set_window_start(&mut self, id: WindowId, start: usize) -> Result<()> {
         let buffer = self.state.windows.view(id)?.buffer;
         if start > self.document(buffer)?.len_chars() {

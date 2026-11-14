@@ -10,6 +10,18 @@ pub trait EditorHost {
     fn execute(&mut self, command: Command) -> Result<CommandOutcome>;
     fn dispatch_key(&mut self, key: Key) -> Result<Dispatch>;
     fn cancel_prefix(&mut self) -> Result<()>;
+    /// Unsupported hosts fail explicitly; never manufacture a successful scroll.
+    fn scroll_window(
+        &mut self,
+        _window: WindowId,
+        _buffer: BufferId,
+        _sequence: u64,
+        _lines: i64,
+    ) -> Result<bool> {
+        Err(crate::EditorError::Backend(
+            "Scoped scrolling is unsupported by this host".into(),
+        ))
+    }
     fn place_pointer(
         &mut self,
         window: WindowId,
@@ -40,6 +52,15 @@ impl<D: Document> EditorHost for Session<D> {
     fn cancel_prefix(&mut self) -> Result<()> {
         Session::cancel_prefix(self);
         Ok(())
+    }
+    fn scroll_window(
+        &mut self,
+        w: WindowId,
+        b: BufferId,
+        sequence: u64,
+        lines: i64,
+    ) -> Result<bool> {
+        Session::scroll_window(self, w, b, sequence, lines)
     }
     fn place_pointer(
         &mut self,
