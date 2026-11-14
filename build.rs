@@ -147,7 +147,45 @@ fn main() {
     let dest_path = Path::new(&out_dir).join("sym.rs");
     let mut f = File::create(dest_path).unwrap();
 
-    let symbol_len = all_defsym.len() + all_defun.len() + all_defvar.len() + 2;
+    // One Lisp identity may have independent value/function declarations.
+    let mut symbols: Vec<(String, bool)> = vec![("nil".into(), false), ("t".into(), false)];
+    let mut aliases = std::collections::BTreeMap::<String, usize>::new();
+    aliases.insert("NIL".into(), 0);
+    aliases.insert("TRUE".into(), 1);
+    let mut declare = |rust: &str, lisp: String, special: bool| {
+        let index = match symbols.iter().position(|entry| entry.0 == lisp) {
+            Some(index) => {
+                symbols[index].1 |= special;
+                index
+            }
+            None => {
+                let index = symbols.len();
+                symbols.push((lisp, special));
+                index
+            }
+        };
+        let rust = rust.to_ascii_uppercase();
+        if let Some(previous) = aliases.insert(rust.clone(), index) {
+            assert_eq!(previous, index, "Rust symbol alias {rust} names different Lisp symbols");
+        }
+        index
+    };
+    for (rust, lisp) in &all_defsym {
+        declare(
+            rust,
+            lisp.as_ref()
+                .map_or_else(|| map_varname(rust), |name| name.trim_matches('"').to_owned()),
+            false,
+        );
+    }
+    for (rust, lisp, _, _) in &all_defvar {
+        declare(rust, lisp.clone(), true);
+    }
+    let subr_indices: Vec<_> = all_defun
+        .iter()
+        .map(|(_, rust, lisp)| declare(rust, lisp.clone(), false))
+        .collect();
+    let symbol_len = symbols.len();
     writeln!(
         f,
         "
@@ -164,40 +202,13 @@ pub(in crate::core) static BUILTIN_SYMBOLS: [SymbolCell; {symbol_len}] = [
     )
     .unwrap();
 
-    // write the list of all defsym to the file
-    for (sym, name) in &all_defsym {
-        let sym_name = match name {
-            Some(name) => name.trim_matches('"').to_string(),
-            None => map_varname(sym),
-        };
-        writeln!(f, "    SymbolCell::new_static(\"{sym_name}\"),").unwrap();
+    for (name, special) in symbols.iter().skip(2) {
+        let constructor = if *special { "new_static_special" } else { "new_static" };
+        writeln!(f, "    SymbolCell::{constructor}({name:?}),").unwrap();
     }
-
-    for (_, name, _, _) in &all_defvar {
-        #[rustfmt::skip]
-        writeln!(f, "    SymbolCell::new_static_special(\"{name}\"),").unwrap();
-    }
-
-    // write the list of all defun to a file in out_dir
-    for (_, _, lisp_name) in &all_defun {
-        #[rustfmt::skip]
-        writeln!(f, "    SymbolCell::new_static(\"{lisp_name}\"),").unwrap();
-    }
-
-    // End BUILTIN_SYMBOLS
     writeln!(f, "];\n").unwrap();
-
-    let special = ["nil".to_owned(), "true".to_owned()];
-    let all_elements = special
-        .iter()
-        .chain(all_defsym.iter().map(|x| &x.0))
-        .chain(all_defvar.iter().map(|x| &x.0))
-        .chain(all_defun.iter().map(|x| &x.1))
-        .enumerate();
-    for (idx, element) in all_elements {
-        let sym_name = element.to_ascii_uppercase();
-        #[rustfmt::skip]
-        writeln!(f, "pub(crate) const {sym_name}: Symbol = Symbol::new_builtin({idx});").unwrap();
+    for (alias, index) in aliases {
+        writeln!(f, "pub(crate) const {alias}: Symbol = Symbol::new_builtin({index});").unwrap();
     }
 
     // all SubrFn
@@ -210,16 +221,37 @@ pub(in crate::core) static BUILTIN_SYMBOLS: [SymbolCell; {symbol_len}] = [
     // End SUBR_DEFS
     writeln!(f, "];\n").unwrap();
 
-    let defun_start = symbol_len - subr_len;
+    writeln!(f, "const SUBR_SYMBOL_INDICES: [usize; {subr_len}] = {subr_indices:?};").unwrap();
     writeln!(
         f,
         "
 pub(crate) fn init_symbols() {{
-    for (sym, func) in BUILTIN_SYMBOLS[{defun_start}..].iter().zip(SUBR_DEFS.iter()) {{
+    for (index, func) in SUBR_SYMBOL_INDICES.iter().zip(SUBR_DEFS.iter()) {{
+        let sym = &BUILTIN_SYMBOLS[*index];
         unsafe {{ sym.set_func((*func).into()).unwrap(); }}
     }}
 }}
 "
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"
+#[cfg(test)]
+mod generated_symbol_manifest_tests {{
+    use super::*;
+    #[test]
+    fn canonical_names_are_unique_and_subr_indices_match_names() {{
+        let mut names = std::collections::BTreeSet::new();
+        for index in 0..BUILTIN_SYMBOLS.len() {{
+            assert!(names.insert(Symbol::new_builtin(index).get().name()));
+        }}
+        for (index, function) in SUBR_SYMBOL_INDICES.iter().zip(SUBR_DEFS.iter()) {{
+            assert_eq!(Symbol::new_builtin(*index).get().name(), function.name);
+        }}
+    }}
+}}
+"#
     )
     .unwrap();
     // End mod sym

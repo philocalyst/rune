@@ -180,7 +180,11 @@ impl Interpreter<'_, '_> {
         cx: &'ob mut Context,
     ) -> EvalResult<'ob> {
         let Some(func) = sym.bind(cx).follow_indirect(cx) else {
-            bail_err!("Invalid function: {sym}")
+            return Err(EvalError::signal(
+                sym::VOID_FUNCTION.into(),
+                Cons::new1(sym.bind(cx), cx).into(),
+                cx,
+            ));
         };
         root!(func, cx);
 
@@ -469,7 +473,11 @@ impl Interpreter<'_, '_> {
                 Some(value) => Ok(value),
                 None => match self.env.vars.get(sym) {
                     Some(v) => Ok(v.bind(cx)),
-                    None => Err(error!("Void variable: {sym}")),
+                    None => Err(EvalError::signal(
+                        sym::VOID_VARIABLE.into(),
+                        Cons::new1(sym, cx).into(),
+                        cx,
+                    )),
                 },
             }
         }
@@ -994,6 +1002,32 @@ mod test {
         let obj = crate::reader::read(test_str, cx).unwrap().0;
         root!(obj, cx);
         assert!(eval(obj, None, env, cx).is_err());
+    }
+
+    #[test]
+    fn named_void_conditions_preserve_symbol_data() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        for (source, expected) in [
+            (
+                "(condition-case e vm-missing-variable (void-variable e))",
+                "(void-variable vm-missing-variable)",
+            ),
+            (
+                "(condition-case e (vm-missing-function) (void-function e))",
+                "(void-function vm-missing-function)",
+            ),
+            ("(condition-case e vm-missing-variable (error (car e)))", "void-variable"),
+        ] {
+            let form = crate::reader::read(source, cx).unwrap().0;
+            root!(form, cx);
+            let result = rebind!(eval(form, None, env, cx).unwrap(), cx);
+            let expected = crate::reader::read(expected, cx).unwrap().0;
+            assert_eq!(result, expected);
+        }
     }
 
     #[test]

@@ -147,9 +147,15 @@ impl<'ob> RootedVM<'_, '_, '_> {
         Ok(())
     }
 
-    fn varref(&mut self, idx: u16, cx: &'ob Context) -> Result<()> {
+    fn varref(&mut self, idx: u16, cx: &'ob Context) -> Result<(), EvalError> {
         let symbol: Symbol = self.get_const(idx as usize, cx)?.try_into()?;
-        let Some(var) = self.env.vars.get(symbol) else { bail!("Void Variable: {symbol}") };
+        let Some(var) = self.env.vars.get(symbol) else {
+            return Err(EvalError::signal(
+                sym::VOID_VARIABLE.into(),
+                Cons::new1(symbol, cx).into(),
+                cx,
+            ));
+        };
         let var = var.bind(cx);
         self.env.stack.push(var);
         Ok(())
@@ -2053,6 +2059,39 @@ mod test {
             let error = call(bytecode, 0, "nonsymbol-constant", frame, cx).unwrap_err();
             assert!(matches!(error.error, ErrorType::Err(_)));
         }
+    }
+
+    #[test]
+    fn missing_vm_variable_signals_named_condition() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let missing = crate::reader::read("vm-missing-variable", cx).unwrap().0;
+        root!(missing, cx);
+        make_bytecode!(
+            bytecode,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                7,
+                0,
+                O::VarRef1,
+                O::PopHandler,
+                O::Return,
+                O::Constant2,
+                O::Return
+            ],
+            [sym::VOID_VARIABLE, missing.bind(cx), 7],
+            cx
+        );
+        let mut frame = CallFrame::new(env);
+        frame.finalize_arguments().unwrap();
+        assert_eq!(call(bytecode, 0, "missing-variable", &mut frame, cx).unwrap(), Object::from(7));
+        assert_eq!(frame.binding_depth(), 0);
     }
 
     #[test]

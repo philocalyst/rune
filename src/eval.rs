@@ -208,6 +208,8 @@ impl EvalError {
             }
             if symbol == sym::ERROR
                 || symbol == sym::RUNE_UNIMPLEMENTED
+                || symbol == sym::VOID_VARIABLE
+                || symbol == sym::VOID_FUNCTION
                 || matches!(self.error, ErrorType::Err(_))
             {
                 return Ok(requested == symbol || requested == sym::ERROR);
