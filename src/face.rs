@@ -53,6 +53,7 @@ impl Default for FontSelection {
     }
 }
 impl FontSelection {
+    pub(crate) fn generation(&self) -> u64 { self.generation }
     pub(crate) fn next_generation(&self) -> Result<u64> {
         self.generation
             .checked_add(1)

@@ -8,6 +8,8 @@ use crate::core::{
 use anyhow::{Result, anyhow, ensure};
 use rune_macros::defun;
 defsym!(FACE);
+defsym!(DEFAULT);
+defsym!(FACE_ALIAS);
 defsym!(UNSPECIFIED);
 // GNU Emacs src/emacs.c initializes the X-resource policy switch to false.
 // Terminal frame capability, not a forced true flag, avoids X resource calls.
@@ -471,3 +473,6 @@ mod tests {
         );
     }
 }
+
+mod publication;
+pub(crate) use publication::default_face as resolved_default_face;

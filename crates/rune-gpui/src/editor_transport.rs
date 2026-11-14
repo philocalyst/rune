@@ -387,7 +387,7 @@ where
         let mut preserve_context = false;
         let edit = match event {
             OwnerEvent::SaveVisited { request_id, max_bytes } => {
-                match self.bridge.snapshot().map(|snapshot| snapshot.sequence) {
+                match self.bridge.publication_revision() {
                     Err(error) => {
                         save = Some(SaveReply {
                             request_id,
@@ -403,10 +403,10 @@ where
                         };
                         let success = outcome.is_ok();
                         save = Some(SaveReply { request_id, outcome });
-                        match self.bridge.snapshot() {
+                        match self.bridge.publication_revision() {
                             Ok(after) => {
-                                let changed = before != after.sequence;
-                                preserve_context = !changed;
+                                let changed = before != after;
+                                preserve_context = before.0 == after.0;
                                 Ok(success || changed)
                             }
                             Err(error) => {
@@ -420,7 +420,7 @@ where
                 }
             }
             OwnerEvent::Evaluate { request_id, source } => {
-                let before = self.bridge.snapshot().map(|s| s.sequence);
+                let before = self.bridge.publication_revision();
                 match before {
                     Err(error) => {
                         evaluation = Some(EvaluationOutcome {
@@ -449,8 +449,8 @@ where
                         evaluation = Some(EvaluationOutcome { request_id, outcome });
                         // Evaluation may edit and then signal. Never replay it;
                         // publication follows owner sequence, not its Result.
-                        match self.bridge.snapshot() {
-                            Ok(after) => Ok(after.sequence != before),
+                        match self.bridge.publication_revision() {
+                            Ok(after) => { preserve_context = before.0 == after.0; Ok(after != before) },
                             Err(error) => {
                                 if let Some(platform) = &self.platform {
                                     let _ = platform.invalidate();
@@ -466,7 +466,7 @@ where
                 if let Some((dispatch, channel)) = &self.key_dispatcher {
                     let dispatch = *dispatch;
                     let channel = channel.clone();
-                    let before = if request.key.len()>128 {Err(BridgeError::UnsupportedInput)} else {self.bridge.snapshot().map(|s|s.sequence)};
+                    let before = if request.key.len()>128 {Err(BridgeError::UnsupportedInput)} else {self.bridge.publication_revision()};
                     match before {
                         Err(error) => Err(error),
                         Ok(before) => {
@@ -489,7 +489,7 @@ where
                                     Err(BridgeError::UnsupportedInput)
                                 }
                             } else {
-                                self.bridge.snapshot().map(|s| s.sequence != before)
+                                self.bridge.publication_revision().map(|s| { preserve_context = s.0 == before.0; s != before })
                             }
                         }
                     }
@@ -504,7 +504,7 @@ where
                 if let Some((dispatch, channel)) = &self.key_dispatcher {
                     let dispatch = *dispatch;
                     let channel = channel.clone();
-                    let before = self.bridge.snapshot().map(|s| s.sequence);
+                    let before = self.bridge.publication_revision();
                     match before {
                         Err(error) => Err(error),
                         Ok(before) => {
@@ -533,7 +533,7 @@ where
                             if !handled {
                                 self.bridge.commit_text(window_id, buffer_id, text)
                             } else {
-                                self.bridge.snapshot().map(|s| s.sequence != before)
+                                self.bridge.publication_revision().map(|s| { preserve_context = s.0 == before.0; s != before })
                             }
                         }
                     }

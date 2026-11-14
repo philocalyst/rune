@@ -1725,6 +1725,25 @@ impl rune_editor::EditorHost for LispRuntimeHost<'_, '_, '_> {
         use rune_editor::EditorHost;
         self.owner.snapshot()
     }
+    fn display_style_revision(&self) -> rune_editor::Result<rune_editor::DisplayStyleRevision> {
+        Ok(rune_editor::DisplayStyleRevision {
+            epoch: self.env.font_selection.generation(),
+            frame_id: self.owner.cx.selected_frame().map(|f|f.id()).unwrap_or(0),
+            default_face: crate::face_attributes::resolved_default_face(self.env, self.owner.cx),
+        })
+    }
+    fn display_window_style(&self, window: rune_editor::WindowId, buffer: rune_editor::BufferId, len: usize) -> rune_editor::Result<rune_editor::WindowStyle> {
+        use rune_editor::EditorHost;
+        let snapshot = self.owner.snapshot()?;
+        let view = snapshot.views.iter().find(|v|v.id == window && v.view.buffer == buffer).ok_or(rune_editor::EditorError::InvalidWindow)?;
+        let doc = snapshot.buffers.iter().find(|b|b.id == view.view.buffer).ok_or(rune_editor::EditorError::InvalidBuffer)?;
+        if doc.document.len_chars() != len { return Err(rune_editor::EditorError::InvalidPosition); }
+        let face = crate::face_attributes::resolved_default_face(self.env, self.owner.cx).map_err(|e|rune_editor::EditorError::Backend(e.into()))?;
+        Ok(rune_editor::WindowStyle {
+            default_face: face,
+            spans: if len == 0 {vec![]} else {vec![rune_editor::display::FaceSpan { range: 0..len, face }]},
+        })
+    }
     fn execute(
         &mut self,
         c: rune_editor::Command,
@@ -1779,6 +1798,8 @@ pub(crate) fn with_lisp_runtime_owner<R>(
     sym::init_symbols();
     crate::core::env::init_variables(&cx, env);
     crate::data::defalias(intern("not", &cx), sym::NULL.into(), None)?;
+    // Initialize the real owner frame before callback-free style snapshots.
+    cx.selected_frame()?;
     let gateway = cx.editor_gateway()?;
     let mut host =
         LispRuntimeHost { owner: MutableGatewayEditorHost { gateway, cx: &mut cx }, env };

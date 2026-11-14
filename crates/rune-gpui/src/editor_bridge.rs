@@ -98,6 +98,9 @@ where
     pub fn snapshot(&self) -> Result<rune_editor::SessionSnapshot<H::Doc>, BridgeError> {
         self.host.snapshot().map_err(Into::into)
     }
+    pub fn publication_revision(&self) -> Result<(u64, rune_editor::DisplayStyleRevision), BridgeError> {
+        Ok((self.host.snapshot()?.sequence, self.host.display_style_revision()?))
+    }
     pub fn with_text_source(mut self, source: TextSource) -> Result<Self, BridgeError> {
         self.host.cancel_prefix()?;
         self.text_source = source;
@@ -311,6 +314,8 @@ where
             spec.point = view.view.point;
             spec.hscroll = view.view.hscroll as f32 * self.metrics.0.advance;
             let published = buffer.display_snapshot();
+            let style = self.host.display_window_style(view.id, buffer.id, published.len_chars())?;
+            spec.default_face = style.default_face;
             let manual =
                 self.manual_scroll == Some((spec.window_id, buffer.id.as_u64(), view.view.point));
             if let Some(&(epoch, anchor)) = self.anchors.get(&spec.window_id).filter(|_| !manual) {
@@ -318,10 +323,10 @@ where
                     spec.anchor = anchor;
                 }
             }
-            let mut window = layout_window(&published, &spec, &[], &self.metrics)?;
+            let mut window = layout_window(&published, &spec, &style.spans, &self.metrics)?;
             if view.id == s.selected_window && window.cursor.is_none() && !manual {
                 spec.anchor = spec.point;
-                window = layout_window(&published, &spec, &[], &self.metrics)?;
+                window = layout_window(&published, &spec, &style.spans, &self.metrics)?;
             }
             if view.id != s.selected_window {
                 window.cursor = None;

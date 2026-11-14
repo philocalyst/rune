@@ -7,6 +7,14 @@ use std::ops::Range;
 pub trait EditorHost {
     type Doc: Document;
     fn snapshot(&self) -> Result<crate::SessionSnapshot<Self::Doc>>;
+    #[cfg(feature = "display")]
+    fn display_style_revision(&self) -> Result<crate::DisplayStyleRevision> {
+        Ok(crate::DisplayStyleRevision::default())
+    }
+    #[cfg(feature = "display")]
+    fn display_window_style(&self, _window: WindowId, _buffer: BufferId, _len: usize) -> Result<crate::WindowStyle> {
+        Ok(crate::WindowStyle::default())
+    }
     fn execute(&mut self, command: Command) -> Result<CommandOutcome>;
     fn dispatch_key(&mut self, key: Key) -> Result<Dispatch>;
     fn cancel_prefix(&mut self) -> Result<()>;
