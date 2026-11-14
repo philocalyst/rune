@@ -1,0 +1,13 @@
+[package]
+name = "rune-gpui"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Standalone GPUI native first-light adapter for Rune's immutable display protocol"
+
+# Deliberately standalone: native dependencies do not enter the interpreter workspace.
+[workspace]
+
+[dependencies]
+rune-display = { path = "../rune-display" }
+gpui = "=0.2.2"
