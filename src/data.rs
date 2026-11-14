@@ -235,6 +235,15 @@ pub(crate) fn integerp(object: Object) -> bool {
 }
 
 #[defun]
+fn natnump(object: Object) -> bool {
+    match object.untag() {
+        ObjectType::Int(value) => value >= 0,
+        ObjectType::BigInt(value) => value.sign() != num_bigint::Sign::Minus,
+        _ => false,
+    }
+}
+
+#[defun]
 pub(crate) fn floatp(object: Object) -> bool {
     object.is_float()
 }
@@ -383,25 +392,29 @@ fn subr_arity<'ob>(subr: &SubrFn, cx: &'ob Context) -> Object<'ob> {
     Cons::new(min, max, cx).into()
 }
 
+// The numeric policy is a Lisp variable, not an arbitrary host allocation cap.
+defvar!(INTEGER_WIDTH, 65_536);
+// Bundled subr.el's fixnump/bignump/lsh need the actual storage bounds, not
+// GNU's future low-tag encoding bounds.
+defvar!(MOST_POSITIVE_FIXNUM, crate::core::object::MAX_FIXNUM);
+defvar!(MOST_NEGATIVE_FIXNUM, crate::core::object::MIN_FIXNUM);
+
+pub(crate) fn integer_width(env: &Rt<Env>, cx: &Context) -> Result<u64> {
+    match env.vars.get(sym::INTEGER_WIDTH) {
+        Some(value) => Ok(Number::try_from(value.bind(cx))?.val().into_integer_width()?),
+        None => Ok(65_536),
+    }
+}
+
 #[defun]
-fn ash(value: i64, count: i64) -> i64 {
-    if value == 0 || count == 0 {
-        return value;
-    }
-    if count < 0 {
-        // Signed right shift rounds negative values down. Saturate before
-        // negating COUNT so even i64::MIN never overflows or shifts by >= 64.
-        return if count <= -i64::from(i64::BITS) {
-            if value < 0 { -1 } else { 0 }
-        } else {
-            value >> -count
-        };
-    }
-    // Known limitation: positive shifts still use the old fixed-width path.
-    // Large positive counts/overflow and BigInt arguments need a separate
-    // promotion/allocation design; this change only repairs right shifts.
-    let result = std::ops::Shl::shl(value.abs(), count.abs());
-    if value >= 0 { result } else { -result }
+fn ash(
+    value: Number,
+    count: Number,
+    env: &Rt<Env>,
+    cx: &Context,
+) -> Result<crate::core::object::NumberValue> {
+    let limit = integer_width(env, cx)?;
+    Ok(value.val().arithmetic_shift(count.val(), limit)?)
 }
 
 #[defun]
@@ -664,6 +677,44 @@ impl LispError {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn bootstrap_numeric_bounds_and_natural_integer_predicate() {
+        use crate::core::{
+            env::{Env, sym},
+            gc::{Context, RootSet},
+        };
+        use rune_core::macros::{rebind, root};
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, new(Env), cx);
+        // Unlike assert_lisp's deliberately empty environment, exercise the
+        // generated variable initializers used by production startup.
+        crate::core::env::init_variables(cx, env);
+        for (source, expected) in [
+            ("most-positive-fixnum", "36028797018963967"),
+            ("most-negative-fixnum", "-36028797018963968"),
+            ("(= (+ most-negative-fixnum most-positive-fixnum) -1)", "t"),
+            ("(fixnump most-positive-fixnum)", "t"),
+            ("(bignump (1+ most-positive-fixnum))", "t"),
+            ("(natnump 0)", "t"),
+            ("(natnump -1)", "nil"),
+            ("(natnump 18446744073709551616)", "t"),
+            ("(natnump -18446744073709551616)", "nil"),
+            ("(natnump 0.0)", "nil"),
+            ("(natnump nil)", "nil"),
+        ] {
+            let actual = {
+                let form = crate::reader::read(source, cx).unwrap().0;
+                root!(form, cx);
+                rebind!(crate::interpreter::eval(form, None, env, cx).unwrap(), cx)
+            };
+            root!(actual, cx);
+            let expected = crate::reader::read(expected, cx).unwrap().0;
+            assert_eq!(actual.bind(cx), expected, "{source}");
+        }
+    }
+
     use super::*;
     use crate::interpreter::assert_lisp;
 
@@ -687,7 +738,13 @@ mod test {
             (0, i64::MIN, 0),
             (0, i64::MAX, 0),
         ] {
-            assert_eq!(ash(value, count), expected, "ash({value}, {count})");
+            assert_eq!(
+                crate::core::object::NumberValue::Int(value)
+                    .arithmetic_shift(crate::core::object::NumberValue::Int(count), 65_536)
+                    .unwrap(),
+                crate::core::object::NumberValue::integer(expected),
+                "ash({value}, {count})"
+            );
         }
         assert_lisp("(ash -3 -1)", "-2");
         assert_lisp("(ash -3 -1000)", "-1");

@@ -24,11 +24,9 @@ impl<'ob> TryFrom<Object<'ob>> for &'ob str {
 impl TryFrom<Object<'_>> for f64 {
     type Error = TypeError;
     fn try_from(obj: Object) -> Result<Self, Self::Error> {
-        match obj.untag() {
-            ObjectType::Int(x) => Ok(x as f64),
-            ObjectType::Float(x) => Ok(**x),
-            x => Err(TypeError::new(Type::Number, x)),
-        }
+        // Primitive parameters typed as f64 must use the same bignum/overflow
+        // conversion policy as parameters typed as Number.
+        super::Number::try_from(obj).map(|number| number.to_float())
     }
 }
 
@@ -157,6 +155,25 @@ mod test {
     fn inner(arg0: Option<i64>, arg1: &Cons) -> i64 {
         let x: i64 = arg1.car().try_into().unwrap();
         arg0.unwrap() + x
+    }
+
+    #[test]
+    fn float_conversion_uses_the_numeric_kernel_for_all_number_kinds() {
+        use num_bigint::BigInt;
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for (object, expected) in [
+            (cx.add(7_i64), 7.0_f64),
+            (cx.add(-0.0_f64), -0.0),
+            (cx.add(BigInt::from(9_007_199_254_740_993_i64)), 9_007_199_254_740_992.0),
+            (cx.add(BigInt::from(1_u8) << 4096_usize), f64::INFINITY),
+            (cx.add(-(BigInt::from(1_u8) << 4096_usize)), f64::NEG_INFINITY),
+        ] {
+            assert_eq!(f64::try_from(object).unwrap().to_bits(), expected.to_bits());
+        }
+        assert!(f64::try_from(cx.add(f64::NAN)).unwrap().is_nan());
+        assert!(f64::try_from(NIL).is_err());
+        assert!(f64::try_from(cx.add("7")).is_err());
     }
 
     #[test]

@@ -1,11 +1,10 @@
 #![allow(dead_code)]
+use crate::core::object::{MAX_FIXNUM, MIN_FIXNUM};
 use num_bigint::{BigInt, Sign};
 use prop::collection::VecStrategy;
 use proptest::prelude::*;
 
 const SYMBOL_CHARS: &str = "[a-zA-Z][a-zA-Z0-9-]*";
-const MAX_FIXNUM: i64 = i64::MAX >> 8;
-const MIN_FIXNUM: i64 = i64::MIN >> 8;
 
 impl std::fmt::Display for ArbitraryType {
     #[expect(clippy::too_many_lines)]
@@ -27,13 +26,7 @@ impl std::fmt::Display for ArbitraryType {
                 }
                 write!(f, "\"")
             }
-            ArbitraryType::Float(n) => {
-                if n.fract() == 0.0_f64 {
-                    write!(f, "{n:.1}")
-                } else {
-                    write!(f, "{n}")
-                }
-            }
+            ArbitraryType::Float(n) => crate::core::object::fmt_float(*n, f),
             ArbitraryType::Cons(list) => {
                 let mut cells: Vec<_> = list.0.iter().map(ToString::to_string).collect();
                 let len = list.0.len();
@@ -275,13 +268,11 @@ fn cons_strategy() -> (VecStrategy<BoxedStrategy<ArbitraryType>>, BoxedStrategy<
 }
 
 fn fixnum_strategy() -> BoxedStrategy<i64> {
-    any::<i64>()
-        .prop_filter("Fixnum", |x| *x >= MIN_FIXNUM && *x <= MAX_FIXNUM)
-        .boxed()
+    (MIN_FIXNUM..=MAX_FIXNUM).boxed()
 }
 
 fn pos_fixnum_strategy() -> BoxedStrategy<i64> {
-    any::<i64>().prop_filter("Fixnum", |x| *x >= 0 && *x <= MAX_FIXNUM).boxed()
+    (0..=MAX_FIXNUM).boxed()
 }
 
 fn big_int_strategy() -> BoxedStrategy<BigInt> {

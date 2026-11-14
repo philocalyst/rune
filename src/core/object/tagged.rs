@@ -12,7 +12,7 @@ use super::{
     RecordBuilder, SubrFn, Symbol, SymbolCell,
 };
 use crate::{
-    arith::{MAX_FIXNUM, MIN_FIXNUM},
+    core::object::{MAX_FIXNUM, MIN_FIXNUM},
     core::{
         env::sym,
         gc::{DropStackElem, GcMoveable, GcState, Trace, TracePtr},

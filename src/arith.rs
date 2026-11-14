@@ -1,220 +1,10 @@
-//! Arithmetic operators.
-use crate::core::object::{Gc, IntoObject, Number, NumberType, ObjectType};
-use anyhow::{Result, anyhow};
-use float_cmp::ApproxEq;
+//! Lisp arithmetic adapters over the owned numeric model.
+pub(crate) use crate::core::object::{MAX_FIXNUM, MIN_FIXNUM, NumberValue};
+use crate::core::object::{Number, Object};
+use anyhow::Result;
+#[cfg(test)]
 use num_bigint::BigInt;
-use num_traits::{FromPrimitive, ToPrimitive, Zero};
 use rune_macros::defun;
-use std::cmp::PartialEq;
-use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
-
-pub(crate) const MAX_FIXNUM: i64 = i64::MAX >> 8;
-pub(crate) const MIN_FIXNUM: i64 = i64::MIN >> 8;
-
-/// Similar to the object type [NumberType], but contains a float instead of a
-/// reference to a float. This makes it easier to construct and mutate.
-#[derive(Debug, PartialEq, Clone)]
-pub(crate) enum NumberValue {
-    Int(i64),
-    Float(f64),
-    Big(BigInt),
-}
-
-impl Number<'_> {
-    pub(crate) fn val(self) -> NumberValue {
-        match self.untag() {
-            NumberType::Int(x) => NumberValue::Int(x),
-            NumberType::Float(x) => NumberValue::Float(**x),
-            NumberType::Big(x) => NumberValue::Big((**x).clone()),
-        }
-    }
-}
-
-impl IntoObject for NumberValue {
-    type Out<'ob> = ObjectType<'ob>;
-
-    fn into_obj<const C: bool>(self, block: &crate::core::gc::Block<C>) -> Gc<Self::Out<'_>> {
-        match self {
-            NumberValue::Int(x) => x.into(),
-            NumberValue::Float(x) => block.add(x),
-            NumberValue::Big(x) => block.add(x),
-        }
-    }
-}
-
-impl NumberValue {
-    pub fn coerce_integer(self) -> NumberValue {
-        match self {
-            NumberValue::Float(x) => {
-                // MAX_FIXNUM rounds upward when cast to f64. Check the
-                // converted integer instead, or the first bignum is clamped
-                // back to the largest fixnum when it is tagged.
-                match x.to_i64().filter(|value| (MIN_FIXNUM..=MAX_FIXNUM).contains(value)) {
-                    Some(value) => NumberValue::Int(value),
-                    None => NumberValue::Big(BigInt::from_f64(x).unwrap_or_else(BigInt::zero)),
-                }
-            }
-            NumberValue::Big(x) => x
-                .to_i64()
-                .filter(|&n| (MIN_FIXNUM..=MAX_FIXNUM).contains(&n))
-                .map(NumberValue::Int)
-                .unwrap_or_else(|| NumberValue::Big(x)),
-            other => other,
-        }
-    }
-}
-
-pub(crate) fn arith(
-    cur: NumberValue,
-    next: NumberValue,
-    int_fn: fn(i64, i64) -> Option<i64>,
-    float_fn: fn(f64, f64) -> f64,
-    big_fn: fn(BigInt, BigInt) -> BigInt,
-) -> NumberValue {
-    use NumberValue as N;
-    match (cur, next) {
-        (N::Int(l), N::Int(r)) => {
-            match int_fn(l, r).filter(|value| (MIN_FIXNUM..=MAX_FIXNUM).contains(value)) {
-                Some(value) => N::Int(value),
-                None => N::Big(big_fn(l.into(), r.into())).coerce_integer(),
-            }
-        }
-        (N::Int(l), N::Float(r)) => N::Float(float_fn(l as f64, r)),
-        (N::Float(l), N::Int(r)) => N::Float(float_fn(l, r as f64)),
-        (N::Float(l), N::Float(r)) => N::Float(float_fn(l, r)),
-        (N::Int(l), N::Big(r)) => N::Big(big_fn(l.into(), r)).coerce_integer(),
-        (N::Big(l), N::Int(r)) => N::Big(big_fn(l, r.into())).coerce_integer(),
-        (N::Big(l), N::Big(r)) => N::Big(big_fn(l, r)).coerce_integer(),
-        (N::Float(l), N::Big(r)) => N::Float(float_fn(l, r.to_f64().unwrap())), // TODO: Should round to nearest float on error
-        (N::Big(l), N::Float(r)) => N::Float(float_fn(l.to_f64().unwrap(), r)), // TODO: Should round to nearest float on error
-    }
-}
-
-//////////////////////////
-// Arithmetic operators //
-//////////////////////////
-
-impl Zero for NumberValue {
-    fn zero() -> Self {
-        NumberValue::Int(0)
-    }
-    fn is_zero(&self) -> bool {
-        match self {
-            NumberValue::Int(x) => *x == 0,
-            NumberValue::Float(x) => *x == 0.0,
-            NumberValue::Big(x) => x.is_zero(),
-        }
-    }
-}
-
-impl Neg for NumberValue {
-    type Output = Self;
-    fn neg(self) -> Self::Output {
-        match self {
-            NumberValue::Int(x) => {
-                match x.checked_neg().filter(|value| (MIN_FIXNUM..=MAX_FIXNUM).contains(value)) {
-                    Some(value) => NumberValue::Int(value),
-                    None => NumberValue::Big(-BigInt::from(x)).coerce_integer(),
-                }
-            }
-            NumberValue::Float(x) => NumberValue::Float(-x),
-            NumberValue::Big(x) => NumberValue::Big(-x).coerce_integer(),
-        }
-    }
-}
-
-impl Add for NumberValue {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, i64::checked_add, Add::add, Add::add)
-    }
-}
-
-impl Sub for NumberValue {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, i64::checked_sub, Sub::sub, Sub::sub)
-    }
-}
-
-impl Mul for NumberValue {
-    type Output = Self;
-    fn mul(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, i64::checked_mul, Mul::mul, Mul::mul)
-    }
-}
-
-impl Div for NumberValue {
-    type Output = Self;
-    fn div(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, i64::checked_div, Div::div, Div::div)
-    }
-}
-
-impl Rem for NumberValue {
-    type Output = Self;
-    fn rem(self, rhs: Self) -> Self::Output {
-        arith(self, rhs, i64::checked_rem, Rem::rem, Rem::rem)
-    }
-}
-
-impl PartialEq<i64> for Number<'_> {
-    fn eq(&self, other: &i64) -> bool {
-        match self.val() {
-            NumberValue::Int(num) => num == *other,
-            NumberValue::Float(num) => num == *other as f64,
-            NumberValue::Big(num) => num == BigInt::from(*other),
-        }
-    }
-}
-
-impl PartialEq<f64> for Number<'_> {
-    fn eq(&self, other: &f64) -> bool {
-        match self.val() {
-            NumberValue::Int(num) => num as f64 == *other,
-            NumberValue::Float(num) => num.approx_eq(*other, (f64::EPSILON, 2)),
-            NumberValue::Big(num) => {
-                num.to_f64().is_some_and(|n| n.approx_eq(*other, (f64::EPSILON, 2)))
-            } // TODO: Check behavior when conversion fails
-        }
-    }
-}
-
-impl PartialEq<BigInt> for Number<'_> {
-    fn eq(&self, other: &BigInt) -> bool {
-        match self.val() {
-            NumberValue::Int(num) => BigInt::from(num) == *other,
-            NumberValue::Float(num) => {
-                other.to_f64().is_some_and(|n| n.approx_eq(num, (f64::EPSILON, 2)))
-            } // TODO: Check
-            NumberValue::Big(num) => num == *other,
-        }
-    }
-}
-
-impl PartialOrd for NumberValue {
-    fn partial_cmp(&self, other: &NumberValue) -> Option<std::cmp::Ordering> {
-        match self {
-            NumberValue::Int(lhs) => match other {
-                NumberValue::Int(rhs) => lhs.partial_cmp(rhs),
-                NumberValue::Float(rhs) => (*lhs as f64).partial_cmp(rhs),
-                NumberValue::Big(rhs) => BigInt::from(*lhs).partial_cmp(rhs),
-            },
-            NumberValue::Float(lhs) => match other {
-                NumberValue::Int(rhs) => lhs.partial_cmp(&(*rhs as f64)),
-                NumberValue::Float(rhs) => lhs.partial_cmp(rhs),
-                NumberValue::Big(rhs) => {
-                    lhs.partial_cmp(&rhs.to_f64().unwrap_or(f64::NAN)) // TODO: Handle conversion failure
-                }
-            },
-            NumberValue::Big(lhs) => match other {
-                NumberValue::Int(rhs) => lhs.partial_cmp(&BigInt::from(*rhs)),
-                NumberValue::Float(rhs) => lhs.to_f64().and_then(|n| n.partial_cmp(rhs)),
-                NumberValue::Big(rhs) => lhs.partial_cmp(rhs),
-            },
-        }
-    }
-}
 
 #[defun(name = "+")]
 pub(crate) fn add(vars: &[Number]) -> NumberValue {
@@ -243,44 +33,18 @@ pub(crate) fn mul(numbers: &[Number]) -> NumberValue {
 
 #[defun(name = "/")]
 pub(crate) fn div(number: Number, divisors: &[Number]) -> Result<NumberValue> {
-    fn float_value(number: Number) -> Result<f64> {
-        match number.untag() {
-            NumberType::Int(value) => Ok(value as f64),
-            NumberType::Float(value) => Ok(**value),
-            NumberType::Big(value) => value.to_f64().ok_or_else(|| anyhow!("float overflow")),
-        }
-    }
-    fn integer_value(number: Number) -> BigInt {
-        match number.untag() {
-            NumberType::Int(value) => value.into(),
-            NumberType::Big(value) => (**value).clone(),
-            NumberType::Float(_) => unreachable!("float division was selected first"),
-        }
-    }
-
-    // GNU Fquo selects floating point for the whole operation if any operand
-    // is a float, even a late divisor. Float zero uses IEEE infinity/NaN.
+    // Preserve the source-verified whole-expression floating selection. The
+    // kernel handles IEEE floats and fallible exact integer operations.
     let floating = number.is_float() || divisors.iter().any(Number::is_float);
     let denominators = if divisors.is_empty() { std::slice::from_ref(&number) } else { divisors };
-    if floating {
-        let mut result = if divisors.is_empty() { 1.0 } else { float_value(number)? };
-        for &denominator in denominators {
-            result /= float_value(denominator)?;
-        }
-        return Ok(NumberValue::Float(result));
-    }
-
-    let mut result = if divisors.is_empty() { BigInt::from(1) } else { integer_value(number) };
-    for &denominator in denominators {
-        let denominator = integer_value(denominator);
-        if denominator.is_zero() {
-            return Err(anyhow!("(arith-error)"));
-        }
-        // BigInt also handles fixed-width MIN / -1 and tagged-fixnum overflow
-        // without panicking or silently clamping the quotient.
-        result /= denominator;
-    }
-    Ok(NumberValue::Big(result).coerce_integer())
+    let initial = if divisors.is_empty() { NumberValue::Int(1) } else { number.val() };
+    let initial = if floating { NumberValue::Float(initial.to_float()) } else { initial };
+    Ok(denominators.iter().try_fold(initial, |value, denominator| {
+        let denominator = denominator.val();
+        let denominator =
+            if floating { NumberValue::Float(denominator.to_float()) } else { denominator };
+        value.checked_div(denominator)
+    })?)
 }
 
 #[defun(name = "1+")]
@@ -293,99 +57,135 @@ pub(crate) fn sub_one(number: Number) -> NumberValue {
     number.val() - NumberValue::Int(1)
 }
 
-#[defun(name = "=")]
 pub(crate) fn num_eq(number: Number, numbers: &[Number]) -> bool {
-    match number.val() {
-        NumberValue::Int(num) => numbers.iter().all(|&x| x == num),
-        NumberValue::Float(num) => numbers.iter().all(|&x| x == num),
-        NumberValue::Big(num) => numbers.iter().all(|&x| x == num),
+    numbers
+        .iter()
+        .all(|next| number.numeric_cmp(*next) == Some(std::cmp::Ordering::Equal))
+}
+
+#[defun(name = "=")]
+fn num_eq_lisp(number: Number, numbers: &[Object]) -> Result<bool> {
+    for &next in numbers {
+        let next = Number::try_from(next)?;
+        if number.numeric_cmp(next) != Some(std::cmp::Ordering::Equal) {
+            return Ok(false);
+        }
     }
+    Ok(true)
 }
 
 #[defun(name = "/=")]
-pub(crate) fn num_ne(number: Number, numbers: &[Number]) -> bool {
-    match number.val() {
-        NumberValue::Int(num) => numbers.iter().all(|&x| x != num),
-        NumberValue::Float(num) => numbers.iter().all(|&x| x != num),
-        NumberValue::Big(num) => numbers.iter().all(|&x| x != num),
-    }
+pub(crate) fn num_ne(number: Number, other: Number) -> bool {
+    number.numeric_cmp(other) != Some(std::cmp::Ordering::Equal)
 }
 
-fn cmp(number: Number, numbers: &[Number], cmp: fn(&NumberValue, &NumberValue) -> bool) -> bool {
+fn cmp(number: Number, numbers: &[Number], predicate: fn(std::cmp::Ordering) -> bool) -> bool {
     numbers
         .iter()
-        .try_fold(number.val(), |previous, &x| {
-            let next = x.val();
-            cmp(&previous, &next).then_some(next)
+        .try_fold(number, |previous, &next| {
+            previous.numeric_cmp(next).is_some_and(predicate).then_some(next)
         })
         .is_some()
 }
 
-#[defun(name = "<")]
 pub(crate) fn less_than(number: Number, numbers: &[Number]) -> bool {
-    cmp(number, numbers, NumberValue::lt)
+    cmp(number, numbers, |order| order == std::cmp::Ordering::Less)
+}
+
+pub(crate) fn less_than_or_eq(number: Number, numbers: &[Number]) -> bool {
+    cmp(number, numbers, |order| order != std::cmp::Ordering::Greater)
+}
+
+pub(crate) fn greater_than(number: Number, numbers: &[Number]) -> bool {
+    cmp(number, numbers, |order| order == std::cmp::Ordering::Greater)
+}
+
+pub(crate) fn greater_than_or_eq(number: Number, numbers: &[Number]) -> bool {
+    cmp(number, numbers, |order| order != std::cmp::Ordering::Less)
+}
+
+// Lisp evaluates all arguments before calling these adapters, but GNU checks
+// numeric types only until a comparison fails. Preserve VM helpers' typed APIs
+// without eagerly converting an entire variadic slice at the Lisp boundary.
+fn cmp_objects(
+    number: Number,
+    numbers: &[Object],
+    predicate: fn(std::cmp::Ordering) -> bool,
+) -> Result<bool> {
+    let mut previous = number;
+    for &next in numbers {
+        let next = Number::try_from(next)?;
+        if !previous.numeric_cmp(next).is_some_and(predicate) {
+            return Ok(false);
+        }
+        previous = next;
+    }
+    Ok(true)
+}
+
+#[defun(name = "<")]
+fn less_than_lisp(number: Number, numbers: &[Object]) -> Result<bool> {
+    cmp_objects(number, numbers, |order| order == std::cmp::Ordering::Less)
 }
 
 #[defun(name = "<=")]
-pub(crate) fn less_than_or_eq(number: Number, numbers: &[Number]) -> bool {
-    cmp(number, numbers, NumberValue::le)
+fn less_than_or_eq_lisp(number: Number, numbers: &[Object]) -> Result<bool> {
+    cmp_objects(number, numbers, |order| order != std::cmp::Ordering::Greater)
 }
 
 #[defun(name = ">")]
-pub(crate) fn greater_than(number: Number, numbers: &[Number]) -> bool {
-    cmp(number, numbers, NumberValue::gt)
+fn greater_than_lisp(number: Number, numbers: &[Object]) -> Result<bool> {
+    cmp_objects(number, numbers, |order| order == std::cmp::Ordering::Greater)
 }
 
 #[defun(name = ">=")]
-pub(crate) fn greater_than_or_eq(number: Number, numbers: &[Number]) -> bool {
-    cmp(number, numbers, NumberValue::ge)
+fn greater_than_or_eq_lisp(number: Number, numbers: &[Object]) -> Result<bool> {
+    cmp_objects(number, numbers, |order| order != std::cmp::Ordering::Less)
 }
 
 #[defun]
-pub(crate) fn logior(ints_or_markers: &[Gc<i64>]) -> i64 {
-    ints_or_markers.iter().fold(0, |acc, x| acc | x.untag())
+pub(crate) fn logior(ints_or_markers: &[Number]) -> Result<NumberValue> {
+    Ok(ints_or_markers
+        .iter()
+        .try_fold(NumberValue::Int(0), |value, next| value.bit_or(next.val()))?)
 }
 
 #[defun]
-fn logand(int_or_markers: &[Gc<i64>]) -> i64 {
-    int_or_markers.iter().fold(-1, |accum, x| accum & x.untag())
+fn logand(int_or_markers: &[Number]) -> Result<NumberValue> {
+    Ok(int_or_markers
+        .iter()
+        .try_fold(NumberValue::Int(-1), |value, next| value.bit_and(next.val()))?)
+}
+
+#[defun]
+fn logxor(integers: &[Number]) -> Result<NumberValue> {
+    Ok(integers
+        .iter()
+        .try_fold(NumberValue::Int(0), |value, next| value.bit_xor(next.val()))?)
+}
+
+#[defun]
+fn lognot(integer: Number) -> Result<NumberValue> {
+    Ok(integer.val().bit_not()?)
+}
+
+#[defun]
+fn logcount(integer: Number) -> Result<NumberValue> {
+    Ok(integer.val().bit_count()?)
+}
+
+#[defun]
+fn fixnump(value: crate::core::object::Object) -> bool {
+    value.is_int()
+}
+
+#[defun]
+fn bignump(value: crate::core::object::Object) -> bool {
+    value.is_big_int()
 }
 
 fn remainder_driver(x: Number, y: Number, modulo: bool) -> Result<NumberValue> {
-    if x.is_float() || y.is_float() {
-        if !modulo {
-            return Err(anyhow!("remainder requires integer arguments"));
-        }
-        let to_float = |number: Number| -> Result<f64> {
-            match number.untag() {
-                NumberType::Int(value) => Ok(value as f64),
-                NumberType::Float(value) => Ok(**value),
-                NumberType::Big(value) => value.to_f64().ok_or_else(|| anyhow!("float overflow")),
-            }
-        };
-        let (numerator, denominator) = (to_float(x)?, to_float(y)?);
-        let mut result = numerator % denominator;
-        // Match GNU fmod_float: nonzero modulo has the divisor's sign. Float
-        // zero denominators remain IEEE NaN, unlike integer zero errors.
-        if if denominator < 0.0 { result > 0.0 } else { result < 0.0 } {
-            result += denominator;
-        }
-        return Ok(NumberValue::Float(result));
-    }
-    let integer = |number: Number| match number.untag() {
-        NumberType::Int(value) => BigInt::from(value),
-        NumberType::Big(value) => (**value).clone(),
-        NumberType::Float(_) => unreachable!("float operands were handled first"),
-    };
-    let (numerator, denominator) = (integer(x), integer(y));
-    if denominator.is_zero() {
-        return Err(anyhow!("(arith-error)"));
-    }
-    let mut result = numerator % &denominator;
-    if modulo && !result.is_zero() && result.sign() != denominator.sign() {
-        result += denominator;
-    }
-    Ok(NumberValue::Big(result).coerce_integer())
+    Ok(x.val().checked_rem(y.val(), modulo)?)
 }
 
 #[defun(name = "mod")]
@@ -401,14 +201,12 @@ pub(crate) fn remainder(x: Number, y: Number) -> Result<NumberValue> {
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn max_val(x: NumberValue, y: &Number) -> NumberValue {
-    let y = y.val();
-    if x > y { x } else { y }
+    x.maximum(y.val())
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn min_val(x: NumberValue, y: &Number) -> NumberValue {
-    let y = y.val();
-    if x < y { x } else { y }
+    x.minimum(y.val())
 }
 
 #[defun]
@@ -424,7 +222,10 @@ pub(crate) fn min(number_or_marker: Number, number_or_markers: &[Number]) -> Num
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::core::gc::{Context, RootSet};
+    use crate::core::{
+        gc::{Context, RootSet},
+        object::IntoObject,
+    };
 
     #[test]
     fn test_add() {
@@ -630,6 +431,26 @@ mod test {
     }
 
     #[test]
+    fn comparison_type_checks_short_circuit_without_skipping_argument_effects() {
+        for (source, expected) in [
+            ("(= 0.0e+NaN 1 'invalid)", "nil"),
+            ("(= 1 2 'invalid)", "nil"),
+            ("(< 2 1 'invalid)", "nil"),
+            ("(<= 2 1 'invalid)", "nil"),
+            ("(> 1 2 'invalid)", "nil"),
+            ("(>= 1 2 'invalid)", "nil"),
+            ("(< 1 0.0e+NaN 'invalid)", "nil"),
+            ("(condition-case nil (= 1 1 'invalid) (error 'caught))", "caught"),
+            ("(condition-case nil (< 1 2 'invalid) (error 'caught))", "caught"),
+            ("(condition-case nil (< 'invalid 2 1) (error 'caught))", "caught"),
+            ("(let ((n 0)) (list (< 2 1 (progn (setq n 1) 'invalid)) n))", "(nil 1)"),
+            ("(let ((n 0)) (list (= 1 2 (progn (setq n 1) 'invalid)) n))", "(nil 1)"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
     fn test_cmp() {
         let roots = &RootSet::default();
         let cx = &Context::new(roots);
@@ -665,6 +486,114 @@ mod test {
     }
 
     #[test]
+    fn bit_count_accepts_bignums_and_counts_negative_zero_bits() {
+        for (source, expected) in [
+            ("(logcount 0)", "0"),
+            ("(logcount -1)", "0"),
+            ("(logcount -2)", "1"),
+            ("(logcount 255)", "8"),
+            ("(logcount -256)", "8"),
+            ("(logcount 18446744073709551615)", "64"),
+            ("(logcount -18446744073709551617)", "1"),
+            ("(logcount -9223372036854775808)", "63"),
+            ("(condition-case nil (logcount 1.0) (error 'caught))", "caught"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn integer_width_uses_signed_machine_range_not_fixnum_or_u64_range() {
+        for (source, expected) in [
+            (
+                "(let ((integer-width 9223372036854775807)) (ash 1 128))",
+                "340282366920938463463374607431768211456",
+            ),
+            (
+                "(let ((integer-width -9223372036854775808)) (ash 1 128))",
+                "340282366920938463463374607431768211456",
+            ),
+            (
+                "(condition-case nil (let ((integer-width 9223372036854775808)) (ash 1 1)) (error 'caught))",
+                "caught",
+            ),
+            (
+                "(condition-case nil (let ((integer-width -9223372036854775809)) (ash 1 1)) (error 'caught))",
+                "caught",
+            ),
+            (
+                "(condition-case nil (let ((integer-width 18446744073709551615)) (expt 2 3)) (error 'caught))",
+                "caught",
+            ),
+            (
+                "(condition-case nil (let ((integer-width 1.0)) (ash 1 1)) (error 'caught))",
+                "caught",
+            ),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn exponentiation_uses_owned_numbers_and_dynamic_width() {
+        for (source, expected) in [
+            ("(expt 2 64)", "18446744073709551616"),
+            ("(expt 2 -1)", "0.5"),
+            ("(expt -2 -3)", "-0.125"),
+            ("(expt 0 0)", "1"),
+            ("(expt 0 9999999999999999999999999)", "0"),
+            ("(expt 1 9999999999999999999999999)", "1"),
+            ("(expt -1 9999999999999999999999999)", "-1"),
+            (
+                "(let ((integer-width 129)) (expt 2 128))",
+                "340282366920938463463374607431768211456",
+            ),
+            (
+                "(let ((integer-width 129)) (condition-case nil (expt 2 129) (error 'caught)))",
+                "caught",
+            ),
+            (
+                "(let ((integer-width 129)) (expt 3 81))",
+                "443426488243037769948249630619149892803",
+            ),
+            (
+                "(let ((integer-width 129)) (condition-case nil (expt 3 82) (error 'caught)))",
+                "caught",
+            ),
+            (
+                "(condition-case nil (let ((integer-width nil)) (expt 2.0 3)) (error 'caught))",
+                "caught",
+            ),
+            ("(let ((integer-width -1)) (ash 1 -1))", "0"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn extrema_and_inequality_match_emacs_operand_rules() {
+        for (source, expected) in [
+            ("(integerp (max 1 1.0))", "t"),
+            ("(integerp (min 1 1.0))", "t"),
+            ("(floatp (max 1.0 1))", "t"),
+            ("(floatp (min 1.0 1))", "t"),
+            ("(= (max 0.0e+NaN 1 2) 2)", "nil"),
+            ("(= (min 0.0e+NaN 1 2) 2)", "nil"),
+            ("(copysign 1.0 (max 0.0e+NaN -0.0e+NaN))", "-1.0"),
+            ("(copysign 1.0 (max -0.0e+NaN 0.0e+NaN))", "1.0"),
+            ("(copysign 1.0 (min 0.0e+NaN -0.0e+NaN))", "-1.0"),
+            ("(copysign 1.0 (min -0.0e+NaN 0.0e+NaN))", "1.0"),
+            ("(/= 1 1.0)", "nil"),
+            ("(/= 1 2)", "t"),
+            ("(/= 0.0e+NaN 0.0e+NaN)", "t"),
+            ("(condition-case nil (/= 1) (error 'caught))", "caught"),
+            ("(condition-case nil (/= 1 2 2) (error 'caught))", "caught"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
     fn test_max_min() {
         let roots = &RootSet::default();
         let cx = &Context::new(roots);
@@ -682,6 +611,6 @@ mod test {
     fn test_other() {
         let roots = &RootSet::default();
         let cx = &Context::new(roots);
-        assert_eq!(logand(&[258.into_obj(cx), 255.into_obj(cx)]), 2);
+        assert_eq!(logand(&[258_i64.into(), 255_i64.into()]).unwrap(), NumberValue::Int(2));
     }
 }

@@ -64,6 +64,11 @@ pub(crate) fn equal<'ob>(obj1: Object<'ob>, obj2: Object<'ob>) -> bool {
 pub(crate) fn eql<'ob>(obj1: Object<'ob>, obj2: Object<'ob>) -> bool {
     match (obj1.untag(), obj2.untag()) {
         (ObjectType::Float(f1), ObjectType::Float(f2)) => f1.to_bits() == f2.to_bits(),
+        (ObjectType::BigInt(left), ObjectType::BigInt(right)) => (**left).eq(&**right),
+        (ObjectType::Int(integer), ObjectType::BigInt(big))
+        | (ObjectType::BigInt(big), ObjectType::Int(integer)) => {
+            num_traits::ToPrimitive::to_i64(&**big) == Some(integer)
+        }
         _ => obj1.ptr_eq(obj2),
     }
 }
@@ -1274,6 +1279,38 @@ fn base64_encode(string: &str, _line_break: bool, pad: bool, base64url: bool) ->
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn eql_compares_integer_values_without_erasing_float_identity_bits() {
+        use crate::core::gc::{Context, RootSet};
+        use crate::interpreter::assert_lisp;
+        use num_bigint::BigInt;
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        for value in
+            [0_i64, 1, -1, crate::core::object::MIN_FIXNUM, crate::core::object::MAX_FIXNUM]
+        {
+            let boxed = cx.add(BigInt::from(value));
+            let immediate = cx.add(value);
+            assert!(super::eql(boxed, immediate));
+            assert!(super::eql(immediate, boxed));
+        }
+        drop(cx);
+        for (source, expected) in [
+            ("(eql (+ 18446744073709551616 1) (+ 18446744073709551616 1))", "t"),
+            ("(eql (+ 18446744073709551616 1) (+ 18446744073709551616 2))", "nil"),
+            ("(eql 1 1.0)", "nil"),
+            ("(eql 0.0 -0.0)", "nil"),
+            ("(eql 0.0e+NaN 0.0e+NaN)", "t"),
+            ("(eql (list 1) (list 1))", "nil"),
+            (
+                "(memql (+ 18446744073709551616 1) (list (+ 18446744073709551616 1)))",
+                "(18446744073709551617)",
+            ),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
+
     use super::{compare_strings, string_search, substring};
     use crate::core::object::NIL;
     use crate::{

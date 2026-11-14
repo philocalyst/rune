@@ -1,13 +1,10 @@
 //! Operations on floats.
 use std::ops::{AddAssign, BitAnd, Div, Rem, SubAssign};
 
-use crate::{
-    arith::NumberValue,
-    core::{
-        cons::Cons,
-        gc::Context,
-        object::{Number, NumberType, Object},
-    },
+use crate::core::{
+    cons::Cons,
+    gc::Context,
+    object::{LispFloat, Number, NumberType, NumberValue, Object},
 };
 use anyhow::Result;
 use anyhow::anyhow;
@@ -19,11 +16,7 @@ use rune_macros::defun;
 
 #[inline(always)]
 fn coerce(arg: Number) -> f64 {
-    match arg.untag() {
-        NumberType::Int(i) => i as f64,
-        NumberType::Float(f) => **f,
-        NumberType::Big(b) => b.to_f64().unwrap(), // TODO: Handle big integers
-    }
+    arg.to_float()
 }
 
 /* Return the integer exponent E such that D * FLT_RADIX**E (i.e.,
@@ -93,7 +86,7 @@ fn rounding_driver(
                     if !rounded.is_finite() {
                         return Err(anyhow!("Overflow error"));
                     }
-                    NumberValue::Float(rounded).coerce_integer()
+                    NumberValue::Float(rounded).try_truncate()?
                 }
                 other => other,
             });
@@ -168,20 +161,6 @@ where
     q
 }
 
-const LIMBS_LIMIT: usize = 2147483642;
-
-fn checked_pow(base: BigInt, exp: u32) -> Result<BigInt> {
-    // Check base size (number of limbs)
-    let nbase = base.bits() as usize; // Number of bits used by the base
-    let n = nbase * exp as usize; // Approximate number of limbs required for the result
-
-    // Check overflow condition
-    if n > LIMBS_LIMIT {
-        return Err(anyhow!("Overflow error".to_string()));
-    }
-    Ok(base.pow(exp))
-}
-
 #[defun]
 fn floor(num: Number, divisor: Option<Number>) -> Result<NumberValue> {
     rounding_driver(
@@ -209,7 +188,8 @@ fn round(num: Number, divisor: Option<Number>) -> Result<NumberValue> {
     rounding_driver(
         num.val(),
         divisor.map(|d| d.val()), //
-        |f| f.round(),
+        // Use the same even-midpoint policy as the exact divisor path.
+        |f| f.round_ties_even(),
         round2,
         round2,
     )
@@ -227,22 +207,22 @@ fn truncate(num: Number, divisor: Option<Number>) -> Result<NumberValue> {
 }
 
 #[defun]
-fn fceiling(num: f64) -> f64 {
+fn fceiling(num: &LispFloat) -> f64 {
     num.ceil()
 }
 
 #[defun]
-fn ffloor(num: f64) -> f64 {
+fn ffloor(num: &LispFloat) -> f64 {
     num.floor()
 }
 
 #[defun]
-fn fround(num: f64) -> f64 {
-    num.round()
+fn fround(num: &LispFloat) -> f64 {
+    num.round_ties_even()
 }
 
 #[defun]
-fn ftruncate(num: f64) -> f64 {
+fn ftruncate(num: &LispFloat) -> f64 {
     num.trunc()
 }
 
@@ -282,16 +262,13 @@ fn tan(arg: Number) -> f64 {
 }
 
 #[defun]
-fn isnan(arg: Number) -> bool {
-    match arg.untag() {
-        NumberType::Float(f) => f.is_nan(),
-        _ => false,
-    }
+fn isnan(arg: &LispFloat) -> bool {
+    arg.is_nan()
 }
 
 #[defun]
-fn copysign(x: f64, y: f64) -> f64 {
-    x.copysign(y)
+fn copysign(x: &LispFloat, y: &LispFloat) -> f64 {
+    x.copysign(**y)
 }
 
 #[defun]
@@ -300,37 +277,13 @@ fn exp(arg: Number) -> f64 {
 }
 
 #[defun]
-fn expt(x: Number, y: Number) -> NumberValue {
-    // If either is a float, we use the float version
-    match (x.untag(), y.untag()) {
-        (NumberType::Float(_), _) | (_, NumberType::Float(_)) => {
-            return NumberValue::Float(coerce(x).powf(coerce(y)));
-        }
-        (_, _) => {}
-    };
-
-    // Otherwise, we use the integer version
-    let bx = match x.untag() {
-        NumberType::Int(x) => BigInt::from(x),
-        NumberType::Big(b) => (*b).clone(),
-        NumberType::Float(x) => {
-            return NumberValue::Float(x.powf(coerce(y)));
-        }
-    };
-
-    let by = match y.untag() {
-        NumberType::Int(x) => u32::try_from(x).ok(),
-        NumberType::Big(b) => b.to_u32(),
-        NumberType::Float(y) => {
-            return NumberValue::Float(coerce(x).powf(**y));
-        }
-    };
-
-    if let Some(y) = by {
-        let result = checked_pow(bx, y).unwrap();
-        return NumberValue::Big(result).coerce_integer();
-    }
-    NumberValue::Float(coerce(x).powf(coerce(y)))
+fn expt(
+    x: Number,
+    y: Number,
+    env: &crate::core::gc::Rt<crate::core::env::Env>,
+    cx: &Context,
+) -> Result<NumberValue> {
+    Ok(x.val().checked_pow(y.val(), crate::data::integer_width(env, cx)?)?)
 }
 
 #[defun]
@@ -404,6 +357,55 @@ fn frexp_f(f: f64) -> (f64, i64) {
 mod m0_rounding_regressions {
     use super::*;
     use crate::interpreter::assert_lisp;
+
+    #[test]
+    fn unary_rounding_uses_the_same_even_midpoints_as_division() {
+        for (value, expected) in [
+            (0.5_f64, 0.0_f64),
+            (1.5, 2.0),
+            (2.5, 2.0),
+            (3.5, 4.0),
+            (-0.5, -0.0),
+            (-1.5, -2.0),
+            (-2.5, -2.0),
+            (-3.5, -4.0),
+        ] {
+            let value = LispFloat::new(value, false);
+            assert_eq!(fround(&value).to_bits(), expected.to_bits());
+        }
+        for (source, expected) in [
+            ("(round 2.5)", "2"),
+            ("(round 3.5)", "4"),
+            ("(round -2.5)", "-2"),
+            ("(round -3.5)", "-4"),
+            ("(fround 2.5)", "2.0"),
+            ("(fround -2.5)", "-2.0"),
+            ("(= (round 2.5) (round 5 2))", "t"),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn float_only_primitives_reject_integer_coercion() {
+        for (source, expected) in [
+            ("(condition-case nil (fround 1) (error 'caught))", "caught"),
+            ("(condition-case nil (fceiling 1) (error 'caught))", "caught"),
+            ("(condition-case nil (ffloor 1) (error 'caught))", "caught"),
+            ("(condition-case nil (ftruncate 1) (error 'caught))", "caught"),
+            ("(condition-case nil (copysign 1 1.0) (error 'caught))", "caught"),
+            ("(condition-case nil (copysign 1.0 1) (error 'caught))", "caught"),
+            ("(condition-case nil (isnan 1) (error 'caught))", "caught"),
+            ("(condition-case nil (fround 18446744073709551616) (error 'caught))", "caught"),
+            ("(fround 1.5)", "2.0"),
+            ("(copysign 1.0 -1.0)", "-1.0"),
+            ("(isnan 0.0e+NaN)", "t"),
+            ("(atan 0 18446744073709551616)", "0.0"),
+            ("(log 18446744073709551616 18446744073709551616)", "1.0"),
+        ] {
+            assert_lisp(source, expected);
+        }
+    }
 
     #[test]
     fn integer_divisor_rounding_uses_even_midpoints() {
