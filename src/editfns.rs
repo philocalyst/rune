@@ -199,6 +199,30 @@ fn char_after(position: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<Opti
 fn char_before(position: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<Option<usize>> {
     character_at_point(position, true, env, cx)
 }
+fn line_position(count: Option<i64>, end: bool, env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    let read = env.buffer_read(cx)?;
+    let text = read.document.text();
+    let current = text.char_to_line(rune_text::CharPos(read.point))?.0;
+    let target = current as i128 + i128::from(count.unwrap_or(1)) - 1;
+    if target < 0 { return Ok(1); }
+    let last = text.summary().newlines;
+    if target > last as i128 { return Ok(text.len_chars() + 1); }
+    let target = target as usize;
+    if end {
+        Ok(if target == last { text.len_chars() + 1 } else { text.line_to_char(rune_text::LinePos(target + 1))?.0 })
+    } else {
+        Ok(text.line_to_char(rune_text::LinePos(target))?.0 + 1)
+    }
+}
+#[defun]
+fn line_beginning_position(count: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    line_position(count, false, env, cx)
+}
+#[defun]
+fn line_end_position(count: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    line_position(count, true, env, cx)
+}
+
 /// Unicode buffer byte coordinates are one-based UTF-8 offsets.
 #[defun]
 fn position_bytes(position: i64, env: &Rt<Env>, cx: &Context) -> Result<Option<usize>> {
@@ -452,6 +476,19 @@ mod owner_buffer_primitives_tests {
                   (list (bobp) (eobp) (following-char) (preceding-char) (point))
                   (progn (goto-char 2) (list (following-char) (preceding-char) (point)))
                   (progn (goto-char 4) (list (bobp) (eobp) (bolp) (eolp) (following-char) (preceding-char) (point))))))"#);
+    }
+    #[test]
+    fn indexed_line_boundaries_match_gnu_unicode_empty_and_offsets() {
+        crate::assert_elprop!(r#"(progn (erase-buffer)
+          (let ((empty (list (line-beginning-position) (line-end-position))))
+            (insert "aé\n🙂x\nef") (goto-char 5)
+            (list empty
+                  (mapcar (function line-beginning-position) (quote (-99 0 1 2 99)))
+                  (mapcar (function line-end-position) (quote (-99 0 1 2 99)))
+                  (point))))"#);
+        crate::assert_elprop!(r#"(progn (erase-buffer) (insert "é\n")
+          (list (line-beginning-position) (line-end-position)
+                (line-beginning-position 0) (line-end-position 0) (point)))"#);
     }
     #[test]
     fn unicode_byte_coordinates_match_gnu_interior_rounding() {
