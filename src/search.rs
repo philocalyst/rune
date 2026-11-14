@@ -12,6 +12,8 @@ use rune_macros::defun;
 // Scoped Env/dynamic default. GNU buffer-local case tables/forwarding remain
 // separate; do not claim per-buffer behavior from this variable alone.
 defvar!(CASE_FOLD_SEARCH, true);
+defsym!(SEARCH_FAILED);
+defsym!(INVALID_REGEXP);
 fn case_fold(env: &Rt<Env>, cx: &Context) -> Result<bool> {
     Ok(!crate::data::symbol_value(sym::CASE_FOLD_SEARCH, env, cx)?.is_nil())
 }
@@ -132,6 +134,103 @@ fn char_byte_offset(string: &str, position: usize) -> Result<usize> {
     }
     ensure!(position == string.chars().count(), "string position out of range");
     Ok(string.len())
+}
+
+fn compile_buffer_regex(pattern: &str, fold: bool, env: &mut Rt<Env>, cx: &Context) -> Result<fancy_regex::Regex> {
+    RegexBuilder::new(pattern).case_insensitive(fold).multi_line(true).build().map_err(|error| {
+        env.initialize_condition_metadata(cx);
+        let data = crate::core::cons::Cons::new1(cx.add(error.to_string()), cx).into();
+        crate::eval::EvalError::signal(sym::INVALID_REGEXP.into(), data, cx).into()
+    })
+}
+
+/// Buffer character positions are one-based; regex offsets remain UTF8 bytes.
+#[defun]
+fn re_search_backward<'ob>(
+    regexp: &str, bound: Option<i64>, noerror: Option<Object>, count: Option<i64>,
+    env: &mut Rt<Env>, cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    let read = env.buffer_read(cx)?;
+    ensure!(read.document.text().len_bytes() <= 4 * 1024 * 1024, "Buffer regexp search exceeds 4 MiB limit");
+    let text = read.document.text().to_string();
+    let mut offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    offsets.push(text.len());
+    let length = offsets.len() - 1;
+    let original = read.point;
+    let count = count.unwrap_or(1);
+    ensure!(count.unsigned_abs() <= 10_000, "Buffer regexp repeat limit exceeded");
+    let backward = count >= 0;
+    let limit = match bound {
+        Some(value) => {
+            if backward { ensure!(value <= original as i64 + 1, "Invalid search bound (wrong side of point)"); }
+            else { ensure!(value >= original as i64 + 1, "Invalid search bound (wrong side of point)"); }
+            usize::try_from(value.max(1) - 1).unwrap_or(usize::MAX).min(length)
+        }
+        None => if backward { 0 } else { length },
+    };
+    let pattern = lisp_regex_to_rust(regexp);
+    if count != 0 { compile_buffer_regex(&pattern, case_fold(env, cx)?, env, cx)?; }
+    let mut point = original;
+    let mut attempts = 0usize;
+    let mut last = None;
+    if count == 0 { last = Some(vec![point + 1, point + 1].into_iter().map(Some).collect::<Vec<_>>()); }
+    for _ in 0..count.unsigned_abs() {
+        env.poll_quit(cx)?;
+        let ceiling = if backward { point } else { limit };
+        // Constrain consumption without slicing: anchors/lookarounds still see
+        // the actual buffer, and greedy matches may backtrack at the search bound.
+        let bounded = format!(r"(?:{})(?=[\s\S]{{{},}}\z)", pattern, length - ceiling);
+        let expression = if backward { format!(r"\G{bounded}") } else { bounded };
+        let regex = compile_buffer_regex(&expression, case_fold(env, cx)?, env, cx)?;
+        let mut found = None;
+        if backward {
+            for start in (limit..=point).rev() {
+                env.poll_quit(cx)?;
+                attempts += 1;
+                ensure!(attempts <= 100_000, "Buffer regexp search work limit exceeded");
+                if let Some(captures) = regex.captures_from_pos(&text, offsets[start])? {
+                    if captures.get(0).is_some_and(|m| m.start() == offsets[start]) {
+                        found = Some(captures); break;
+                    }
+                }
+            }
+        } else {
+            found = regex.captures_from_pos(&text, offsets[point])?;
+        }
+        let Some(captures) = found else {
+            if let Some(data) = last {
+                let values: Vec<Object> = data.into_iter().map(|n| n.map_or(NIL, Object::from)).collect();
+                env.match_data.set(crate::fns::slice_into_list(&values, None, cx));
+            }
+            let noerror = noerror.unwrap_or(NIL);
+            if !noerror.is_nil() && noerror != crate::core::object::TRUE {
+                env.editor_gateway().set_point(read.handle, limit, cx)?;
+            }
+            if noerror.is_nil() {
+                env.initialize_condition_metadata(cx);
+                let condition = sym::SEARCH_FAILED;
+                let data = crate::core::cons::Cons::new1(cx.add(regexp), cx).into();
+                return Err(crate::eval::EvalError::signal(condition.into(), data, cx).into());
+            }
+            return Ok(NIL);
+        };
+        let mut positions = Vec::new();
+        for group in captures.iter() {
+            if let Some(group) = group {
+                positions.push(Some(text[..group.start()].chars().count() + 1));
+                positions.push(Some(text[..group.end()].chars().count() + 1));
+            } else { positions.extend([None, None]); }
+        }
+        point = positions[if backward { 0 } else { 1 }].unwrap();
+        point -= 1;
+        last = Some(positions);
+    }
+    let values: Vec<Object> = last.unwrap().into_iter().map(|n| n.map_or(NIL, Object::from)).collect();
+    // Prepare match data before publishing point, and retain no owner borrow.
+    let data = crate::fns::slice_into_list(&values, None, cx);
+    env.editor_gateway().set_point(read.handle, point, cx)?;
+    env.match_data.set(data);
+    Ok((point + 1).into())
 }
 
 #[defun]
@@ -479,5 +578,68 @@ mod case_fold_scope_tests {
         env.set_var_context(sym::CASE_FOLD_SEARCH, NIL, cx).unwrap();
         assert_eq!(byte_string_match(b"a", b"A", None, env, cx).unwrap(), NIL);
         assert_eq!(byte_string_match(b"A", b"A", None, env, cx).unwrap(), Object::from(0));
+    }
+}
+
+#[cfg(test)]
+mod backward_buffer_tests {
+    use crate::interpreter::assert_lisp;
+    #[test]
+    fn backward_regexp_uses_character_positions_and_nearest_start() {
+        for (pattern, expected) in [("a+", "(3 3 3 4)"), ("aa", "(2 2 2 4)"), (".*", "(4 4 4 4)"), ("", "(4 4 4 4)")] {
+            assert_lisp(&format!(r#"(progn (set-buffer (get-buffer-create "backward-case")) (insert "aaa") (goto-char 4) (list (re-search-backward {pattern:?} nil t) (point) (match-beginning 0) (match-end 0)))"#), expected);
+        }
+        assert_lisp(r#"(progn (set-buffer (get-buffer-create "backward-unicode")) (insert "λ🙂λ") (goto-char 4) (list (re-search-backward "λ" nil t 2) (point) (match-beginning 0) (match-end 0)))"#, "(1 1 1 2)");
+        assert_lisp(r#"(progn (set-buffer (get-buffer-create "backward-truncate")) (insert "aaa") (goto-char 3) (list (re-search-backward "a+" nil t) (match-beginning 0) (match-end 0)))"#, "(2 2 3)");
+        assert_lisp(r#"(progn (set-buffer (get-buffer-create "backward-anchor")) (insert "aaa") (goto-char 3) (re-search-backward "a$" nil t))"#, "nil");
+    }
+    #[test]
+    fn backward_buffer_matrix_matches_gnu() {
+        for text in ["aba", "aaa", "λa🙂a", "a\nb\na"] {
+            let length = text.chars().count();
+            for pattern in ["a", "aa", "a+", ".*", "", "^a", "a$", r"\(a\)\(b\)?"] {
+                for point in [1, length / 2 + 1, length + 1] {
+                    for count in [0, 1, 2, -1] {
+                        for noerror in ["t", "2"] {
+                            let source = format!(r#"(progn (erase-buffer) (insert {text:?}) (goto-char {point}) (set-match-data '(9 10)) (let ((case-fold-search nil)) (list (re-search-backward {pattern:?} nil {noerror} {count}) (point) (match-beginning 0) (match-end 0) (match-beginning 1) (match-end 1))))"#);
+                            crate::assert_elprop!("{}", source);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backward_bounds_and_error_classes_match_gnu() {
+        for pattern in ["a", "["] {
+            for point in [1, 2, 4] {
+                for bound in ["nil", "-3", "0", "1", "2", "3", "4", "8"] {
+                    for count in [0, 1, -1] {
+                        for noerror in ["nil", "t", "2"] {
+                            let source = format!(r#"(progn (erase-buffer) (insert "aba") (goto-char {point}) (set-match-data '(9 10)) (let ((case-fold-search nil)) (list (condition-case e (re-search-backward {pattern:?} {bound} {noerror} {count}) (error (car e))) (point) (match-beginning 0) (match-end 0))))"#);
+                            crate::assert_elprop!("{}", source);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_buffer_rejects_before_search_without_point_or_match_changes() {
+        for (length, character) in [(4_194_305, 97), (1_048_577, 0x1f642)] {
+            assert_lisp(&format!(r#"(progn (set-buffer (get-buffer-create "oversized-regexp-buffer")) (insert (make-string {length} {character} t)) (goto-char 2) (set-match-data '(9 10)) (list (condition-case nil (re-search-backward "" nil t) (error 'bounded)) (point) (match-beginning 0) (match-end 0)))"#), "(bounded 2 9 10)");
+        }
+    }
+
+    #[test]
+    fn backward_failure_partial_data_point_and_count_zero() {
+        for (noerror, expected) in [("t", "(nil 4 1 2)"), ("2", "(nil 1 1 2)")] {
+            assert_lisp(&format!(r#"(progn (set-buffer (get-buffer-create "backward-partial")) (insert "aba") (goto-char 4) (list (re-search-backward "a" nil {noerror} 3) (point) (match-beginning 0) (match-end 0)))"#), expected);
+        }
+        assert_lisp(r#"(progn (set-buffer (get-buffer-create "backward-noerror")) (insert "aba") (goto-char 4) (set-match-data '(9 10)) (list (condition-case e (re-search-backward "z") (search-failed (car e))) (point) (match-beginning 0) (match-end 0)))"#, "(search-failed 4 9 10)");
+        assert_lisp(r#"(progn (set-buffer (get-buffer-create "backward-zero")) (insert "aba") (goto-char 4) (list (re-search-backward "[" nil t 0) (match-beginning 0) (match-end 0)))"#, "(4 4 4)");
+        assert_lisp(r#"(progn (set-buffer (get-buffer-create "backward-negative")) (insert "aba") (goto-char 1) (list (re-search-backward "a" nil t -2) (point) (match-beginning 0) (match-end 0)))"#, "(4 4 3 4)");
     }
 }

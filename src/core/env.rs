@@ -128,6 +128,8 @@ impl<'a> RootedEnv<'a> {
         use super::object::NIL;
         let simple = [
             sym::WRONG_NUMBER_OF_ARGUMENTS,
+            sym::SEARCH_FAILED,
+            sym::INVALID_REGEXP,
             sym::WRONG_TYPE_ARGUMENT,
             sym::VOID_VARIABLE,
             sym::VOID_FUNCTION,
