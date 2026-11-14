@@ -54,6 +54,14 @@ where
     ) -> Result<(), String> {
         evaluate(&mut self.host, source)
     }
+    pub(crate) fn evaluate_with_quit(
+        &mut self,
+        evaluate: fn(&mut H, &str, Arc<std::sync::atomic::AtomicBool>) -> Result<(), String>,
+        source: &str,
+        token: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), String> {
+        evaluate(&mut self.host, source, token)
+    }
     pub fn new(mut host: H, metrics: FixedMetrics, bounds: Rect) -> Result<Self, BridgeError> {
         if !bounds.valid() || !metrics.0.valid() {
             return Err(LayoutError("invalid editor geometry").into());

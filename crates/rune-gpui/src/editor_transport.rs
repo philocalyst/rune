@@ -54,6 +54,8 @@ pub struct NativeEditorOwner {
     reply: Arc<Mutex<ReplyState>>,
     publisher: HostPublisher,
 }
+pub type InterruptibleEvaluator<H> =
+    fn(&mut H, &str, Arc<std::sync::atomic::AtomicBool>) -> Result<(), String>;
 pub struct NativeEditorWorker<H: EditorHost>
 where
     H::Doc: DisplayDocument,
@@ -64,6 +66,7 @@ where
     publisher: HostPublisher,
     initialized: bool,
     evaluator: Option<fn(&mut H, &str) -> Result<(), String>>,
+    interruptible: Option<(InterruptibleEvaluator<H>, crate::evaluation_quit::EvaluationQuit)>,
     platform: Option<crate::platform_context::PlatformPublisher>,
     prepare_input: Option<
         fn(
@@ -128,6 +131,7 @@ impl NativeEditorOwner {
             publisher: self.publisher,
             initialized: false,
             evaluator: None,
+            interruptible: None,
             platform: None,
             prepare_input: None,
         }
@@ -277,6 +281,18 @@ where
     /// belongs in H, not a UI closure. Absent adapters explicitly reject source.
     pub fn with_evaluator(mut self, evaluate: fn(&mut H, &str) -> Result<(), String>) -> Self {
         self.evaluator = Some(evaluate);
+        self.interruptible = None;
+        self
+    }
+    /// Configure a scoped interruption token, active only during one callback.
+    /// Idle C-g is not carried forward; accepted evaluations are never replayed.
+    pub fn with_interruptible_evaluator(
+        mut self,
+        evaluate: InterruptibleEvaluator<H>,
+        signal: crate::evaluation_quit::EvaluationQuit,
+    ) -> Self {
+        self.evaluator = None;
+        self.interruptible = Some((evaluate, signal));
         self
     }
     /// Retry preparation/publication only. Never replay a committed command or
@@ -305,6 +321,15 @@ where
                     Ok(before) => {
                         let outcome = if source.len() > 65_536 {
                             Err("evaluation source exceeds 65536-byte limit".into())
+                        } else if let Some((evaluate, signal)) = &self.interruptible {
+                            match signal.begin() {
+                                Ok(scope) => self.bridge.evaluate_with_quit(
+                                    *evaluate,
+                                    &source,
+                                    scope.token(),
+                                ),
+                                Err(error) => Err(error.into()),
+                            }
                         } else if let Some(evaluate) = self.evaluator {
                             self.bridge.evaluate_with(evaluate, &source)
                         } else {
@@ -574,5 +599,46 @@ mod tests {
         ));
         assert!(replies.take().unwrap().outcome.is_err());
         assert_eq!(worker.bridge().snapshot().unwrap().buffers[0].document.to_text(), "before");
+    }
+    thread_local! {
+        static TEST_SIGNAL: std::cell::RefCell<Option<crate::evaluation_quit::EvaluationQuit>> = const {std::cell::RefCell::new(None)};
+    }
+    fn scoped_interruption(
+        host: &mut Session<RopeDocument>,
+        source: &str,
+        token: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        assert!(!token.load(Ordering::Acquire));
+        TEST_SIGNAL.with(|signal| assert!(signal.borrow().as_ref().unwrap().request()));
+        assert!(token.swap(false, Ordering::AcqRel));
+        if source == "edit" {
+            host.execute(rune_editor::Command::Insert("partial".into()))
+                .map_err(|e| e.to_string())?;
+        }
+        Err("mock structured interruption".into())
+    }
+    #[test]
+    fn scoped_callback_closes_signal_after_error_and_next_request_starts_fresh() {
+        let signal = crate::evaluation_quit::EvaluationQuit::default();
+        TEST_SIGNAL.with(|slot| *slot.borrow_mut() = Some(signal.clone()));
+        let (publisher, _updates) = host_updates();
+        let (sender, _replies, worker) = editor_transport(bridge(), 2, publisher);
+        let mut worker = worker.with_interruptible_evaluator(scoped_interruption, signal.clone());
+        assert!(!signal.request());
+        for (request_id, source) in [(1, "edit"), (2, "no edit")] {
+            sender
+                .try_send(OwnerEvent::Evaluate { request_id, source: source.into() })
+                .unwrap();
+            let step = worker.try_step().unwrap();
+            assert_eq!(step.edit.unwrap(), request_id == 1);
+            assert_eq!(
+                step.evaluation.unwrap().outcome.unwrap_err(),
+                "mock structured interruption"
+            );
+            assert!(!signal.request());
+        }
+        assert_eq!(worker.bridge().snapshot().unwrap().buffers[0].document.to_text(), "partial");
+        TEST_SIGNAL.with(|slot| *slot.borrow_mut() = None);
     }
 }

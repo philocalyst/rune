@@ -1649,7 +1649,21 @@ impl LispRuntimeHost<'_, '_, '_> {
         self.env.set_current_buffer(handle, self.owner.cx).map_err(|e| e.to_string())?;
         crate::lread::load_internal(source, self.owner.cx, self.env)
             .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(|error| {
+                // Preserve the structured QUIT identity without printing an
+                // arbitrary Lisp payload or reconstituting a condition by text.
+                if let Some(error) = error.downcast_ref::<crate::eval::EvalError>() {
+                    if let crate::eval::ErrorType::Signal(exit) = &error.error {
+                        if exit
+                            .bind(self.owner.cx)
+                            .is_ok_and(|condition| condition.car() == crate::core::env::sym::QUIT)
+                        {
+                            return "quit".to_owned();
+                        }
+                    }
+                }
+                error.to_string()
+            })
     }
 }
 impl rune_editor::EditorHost for LispRuntimeHost<'_, '_, '_> {
@@ -1780,5 +1794,36 @@ impl RuntimeEditorGateway {
         let mut owner = self.inner.try_borrow_mut()?;
         let id = owner.validate_handle(handle, cx)?;
         Ok(owner.session.set_modified(id, value)?)
+    }
+}
+
+impl LispRuntimeHost<'_, '_, '_> {
+    /// Fresh request-scoped interruption token. Guard installation owns no Env
+    /// borrow and restores the previous token on success, signal or Rust unwind.
+    /// This does not roll back earlier Lisp effects or bound blocking foreign calls.
+    pub(crate) fn evaluate_source_with_quit(
+        &mut self,
+        source: &str,
+        token: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), String> {
+        let _quit = self.env.install_quit_token(token);
+        self.evaluate_source(source)
+    }
+}
+#[cfg(test)]
+mod persistent_lisp_quit_adapter_tests {
+    use super::*;
+    use rune_editor::{Document, EditorHost};
+    #[test]
+    fn requested_token_reports_quit_and_does_not_poison_next_request() {
+        with_lisp_runtime_owner(80, 24, |mut host| {
+            let requested = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let error = host.evaluate_source_with_quit("(while t)", requested).unwrap_err();
+            assert!(error.to_lowercase().contains("quit"), "unexpected error: {error}");
+            host.evaluate_source("(insert \"after\")").map_err(anyhow::Error::msg)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "after");
+            Ok(())
+        })
+        .unwrap();
     }
 }

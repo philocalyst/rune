@@ -195,6 +195,21 @@ impl FrameView {
             ime: None,
         }
     }
+    /// Connect UI C-g to the same request-scoped channel configured on its
+    /// owner worker. Legacy quit observability remains independent.
+    #[cfg(feature = "editor")]
+    pub fn set_evaluation_quit(
+        &mut self,
+        signal: evaluation_quit::EvaluationQuit,
+    ) -> Result<(), &'static str> {
+        match &self.input {
+            FrameInput::Owner(input) => {
+                input.borrow_mut().set_evaluation_quit(signal);
+                Ok(())
+            }
+            FrameInput::Legacy(_) => Err("evaluator quit requires an editor owner view"),
+        }
+    }
     /// Consume explicit composition outcomes before retrying the owner FIFO.
     /// This order frees its reserved reply slot without letting input overtake.
     pub fn retry_input(&mut self) -> Result<(), std::sync::mpsc::TrySendError<()>> {
@@ -622,6 +637,8 @@ pub mod composition;
 pub mod editor_bridge;
 #[cfg(feature = "editor")]
 pub mod editor_transport;
+#[cfg(feature = "editor")]
+pub mod evaluation_quit;
 #[cfg(feature = "editor")]
 pub mod ime_context;
 

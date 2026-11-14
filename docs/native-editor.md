@@ -35,9 +35,25 @@ explicitly enabled at build time.
 The editor currently uses fixed native movement/edit commands and platform-only
 printable text. Typed C-x keymaps, shift selection, a live evaluation prompt,
 clipboard shortcut UX and full complex shaping are not provided by this path.
-C-g cancels local preedit and records an interrupt request, but the evaluator/VM
-does not yet poll that request at safe points. It does not currently interrupt
-a long-running startup Lisp evaluation.
+C-g cancels local preedit and requests QUIT for a currently active evaluation.
+The UI and owner share a plain request-scoped channel; a fresh atomic token is
+installed only during each callback and removed on every return path. An idle
+C-g is not carried into a future evaluation, and a delayed old token cannot
+cancel the next request. C-g before a queued evaluation becomes active is not a
+request to cancel that future evaluation.
+
+The interpreter polls at form boundaries and the bytecode VM at instruction
+boundaries. `inhibit-quit` preserves a pending request; cleanup runs through the
+existing nonlocal-exit machinery without repeatedly polling the same request.
+A program may catch QUIT or inhibit it. Reader work, long native subroutines,
+allocation, blocking locks and nonterminating cleanup are not preemptible. No
+owner thread is forcibly killed and no evaluation is retried after interruption.
+See [runtime quit safe points](runtime-quit-safe-points.md).
+
+A linked, headless native owner-pipeline test verifies pending/inhibited QUIT,
+cleanup and partial edits, publication failure without replay, and the next FIFO
+request with a fresh token. Dependency-light tests verify the busy-input C-g
+signal path. These are not OS keyboard callback or native window tests.
 
 Evaluation/input failures are currently reported to stderr, not a finished
 in-window recovery panel. A failed initialization preserves queued events for

@@ -27,6 +27,7 @@ pub(crate) struct OwnerInput {
     policy: InputPolicy,
     capacity: usize,
     quit: Arc<AtomicBool>,
+    evaluation_quit: Option<crate::evaluation_quit::EvaluationQuit>,
     rejected: RejectedOwnerInput,
     replies: NativeEditorReplies,
     outcome: CompositionOutcome,
@@ -45,15 +46,22 @@ impl OwnerInput {
             policy: InputPolicy::default(),
             capacity: 256,
             quit,
+            evaluation_quit: None,
             rejected,
             replies,
             outcome,
         }))
     }
+    pub(crate) fn set_evaluation_quit(&mut self, signal: crate::evaluation_quit::EvaluationQuit) {
+        self.evaluation_quit = Some(signal);
+    }
     fn signal_quit(&self, e: &OwnerEvent) {
         if matches!(e,OwnerEvent::Input(rune_display::InputEvent::Key{key,control:true,..}) if key=="g")
         {
             self.quit.store(true, Ordering::Release);
+            if let Some(signal) = &self.evaluation_quit {
+                signal.request();
+            }
         }
     }
     fn flush(&mut self) -> Result<(), TrySendError<()>> {
@@ -315,5 +323,39 @@ mod tests {
         let rejected = rejected.borrow();
         assert!(matches!(&rejected[2].event,OwnerEvent::Composition(r) if r.token==token));
         assert_eq!(i.borrow().readiness(), InputReadiness::Disconnected);
+    }
+    #[test]
+    fn busy_fifo_c_g_signals_only_current_evaluation_before_admission() {
+        let (publisher, _updates) = host_updates();
+        let (sender, replies, _owner) = pending_editor_transport(1, publisher);
+        let legacy_quit = Arc::new(AtomicBool::new(false));
+        let input = OwnerInput::new(
+            sender,
+            replies,
+            legacy_quit.clone(),
+            Rc::new(|_| panic!("unexpected rejection")),
+            Rc::new(|_| {}),
+        );
+        let signal = crate::evaluation_quit::EvaluationQuit::default();
+        input.borrow_mut().set_evaluation_quit(signal.clone());
+        assert!(OwnerInput::submit(&input, OwnerEvent::Command(rune_editor::Command::Undo)));
+        let scope = signal.begin().unwrap();
+        let token = scope.token();
+        assert!(OwnerInput::submit(
+            &input,
+            OwnerEvent::Input(InputEvent::Key {
+                key: "g".into(),
+                text: None,
+                control: true,
+                meta: false,
+                shift: false
+            })
+        ));
+        assert!(token.load(Ordering::Acquire));
+        assert!(legacy_quit.load(Ordering::Acquire));
+        drop(scope);
+        assert!(!signal.request());
+        let next = signal.begin().unwrap();
+        assert!(!next.token().load(Ordering::Acquire));
     }
 }

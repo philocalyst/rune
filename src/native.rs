@@ -6,6 +6,7 @@ use rune_gpui::{
     FrameView, NativeFont,
     editor_bridge::EditorBridge,
     editor_transport::{OwnerEvent, pending_editor_transport},
+    evaluation_quit::EvaluationQuit,
     platform_context::platform_frames,
 };
 use std::{
@@ -56,6 +57,8 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
         }
         let failure = Arc::new(Mutex::new(None::<(String, Vec<OwnerEvent>)>));
         let report = failure.clone();
+        let evaluation_quit = EvaluationQuit::default();
+        let owner_quit = evaluation_quit.clone();
         std::thread::spawn(move || {
             // Context, one rooted Env, and the shared editor authority are created
             // only here; nothing live crosses into the UI executor.
@@ -75,7 +78,7 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                         }
                     };
                     worker
-                        .with_evaluator(evaluate_source)
+                        .with_interruptible_evaluator(evaluate_source_with_quit, owner_quit)
                         .run_with_outcome(|step| {
                             if let Some(evaluation) = step.evaluation {
                                 if let Err(error) = evaluation.outcome {
@@ -145,7 +148,7 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                     move |window, cx| {
                         let view = cx.new(|cx| {
                             FrameView::watch_updates(updates, cx).detach();
-                            FrameView::new_ime(
+                            let mut view = FrameView::new_ime(
                                 frame,
                                 font,
                                 sender,
@@ -160,7 +163,9 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                                 window,
                                 cx,
                             )
-                            .expect("prepared IME context")
+                            .expect("prepared IME context");
+                            view.set_evaluation_quit(evaluation_quit).expect("editor owner view");
+                            view
                         });
                         window.focus(&view.read(cx).focus_handle());
                         view
@@ -182,6 +187,14 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
 fn evaluate_source(host: &mut LispRuntimeHost<'_, '_, '_>, source: &str) -> Result<(), String> {
     host.evaluate_source(source)
 }
+fn evaluate_source_with_quit(
+    host: &mut LispRuntimeHost<'_, '_, '_>,
+    source: &str,
+    token: Arc<AtomicBool>,
+) -> Result<(), String> {
+    host.evaluate_source_with_quit(source, token)
+}
+
 #[cfg(test)]
 mod joined_owner_tests {
     use super::*;
@@ -265,5 +278,64 @@ mod joined_owner_tests {
             Ok(())
         })
         .unwrap();
+    }
+    thread_local! {
+        static ACTIVE_QUIT: std::cell::RefCell<Option<EvaluationQuit>> = const { std::cell::RefCell::new(None) };
+    }
+    fn signal_active_evaluation(
+        host: &mut LispRuntimeHost<'_, '_, '_>,
+        source: &str,
+        token: Arc<AtomicBool>,
+    ) -> Result<(), String> {
+        assert!(!token.load(Ordering::Acquire));
+        if source.contains("request-native-quit") {
+            ACTIVE_QUIT.with(|slot| assert!(slot.borrow().as_ref().unwrap().request()));
+            assert!(token.load(Ordering::Acquire));
+        }
+        evaluate_source_with_quit(host, source, token)
+    }
+    #[test]
+    fn actual_scoped_quit_preserves_cleanup_partial_edit_and_next_fifo_request() {
+        with_lisp_runtime_owner(80, 24, |host| {
+            let signal = EvaluationQuit::default();
+            assert!(!signal.request());
+            ACTIVE_QUIT.with(|slot| *slot.borrow_mut() = Some(signal.clone()));
+            let (publisher, updates) = host_updates();
+            let (sender, _replies, pending) = pending_editor_transport(8, publisher);
+            let bridge = EditorBridge::new(host, FixedMetrics::default(), Rect {x:0.,y:0.,width:640.,height:480.}).map_err(|e|anyhow::anyhow!("{e:?}"))?;
+            let (platform, _reader) = platform_frames();
+            let mut worker = pending.bind_ime_initialized(bridge, platform).map_err(|e|anyhow::anyhow!("{e:?}"))?.with_interruptible_evaluator(signal_active_evaluation, signal.clone());
+            sender.try_send(OwnerEvent::Evaluate {request_id:1, source:"(setq inhibit-quit t)".into()}).unwrap();
+            let first = worker.try_step().unwrap();
+            assert!(first.evaluation.unwrap().outcome.is_ok());
+            assert!(!signal.request());
+            drop(updates);
+            sender.try_send(OwnerEvent::Evaluate {request_id:2, source:"; request-native-quit\n(unwind-protect (progn (insert \"x\") (setq inhibit-quit nil) (+ 1 2)) (insert \"c\"))".into()}).unwrap();
+            let quit = worker.try_step().unwrap();
+            assert!(quit.edit.unwrap());
+            let outcome = quit.evaluation.unwrap();
+            assert_eq!(outcome.request_id, 2);
+            assert!(outcome.outcome.unwrap_err().to_lowercase().contains("quit"));
+            assert!(quit.render_error.is_some());
+            assert!(!signal.request());
+            assert!(worker.retry_frame().is_err());
+            assert_eq!(worker.bridge().snapshot().unwrap().buffers[0].document.to_text(), "xc");
+            sender.try_send(OwnerEvent::Evaluate {request_id:3, source:"(insert \"n\")".into()}).unwrap();
+            let next = worker.try_step().unwrap();
+            assert!(next.edit.unwrap());
+            assert!(next.evaluation.unwrap().outcome.is_ok());
+            assert!(!signal.request());
+            assert_eq!(worker.bridge().snapshot().unwrap().buffers[0].document.to_text(), "xcn");
+            sender.try_send(OwnerEvent::Command(rune_editor::Command::Undo)).unwrap();
+            assert!(worker.try_step().unwrap().edit.unwrap());
+            assert_eq!(worker.bridge().snapshot().unwrap().buffers[0].document.to_text(), "xc");
+            ACTIVE_QUIT.with(|slot| *slot.borrow_mut() = None);
+            Ok(())
+        }).unwrap();
+    }
+    #[test]
+    fn startup_source_caps_reject_before_application_or_window_creation() {
+        assert!(run(vec![String::new(); 65]).is_err());
+        assert!(run(vec!["x".repeat(65_537)]).is_err());
     }
 }
