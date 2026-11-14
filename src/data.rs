@@ -435,14 +435,26 @@ pub(crate) fn integer_width(env: &Rt<Env>, cx: &Context) -> Result<u64> {
 }
 
 #[defun]
-fn ash(
-    value: Number,
-    count: Number,
+fn ash<'ob>(
+    value: Number<'ob>,
+    count: Object,
     env: &Rt<Env>,
-    cx: &Context,
-) -> Result<crate::core::object::NumberValue> {
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    if value.is_float() {
+        return Err(crate::core::object::NumericError::ExpectedInteger.into());
+    }
+    let count = Number::try_from(count)?;
+    if count.is_float() {
+        return Err(crate::core::object::NumericError::ExpectedInteger.into());
+    }
+    // A zero shift is identity, not an allocating arithmetic result. Validate
+    // both integer operands first, then preserve even an over-width old object.
+    if count.numeric_cmp(0_i64.into()) == Some(std::cmp::Ordering::Equal) {
+        return Ok(value.as_obj_copy());
+    }
     let limit = integer_width(env, cx)?;
-    Ok(value.val().arithmetic_shift(count.val(), limit)?)
+    Ok(cx.add(value.val().arithmetic_shift(count.val(), limit)?))
 }
 
 #[defun]
@@ -745,6 +757,44 @@ mod test {
 
     use super::*;
     use crate::interpreter::assert_lisp;
+
+    #[test]
+    fn zero_shift_retains_integer_object_identity_after_type_validation() {
+        for value in [
+            "18446744073709551616",
+            "-18446744073709551616",
+            "(ash 1 200)",
+            "(- (ash 1 200))",
+        ] {
+            assert_lisp(
+                &format!(
+                    "(let ((x {value})) (let ((integer-width 128)) (let ((y (ash x 0))) (garbage-collect) (eq x y))))"
+                ),
+                "t",
+            );
+        }
+        assert_lisp("(condition-case nil (ash 1 0.0) (error 'caught))", "caught");
+        assert_lisp("(condition-case nil (ash 1.0 0) (error 'caught))", "caught");
+    }
+
+    #[test]
+    fn ash_reports_first_float_before_later_nonnumeric_count() {
+        {
+            let roots = crate::core::gc::RootSet::default();
+            let cx = Context::new(&roots);
+            let context = &cx;
+            rune_core::macros::root!(env, init(Env::new(context).unwrap()), context);
+            let error = ash(cx.add_as(1.0), crate::sym::NIL.into(), env, &cx).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<crate::core::object::NumericError>(),
+                Some(&crate::core::object::NumericError::ExpectedInteger)
+            );
+        }
+        crate::interpreter::assert_lisp(
+            "(let ((seen 0)) (condition-case nil (ash 1.0 (progn (setq seen 1) 'bad)) (error nil)) seen)",
+            "1",
+        );
+    }
 
     #[test]
     fn test_ash() {

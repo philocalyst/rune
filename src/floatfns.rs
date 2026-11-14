@@ -362,7 +362,13 @@ fn abs<'ob>(arg: Number<'ob>, env: &Rt<Env>, cx: &'ob Context) -> Result<Object<
 }
 
 #[defun]
-fn ldexp(s: Number, e: i64) -> f64 {
+fn ldexp(significand: Object, exponent: Object) -> Result<f64> {
+    // Fldexp validates its fixnum exponent before coercing the significand.
+    let exponent: i64 = exponent.try_into()?;
+    Ok(ldexp_value(Number::try_from(significand)?, exponent))
+}
+
+fn ldexp_value(s: Number, e: i64) -> f64 {
     // Match GNU Fldexp's C-int exponent clamp. Scaling directly avoids both
     // wrapping casts and an overflowing/underflowing intermediate power of 2.
     let exponent = e.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
@@ -663,21 +669,39 @@ mod m0_ldexp_regressions {
     };
 
     #[test]
+    fn ldexp_validates_exponent_before_significand_after_argument_evaluation() {
+        {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            let exponent = cx.add(1.5);
+            let error = ldexp(crate::sym::NIL.into(), exponent).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<crate::core::error::TypeError>(),
+                Some(&crate::core::error::TypeError::new(crate::core::error::Type::Int, exponent))
+            );
+        }
+        assert_lisp(
+            "(let ((seen 0)) (condition-case nil (ldexp (progn (setq seen 1) 'bad) (progn (setq seen 2) 'bad2)) (error nil)) seen)",
+            "2",
+        );
+    }
+
+    #[test]
     fn ldexp_scales_without_intermediate_overflow_or_wrapping_exponents() {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
         let half = cx.add_as(0.5);
-        assert_eq!(ldexp(half, 1024), f64::from_bits(0x7fe0_0000_0000_0000));
-        assert_eq!(ldexp(cx.add_as(1.0), -1074), f64::from_bits(1));
-        assert!(ldexp(half, 1_i64 << 32).is_infinite());
-        assert_eq!(ldexp(half, -(1_i64 << 32)), 0.0);
+        assert_eq!(ldexp_value(half, 1024), f64::from_bits(0x7fe0_0000_0000_0000));
+        assert_eq!(ldexp_value(cx.add_as(1.0), -1074), f64::from_bits(1));
+        assert!(ldexp_value(half, 1_i64 << 32).is_infinite());
+        assert_eq!(ldexp_value(half, -(1_i64 << 32)), 0.0);
         for exponent in [i64::MIN, i64::MAX] {
-            let zero = ldexp(cx.add_as(-0.0), exponent);
+            let zero = ldexp_value(cx.add_as(-0.0), exponent);
             assert_eq!(zero, 0.0);
             assert!(zero.is_sign_negative());
-            assert_eq!(ldexp(cx.add_as(f64::INFINITY), exponent), f64::INFINITY);
+            assert_eq!(ldexp_value(cx.add_as(f64::INFINITY), exponent), f64::INFINITY);
         }
-        assert!(ldexp(cx.add_as(f64::NAN), 100).is_nan());
+        assert!(ldexp_value(cx.add_as(f64::NAN), 100).is_nan());
         drop(cx);
         assert_lisp("(ldexp 0.5 4)", "8.0");
         assert_lisp("(ldexp 0.5 4294967296)", "1.0e+INF");

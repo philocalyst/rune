@@ -890,7 +890,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     top.set(fns::nconc(&[top.bind_as(cx)?, list2.try_into()?])?);
                 }
                 op::Quo | op::Rem => {
-                    let right = self.env.stack[0].bind_as(cx)?;
+                    let right = self.env.stack[0].bind(cx);
                     let left = self.env.stack[1].bind_as(cx)?;
                     let result = if op == op::Quo {
                         arith::div(left, &[right], self.env, cx)?

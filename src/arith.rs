@@ -65,19 +65,27 @@ pub(crate) fn mul<'ob>(
     }
 }
 
+fn division_fold<'ob>(
+    initial: NumberValue,
+    floating: bool,
+    mut denominators: impl Iterator<
+        Item = std::result::Result<Number<'ob>, crate::core::error::TypeError>,
+    >,
+) -> Result<NumberValue> {
+    let initial = if floating { NumberValue::Float(initial.to_float()) } else { initial };
+    denominators.try_fold(initial, |value, denominator| -> Result<NumberValue> {
+        let denominator = denominator?.val();
+        let denominator =
+            if floating { NumberValue::Float(denominator.to_float()) } else { denominator };
+        Ok(value.checked_div(denominator)?)
+    })
+}
+
 pub(crate) fn div_value(number: Number, divisors: &[Number]) -> Result<NumberValue> {
-    // Preserve the source-verified whole-expression floating selection. The
-    // kernel handles IEEE floats and fallible exact integer operations.
     let floating = number.is_float() || divisors.iter().any(Number::is_float);
     let denominators = if divisors.is_empty() { std::slice::from_ref(&number) } else { divisors };
     let initial = if divisors.is_empty() { NumberValue::Int(1) } else { number.val() };
-    let initial = if floating { NumberValue::Float(initial.to_float()) } else { initial };
-    Ok(denominators.iter().try_fold(initial, |value, denominator| {
-        let denominator = denominator.val();
-        let denominator =
-            if floating { NumberValue::Float(denominator.to_float()) } else { denominator };
-        value.checked_div(denominator)
-    })?)
+    division_fold(initial, floating, denominators.iter().copied().map(Ok))
 }
 
 pub(crate) fn add_one_value(number: Number) -> NumberValue {
@@ -114,11 +122,19 @@ pub(crate) fn sub(
 #[defun(name = "/")]
 pub(crate) fn div(
     number: Number,
-    divisors: &[Number],
+    divisors: &[Object],
     env: &Rt<Env>,
     cx: &Context,
 ) -> Result<NumberValue> {
-    finish_arithmetic(div_value(number, divisors)?, env, cx)
+    let value = if divisors.is_empty() {
+        div_value(number, &[])?
+    } else {
+        // Float selection scans tags, not numeric types. Without any float,
+        // an earlier zero divisor must beat a later nonnumeric operand.
+        let floating = number.is_float() || divisors.iter().any(Object::is_float);
+        division_fold(number.val(), floating, divisors.iter().copied().map(Number::try_from))?
+    };
+    finish_arithmetic(value, env, cx)
 }
 
 #[defun(name = "1+")]
@@ -303,9 +319,13 @@ pub(crate) fn modulo(x: Number, y: Number, env: &Rt<Env>, cx: &Context) -> Resul
 }
 
 #[defun(name = "%")]
-pub(crate) fn remainder(x: Number, y: Number, env: &Rt<Env>, cx: &Context) -> Result<NumberValue> {
-    // TODO: Handle markers
-    finish_arithmetic(remainder_driver(x, y, false)?, env, cx)
+pub(crate) fn remainder(x: Number, y: Object, env: &Rt<Env>, cx: &Context) -> Result<NumberValue> {
+    // GNU validates the first integer before converting the second operand.
+    // TODO: Handle markers and named integer-or-marker type conditions.
+    if x.is_float() {
+        return Err(crate::core::object::NumericError::ExpectedInteger.into());
+    }
+    finish_arithmetic(remainder_driver(x, Number::try_from(y)?, false)?, env, cx)
 }
 
 // Extrema select an existing operand. Keep the borrowed identity rather than
@@ -719,6 +739,75 @@ mod test {
         ] {
             crate::interpreter::assert_lisp(source, expected);
         }
+    }
+
+    #[test]
+    fn division_prescans_float_tags_then_validates_operands_in_operation_order() {
+        {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            let context = &cx;
+            rune_core::macros::root!(env, init(Env::new(context).unwrap()), context);
+            let zero = Object::from(0_i64);
+            let bad: Object = crate::sym::NIL.into();
+            let float = cx.add(2.0);
+            let error = div(1_i64.into(), &[zero, bad], env, &cx).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<crate::core::object::NumericError>(),
+                Some(&crate::core::object::NumericError::DivisionByZero)
+            );
+            for divisors in
+                [&[zero, bad, float][..], &[zero, float, bad][..], &[cx.add(0.0), bad][..]]
+            {
+                let error = div(1_i64.into(), divisors, env, &cx).unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<crate::core::error::TypeError>(),
+                    Some(&crate::core::error::TypeError::new(
+                        crate::core::error::Type::Number,
+                        bad
+                    ))
+                );
+            }
+            let error = div(cx.add_as(1.0), &[zero, bad], env, &cx).unwrap_err();
+            assert!(error.downcast_ref::<crate::core::error::TypeError>().is_some());
+            let NumberValue::Float(infinity) = div(1_i64.into(), &[zero, float], env, &cx).unwrap()
+            else {
+                panic!("float expected")
+            };
+            assert_eq!(infinity, f64::INFINITY);
+        }
+        for (source, expected) in [
+            (
+                "(let ((seen 0)) (condition-case nil (/ 1 0 (progn (setq seen 1) 'bad)) (error nil)) seen)",
+                "1",
+            ),
+            (
+                "(let ((seen 0)) (condition-case nil (/ 1 0 (progn (setq seen 1) 'bad) (progn (setq seen 2) 2.0)) (error nil)) seen)",
+                "2",
+            ),
+            ("(/ 1 0 2.0)", "1.0e+INF"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
+    }
+
+    #[test]
+    fn remainder_reports_first_float_before_later_nonnumeric_argument() {
+        {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            let context = &cx;
+            rune_core::macros::root!(env, init(Env::new(context).unwrap()), context);
+            let error = remainder(cx.add_as(1.0), crate::sym::NIL.into(), env, &cx).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<crate::core::object::NumericError>(),
+                Some(&crate::core::object::NumericError::ExpectedInteger)
+            );
+        }
+        crate::interpreter::assert_lisp(
+            "(let ((seen 0)) (condition-case nil (% 1.0 (progn (setq seen 1) 'bad)) (error nil)) seen)",
+            "1",
+        );
     }
 
     #[test]
