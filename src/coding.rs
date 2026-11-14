@@ -2,7 +2,6 @@
 //! Invalid UTF8 is rejected, never replaced or mapped byte-for-Unicode.
 use crate::core::{
     env::{Env, intern},
-    error::{Type, TypeError},
     gc::{Context, Rt},
     object::{Object, ObjectType},
 };
@@ -49,10 +48,19 @@ enum Coding {
     Binary,
     Ascii,
 }
-fn select(value: Object) -> Result<Coding> {
+fn codec_type_error(predicate: crate::core::object::Symbol, value: Object, env: &mut Rt<Env>, cx: &Context) -> anyhow::Error {
+    env.initialize_condition_metadata(cx);
+    let data = list!(predicate,value;cx);
+    crate::eval::EvalError::signal(crate::sym::WRONG_TYPE_ARGUMENT.into(),data,cx).into()
+}
+fn validate_string_input(value: Object, env: &mut Rt<Env>, cx: &Context) -> Result<()> {
+    if matches!(value.untag(),ObjectType::String(_) | ObjectType::ByteString(_)) { return Ok(()); }
+    Err(codec_type_error(crate::sym::STRINGP,value,env,cx))
+}
+fn select(value: Object, env: &mut Rt<Env>, cx: &Context) -> Result<Coding> {
     if value.is_nil() { return Ok(Coding::Identity); }
     let ObjectType::Symbol(symbol) = value.untag() else {
-        return Err(TypeError::new(Type::Symbol, value.untag()).into());
+        return Err(codec_type_error(crate::sym::SYMBOLP,value,env,cx));
     };
     Ok(match symbol.name() {
         "utf-8" => Coding::Utf8,
@@ -68,7 +76,7 @@ fn input_bytes(value: Object) -> Result<&[u8]> {
     match value.untag() {
         ObjectType::String(string) => Ok(string.as_bytes()),
         ObjectType::ByteString(string) => Ok(&string),
-        other => Err(TypeError::new(Type::String, other).into()),
+        _ => anyhow::bail!("Coding input is not a String"),
     }
 }
 fn decoded(bytes: &[u8], coding: Coding) -> Result<(String, &'static str)> {
@@ -130,7 +138,8 @@ fn decode_coding_string<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    let coding = select(coding_system)?;
+    validate_string_input(string,env,cx)?;
+    let coding = select(coding_system,env,cx)?;
     if buffer.is_some_and(|value| !value.is_nil()) {
         return Err(CodingError::DestinationUnsupported.into());
     }
@@ -171,7 +180,8 @@ fn encode_coding_string<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    let coding = select(coding_system)?;
+    validate_string_input(string,env,cx)?;
+    let coding = select(coding_system,env,cx)?;
     if buffer.is_some_and(|value| !value.is_nil()) {
         return Err(CodingError::DestinationUnsupported.into());
     }
@@ -304,5 +314,28 @@ mod locale_nil_tests {
         assert!(crate::data::symbol_value(sym::LOCALE_CODING_SYSTEM,env,cx).unwrap().ptr_eq(utf8));
         cx.garbage_collect(true);
         assert_eq!(crate::data::symbol_value(sym::LOCALE_CODING_SYSTEM,env,cx).unwrap().to_string(),"utf-8-unix");
+    }
+}
+
+#[cfg(test)]
+mod structured_codec_boundary_tests {
+    #[test]
+    fn string_then_coding_type_precedence_matches_gnu() {
+        for op in ["encode-coding-string","decode-coding-string"] {
+            for (string,coding) in [("42","42"),("42","'bogus"),("42","nil"),("\"a\"","42")] {
+                crate::assert_elprop!("(condition-case e ({} {} {}) (wrong-type-argument (list (car e) (car (cdr e)) (car (cdr (cdr e))))))",op,string,coding);
+            }
+        }
+    }
+    #[test]
+    fn cyclic_invalid_codec_operands_signal_without_rendering() {
+        for op in ["encode-coding-string","decode-coding-string"] {
+            for object in ["(vector nil)","(list nil)","(make-byte-code 0 (make-string 0 0) (vector nil) 0)"] {
+                // Cycles live in the vector/cons/bytecode constants. Each error
+                // returns only predicate and pointer identity, never the graph.
+                let mutate=if object.starts_with("(list") { "(setcar v v)" } else if object.starts_with("(vector") { "(aset v 0 v)" } else { "(aset (aref v 2) 0 v)" };
+                crate::assert_elprop!("(let ((v {})) {} (list (condition-case e ({} v 42) (wrong-type-argument (list (car (cdr e)) (eq v (car (cdr (cdr e))))))) (condition-case e ({} \"a\" v) (wrong-type-argument (list (car (cdr e)) (eq v (car (cdr (cdr e)))))))))",object,mutate,op,op);
+            }
+        }
     }
 }
