@@ -468,9 +468,12 @@ impl<T> Rt<Slot<T>> {
         self.inner().get().with_lifetime()
     }
 
-    /// Get a copy of the inner value without requiring a Context.
-    /// This is useful when you need to access the value but don't have a Context available.
-    pub(crate) fn get_inner(&self) -> T
+    /// Copy an erased-lifetime root value without binding it to a Context.
+    ///
+    /// SAFETY: The caller must independently keep the owning heap alive and
+    /// prevent collection or mutation for every use of the returned value.
+    /// A rooted slot alone does not make a copied raw pointer safe across GC.
+    pub(crate) unsafe fn get_inner(&self) -> T
     where
         T: Copy,
     {

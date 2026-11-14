@@ -432,7 +432,7 @@ pub(crate) fn aset<'ob>(
             }
         }
         ObjectType::CharTable(table) => {
-            table.set(idx, newlet);
+            table.set(idx, newlet)?;
             Ok(newlet)
         }
         x => Err(TypeError::new(Type::Sequence, x).into()),
@@ -632,9 +632,11 @@ impl std::fmt::Display for LispError {
 
 defsym!(WRONG_NUMBER_OF_ARGUMENTS);
 impl LispError {
-    pub(crate) fn new(message: &Cons, cx: &Context) -> Self {
+    fn new(message: &Cons, cx: &Context) -> Self {
         Self {
-            message: HeapDomainValue::new(cx.add(message), cx),
+            // SAFETY: The sole caller builds this message list in cx below;
+            // its inputs are the evaluator's current-heap argument values.
+            message: unsafe { HeapDomainValue::new(cx.add(message), cx) },
             rendered: message.to_string(),
         }
     }

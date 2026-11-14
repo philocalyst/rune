@@ -1043,8 +1043,11 @@ pub(crate) fn string_version_lessp<'ob>(
 }
 
 #[defun]
-pub(crate) fn clear_string(string: &LispString) -> Result<Object<'_>> {
-    string.clear();
+pub(crate) fn clear_string<'ob>(
+    string: &Rto<Gc<&LispString>>,
+    cx: &'ob mut Context,
+) -> Result<Object<'ob>> {
+    LispString::clear_rooted(string, cx)?;
     Ok(NIL)
 }
 

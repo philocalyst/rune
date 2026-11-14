@@ -527,6 +527,9 @@ impl IntoObject for CharTableInner<'_> {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         unsafe {
             let ptr = block.objects.alloc(CharTable::new(self, C));
+            if !C {
+                block.lisp_chartables.borrow_mut().push(ptr);
+            }
             <Self::Out<'_>>::tag_ptr(ptr)
         }
     }

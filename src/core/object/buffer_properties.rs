@@ -89,7 +89,10 @@ impl BufferProperties {
 pub(crate) struct HeapDomainValue(BufferProperties);
 
 impl HeapDomainValue {
-    pub(crate) fn new(value: super::Object, cx: &Context) -> Self {
+    /// SAFETY: Every reachable local allocation in value must belong to cx;
+    /// globally shared allocations must satisfy their audited sharing contract.
+    /// Registration checks the destination owner, not payload provenance.
+    pub(crate) unsafe fn new(value: super::Object, cx: &Context) -> Self {
         let slots = BufferProperties::new();
         slots.lock(cx).unwrap().set_properties(1, 2, value);
         Self(slots)
@@ -97,7 +100,9 @@ impl HeapDomainValue {
 
     pub(crate) fn bind<'ob>(&self, cx: &'ob Context) -> Result<super::Object<'ob>> {
         let slots = self.0.lock(cx)?;
-        let value = *slots.find(1).expect("live domain value slot").val;
+        // IntervalTree canonicalizes an explicit NIL slot away. That is still
+        // a valid retained value, not a missing/corrupt root.
+        let value = slots.find(1).map(|node| *node.val).unwrap_or(super::NIL);
         // Owner validation establishes cx's lifetime, independent of the slot
         // mutex guard. No mutable Context collection can overlap that borrow.
         Ok(unsafe { crate::core::object::WithLifetime::with_lifetime(value) })
@@ -151,6 +156,15 @@ mod ownership_tests {
         object::{NIL, Object},
     };
     use rune_core::macros::root;
+
+    #[test]
+    fn generic_domain_value_retains_nil_without_a_tree_node() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let value = unsafe { HeapDomainValue::new(NIL, cx) };
+        cx.garbage_collect(true);
+        assert!(value.bind(cx).unwrap().is_nil());
+    }
 
     #[test]
     fn debug_does_not_reenter_held_metadata_mutex() {

@@ -1,8 +1,8 @@
 use super::GcState;
 use super::Trace;
 use crate::core::object::GcString;
-use crate::core::object::LispHashTable;
 use crate::core::object::WeakBufferPropertyRoot;
+use crate::core::object::{CharTable, LispHashTable};
 use crate::core::object::{Gc, IntoObject, Object, UninternedSymbolMap, WithLifetime};
 use bumpalo::collections::Vec as GcVec;
 use std::cell::{Cell, RefCell};
@@ -56,6 +56,8 @@ pub(crate) struct Block<const CONST: bool> {
     // track of the memory and free it only after the table is garbage
     // collected. Kind of a hack.
     pub(in crate::core) lisp_hashtables: RefCell<Vec<*const LispHashTable>>,
+    // Char-tables also own native map/mutex resources requiring finalization.
+    pub(in crate::core) lisp_chartables: RefCell<Vec<*const CharTable>>,
     pub(in crate::core) uninterned_symbol_map: UninternedSymbolMap,
 }
 
@@ -138,6 +140,7 @@ impl<const CONST: bool> Block<CONST> {
             objects: bumpalo::Bump::new(),
             drop_stack: RefCell::default(),
             lisp_hashtables: RefCell::default(),
+            lisp_chartables: RefCell::default(),
             uninterned_symbol_map: UninternedSymbolMap::default(),
         }
     }
@@ -264,6 +267,17 @@ impl<'ob, 'rt> Context<'rt> {
             }
         });
 
+        self.block.lisp_chartables.borrow_mut().retain_mut(|ptr| {
+            let table = unsafe { &**ptr };
+            if let Some(fwd) = table.forwarding_ptr() {
+                *ptr = fwd.as_ptr().cast::<CharTable>();
+                true
+            } else {
+                unsafe { std::ptr::drop_in_place(*ptr as *mut CharTable) };
+                false
+            }
+        });
+
         self.block.objects = state.to_space;
     }
 }
@@ -276,7 +290,7 @@ impl<'ob, 'rt> Context<'rt> {
 /// Caller must ensure:
 /// 1. Exclusive access to the block (no concurrent reads/writes)
 /// 2. The root_set accurately represents all live references to objects in the block
-/// 3. The block's drop_stack and lisp_hashtables are properly maintained
+/// 3. The block's drop_stack and native-resource allocation lists are properly maintained
 /// 4. No active Context exists that references this block or root_set
 pub(crate) unsafe fn collect_garbage_raw(
     block: &mut Block<false>,
@@ -312,6 +326,17 @@ pub(crate) unsafe fn collect_garbage_raw(
             true
         } else {
             unsafe { std::ptr::drop_in_place(*ptr as *mut LispHashTable) };
+            false
+        }
+    });
+
+    block.lisp_chartables.borrow_mut().retain_mut(|ptr| {
+        let table = unsafe { &**ptr };
+        if let Some(fwd) = table.forwarding_ptr() {
+            *ptr = fwd.as_ptr().cast::<CharTable>();
+            true
+        } else {
+            unsafe { std::ptr::drop_in_place(*ptr as *mut CharTable) };
             false
         }
     });

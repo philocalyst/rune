@@ -263,7 +263,9 @@ impl ChannelManager {
 
         if let Some(rooted) = data.queue.pop_front() {
             let _gc_guard = self.gc_access.read().unwrap();
-            let obj: Object<'static> = rooted.get_inner();
+            // SAFETY: gc_access read-lock excludes manager collection and
+            // rooted remains alive until the complete target deep-copy ends.
+            let obj: Object<'static> = unsafe { rooted.get_inner() };
             let result = {
                 let _clone_session = target_block.clone_session();
                 obj.clone_in(target_block)
@@ -312,7 +314,9 @@ impl ChannelManager {
 
         if let Some(rooted) = data.queue.pop_front() {
             let _gc_guard = self.gc_access.read().unwrap();
-            let obj: Object<'static> = rooted.get_inner();
+            // SAFETY: gc_access read-lock excludes manager collection and
+            // rooted remains alive until the complete target deep-copy ends.
+            let obj: Object<'static> = unsafe { rooted.get_inner() };
             let result = {
                 let _clone_session = target_block.clone_session();
                 obj.clone_in(target_block)
@@ -407,7 +411,7 @@ impl ChannelManager {
 
 // SAFETY: ChannelManager is safe to Send/Sync across threads because:
 // 1. All state is protected by Mutex or is Atomic
-// 2. The Block<false> contains RefCell fields (drop_stack, lisp_hashtables) but:
+// 2. The Block<false> contains RefCell allocation/finalization lists, but:
 //    - These are only accessed during GC, which holds the gc_state mutex
 //    - The mutex ensures no concurrent access to these RefCells
 //    - No references to Block internals escape the mutex guard

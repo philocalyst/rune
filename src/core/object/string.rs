@@ -1,5 +1,5 @@
-use super::{CloneIn, IntoObject};
-use crate::core::gc::{AllocState, Block, GcHeap, GcMoveable, GcState, Trace};
+use super::{CloneIn, Gc, IntoObject};
+use crate::core::gc::{AllocState, Block, Context, GcHeap, GcMoveable, GcState, Rto, Trace};
 use std::cell::Cell;
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
@@ -100,11 +100,28 @@ impl LispString {
         self.chars().count()
     }
 
-    pub(crate) fn clear(&self) {
-        let inner_mut_str = unsafe { &mut *self.0.0.get() };
-        for byte in unsafe { inner_mut_str.as_bytes_mut().iter_mut() } {
-            *byte = b'\0';
+    /// Physically erase a local string through an exclusive heap borrow.
+    /// A rooted input avoids retaining a raw string borrow before taking cx.
+    /// No Lisp allocation, callbacks, or collection occurs during this operation.
+    pub(crate) fn clear_rooted(string: &Rto<Gc<&Self>>, cx: &mut Context) -> anyhow::Result<()> {
+        let string = string.bind(cx).untag();
+        if !matches!(string.0.allocation_state(), AllocState::Unmoved) {
+            anyhow::bail!("Attempt to clear an immutable or forwarded string");
         }
+        // SAFETY: The exclusive Context borrow excludes live safe borrows into
+        // this local heap. Global strings are rejected above, and the root is
+        // kept alive with no GC/callback here. Its backing allocation may be
+        // mutated without aliasing a live &str. Volatile writes preserve actual
+        // erasure rather than switching to a fresh zero-filled allocation.
+        unsafe {
+            let raw = string.0.0.get();
+            let len = (&*raw).len();
+            let bytes = raw.cast::<u8>();
+            for offset in 0..len {
+                bytes.add(offset).write_volatile(0);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -246,5 +263,66 @@ mod test {
         root!(s2, cx);
         cx.garbage_collect(true);
         assert_eq!(s1, s2);
+    }
+}
+
+#[cfg(test)]
+mod clear_ownership_tests {
+    use super::*;
+    use crate::core::{env::INTERNED_SYMBOLS, gc::RootSet};
+    use rune_core::macros::root;
+
+    #[test]
+    fn rooted_clear_erases_original_local_allocation_without_gc() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let string = "sensitive λ".into_obj(&cx.block);
+        root!(string, cx);
+        let before = string.bind(cx).untag().inner().as_ptr() as usize;
+        let bytes = string.bind(cx).untag().inner().len();
+        LispString::clear_rooted(string, cx).unwrap();
+        let cleared = string.bind(cx).untag().inner();
+        assert_eq!(cleared.as_ptr() as usize, before);
+        assert_eq!(cleared.as_bytes(), vec![0; bytes]);
+    }
+
+    #[test]
+    fn rooted_clear_after_gc_is_visible_through_all_lisp_aliases() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let first = "shared secret".into_obj(&cx.block);
+        root!(first, cx);
+        let second = first.bind(cx);
+        root!(second, cx);
+        cx.garbage_collect(true);
+        let before = first.bind(cx).untag().inner().as_ptr() as usize;
+        LispString::clear_rooted(first, cx).unwrap();
+        let a = first.bind(cx).untag().inner();
+        let b = second.bind(cx).untag().inner();
+        assert_eq!(a.as_ptr() as usize, before);
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert!(a.bytes().all(|byte| byte == 0));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rooted_clear_rejects_global_readonly_string_without_mutation() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let map = INTERNED_SYMBOLS.lock().unwrap();
+        let string = "global readonly".into_obj(map.global_block());
+        root!(string, cx);
+        assert!(LispString::clear_rooted(string, cx).is_err());
+        assert_eq!(string.bind(cx).untag().inner(), "global readonly");
+    }
+
+    #[test]
+    fn borrowed_string_cannot_cross_thread_while_owner_mutates() {
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+        let _ = <&'static LispString as AmbiguousIfSend<_>>::check;
     }
 }
