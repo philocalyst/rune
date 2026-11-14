@@ -31,6 +31,9 @@ type PropertyMap<'a> = ObjectMap<Slot<Symbol<'a>>, Vec<(Slot<Symbol<'a>>, Slot<O
 #[derive(Debug, Trace)]
 pub(crate) struct Env<'a> {
     pub(crate) vars: ObjectMap<Slot<Symbol<'a>>, Slot<Object<'a>>>,
+    // Immutable native initialization input, not a second mutable variable store.
+    #[no_trace]
+    pub(crate) startup_default_directory: String,
     pub(crate) props: PropertyMap<'a>,
     pub(crate) catch_stack: Vec<Slot<Object<'a>>>,
     binding_stack: Vec<(Slot<Symbol<'a>>, Option<Slot<Object<'a>>>)>,
@@ -61,10 +64,18 @@ pub(crate) struct ExcursionToken {
 }
 impl<'a> Env<'a> {
     pub(crate) fn new(cx: &Context) -> Result<Self> {
+        let cwd = std::env::current_dir()?;
+        anyhow::ensure!(cwd.is_absolute(), "Initial working directory is not absolute");
+        let mut startup_default_directory = cwd.to_str()
+            .ok_or_else(|| anyhow!("Initial working directory is not UTF-8"))?.to_owned();
+        if !startup_default_directory.ends_with(std::path::MAIN_SEPARATOR) {
+            startup_default_directory.push(std::path::MAIN_SEPARATOR);
+        }
         let editor_gateway = cx.editor_gateway()?;
         let current_buffer = editor_gateway.scratch(cx)?;
         Ok(Self {
             vars: Default::default(),
+            startup_default_directory,
             props: Default::default(),
             catch_stack: Default::default(),
             binding_stack: Default::default(),

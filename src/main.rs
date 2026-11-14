@@ -47,6 +47,8 @@ mod search;
 mod textprops;
 mod threads;
 mod timefns;
+#[cfg(test)]
+mod process_real_mu_tests;
 
 use crate::core::{
     env::{Env, intern, sym},

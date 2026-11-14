@@ -55,14 +55,23 @@ fn locate_file_internal(
         endings.push(String::from(&**value));
     }
     if endings.is_empty() { endings.push(String::new()); }
-    let directory = symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?;
-    let ObjectType::String(directory) = directory.untag() else {
-        return Err(TypeError::new(Type::String, directory).into());
-    };
-    ensure!(directory.len() <= 65536 && !directory.as_bytes().contains(&0), "Invalid default-directory");
-    let default = std::path::absolute(Path::new(&**directory))?;
-    ensure!(default.is_absolute(), "default-directory is not absolute");
     let absolute = Path::new(filename).is_absolute();
+    let needs_default = !absolute && directories.iter().any(|directory| {
+        directory.as_deref().is_none_or(|value| !Path::new(value).is_absolute())
+    });
+    // Absolute search paths do not depend on default-directory, including an
+    // explicitly empty binding. Relative lookup requires a usable base.
+    let default = if needs_default {
+        let directory = symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?;
+        let ObjectType::String(directory) = directory.untag() else {
+            return Err(TypeError::new(Type::String, directory).into());
+        };
+        ensure!(!directory.is_empty(), "Empty default-directory for relative lookup is not implemented");
+        ensure!(directory.len() <= 65536 && !directory.as_bytes().contains(&0), "Invalid default-directory");
+        let directory = std::path::absolute(Path::new(&**directory))?;
+        ensure!(directory.is_absolute(), "default-directory is not absolute");
+        directory
+    } else { std::path::PathBuf::new() };
     let mut attempts = 0usize;
     for directory in directories {
         let base = match directory {
@@ -1116,6 +1125,35 @@ mod locate_file_internal_tests {
             let mut too_many = Object::from(NIL);
             for _ in 0..129 { too_many = Cons::new(".el", too_many, cx).into(); }
             assert!(locate_file_internal("pkg", NIL.into(), Some(too_many), None, env, cx).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+}
+
+#[cfg(test)]
+mod startup_directory_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::{list, root};
+    #[test]
+    fn startup_directory_is_real_absolute_cwd_and_absolute_lookup_ignores_empty_override() -> Result<()> {
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        cx.garbage_collect(true);
+        let value = symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?;
+        let directory = <&str>::try_from(value)?;
+        assert!(Path::new(directory).is_absolute());
+        assert!(directory.ends_with(std::path::MAIN_SEPARATOR));
+        assert_eq!(Path::new(directory), std::env::current_dir()?.as_path());
+        let dir = std::env::temp_dir().join(format!("rune-empty-default-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?; std::fs::write(dir.join("target.el"), "test")?;
+        let result = (|| -> Result<()> {
+            env.set_var(sym::DEFAULT_DIRECTORY, cx.add(""))?;
+            let found = locate_file_internal("target.el", list![dir.to_str().unwrap(); cx], None, None, env, cx)?;
+            assert_eq!(found, Some(dir.join("target.el").to_str().unwrap().to_owned()));
+            assert!(locate_file_internal("target.el", list!["."; cx], None, None, env, cx).is_err());
             Ok(())
         })();
         std::fs::remove_dir_all(&dir)?; result

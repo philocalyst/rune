@@ -68,7 +68,7 @@ def sources(marker, org_path, mu_driver, mu_home, mu_binary, mu_lisp):
 '''
     return prelude, [('doom-profile-boot', boot), ('doom-real-keymap', boot + keys),
                      ('doom-org-edit-save-reopen', boot + org),
-                     ('doom-mu4e-real-navigation', boot + '(load ' + literal(str(mu_driver)) + ' nil nil t)\n')]
+                     ('doom-mu4e-real-navigation', boot + '(load ' + literal(str(mu_driver)) + ' nil nil)\n')]
 
 
 def summarize(rows):
@@ -121,7 +121,7 @@ def main():
         prelude, gates = sources(marker, temp/'synthetic.org', a.mu_driver, a.mu_home, a.mu_binary, a.mu_lisp)
         (temp/'prelude.el').write_text(prelude, encoding='utf-8')
         failure_handler = '(t (let ((inhibit-message nil)) (message ' + literal(marker + ':failure %S') + ' rune-benchmark-error)) (signal (car rune-benchmark-error) (cdr rune-benchmark-error)))'
-        (temp/'early-wrapper.el').write_text('(condition-case rune-benchmark-error (load ' + literal(str(a.doom_root/'early-init.el')) + ' nil nil t) ' + failure_handler + ')\n', encoding='utf-8')
+        (temp/'early-wrapper.el').write_text('(condition-case rune-benchmark-error (load ' + literal(str(a.doom_root/'early-init.el')) + ' nil nil) ' + failure_handler + ')\n', encoding='utf-8')
         for gate, form in gates:
             if a.gate and gate not in a.gate:
                 continue

@@ -308,7 +308,7 @@ env.initialize_condition_metadata(cx);
             let len = value.len();
             value.insert_str(len - 1, "; cx");
         }
-        writeln!(f, "env.vars.insert(sym::{ident}, cx.add({value}));").unwrap();
+        writeln!(f, "let initial_value = cx.add({value}); env.vars.insert(sym::{ident}, initial_value);").unwrap();
         if DefvarType::Bool == ty {
             bool_vars.push(ident);
         }
