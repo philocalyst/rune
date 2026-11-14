@@ -176,7 +176,7 @@ impl Interpreter<'_, '_> {
         }
         let value = rebind!(self.eval_form(initializer, cx)?);
         let name = name.bind(cx);
-        self.env.set_var(name, value)?;
+        self.env.set_var_context(name, value,cx)?;
         name.make_special();
         // DEFCONST declares special storage, not an immutable value/function
         // cell: later SETQ, rebinding and redefinition remain permitted.
@@ -191,19 +191,22 @@ impl Interpreter<'_, '_> {
         };
         let name: Symbol = sym.bind(cx).try_into()?;
         root!(name, cx);
-        let value = match forms.next()? {
-            // (defvar x y)
-            Some(value) => rebind!(self.eval_form(value, cx)?),
-            // (defvar x)
-            None => {
-                if !self.local_specials.iter().any(|s| s.bind(cx) == name.bind(cx)) {
-                    self.local_specials.push(name.bind(cx));
-                }
-                return Ok(name.bind(cx).into());
+        let initializer = forms.next()?;
+        root!(initializer, cx);
+        forms.next()?; // Documentation is not evaluated.
+        if forms.next()?.is_some() { bail_err!("Too many arguments"); }
+        let Some(initializer) = initializer.as_ref() else {
+            if !self.local_specials.iter().any(|s| s.bind(cx) == name.bind(cx)) {
+                self.local_specials.push(name.bind(cx));
             }
+            return Ok(name.bind(cx).into());
         };
-        self.env.defvar(name.bind(cx), value)?;
-        Ok(value)
+        name.bind(cx).make_special();
+        if self.env.defvar_needs_initialization(name.bind(cx),cx)? {
+            let value = rebind!(self.eval_form(initializer,cx)?);
+            self.env.defvar(name.bind(cx),value,cx)?;
+        }
+        Ok(name.bind(cx).into())
     }
 
     fn eval_call<'ob>(
@@ -302,9 +305,9 @@ impl Interpreter<'_, '_> {
         };
         // This function will trim the environment down to only what is actually
         // captured in the closure
-        if let Some(closure_fn) = self.env.vars.get(sym::INTERNAL_MAKE_INTERPRETED_CLOSURE_FUNCTION)
-            && closure_fn.bind(cx) != sym::NIL
-        {
+        let closure_fn = self.env.variable_value(sym::INTERNAL_MAKE_INTERPRETED_CLOSURE_FUNCTION,cx)?.unwrap_or(NIL);
+        root!(closure_fn,cx);
+        if !closure_fn.bind(cx).is_nil() {
             let closure_fn: Result<&Rto<Function>, _> = closure_fn.try_as();
             if let Ok(closure_fn) = closure_fn {
                 let lambda = Object::from(Cons::new(sym::LAMBDA, body, cx));

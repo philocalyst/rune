@@ -595,14 +595,53 @@ fn sort<'ob>(
     }
 }
 
+defsym!(CYCLIC_VARIABLE_INDIRECTION);
+defsym!(VARIABLE_DOCUMENTATION);
+
 #[defun]
 pub(crate) fn defvaralias<'ob>(
-    new_alias: Symbol<'ob>,
-    _base_variable: Symbol,
-    _docstring: Option<&str>,
-) -> Symbol<'ob> {
-    // TODO: implement
-    new_alias
+    new_alias: Symbol,
+    base_variable: Symbol<'ob>,
+    docstring: Option<Object>,
+    env: &mut Rt<Env>,
+    cx: &Context,
+) -> Result<Symbol<'ob>> {
+    let doc = docstring.unwrap_or(NIL);
+    if !doc.is_nil() && !matches!(doc.untag(),ObjectType::String(_) | ObjectType::ByteString(_)) {
+        return Err(TypeError::new(Type::String,doc).into());
+    }
+    env.define_variable_alias(new_alias, base_variable, doc, cx)?;
+    Ok(base_variable)
+}
+
+#[defun]
+fn indirect_variable<'ob>(variable: Symbol, env: &Rt<Env>, cx: &'ob Context) -> Result<Symbol<'ob>> {
+    env.indirect_variable(variable, cx)
+}
+
+/// String-valued documentation properties, including variable alias inheritance.
+/// External DOC offsets and command-key substitution require separate support.
+#[defun]
+fn documentation_property<'ob>(
+    symbol: Symbol, property: Symbol, raw: OptionalFlag, env: &Rt<Env>, cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    let value = env.variable_documentation_property(symbol,property,cx)?;
+    if value.is_nil() { return Ok(value); }
+    let needs_keys = match value.untag() {
+        ObjectType::String(text) => [r"\[",r"\{",r"\<"].iter().any(|marker| text.contains(marker)),
+        ObjectType::ByteString(bytes) => bytes.windows(2).any(|pair| pair[0] == b'\\' && matches!(pair[1],b'[' | b'{' | b'<')),
+        _ => bail!("Non-string documentation properties are not supported"),
+    };
+    if raw.is_none() && needs_keys {
+        bail!("Documentation command-key substitution is not supported");
+    }
+    Ok(value)
+}
+
+/// Clear only the global special flag; per-load lexical declarations are separate.
+#[defun]
+fn internal_make_var_non_special(symbol: Symbol) {
+    symbol.make_non_special();
 }
 
 defsym!(SUBFEATURES);
@@ -1324,6 +1363,77 @@ fn base64_encode(string: &str, _line_break: bool, pad: bool, base64url: bool) ->
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn variable_alias_unibyte_documentation_stays_unibyte() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvaralias 'rune-va-byte-doc 'rune-va-byte-doc-base "\377") (let ((doc (documentation-property 'rune-va-byte-doc 'variable-documentation t))) (list (multibyte-string-p doc) (aref doc 0))))"#,
+            "(nil 255)",
+        );
+    }
+
+    #[test]
+    fn variable_alias_rejections_use_structured_message_lists_without_mutation() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-va-bound-source 1) (list (condition-case e (defvaralias t 'rune-va-unused) (error e)) (let ((rune-va-bound-source 9)) (condition-case e (defvaralias 'rune-va-bound-source 'rune-va-unused) (error e))) rune-va-bound-source (boundp 'rune-va-unused)))"#,
+            r#"((error "Cannot make a constant an alias: t") (error "Don’t know how to make a let-bound variable an alias: rune-va-bound-source") 1 nil)"#,
+        );
+    }
+
+    #[test]
+    fn variable_alias_initialized_defvar_uses_canonical_default() {
+        for (source, expected) in [
+            (r#"(progn (defvaralias 'rune-va-flags-a 'rune-va-flags-b) (internal-make-var-non-special 'rune-va-flags-b) (list (defvar rune-va-flags-a 7) (special-variable-p 'rune-va-flags-a) (special-variable-p 'rune-va-flags-b) rune-va-flags-a rune-va-flags-b))"#, "(rune-va-flags-a t nil 7 7)"),
+            (r#"(progn (defvaralias 'rune-va-dv 'rune-va-dv-base) (list (defvar rune-va-dv 7) rune-va-dv-base (defvar rune-va-dv (error "must skip"))))"#, "(rune-va-dv 7 rune-va-dv)"),
+            (r#"(progn (condition-case nil (defvar rune-va-dv-void (error "x")) (error nil)) (list (let ((rune-va-dv-void 9)) (defvaralias 'rune-va-dv-temp 'rune-va-dv-void) rune-va-dv-temp) (boundp 'rune-va-dv-temp)))"#, "(9 nil)"),
+            (r#"(progn (condition-case nil (defvar rune-va-dv-saved (error "x")) (error nil)) (list (let ((rune-va-dv-saved 1)) (defvar rune-va-dv-saved 2) rune-va-dv-saved) rune-va-dv-saved))"#, "(1 2)"),
+        ] { crate::interpreter::assert_lisp(source,expected); }
+    }
+
+    #[test]
+    fn variable_alias_uninterned_edges_survive_moving_collection() {
+        crate::interpreter::assert_lisp(
+            r#"(let ((a (make-symbol "alias")) (b (make-symbol "base"))) (set b 7) (defvaralias a b) (garbage-collect) (list (eq (indirect-variable a) b) (symbol-value a)))"#,
+            "(t 7)",
+        );
+    }
+    #[test]
+    fn variable_alias_documentation_inherits_only_when_alias_doc_is_nil() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-va-doc-base 7) (put 'rune-va-doc-base 'variable-documentation "base doc") (defvaralias 'rune-va-doc 'rune-va-doc-base "alias doc") (list (documentation-property 'rune-va-doc 'variable-documentation t) (progn (defvaralias 'rune-va-doc 'rune-va-doc-base nil) (documentation-property 'rune-va-doc 'variable-documentation t))))"#,
+            r#"("alias doc" "base doc")"#,
+        );
+    }
+    #[test]
+    fn variable_alias_void_and_default_reads_keep_original_name() {
+        crate::interpreter::assert_lisp(
+            "(progn (defvaralias 'rune-va-void 'rune-va-void-base) (list (condition-case e (symbol-value 'rune-va-void) (void-variable e)) (condition-case e (default-toplevel-value 'rune-va-void) (void-variable e))))",
+            "((void-variable rune-va-void) (void-variable rune-va-void))",
+        );
+    }
+
+    #[test]
+    fn variable_alias_value_and_captured_dynamic_base() {
+        crate::interpreter::assert_lisp(
+            "(progn (setq rune-va-base 7 rune-va-next 11) (defvaralias 'rune-va-alias 'rune-va-base) (list (let ((rune-va-alias 9)) (defvaralias 'rune-va-alias 'rune-va-next) (list rune-va-alias rune-va-base rune-va-next)) rune-va-alias rune-va-base rune-va-next))",
+            "((11 9 11) 11 7 11)",
+        );
+    }
+    #[test]
+    fn variable_alias_constants_and_cycle_rejection() {
+        crate::interpreter::assert_lisp(
+            "(progn (defvaralias 'rune-va-constant t) (list rune-va-constant (condition-case e (set 'rune-va-constant 3) (setting-constant e)) (condition-case nil (defvaralias 'rune-va-cycle 'rune-va-cycle) (cyclic-variable-indirection 'caught))))",
+            "(t (setting-constant rune-va-constant) caught)",
+        );
+    }
+
+    #[test]
+    fn clearing_global_special_flag_does_not_change_existing_value() {
+        crate::interpreter::assert_lisp(
+            "(progn (defvar rune-alias-clear-probe 7) (list (special-variable-p 'rune-alias-clear-probe) (internal-make-var-non-special 'rune-alias-clear-probe) (special-variable-p 'rune-alias-clear-probe) (let ((rune-alias-clear-probe 9)) (list rune-alias-clear-probe (symbol-value 'rune-alias-clear-probe)))))",
+            "(t nil nil (9 7))",
+        );
+    }
+
     #[test]
     fn eql_compares_integer_values_without_erasing_float_identity_bits() {
         use crate::core::gc::{Context, RootSet};

@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use rune_macros::Trace;
 use std::sync::{LazyLock, Mutex};
 
+mod variable_aliases;
 mod quit;
 pub(crate) use quit::QuitTokenGuard;
 mod stack;
@@ -31,6 +32,7 @@ type PropertyMap<'a> = ObjectMap<Slot<Symbol<'a>>, Vec<(Slot<Symbol<'a>>, Slot<O
 #[derive(Debug, Trace)]
 pub(crate) struct Env<'a> {
     pub(crate) vars: ObjectMap<Slot<Symbol<'a>>, Slot<Object<'a>>>,
+    variable_aliases: ObjectMap<Slot<Symbol<'a>>, Slot<Symbol<'a>>>,
     // Immutable native initialization input, not a second mutable variable store.
     #[no_trace]
     pub(crate) startup_default_directory: String,
@@ -82,6 +84,7 @@ impl<'a> Env<'a> {
         let current_buffer = editor_gateway.scratch(cx)?;
         Ok(Self {
             vars: Default::default(),
+            variable_aliases: Default::default(),
             startup_default_directory,
             props: Default::default(),
             catch_stack: Default::default(),
@@ -135,6 +138,7 @@ impl<'a> RootedEnv<'a> {
             sym::VOID_FUNCTION,
             sym::INVALID_FUNCTION,
             sym::SETTING_CONSTANT,
+            sym::CYCLIC_VARIABLE_INDIRECTION,
             sym::BUFFER_READ_ONLY,
             sym::ARITH_ERROR,
             sym::RUNE_UNIMPLEMENTED,
@@ -218,6 +222,8 @@ impl<'a> RootedEnv<'a> {
         symbol: Symbol,
         cx: &'cx Context,
     ) -> Result<Option<Object<'cx>>> {
+        let symbol = self.indirect_variable(symbol, cx)?;
+        if symbol.is_const() { return Ok(Some(symbol.into())); }
         if symbol == crate::sym::BUFFER_READ_ONLY {
             return self.editor_gateway.read_only_value(self.current_buffer, cx).map(Some);
         }
@@ -231,6 +237,13 @@ impl<'a> RootedEnv<'a> {
         value: Object,
         cx: &Context,
     ) -> Result<()> {
+        let requested = symbol;
+        let symbol = self.indirect_variable(symbol, cx)?;
+        if symbol.is_const() || symbol.is_builtin_value_constant() {
+            return Err(crate::eval::EvalError::signal(
+                crate::sym::SETTING_CONSTANT.into(),
+                super::cons::Cons::new1(requested, cx).into(), cx).into());
+        }
         Self::validate_variable_value(symbol, value)?;
         if symbol == crate::sym::BUFFER_READ_ONLY {
             // SAFETY: Env assignment callers supply values rooted in this owning
@@ -265,7 +278,8 @@ impl<'a> RootedEnv<'a> {
     }
 
     pub(crate) fn varbind(&mut self, var: Symbol, value: Object, cx: &Context) -> Result<()> {
-        Self::validate_variable_value(var, value)?;
+        let requested = var;
+        let var = self.indirect_variable(var, cx)?;
         assert_eq!(
             self.binding_stack.len(),
             self.binding_targets.len(),
@@ -277,7 +291,7 @@ impl<'a> RootedEnv<'a> {
         let prev_value = self.variable_value(var, cx)?;
         // Prepare and publish the forwarded write before pushing its unwind record.
         // No Lisp allocation or callback occurs between publication and both pushes.
-        self.set_var_context(var, value, cx)?;
+        self.set_var_context(requested, value, cx)?;
         self.binding_stack.push((var, prev_value));
         self.binding_targets.push(target);
         Ok(())
@@ -336,20 +350,26 @@ impl<'a> RootedEnv<'a> {
         self.try_unbind(count, cx).expect("dynamic binding restoration failed");
     }
 
-    pub(crate) fn toplevel_value<'ob>(&self, var: Symbol, cx: &'ob Context) -> Option<Object<'ob>> {
+    pub(crate) fn toplevel_value<'ob>(&self, var: Symbol, cx: &'ob Context) -> Result<Option<Object<'ob>>> {
+        let var = self.indirect_variable(var, cx)?;
         if var.is_const() {
-            return Some(var.into());
+            return Ok(Some(var.into()));
         }
         for ((symbol, saved), target) in
             self.binding_stack.bind_ref(cx).iter().zip(&self.binding_targets)
         {
             if target.is_none() && **symbol == var {
-                return saved.as_ref().map(|value| cx.bind(**value));
+                return Ok(saved.as_ref().map(|value| cx.bind(**value)));
             }
         }
-        self.vars.get(var).map(|value| value.bind(cx))
+        Ok(self.vars.get(var).map(|value| value.bind(cx)))
     }
-    pub(crate) fn set_toplevel_value(&mut self, var: Symbol, value: Object) -> Result<()> {
+    pub(crate) fn set_toplevel_value(&mut self, var: Symbol, value: Object, cx: &Context) -> Result<()> {
+        let requested = var;
+        let var = self.indirect_variable(var, cx)?;
+        if var.is_const() || var.is_builtin_value_constant() {
+            return Err(crate::eval::EvalError::signal(crate::sym::SETTING_CONSTANT.into(), super::cons::Cons::new1(requested,cx).into(),cx).into());
+        }
         Self::validate_variable_value(var, value)?;
         if var.is_const() {
             return Err(anyhow!("Attempt to set a constant symbol"));
@@ -363,12 +383,22 @@ impl<'a> RootedEnv<'a> {
         self.set_var(var, value)
     }
 
-    pub(crate) fn defvar(&mut self, var: Symbol, value: Object) -> Result<()> {
+    pub(crate) fn defvar_needs_initialization(&self, var: Symbol, cx: &Context) -> Result<bool> {
+        let base = self.indirect_variable(var, cx)?;
+        if base.is_const() { return Ok(false); }
+        if self.variable_value(var,cx)?.is_none() { return Ok(true); }
+        for (binding,target) in self.binding_stack.iter().zip(&self.binding_targets) {
+            if target.is_none() && binding.0 == base { return Ok(binding.1.is_none()); }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn defvar(&mut self, var: Symbol, value: Object, cx: &Context) -> Result<()> {
+        let var = self.indirect_variable(var, cx)?;
         // TOOD: Handle `eval-sexp` on defvar, which should always update the
         // value
         if self.vars.get(var).is_none() {
             self.set_var(var, value)?;
-            var.make_special();
         }
 
         // If this variable was unbound previously in the binding stack,

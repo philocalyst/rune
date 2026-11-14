@@ -190,7 +190,7 @@ fn search_load_path(
     if Path::new(file).is_absolute() {
         return Ok(file_in_path_options(file, "", no_suffix, must_suffix));
     }
-    let load_path = env.vars.get(sym::LOAD_PATH).context("`load-path' is unbound")?.bind(cx);
+    let load_path = env.variable_value(sym::LOAD_PATH,cx)?.context("`load-path' is unbound")?;
     if load_path.is_nil() {
         return Ok(file_in_path_options(file, "", no_suffix, must_suffix));
     }
@@ -274,15 +274,8 @@ fn load_with_options(
         println!("Loading {filename}...");
     }
     let new_load_file = cx.add(final_file.to_string_lossy().to_string());
-    let prev_load_file = match env.vars.get_mut(sym::LOAD_FILE_NAME) {
-        Some(val) => {
-            let prev = val.bind(cx);
-            val.set(new_load_file);
-            prev
-        }
-        None => NIL,
-    };
-    root!(prev_load_file, cx);
+    let binding_depth = env.binding_depth();
+    env.varbind(sym::LOAD_FILE_NAME,new_load_file,cx)?;
     let result = match fs::read_to_string(&final_file) {
         Ok(content) => load_internal(&content, cx, env),
         Err(error) if noerror && error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -294,7 +287,7 @@ fn load_with_options(
     if !nomessage && result.is_ok() {
         println!("Loading {filename} Done");
     }
-    env.vars.insert(sym::LOAD_FILE_NAME, &*prev_load_file);
+    env.unwind_bindings(binding_depth,cx)?;
     result
 }
 

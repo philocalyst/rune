@@ -99,7 +99,7 @@ fn decoded(bytes: &[u8], coding: Coding) -> Result<(String, &'static str)> {
     })
 }
 fn remember(env: &mut Rt<Env>, name: &str, cx: &Context) -> Result<()> {
-    env.set_var(intern("last-coding-system-used", cx), intern(name, cx).into())
+    env.set_var_context(intern("last-coding-system-used", cx), intern(name, cx).into(), cx)
 }
 #[defun]
 fn decode_coding_string<'ob>(

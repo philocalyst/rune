@@ -142,14 +142,14 @@ fn default_toplevel_value<'ob>(
     env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    env.toplevel_value(symbol, cx).ok_or_else(|| {
+    env.toplevel_value(symbol, cx)?.ok_or_else(|| {
         crate::eval::EvalError::signal(sym::VOID_VARIABLE.into(), Cons::new1(symbol, cx).into(), cx)
             .into()
     })
 }
 #[defun]
-fn set_default_toplevel_value(symbol: Symbol, value: Object, env: &mut Rt<Env>) -> Result<()> {
-    env.set_toplevel_value(symbol, value)
+fn set_default_toplevel_value(symbol: Symbol, value: Object, env: &mut Rt<Env>, cx: &Context) -> Result<()> {
+    env.set_toplevel_value(symbol, value, cx)
 }
 
 #[defun]
@@ -158,8 +158,8 @@ pub(crate) fn default_value<'ob>(
     env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    if symbol == sym::BUFFER_READ_ONLY {
-        return env.toplevel_value(symbol, cx).ok_or_else(|| {
+    if env.indirect_variable(symbol,cx)? == sym::BUFFER_READ_ONLY {
+        return env.toplevel_value(symbol, cx)?.ok_or_else(|| {
             crate::eval::EvalError::signal(
                 sym::VOID_VARIABLE.into(),
                 Cons::new1(symbol, cx).into(),
@@ -218,18 +218,24 @@ pub(crate) fn boundp(symbol: Symbol, env: &Rt<Env>, cx: &Context) -> Result<bool
 }
 
 #[defun]
-pub(crate) fn makunbound<'ob>(symbol: Symbol<'ob>, env: &mut Rt<Env>) -> Result<Symbol<'ob>> {
+pub(crate) fn makunbound<'ob>(symbol: Symbol<'ob>, env: &mut Rt<Env>, cx: &Context) -> Result<Symbol<'ob>> {
+    let base = env.indirect_variable(symbol, cx)?;
+    if base.is_const() || base.is_builtin_value_constant() {
+        return Err(crate::eval::EvalError::signal(sym::SETTING_CONSTANT.into(), Cons::new1(symbol,cx).into(),cx).into());
+    }
     anyhow::ensure!(
-        symbol != sym::BUFFER_READ_ONLY,
+        base != sym::BUFFER_READ_ONLY,
         "Unbinding owner-forwarded buffer-read-only is not supported"
     );
-    env.vars.remove(symbol);
+    env.vars.remove(base);
     Ok(symbol)
 }
 
 #[defun]
-pub(crate) fn default_boundp(symbol: Symbol, env: &Rt<Env>) -> bool {
-    env.vars.get(symbol).is_some()
+pub(crate) fn default_boundp(symbol: Symbol, env: &Rt<Env>, cx: &Context) -> Result<bool> {
+    let base = env.indirect_variable(symbol, cx)?;
+    if base == sym::BUFFER_READ_ONLY { return Ok(env.toplevel_value(base,cx)?.is_some()); }
+    Ok(env.variable_value(symbol,cx)?.is_some())
 }
 
 #[defun]
@@ -381,16 +387,16 @@ defvar!(FLOAT_OUTPUT_FORMAT);
 /// Decimal spelling, with a scoped finite-float policy. Recursive object
 /// printers still use the default formatter until policy is threaded through.
 #[defun]
-fn number_to_string(number: Number, env: &Rt<Env>, cx: &Context) -> String {
+fn number_to_string(number: Number, env: &Rt<Env>, cx: &Context) -> Result<String> {
     if let crate::core::object::NumberType::Float(value) = number.untag() {
-        let policy = env.vars.get(sym::FLOAT_OUTPUT_FORMAT).map(|value| value.bind(cx));
+        let policy = env.variable_value(sym::FLOAT_OUTPUT_FORMAT, cx)?;
         let format = match policy.map(|value| value.untag()) {
             Some(ObjectType::String(format)) => Some(&**format),
             _ => None,
         };
-        crate::core::object::float_to_string_with_format(**value, format)
+        Ok(crate::core::object::float_to_string_with_format(**value, format))
     } else {
-        number.to_string()
+        Ok(number.to_string())
     }
 }
 
@@ -535,8 +541,8 @@ defvar!(MOST_POSITIVE_FIXNUM, crate::core::object::MAX_FIXNUM);
 defvar!(MOST_NEGATIVE_FIXNUM, crate::core::object::MIN_FIXNUM);
 
 pub(crate) fn integer_width(env: &Rt<Env>, cx: &Context) -> Result<u64> {
-    match env.vars.get(sym::INTEGER_WIDTH) {
-        Some(value) => Ok(Number::try_from(value.bind(cx))?.integer_width()?),
+    match env.variable_value(sym::INTEGER_WIDTH, cx)? {
+        Some(value) => Ok(Number::try_from(value)?.integer_width()?),
         None => Ok(65_536),
     }
 }

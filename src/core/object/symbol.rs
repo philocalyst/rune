@@ -100,6 +100,10 @@ impl<'a> Symbol<'a> {
         self.0.special.store(true, Ordering::Release);
     }
 
+    pub(crate) fn make_non_special(self) {
+        self.0.special.store(false, Ordering::Release);
+    }
+
     pub(crate) fn is_special(self) -> bool {
         self.0.special.load(Ordering::Acquire)
     }

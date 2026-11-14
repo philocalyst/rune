@@ -262,7 +262,10 @@ impl EvalError {
 
 impl From<anyhow::Error> for EvalError {
     fn from(e: anyhow::Error) -> Self {
-        Self::new_error(e)
+        match e.downcast::<Self>() {
+            Ok(error) => error,
+            Err(error) => Self::new_error(error),
+        }
     }
 }
 
@@ -372,8 +375,7 @@ fn run_hooks<'ob>(hooks: ArgSlice, env: &mut Rt<Env>, cx: &'ob mut Context) -> R
         let hook = env.stack[hook_count - i - 1].bind(cx);
         match hook.untag() {
             ObjectType::Symbol(sym) => {
-                if let Some(val) = env.vars.get(sym) {
-                    let val = val.bind(cx);
+                if let Some(val) = env.variable_value(sym,cx)? {
                     match val.untag() {
                         ObjectType::Cons(hook_list) => {
                             rooted_iter!(hooks, hook_list, cx);
@@ -406,8 +408,7 @@ fn run_hook_with_args<'ob>(
 ) -> Result<Object<'ob>> {
     match hook.untag(cx) {
         ObjectType::Symbol(sym) => {
-            if let Some(val) = env.vars.get(sym) {
-                let val = val.bind(cx);
+            if let Some(val) = env.variable_value(sym,cx)? {
                 match val.untag() {
                     ObjectType::Cons(hook_list) => {
                         rooted_iter!(hooks, hook_list, cx);
@@ -618,9 +619,11 @@ fn set_default<'ob>(
     symbol: Symbol,
     value: Object<'ob>,
     env: &'ob mut Rt<Env>,
+    cx: &Context,
 ) -> Result<Object<'ob>> {
-    // TODO: implement buffer local variables
-    env.set_var(symbol, value)?;
+    // Ordinary variables share their current dynamic value; generic buffer
+    // local defaults other than the explicit owner forwarder remain unsupported.
+    env.set_var_context(symbol, value, cx)?;
     Ok(value)
 }
 
