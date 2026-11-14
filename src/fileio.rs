@@ -251,24 +251,43 @@ fn test_case_sensative_call() {
     let _ = file_name_case_insensitive_p("/");
 }
 
+defsym!(EXCL);
 #[defun]
 #[expect(clippy::too_many_arguments)]
 fn write_region(
     start: i64,
     end: i64,
     filename: &str,
-    append: OptionalFlag,
+    append: Option<Object>,
     visit: OptionalFlag,
     lockname: OptionalFlag,
-    mustbenew: OptionalFlag,
+    mustbenew: Option<Object>,
     env: &Rt<Env>,
     cx: &Context,
 ) -> Result<()> {
-    use std::io::Write;
-    ensure!(append.is_none(), "append not implemented");
+    use std::io::{Seek, SeekFrom, Write};
+    enum Destination { Truncate, Append, Offset(u64) }
+    let destination = match append {
+        None => Destination::Truncate,
+        Some(value) if value.is_nil() => Destination::Truncate,
+        Some(value) => match value.untag() {
+            ObjectType::Int(offset) => {
+                ensure!(offset >= 0, "Negative file offset");
+                Destination::Offset(offset as u64)
+            }
+            ObjectType::BigInt(_) => bail!("File offset outside supported fixnum range"),
+            ObjectType::Float(_) => bail!("Expected integer file offset"),
+            _ => Destination::Append,
+        },
+    };
     ensure!(visit.is_none(), "visit not implemented");
     ensure!(lockname.is_none(), "lockname not implemented");
-    ensure!(mustbenew.is_none(), "mustbenew not implemented");
+    let exclusive = match mustbenew {
+        None => false,
+        Some(value) if value.is_nil() => false,
+        Some(value) if value == Object::from(sym::EXCL) => true,
+        _ => bail!("Confirmation-requiring mustbenew modes are not implemented"),
+    };
     // Capture and validate an immutable owner root before opening/truncating.
     let start = usize::try_from(start)?;
     let end = usize::try_from(end)?;
@@ -282,8 +301,13 @@ fn write_region(
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .create_new(exclusive)
+        .truncate(matches!(destination, Destination::Truncate))
+        .append(matches!(destination, Destination::Append))
         .open(filename)?;
+    if let Destination::Offset(offset) = destination {
+        file.seek(SeekFrom::Start(offset))?;
+    }
     for chunk in chunks {
         file.write_all(chunk.as_bytes())?;
     }
@@ -477,6 +501,130 @@ mod recovered_write_region_tests {
         write_region(1, 1, existing.to_str().unwrap(), None, None, None, None, env, cx)?;
         assert!(std::fs::read(&existing)?.is_empty());
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod streamed_write_append_tests {
+    use super::*;
+    use crate::core::{gc::RootSet, object::TRUE};
+    use rune_core::macros::root;
+    #[test]
+    fn append_and_byte_offset_preserve_other_bytes_and_buffer_state() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let g = env.editor_gateway();
+        let initial = env.buffer_read(cx)?;
+        g.splice(initial.handle, initial.epoch, 0..0, "aé🙂", cx)?;
+        let before = env.buffer_read(cx)?;
+        let dir = std::env::temp_dir().join(format!("rune-append-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(dir.clone());
+        let file = dir.join("existing");
+        let absent = dir.join("absent");
+        std::fs::write(&file, b"0123456789abcdef")?;
+        write_region(1, 4, file.to_str().unwrap(), Some(TRUE), None, None, None, env, cx)?;
+        assert_eq!(std::fs::read(&file)?, "0123456789abcdefaé🙂".as_bytes());
+        std::fs::write(&file, b"0123456789abcdef")?;
+        write_region(1, 4, file.to_str().unwrap(), Some(2_i64.into()), None, None, None, env, cx)?;
+        assert_eq!(std::fs::read(&file)?, "01aé🙂9abcdef".as_bytes());
+        for path in [&file, &absent] {
+            assert!(write_region(1, 4, path.to_str().unwrap(), Some((-1_i64).into()), None, None, None, env, cx).is_err());
+            assert!(write_region(0, 4, path.to_str().unwrap(), Some(TRUE), None, None, None, env, cx).is_err());
+        }
+        assert_eq!(std::fs::read(&file)?, "01aé🙂9abcdef".as_bytes());
+        assert!(!absent.exists());
+        write_region(1, 4, absent.to_str().unwrap(), Some(TRUE), None, None, None, env, cx)?;
+        assert_eq!(std::fs::read(&absent)?, "aé🙂".as_bytes());
+        let after = env.buffer_read(cx)?;
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(after.point, before.point);
+        assert!(g.modified(before.handle, cx)?);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod exclusive_write_region_tests {
+    use super::*;
+    use crate::core::{gc::RootSet, object::TRUE};
+    use rune_core::macros::root;
+    #[test]
+    fn exclusive_creation_never_clobbers_existing_targets() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let g = env.editor_gateway();
+        let initial = env.buffer_read(cx)?;
+        g.splice(initial.handle, initial.epoch, 0..0, "é🙂", cx)?;
+        let dir = std::env::temp_dir().join(format!("rune-exclusive-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(dir.clone());
+        let target = dir.join("target");
+        let absent = dir.join("absent");
+        std::fs::write(&target, b"must survive")?;
+        let exclusive = Some(sym::EXCL.into());
+        for append in [None, Some(TRUE), Some(0_i64.into())] {
+            assert!(write_region(1, 3, target.to_str().unwrap(), append, None, None, exclusive, env, cx).is_err());
+            assert_eq!(std::fs::read(&target)?, b"must survive");
+        }
+        assert!(write_region(1, 1, target.to_str().unwrap(), None, None, None, exclusive, env, cx).is_err());
+        assert_eq!(std::fs::read(&target)?, b"must survive");
+        assert!(write_region(1, 3, absent.to_str().unwrap(), Some(cx.add(1.5_f64)), None, None, exclusive, env, cx).is_err());
+        assert!(write_region(0, 3, absent.to_str().unwrap(), None, None, None, exclusive, env, cx).is_err());
+        assert!(write_region(1, 3, absent.to_str().unwrap(), None, None, None, Some(TRUE), env, cx).is_err());
+        assert!(!absent.exists());
+        write_region(1, 3, absent.to_str().unwrap(), None, None, None, exclusive, env, cx)?;
+        assert_eq!(std::fs::read(&absent)?, "é🙂".as_bytes());
+        #[cfg(unix)] {
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&target, &link)?;
+            assert!(write_region(1, 3, link.to_str().unwrap(), None, None, None, exclusive, env, cx).is_err());
+            assert_eq!(std::fs::read(&target)?, b"must survive");
+            let dangling_target = dir.join("dangling-target");
+            let dangling_link = dir.join("dangling-link");
+            std::os::unix::fs::symlink(&dangling_target, &dangling_link)?;
+            assert!(write_region(1, 3, dangling_link.to_str().unwrap(), None, None, None, exclusive, env, cx).is_err());
+            assert!(!dangling_target.exists());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod append_float_rejection_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+    #[test]
+    fn float_offsets_reject_before_creating_or_modifying_files() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let g = env.editor_gateway();
+        let before = env.buffer_read(cx)?;
+        g.splice(before.handle, before.epoch, 0..0, "é🙂", cx)?;
+        let dir = std::env::temp_dir().join(format!("rune-float-offset-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(dir.clone());
+        let existing = dir.join("existing");
+        let absent = dir.join("absent");
+        std::fs::write(&existing, b"must survive")?;
+        for offset in [1.5, 0.0, -0.0, f64::NAN, f64::INFINITY] {
+            for path in [&existing, &absent] {
+                assert!(write_region(1, 3, path.to_str().unwrap(), Some(cx.add(offset)), None, None, None, env, cx).is_err());
+            }
+            assert_eq!(std::fs::read(&existing)?, b"must survive");
+            assert!(!absent.exists());
+        }
         Ok(())
     }
 }
