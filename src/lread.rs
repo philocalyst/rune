@@ -2,7 +2,7 @@
 use crate::core::cons::Cons;
 use crate::core::env::{Env, sym};
 use crate::core::error::{Type, TypeError};
-use crate::core::gc::{Context, Rt, Rto};
+use crate::core::gc::{Context, Rt, Rto, Slot};
 use crate::core::object::{
     Function, Gc, LispString, NIL, Object, ObjectType, OptionalFlag, Symbol, TRUE, TagType,
     WithLifetime,
@@ -58,6 +58,7 @@ pub(crate) fn read_from_string<'ob>(
 
 pub(crate) fn load_internal(contents: &str, cx: &mut Context, env: &mut Rt<Env>) -> Result<bool> {
     let mut pos = 0;
+    root!(declarations, new(Vec<Slot<Symbol>>), cx);
     let macroexpand: Option<Function> = None;
     root!(macroexpand, cx);
     if let Some(fun) = sym::INTERNAL_MACROEXPAND_FOR_LOAD.func(cx) {
@@ -79,9 +80,9 @@ pub(crate) fn load_internal(contents: &str, cx: &mut Context, env: &mut Rt<Env>)
         }
         root!(obj, cx);
         let result = if let Some(fun) = macroexpand.as_ref() {
-            eager_expand(obj, fun, env, cx)
+            eager_expand(obj, fun, declarations, env, cx)
         } else {
-            interpreter::eval(obj, None, env, cx)
+            interpreter::eval_loaded(obj, declarations, env, cx)
         };
         if let Err(e) = result {
             let content = &contents[pos..(new_pos + pos)];
@@ -94,10 +95,11 @@ pub(crate) fn load_internal(contents: &str, cx: &mut Context, env: &mut Rt<Env>)
     }
 }
 
-fn eager_expand<'ob>(
+fn eager_expand<'ob, 'rt>(
     obj: &Rto<Object>,
     macroexpand: &Rto<Function>,
-    env: &mut Rt<Env>,
+    declarations: &mut Rt<Vec<Slot<Symbol<'rt>>>>,
+    env: &mut Rt<Env<'rt>>,
     cx: &'ob mut Context,
 ) -> Result<Object<'ob>, anyhow::Error> {
     let name = "internal-macroexpand-for-load";
@@ -107,14 +109,14 @@ fn eager_expand<'ob>(
         root!(val, NIL, cx);
         rooted_iter!(forms, forms.tag(), cx);
         while let Some(form) = forms.next()? {
-            let result = eager_expand(form, macroexpand, env, cx)?;
+            let result = eager_expand(form, macroexpand, declarations, env, cx)?;
             val.set(result);
         }
         return Ok(val.bind(cx));
     }
     let result = call!(macroexpand, val, TRUE; name, env, cx)?;
     root!(result, cx);
-    interpreter::eval(result, None, env, cx)
+    interpreter::eval_loaded(result, declarations, env, cx)
 }
 
 fn file_in_path(file: &str, path: &str) -> Option<PathBuf> {
@@ -415,5 +417,75 @@ mod test {
         root!(obj, cx);
         let val = interpreter::eval(obj, None, env, cx).unwrap();
         assert_eq!(val, 4.5);
+    }
+}
+
+#[cfg(test)]
+mod file_declaration_tests {
+    use super::*;
+    use crate::core::{
+        env::{init_variables, intern},
+        gc::RootSet,
+    };
+    #[test]
+    fn declarations_persist_across_forms_but_not_across_load_calls() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        init_variables(cx, env);
+        load_internal("(defvar vm-file-args)\n(garbage-collect)\n(defalias 'vm-file-reader (function (lambda () (car vm-file-args))))\n(defalias 'vm-file-call (function (lambda (args) (let ((vm-file-args args)) (vm-file-reader)))))\n(setq vm-file-observed (vm-file-call '(7)))", cx, env).unwrap();
+        assert_eq!(env.vars.get(intern("vm-file-observed", cx)).unwrap().bind(cx), Object::from(7));
+        assert!(!intern("vm-file-args", cx).is_special());
+        load_internal("(setq vm-file-isolated (let ((vm-file-args '(9))) (condition-case nil (vm-file-reader) (void-variable 'isolated))))", cx, env).unwrap();
+        assert_eq!(
+            env.vars.get(intern("vm-file-isolated", cx)).unwrap().bind(cx),
+            Object::from(intern("isolated", cx))
+        );
+    }
+    #[test]
+    fn eager_expanded_progn_shares_file_declarations() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        init_variables(cx, env);
+        let function_form =
+            reader::read("(function (lambda (form &optional final) form))", cx).unwrap().0;
+        root!(function_form, cx);
+        let function: Function =
+            interpreter::eval(function_form, None, env, cx).unwrap().try_into().unwrap();
+        root!(function, cx);
+        root!(declarations, new(Vec<Slot<Symbol>>), cx);
+        let form = reader::read("(progn (defvar vm-eager-args) (garbage-collect) (defalias 'vm-eager-reader (function (lambda () vm-eager-args))) (setq vm-eager-result (let ((vm-eager-args 17)) (vm-eager-reader))))", cx).unwrap().0;
+        root!(form, cx);
+        eager_expand(form, function, declarations, env, cx).unwrap();
+        assert_eq!(env.vars.get(intern("vm-eager-result", cx)).unwrap().bind(cx), Object::from(17));
+        assert!(!intern("vm-eager-args", cx).is_special());
+    }
+    #[test]
+    fn nested_load_keeps_its_declarations_out_of_callers_scope() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        init_variables(cx, env);
+        let directory =
+            std::env::temp_dir().join(format!("rune-file-declarations-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("inner.el");
+        fs::write(&path, "(defvar vm-inner-args)\n(defalias 'vm-inner-reader (function (lambda () vm-inner-args)))").unwrap();
+        let source = format!(
+            "(load {:?})\n(setq vm-inner-isolated (let ((vm-inner-args 9)) (condition-case nil (vm-inner-reader) (void-variable 'isolated))))",
+            path.to_str().unwrap()
+        );
+        let result = load_internal(&source, cx, env);
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&directory).unwrap();
+        result.unwrap();
+        assert_eq!(
+            env.vars.get(intern("vm-inner-isolated", cx)).unwrap().bind(cx),
+            Object::from(intern("isolated", cx))
+        );
     }
 }

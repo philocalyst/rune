@@ -57,6 +57,20 @@ pub(crate) fn eval<'ob>(
     interpreter.eval_form(form, cx).map_err(Into::into)
 }
 
+/// File-local declarations persist across forms but never escape the loader's
+/// rooted scope or leak into a nested load's independent declaration vector.
+pub(crate) fn eval_loaded<'ob, 'rt>(
+    form: &Rto<Object>,
+    local_specials: &mut Rt<Vec<Slot<Symbol<'rt>>>>,
+    env: &mut Rt<Env<'rt>>,
+    cx: &'ob mut Context,
+) -> Result<Object<'ob>, anyhow::Error> {
+    cx.garbage_collect(false);
+    root!(vars, new(Vec<Slot<&Cons>>), cx);
+    let mut interpreter = Interpreter { vars, env, local_specials, declaration_scopes: Vec::new() };
+    interpreter.eval_form(form, cx).map_err(Into::into)
+}
+
 impl Interpreter<'_, '_> {
     fn eval_form<'ob>(&mut self, rt: &Rto<Object>, cx: &'ob mut Context) -> EvalResult<'ob> {
         self.env.poll_quit(cx)?;
