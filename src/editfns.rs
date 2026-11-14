@@ -224,6 +224,53 @@ fn line_end_position(count: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<
 }
 
 #[defun]
+fn line_number_at_pos(position: Option<i64>, _absolute: crate::core::object::OptionalFlag, env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    let read = env.buffer_read(cx)?;
+    let index = match position {
+        Some(position) => { ensure!(position >= 1, "Buffer position out of bounds"); usize::try_from(position - 1)? },
+        None => read.point,
+    };
+    ensure!(index <= read.document.text().len_chars(), "Buffer position out of bounds");
+    Ok(read.document.text().char_to_line(rune_text::CharPos(index))?.0 + 1)
+}
+#[defun]
+fn count_lines(start: i64, end: i64, env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    let read = env.buffer_read(cx)?;
+    let text = read.document.text();
+    let (start, end) = (start.min(end), start.max(end));
+    ensure!(start >= 1, "Buffer range out of bounds");
+    let start = usize::try_from(start - 1)?;
+    let end = usize::try_from(end - 1)?;
+    ensure!(end <= text.len_chars(), "Buffer range out of bounds");
+    if start == end { return Ok(0); }
+    let first = text.char_to_line(rune_text::CharPos(start))?.0;
+    let last = text.char_to_line(rune_text::CharPos(end))?.0;
+    let final_partial = end != text.line_to_char(rune_text::LinePos(last))?.0;
+    Ok(last - first + usize::from(final_partial))
+}
+#[defun]
+fn forward_line(count: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<i64> {
+    let count = count.unwrap_or(1);
+    let read = env.buffer_read(cx)?;
+    let text = read.document.text();
+    let current = text.char_to_line(rune_text::CharPos(read.point))?.0;
+    let last = text.summary().newlines;
+    let target = current as i128 + i128::from(count);
+    let point = if target < 0 { 0 } else if target > last as i128 { text.len_chars() }
+        else { text.line_to_char(rune_text::LinePos(target as usize))?.0 };
+    let remaining = if count < 0 {
+        (i128::from(count) + current as i128).min(0)
+    } else {
+        // A nonempty terminal partial line counts as one forward line only
+        // when point has not already reached end of buffer.
+        let partial = read.point < text.len_chars()
+            && text.char_at(rune_text::CharPos(text.len_chars() - 1)) != Some('\n');
+        (i128::from(count) - (last - current) as i128 - i128::from(partial)).max(0)
+    };
+    env.editor_gateway().set_point(read.handle, point, cx)?;
+    Ok(i64::try_from(remaining)?)
+}
+#[defun]
 fn beginning_of_line(count: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<()> {
     let position = line_position(count, false, env, cx)?;
     env.editor_gateway().set_point(env.current_buffer_handle(), position - 1, cx)
@@ -487,6 +534,29 @@ mod owner_buffer_primitives_tests {
                   (list (bobp) (eobp) (following-char) (preceding-char) (point))
                   (progn (goto-char 2) (list (following-char) (preceding-char) (point)))
                   (progn (goto-char 4) (list (bobp) (eobp) (bolp) (eolp) (following-char) (preceding-char) (point))))))"#);
+    }
+    #[test]
+    fn indexed_line_counts_match_gnu_reversed_partial_and_invalid_ranges() {
+        crate::assert_elprop!(r#"(progn (erase-buffer) (insert "aé\n🙂x\nef") (goto-char 5)
+          (list (line-number-at-pos) (line-number-at-pos nil t)
+            (mapcar (function (lambda (p) (condition-case nil (line-number-at-pos p) (error 'bad))))
+                    (quote (-1 0 1 3 4 6 7 9 10 99)))
+            (mapcar (function (lambda (r) (condition-case nil (apply (function count-lines) r) (error 'bad))))
+                    (quote ((1 1) (1 2) (2 3) (2 4) (3 4) (4 7) (2 8) (8 2) (0 3) (1 99))))
+            (point)))"#);
+        crate::assert_elprop!(r#"(progn (erase-buffer)
+            (list (line-number-at-pos) (count-lines 1 1)))"#);
+    }
+    #[test]
+    fn forward_line_matches_gnu_partial_lines_remainders_and_eof() {
+        for fixture in ["ab\ncd\nef", "ab\n", "ab", ""] {
+            let literal = fixture.replace('\n', "\\n");
+            for at_end in [false, true] {
+                crate::assert_elprop!(r#"(progn (erase-buffer) (insert "{}") (goto-char {})
+                  (mapcar (function (lambda (n) (save-excursion (list n (forward-line n) (point)))))
+                    (quote (-99 -2 -1 0 1 2 3 99))))"#, literal, if at_end { 999 } else { 2 });
+            }
+        }
     }
     #[test]
     fn line_movement_matches_gnu_unicode_offsets_and_clamping() {
