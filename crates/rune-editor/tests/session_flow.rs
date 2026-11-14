@@ -346,3 +346,29 @@ fn native_commit_rejects_same_window_after_buffer_switch() {
     assert_eq!(session.document(other).unwrap().to_text(), "");
     session.check_invariants().unwrap();
 }
+
+#[cfg(feature="rope")]
+#[test]
+fn marker_history_recaptures_live_ids_each_cycle() {
+    let mut s=Session::new(RopeDocument::empty(),80,24).unwrap();
+    let b=s.current_buffer();
+    s.execute(Command::Insert("λ🙂x".into())).unwrap();
+    let removed=s.register_marker(b,1,Bias::Left).unwrap();
+    s.execute(Command::Undo).unwrap();s.execute(Command::Redo).unwrap();
+    let fresh=s.register_marker(b,2,Bias::Left).unwrap();s.remove_marker(b,removed).unwrap();
+    for _ in 0..3 {
+        s.execute(Command::Undo).unwrap();assert_eq!(s.marker_position(b,fresh).unwrap(),Some(0));
+        s.execute(Command::Redo).unwrap();assert_eq!(s.marker_position(b,fresh).unwrap(),Some(2));
+        assert_eq!(s.marker_position(b,removed).unwrap(),None);
+    }
+}
+#[cfg(feature="rope")]
+#[test]
+fn empty_sparse_records_keep_delete_then_insert_marker_order() {
+    let d=RopeDocument::new(rune_text::Snapshot::new(rune_text::Rope::from("abc")),rune_text::PropSetId(0));
+    let mut s=Session::new(d,80,24).unwrap();let b=s.current_buffer();
+    s.register_marker(b,0,Bias::Left).unwrap();s.register_marker(b,3,Bias::Right).unwrap();
+    s.execute(Command::ReplaceRange {range:0..3,text:"X".into()}).unwrap();
+    let fresh=s.register_marker(b,1,Bias::Left).unwrap();s.execute(Command::Undo).unwrap();
+    assert_eq!(s.marker_position(b,fresh).unwrap(),Some(0));
+}

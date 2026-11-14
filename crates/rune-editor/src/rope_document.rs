@@ -25,6 +25,30 @@ impl RopeDocument {
 }
 impl Document for RopeDocument {
     type Error = TextError;
+    type MarkerUndo = rune_text::DeletionMarkers;
+    fn capture_marker_undo(&self, range: Range<usize>) -> Result<Self::MarkerUndo, Self::Error> {
+        rune_text::DeletionMarkers::capture(
+            self.snapshot.positions(),
+            CharPos(range.start)..CharPos(range.end),
+        )
+    }
+    fn restore_history(
+        &self,
+        historical: &Self,
+        splice: Option<crate::Splice>,
+        records: Option<&Self::MarkerUndo>,
+    ) -> Result<Self, Self::Error> {
+        let delta = splice
+            .map(|s| rune_text::EditDelta::new(CharPos(s.start)..CharPos(s.end), s.inserted))
+            .transpose()?;
+        let snapshot = match (delta.as_ref(), records) {
+            (Some(d), Some(r)) => {
+                self.snapshot.restore_content_with_marker_undo(&historical.snapshot, d, r)?
+            }
+            _ => self.snapshot.restore_content(&historical.snapshot, delta.as_ref())?,
+        };
+        Ok(Self { snapshot, insertion_properties: self.insertion_properties })
+    }
     fn empty() -> Self {
         Self::new(Snapshot::new(rune_text::Rope::from("")), PropSetId(0))
     }
@@ -50,32 +74,9 @@ impl Document for RopeDocument {
     }
 }
 #[cfg(feature = "display")]
-#[derive(Clone, Debug)]
-pub struct PublishedRopeDocument {
-    document: RopeDocument,
-    revision: u64,
-}
+pub type PublishedRopeDocument = crate::PublishedDocument<RopeDocument>;
 #[cfg(feature = "display")]
-impl std::ops::Deref for PublishedRopeDocument {
-    type Target = RopeDocument;
-    fn deref(&self) -> &Self::Target { &self.document }
-}
-#[cfg(feature = "display")]
-impl crate::BufferSnapshot<RopeDocument> {
-    /// Use the editor's branch-safe revision, not the restored text root's
-    /// historical version, when keying renderer caches.
-    pub fn display_snapshot(&self) -> PublishedRopeDocument {
-        PublishedRopeDocument { document: self.document.clone(), revision: self.version }
-    }
-}
-#[cfg(feature = "display")]
-impl rune_display::TextSnapshot for PublishedRopeDocument {
-    fn revision(&self) -> u64 {
-        self.revision
-    }
-    fn len_chars(&self) -> usize {
-        self.snapshot.len_chars()
-    }
+impl crate::DisplayDocument for RopeDocument {
     fn chars_from(&self, start: usize) -> Box<dyn Iterator<Item = char> + '_> {
         Box::new(
             self.snapshot
@@ -86,4 +87,12 @@ impl rune_display::TextSnapshot for PublishedRopeDocument {
     fn next_line_start(&self, start: usize) -> Option<usize> {
         self.snapshot.next_line_start(CharPos(start)).map(|position| position.0)
     }
+}
+impl crate::MarkerDocument for RopeDocument {
+    fn set_live_marker(&self,id:u64,position:usize,bias:crate::Bias)->Result<Self,Self::Error>{
+        let bias=match bias {crate::Bias::Left=>rune_text::Bias::Left,crate::Bias::Right=>rune_text::Bias::Right};
+        Ok(Self { snapshot:self.snapshot.with_marker(rune_text::MarkerId(id),CharPos(position),bias)?,insertion_properties:self.insertion_properties })
+    }
+    fn remove_live_marker(&self,id:u64)->Self {Self {snapshot:self.snapshot.without_marker(rune_text::MarkerId(id)),insertion_properties:self.insertion_properties}}
+    fn marker_position(&self,id:u64)->Option<usize>{self.snapshot.positions().get(rune_text::MarkerId(id)).map(|(p,_)|p.0)}
 }

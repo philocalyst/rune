@@ -3,14 +3,22 @@
 use crate::{EditorError, Result};
 
 pub fn from_lisp_point(position: i64, len_chars: usize) -> Result<usize> {
-    let offset = position.checked_sub(1).and_then(|value| usize::try_from(value).ok())
+    let offset = position
+        .checked_sub(1)
+        .and_then(|value| usize::try_from(value).ok())
         .ok_or(EditorError::InvalidPosition)?;
-    if offset > len_chars { return Err(EditorError::InvalidPosition); }
+    if offset > len_chars {
+        return Err(EditorError::InvalidPosition);
+    }
     Ok(offset)
 }
 pub fn to_lisp_point(offset: usize, len_chars: usize) -> Result<i64> {
-    if offset > len_chars { return Err(EditorError::InvalidPosition); }
-    offset.checked_add(1).and_then(|point| i64::try_from(point).ok())
+    if offset > len_chars {
+        return Err(EditorError::InvalidPosition);
+    }
+    offset
+        .checked_add(1)
+        .and_then(|point| i64::try_from(point).ok())
         .ok_or(EditorError::InvalidPosition)
 }
 #[cfg(test)]

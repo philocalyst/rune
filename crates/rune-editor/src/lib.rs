@@ -22,6 +22,7 @@ macro_rules! id {
 }
 id!(BufferId);
 id!(WindowId);
+id!(MarkerId);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorError {
@@ -74,3 +75,11 @@ pub use rope_document::*;
 
 mod boundary;
 pub use boundary::{from_lisp_point, to_lisp_point};
+
+#[cfg(feature = "display")]
+mod publication;
+#[cfg(feature = "display")]
+pub use publication::*;
+
+mod host;
+pub use host::*;

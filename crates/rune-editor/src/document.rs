@@ -5,6 +5,15 @@ use std::{fmt, ops::Range, sync::Arc};
 /// No Lisp values, runtime locks, or mutable renderer references cross here.
 pub trait Document: Clone {
     type Error: fmt::Display;
+    type MarkerUndo: Clone;
+    fn capture_marker_undo(&self, range: Range<usize>) -> Result<Self::MarkerUndo, Self::Error>;
+    /// Historical content with current live marker IDs; never resurrect markers.
+    fn restore_history(
+        &self,
+        historical: &Self,
+        splice: Option<Splice>,
+        records: Option<&Self::MarkerUndo>,
+    ) -> Result<Self, Self::Error>;
     fn empty() -> Self;
     fn len_chars(&self) -> usize;
     fn replace(&self, range: Range<usize>, text: &str) -> Result<Self, Self::Error>;
@@ -47,6 +56,18 @@ impl std::error::Error for InvalidRange {}
 
 impl Document for StringDocument {
     type Error = InvalidRange;
+    type MarkerUndo = ();
+    fn capture_marker_undo(&self, _: Range<usize>) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn restore_history(
+        &self,
+        historical: &Self,
+        _: Option<Splice>,
+        _: Option<&()>,
+    ) -> Result<Self, Self::Error> {
+        Ok(historical.clone())
+    }
     fn empty() -> Self {
         Self::default()
     }
@@ -107,4 +128,16 @@ impl Splice {
             Ok(if bias == Bias::Right { after } else { self.start })
         }
     }
+}
+
+/// Live marker membership is independent of undoable document content.
+pub trait MarkerDocument: Document {
+    fn set_live_marker(&self, id: u64, position: usize, bias: Bias) -> Result<Self, Self::Error>;
+    fn remove_live_marker(&self, id: u64) -> Self;
+    fn marker_position(&self, id: u64) -> Option<usize>;
+}
+
+/// Owner-private lineage authentication, not text equality or numeric ID equality.
+pub trait MetadataDocument: Document {
+    fn shares_text_lineage(&self, other: &Self) -> bool;
 }

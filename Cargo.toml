@@ -42,6 +42,8 @@ rune-macros = { version = "0.1.0", path = "crates/rune-macros" }
 interval-tree ={ version = "0.1.0", path = "crates/interval-tree" }
 
 [dependencies]
+rune-editor = { path = "crates/rune-editor", features = ["display"] }
+rune-text = { path = "crates/rune-text" }
 anyhow = { workspace = true }
 bytecount = "0.6.3"
 clap = { workspace = true }
@@ -56,7 +58,6 @@ streaming-iterator = "0.1.9"
 fallible-iterator = { workspace = true }
 fallible-streaming-iterator = { workspace = true }
 text-buffer = { workspace = true }
-rune-text = { path = "crates/rune-text" }
 rune-macros = { workspace = true }
 rune-core = { workspace = true }
 bumpalo = { version = "3.15.3", features = ["collections"] }

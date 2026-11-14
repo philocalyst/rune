@@ -18,6 +18,7 @@ mod data;
 mod dired;
 mod dump;
 mod editfns;
+mod editor_document;
 mod emacs;
 mod eval;
 mod fileio;

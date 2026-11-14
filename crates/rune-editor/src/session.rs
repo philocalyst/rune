@@ -20,6 +20,11 @@ pub enum Command {
     DeleteBackward(usize),
     Move(isize),
     GoTo(usize),
+    PlaceCaret {
+        window: WindowId,
+        buffer: BufferId,
+        position: usize,
+    },
     BeginningOfLine,
     EndOfLine,
     MoveLines(isize),
@@ -33,7 +38,10 @@ pub enum Command {
     NextWindow,
     SelectWindow(WindowId),
     SwitchBuffer(BufferId),
-    SwitchToBuffer { name: String, create: bool },
+    SwitchToBuffer {
+        name: String,
+        create: bool,
+    },
     KillBuffer {
         buffer: BufferId,
         force: bool,
@@ -50,6 +58,7 @@ pub enum Command {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandKind {
+    Metadata,
     Insert,
     Delete,
     Motion,
@@ -74,9 +83,10 @@ impl Command {
             Self::Undo => CommandKind::Undo,
             Self::Redo => CommandKind::Redo,
             Self::Resize { .. } => CommandKind::Resize,
-            Self::SwitchBuffer(_) | Self::SwitchToBuffer { .. } | Self::KillBuffer { .. } | Self::RenameBuffer { .. } => {
-                CommandKind::Buffer
-            }
+            Self::SwitchBuffer(_)
+            | Self::SwitchToBuffer { .. }
+            | Self::KillBuffer { .. }
+            | Self::RenameBuffer { .. } => CommandKind::Buffer,
             _ => CommandKind::Window,
         }
     }
@@ -100,7 +110,11 @@ pub enum InputEvent {
     /// Committed IME/paste text, distinct from a physical or control key.
     Text(String),
     /// Native frontend commitment captures its originating focused window.
-    TextForWindow { window: WindowId, buffer: BufferId, text: String },
+    TextForWindow {
+        window: WindowId,
+        buffer: BufferId,
+        text: String,
+    },
     Key(Key),
     Command(Command),
 }
@@ -119,19 +133,22 @@ pub enum Dispatch {
 }
 
 #[derive(Clone)]
-struct HistoryEntry<D> {
+struct HistoryEntry<D: Document> {
     before: D,
     after: D,
     splice: Splice,
+    metadata: bool,
+    before_markers: Option<D::MarkerUndo>,
+    after_markers: Option<D::MarkerUndo>,
     before_version: u64,
     after_version: u64,
 }
 #[derive(Clone)]
-struct History<D> {
+struct History<D: Document> {
     entry: HistoryEntry<D>,
     next: Option<Arc<History<D>>>,
 }
-impl<D> Drop for History<D> {
+impl<D: Document> Drop for History<D> {
     fn drop(&mut self) {
         let mut next = self.next.take();
         while let Some(link) = next {
@@ -143,7 +160,7 @@ impl<D> Drop for History<D> {
     }
 }
 #[derive(Clone)]
-struct Buffer<D> {
+struct Buffer<D: Document> {
     name: String,
     document: D,
     saved_point: usize,
@@ -156,7 +173,7 @@ struct Buffer<D> {
     redo: Option<Arc<History<D>>>,
 }
 #[derive(Clone)]
-struct State<D> {
+struct State<D: Document> {
     buffers: BTreeMap<BufferId, Buffer<D>>,
     mru: Vec<BufferId>,
     current: BufferId,
@@ -279,6 +296,32 @@ impl<D: Document> Session<D> {
     pub fn point(&self) -> usize {
         self.state.windows.view(self.selected_window()).map_or(0, |view| view.point)
     }
+    pub fn current_point(&self) -> Result<usize> {
+        let view = self.state.windows.view(self.selected_window())?;
+        if view.buffer == self.state.current {
+            Ok(view.point)
+        } else {
+            Ok(self
+                .state
+                .buffers
+                .get(&self.state.current)
+                .ok_or(EditorError::InvalidBuffer)?
+                .saved_point)
+        }
+    }
+    pub fn set_current_point(&mut self, position: usize) -> Result<()> {
+        let id = self.state.current;
+        if position > self.document(id)?.len_chars() {
+            return Err(EditorError::InvalidPosition);
+        }
+        if self.state.windows.view(self.selected_window())?.buffer == id {
+            self.move_point(position)
+        } else {
+            self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?.saved_point =
+                position;
+            Ok(())
+        }
+    }
     pub fn last_command(&self) -> Option<CommandKind> {
         self.state.last_command
     }
@@ -293,6 +336,51 @@ impl<D: Document> Session<D> {
     }
     pub fn document(&self, id: BufferId) -> Result<&D> {
         Ok(&self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.document)
+    }
+    pub fn buffer_snapshot(&self, id: BufferId) -> Result<BufferSnapshot<D>> {
+        self.snapshot()
+            .buffers
+            .into_iter()
+            .find(|b| b.id == id)
+            .ok_or(EditorError::InvalidBuffer)
+    }
+    pub fn register_marker(
+        &mut self,
+        buffer: BufferId,
+        position: usize,
+        bias: Bias,
+    ) -> Result<crate::MarkerId>
+    where
+        D: crate::MarkerDocument,
+    {
+        let document = self.document(buffer)?;
+        if position > document.len_chars() {
+            return Err(EditorError::InvalidPosition);
+        }
+        let marker = crate::MarkerId(crate::allocate_id()?);
+        let document = document
+            .set_live_marker(marker.as_u64(), position, bias)
+            .map_err(|e| EditorError::Backend(e.to_string()))?;
+        self.state.buffers.get_mut(&buffer).ok_or(EditorError::InvalidBuffer)?.document = document;
+        Ok(marker)
+    }
+    pub fn marker_position(
+        &self,
+        buffer: BufferId,
+        marker: crate::MarkerId,
+    ) -> Result<Option<usize>>
+    where
+        D: crate::MarkerDocument,
+    {
+        Ok(self.document(buffer)?.marker_position(marker.as_u64()))
+    }
+    pub fn remove_marker(&mut self, buffer: BufferId, marker: crate::MarkerId) -> Result<()>
+    where
+        D: crate::MarkerDocument,
+    {
+        let document = self.document(buffer)?.remove_live_marker(marker.as_u64());
+        self.state.buffers.get_mut(&buffer).ok_or(EditorError::InvalidBuffer)?.document = document;
+        Ok(())
     }
     pub fn buffer_list(&self) -> &[BufferId] {
         &self.state.mru
@@ -318,7 +406,7 @@ impl<D: Document> Session<D> {
                 version: 0,
                 saved_version: 0,
                 next_version: 1,
-            publication_epoch: 0,
+                publication_epoch: 0,
                 undo: None,
                 redo: None,
             },
@@ -407,6 +495,9 @@ impl<D: Document> Session<D> {
     }
     fn edit(&mut self, range: Range<usize>, text: &str) -> Result<BufferId> {
         let id = self.state.windows.view(self.selected_window())?.buffer;
+        self.edit_buffer(id, range, text)
+    }
+    fn edit_buffer(&mut self, id: BufferId, range: Range<usize>, text: &str) -> Result<BufferId> {
         let buffer = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
         if buffer.read_only {
             return Err(EditorError::ReadOnly);
@@ -414,9 +505,20 @@ impl<D: Document> Session<D> {
         if range.start > range.end || range.end > buffer.document.len_chars() {
             return Err(EditorError::InvalidRange);
         }
-        let publication_epoch = buffer.publication_epoch.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let publication_epoch =
+            buffer.publication_epoch.checked_add(1).ok_or(EditorError::IdExhausted)?;
         let inserted = text.chars().count();
         let splice = Splice { start: range.start, end: range.end, inserted };
+        let records = if range.start < range.end {
+            Some(
+                buffer
+                    .document
+                    .capture_marker_undo(range.clone())
+                    .map_err(|e| EditorError::Backend(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         let document = buffer
             .document
             .replace(range, text)
@@ -428,6 +530,9 @@ impl<D: Document> Session<D> {
             before: buffer.document.clone(),
             after: document.clone(),
             splice,
+            metadata: false,
+            before_markers: records,
+            after_markers: None,
             before_version: buffer.version,
             after_version: version,
         };
@@ -441,7 +546,11 @@ impl<D: Document> Session<D> {
         buffer.version = version;
         buffer.publication_epoch = publication_epoch;
         buffer.next_version = next;
-        self.move_point(splice.start.checked_add(inserted).ok_or(EditorError::InvalidPosition)?)?;
+        let point = splice.start.checked_add(inserted).ok_or(EditorError::InvalidPosition)?;
+        buffer.saved_point = point;
+        if self.state.windows.view(self.selected_window())?.buffer == id {
+            self.move_point(point)?;
+        }
         Ok(id)
     }
     fn undo_redo(&mut self, redo: bool) -> Result<BufferId> {
@@ -455,8 +564,9 @@ impl<D: Document> Session<D> {
         } else {
             buffer.undo.clone().ok_or(EditorError::NoUndo)?
         };
-        let publication_epoch = buffer.publication_epoch.checked_add(1).ok_or(EditorError::IdExhausted)?;
-        let entry = history.entry.clone();
+        let publication_epoch =
+            buffer.publication_epoch.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let mut entry = history.entry.clone();
         let (document, version, splice) = if redo {
             (entry.after.clone(), entry.after_version, entry.splice)
         } else {
@@ -474,8 +584,38 @@ impl<D: Document> Session<D> {
                 },
             )
         };
+        let reinserted =
+            if redo { entry.after_markers.clone() } else { entry.before_markers.clone() };
+        let removed = if !entry.metadata && splice.start < splice.end {
+            Some(
+                buffer
+                    .document
+                    .capture_marker_undo(splice.start..splice.end)
+                    .map_err(|e| EditorError::Backend(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        if !entry.metadata {
+            if redo {
+                entry.before_markers = removed;
+            } else {
+                entry.after_markers = removed;
+            }
+        }
+        let document = buffer
+            .document
+            .restore_history(
+                &document,
+                if entry.metadata { None } else { Some(splice) },
+                reinserted.as_ref(),
+            )
+            .map_err(|e| EditorError::Backend(e.to_string()))?;
         let length = document.len_chars();
-        self.map_views(id, splice, length)?;
+        if !entry.metadata {
+            self.map_views(id, splice, length)?;
+        }
+        let metadata = entry.metadata;
         let buffer = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
         if redo {
             buffer.redo = history.next.clone();
@@ -487,9 +627,11 @@ impl<D: Document> Session<D> {
         buffer.document = document;
         buffer.version = version;
         buffer.publication_epoch = publication_epoch;
-        self.move_point(
-            splice.start.checked_add(splice.inserted).ok_or(EditorError::InvalidPosition)?,
-        )?;
+        if !metadata {
+            self.move_point(
+                splice.start.checked_add(splice.inserted).ok_or(EditorError::InvalidPosition)?,
+            )?;
+        }
         Ok(id)
     }
     fn rename(&mut self, id: BufferId, name: String, unique: bool) -> Result<()> {
@@ -594,6 +736,16 @@ impl<D: Document> Session<D> {
                     self.point().checked_add_signed(delta).ok_or(EditorError::InvalidPosition)?;
                 self.move_point(point)?;
             }
+            Command::PlaceCaret { window, buffer, position } => {
+                if self.state.windows.view(window)?.buffer != buffer {
+                    return Err(EditorError::StaleInput);
+                }
+                if position > self.document(buffer)?.len_chars() {
+                    return Err(EditorError::InvalidPosition);
+                }
+                self.select(window)?;
+                self.move_point(position)?;
+            }
             Command::GoTo(point) => self.move_point(point)?,
             Command::BeginningOfLine | Command::EndOfLine => {
                 let point = self.point();
@@ -695,6 +847,161 @@ impl<D: Document> Session<D> {
     }
     /// A native command is one atomic owner-thread transaction. Text roots and
     /// undo chains are shared immutable snapshots; errors/panics restore state.
+    /// Atomic owner-thread validation of an immutable renderer hit.
+    pub fn place_pointer(
+        &mut self,
+        window: WindowId,
+        buffer: BufferId,
+        epoch: u64,
+        position: usize,
+    ) -> Result<CommandOutcome> {
+        if self.state.windows.view(window)?.buffer != buffer {
+            return Err(EditorError::StaleInput);
+        }
+        let current = self.state.buffers.get(&buffer).ok_or(EditorError::InvalidBuffer)?;
+        if current.publication_epoch != epoch {
+            return Err(EditorError::StaleInput);
+        }
+        if position > current.document.len_chars() {
+            return Err(EditorError::InvalidPosition);
+        }
+        // Record semantic intent, not an obsolete transport epoch, in macros.
+        self.execute(Command::PlaceCaret { window, buffer, position })
+    }
+    pub fn commit_replacement(
+        &mut self,
+        window: WindowId,
+        buffer: BufferId,
+        epoch: u64,
+        range: Range<usize>,
+        text: String,
+    ) -> Result<CommandOutcome> {
+        if window != self.selected_window() || self.state.windows.view(window)?.buffer != buffer {
+            return Err(EditorError::StaleInput);
+        }
+        if self
+            .state
+            .buffers
+            .get(&buffer)
+            .ok_or(EditorError::InvalidBuffer)?
+            .publication_epoch
+            != epoch
+        {
+            return Err(EditorError::StaleInput);
+        }
+        let outcome = self.execute(Command::ReplaceRange { range, text })?;
+        self.cancel_prefix();
+        Ok(outcome)
+    }
+    /// Compare-and-swap owner-prepared metadata, preserving CURRENT live markers.
+    pub fn publish_metadata(
+        &mut self,
+        id: BufferId,
+        expected_epoch: u64,
+        document: D,
+    ) -> Result<CommandOutcome>
+    where
+        D: crate::MetadataDocument,
+    {
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let backup = self.state.clone();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let b = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
+            if b.publication_epoch != expected_epoch {
+                return Err(EditorError::StaleInput);
+            }
+            if b.read_only {
+                return Err(EditorError::ReadOnly);
+            }
+            if !b.document.shares_text_lineage(&document)
+                || b.document.len_chars() != document.len_chars()
+            {
+                return Err(EditorError::InvalidRange);
+            }
+            let document = b
+                .document
+                .restore_history(&document, None, None)
+                .map_err(|e| EditorError::Backend(e.to_string()))?;
+            let epoch = b.publication_epoch.checked_add(1).ok_or(EditorError::IdExhausted)?;
+            let version = b.next_version;
+            let next = version.checked_add(1).ok_or(EditorError::IdExhausted)?;
+            let entry = HistoryEntry {
+                before: b.document.clone(),
+                after: document.clone(),
+                splice: Splice { start: 0, end: 0, inserted: 0 },
+                metadata: true,
+                before_markers: None,
+                after_markers: None,
+                before_version: b.version,
+                after_version: version,
+            };
+            let b = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
+            if !b.name.starts_with(' ') {
+                b.undo = Some(Arc::new(History { entry, next: b.undo.clone() }));
+            }
+            b.redo = None;
+            b.document = document;
+            b.version = version;
+            b.next_version = next;
+            b.publication_epoch = epoch;
+            self.state.sequence = sequence;
+            self.state.last_command = Some(CommandKind::Metadata);
+            self.state.last_error = None;
+            Ok(CommandOutcome {
+                sequence,
+                kind: CommandKind::Metadata,
+                changed_buffers: vec![id],
+                selected_window: self.selected_window(),
+                current_buffer: self.state.current,
+            })
+        }));
+        match result {
+            Ok(Ok(outcome)) => Ok(outcome),
+            other => {
+                self.state = backup;
+                let e = match other {
+                    Ok(Err(e)) => e,
+                    _ => EditorError::CommandPanicked,
+                };
+                self.state.last_error = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+    /// Runtime edit of current-buffer without selecting/replacing a UI view.
+    pub fn replace_current_buffer(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+    ) -> Result<CommandOutcome> {
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let backup = self.state.clone();
+        let id = self.state.current;
+        let result = catch_unwind(AssertUnwindSafe(|| self.edit_buffer(id, range, text)));
+        match result {
+            Ok(Ok(id)) => {
+                self.state.sequence = sequence;
+                self.state.last_command = Some(CommandKind::Insert);
+                self.state.last_error = None;
+                Ok(CommandOutcome {
+                    sequence,
+                    kind: CommandKind::Insert,
+                    changed_buffers: vec![id],
+                    selected_window: self.selected_window(),
+                    current_buffer: self.state.current,
+                })
+            }
+            other => {
+                self.state = backup;
+                let error = match other {
+                    Ok(Err(e)) => e,
+                    _ => EditorError::CommandPanicked,
+                };
+                self.state.last_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
     pub fn execute(&mut self, command: Command) -> Result<CommandOutcome> {
         if !self.playing_macro
             && self.recording.as_ref().is_some_and(|commands| commands.len() >= 10_000)
@@ -776,9 +1083,16 @@ impl<D: Document> Session<D> {
         let buffer = self.state.windows.view(window)?.buffer;
         self.commit_text_for_buffer(window, buffer, text)
     }
-    pub fn commit_text_for_buffer(&mut self, window: WindowId, buffer: BufferId, text: String) -> Result<Dispatch> {
-        if window != self.selected_window() || self.state.windows.view(window).is_err()
-            || self.state.windows.view(window)?.buffer != buffer {
+    pub fn commit_text_for_buffer(
+        &mut self,
+        window: WindowId,
+        buffer: BufferId,
+        text: String,
+    ) -> Result<Dispatch> {
+        if window != self.selected_window()
+            || self.state.windows.view(window).is_err()
+            || self.state.windows.view(window)?.buffer != buffer
+        {
             return Err(EditorError::StaleInput);
         }
         self.cancel_prefix();
@@ -794,7 +1108,9 @@ impl<D: Document> Session<D> {
         self.queue.pop_front().map(|event| match event {
             InputEvent::Key(key) => self.dispatch(key),
             InputEvent::Text(text) => self.commit_text(self.selected_window(), text),
-            InputEvent::TextForWindow { window, buffer, text } => self.commit_text_for_buffer(window, buffer, text),
+            InputEvent::TextForWindow { window, buffer, text } => {
+                self.commit_text_for_buffer(window, buffer, text)
+            }
             InputEvent::Command(command) => self.execute(command).map(Dispatch::Executed),
         })
     }
