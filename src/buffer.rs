@@ -227,6 +227,54 @@ mod test {
 #[cfg(test)]
 mod owner_modified_primitive_tests {
     #[test]
+    fn modified_history_restores_clean_savepoints_bidirectionally() -> anyhow::Result<()> {
+        use rune_editor::{Command, Document, EditorHost};
+        crate::editor_document::with_lisp_runtime_owner(80, 24, |mut host| {
+            host.evaluate_source("(insert \"x\") (set-buffer-modified-p nil)").map_err(anyhow::Error::msg)?;
+            for _ in 0..3 {
+                host.execute(Command::Undo)?;
+                let state = host.snapshot()?;
+                assert_eq!(state.buffers[0].document.to_text(), "");
+                assert!(!state.buffers[0].modified);
+                host.execute(Command::Redo)?;
+                let state = host.snapshot()?;
+                assert_eq!(state.buffers[0].document.to_text(), "x");
+                assert!(!state.buffers[0].modified);
+            }
+            Ok(())
+        })
+    }
+    #[test]
+    fn modified_history_recaptures_force_state_between_cycles() -> anyhow::Result<()> {
+        use rune_editor::{Command, EditorHost};
+        crate::editor_document::with_lisp_runtime_owner(80, 24, |mut host| {
+            host.evaluate_source("(set-buffer-modified-p t) (insert \"x\")").map_err(anyhow::Error::msg)?;
+            host.execute(Command::Undo)?;
+            assert!(host.snapshot()?.buffers[0].modified);
+            host.evaluate_source("(set-buffer-modified-p nil)").map_err(anyhow::Error::msg)?;
+            host.execute(Command::Redo)?;
+            assert!(host.snapshot()?.buffers[0].modified);
+            host.execute(Command::Undo)?;
+            assert!(!host.snapshot()?.buffers[0].modified);
+            Ok(())
+        })
+    }
+    #[test]
+    fn metadata_history_restores_dirty_flags_with_properties() -> anyhow::Result<()> {
+        use rune_editor::{Command, EditorHost};
+        crate::editor_document::with_lisp_runtime_owner(80, 24, |mut host| {
+            host.evaluate_source("(insert \"x\") (set-buffer-modified-p nil) (put-text-property 1 2 'face 'bold)").map_err(anyhow::Error::msg)?;
+            assert!(host.snapshot()?.buffers[0].modified);
+            host.execute(Command::Undo)?;
+            assert!(!host.snapshot()?.buffers[0].modified);
+            host.evaluate_source("(if (get-text-property 1 'face) (error \"property undo failed\"))").map_err(anyhow::Error::msg)?;
+            host.execute(Command::Redo)?;
+            assert!(host.snapshot()?.buffers[0].modified);
+            host.evaluate_source("(if (eq (get-text-property 1 'face) 'bold) nil (error \"property redo failed\"))").map_err(anyhow::Error::msg)?;
+            Ok(())
+        })
+    }
+    #[test]
     fn modified_flags_accept_nonnil_zero_and_retain_killed_buffer_state() {
         crate::assert_elprop!(r#"(progn (set-buffer-modified-p nil)
           (list (set-buffer-modified-p 0) (buffer-modified-p)

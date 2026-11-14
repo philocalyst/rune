@@ -143,6 +143,10 @@ struct HistoryEntry<D: Document> {
     after_markers: Option<D::MarkerUndo>,
     before_version: u64,
     after_version: u64,
+    before_dirty: bool,
+    after_dirty: bool,
+    before_dirty_generation: u64,
+    after_dirty_generation: u64,
 }
 #[derive(Clone)]
 struct History<D: Document> {
@@ -169,6 +173,7 @@ struct Buffer<D: Document> {
     version: u64,
     saved_version: u64,
     forced_dirty: bool,
+    save_generation: u64,
     next_version: u64,
     publication_epoch: u64,
     undo: Option<Arc<History<D>>>,
@@ -244,6 +249,7 @@ impl<D: Document> Session<D> {
             version: 0,
             saved_version: 0,
             forced_dirty: false,
+            save_generation: 0,
             next_version: 1,
             publication_epoch: 0,
             undo: None,
@@ -433,6 +439,7 @@ impl<D: Document> Session<D> {
                 version: 0,
                 saved_version: 0,
                 forced_dirty: false,
+                save_generation: 0,
                 next_version: 1,
                 publication_epoch: 0,
                 undo: None,
@@ -457,8 +464,18 @@ impl<D: Document> Session<D> {
         self.state.sequence = sequence;
         Ok(())
     }
+    /// A real native savepoint invalidates earlier historical dirty flags.
+    /// Explicit Lisp set_modified(false) is different and keeps their validity.
     pub fn mark_saved(&mut self, id: BufferId) -> Result<()> {
-        self.set_modified(id, false)
+        let b = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
+        let generation = b.save_generation.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let b = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
+        b.saved_version = b.version;
+        b.forced_dirty = false;
+        b.save_generation = generation;
+        self.state.sequence = sequence;
+        Ok(())
     }
     pub fn modified(&self, id: BufferId) -> Result<bool> {
         if let Some(b) = self.state.buffers.get(&id) {
@@ -602,6 +619,10 @@ impl<D: Document> Session<D> {
             after_markers: None,
             before_version: buffer.version,
             after_version: version,
+            before_dirty: buffer.forced_dirty || buffer.version != buffer.saved_version,
+            after_dirty: true,
+            before_dirty_generation: buffer.save_generation,
+            after_dirty_generation: buffer.save_generation,
         };
         if !coordinate_stable {
             self.map_views(id, splice, length)?;
@@ -636,6 +657,22 @@ impl<D: Document> Session<D> {
         let publication_epoch =
             buffer.publication_epoch.checked_add(1).ok_or(EditorError::IdExhausted)?;
         let mut entry = history.entry.clone();
+        // Record CURRENT reverse-side metadata on every actual undo/redo.
+        // Explicit flag changes between cycles must not be overwritten by a
+        // static initial savepoint record.
+        let (target_dirty, target_generation) = if redo {
+            (entry.after_dirty, entry.after_dirty_generation)
+        } else {
+            (entry.before_dirty, entry.before_dirty_generation)
+        };
+        let current_dirty = buffer.forced_dirty || buffer.version != buffer.saved_version;
+        if redo {
+            entry.before_dirty = current_dirty;
+            entry.before_dirty_generation = buffer.save_generation;
+        } else {
+            entry.after_dirty = current_dirty;
+            entry.after_dirty_generation = buffer.save_generation;
+        }
         let (document, version, splice) = if redo {
             (entry.after.clone(), entry.after_version, entry.splice)
         } else {
@@ -695,6 +732,17 @@ impl<D: Document> Session<D> {
         }
         buffer.document = document;
         buffer.version = version;
+        if target_generation != buffer.save_generation {
+            // A savepoint occurred after this side's dirty record. Keep that
+            // baseline; a historical clean flag cannot mark different saved
+            // content clean merely because undo restored an older root.
+            buffer.forced_dirty = false;
+        } else if target_dirty {
+            buffer.forced_dirty = buffer.version == buffer.saved_version;
+        } else {
+            buffer.saved_version = buffer.version;
+            buffer.forced_dirty = false;
+        }
         buffer.publication_epoch = publication_epoch;
         if !metadata {
             self.move_point(
@@ -1009,6 +1057,10 @@ impl<D: Document> Session<D> {
                 after_markers: None,
                 before_version: b.version,
                 after_version: version,
+                before_dirty: b.forced_dirty || b.version != b.saved_version,
+                after_dirty: true,
+                before_dirty_generation: b.save_generation,
+                after_dirty_generation: b.save_generation,
             };
             let b = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
             if !b.name.starts_with(' ') {

@@ -550,3 +550,41 @@ fn killed_buffer_retains_only_its_last_dirty_status_without_becoming_live() {
     assert!(s.execute(Command::KillBuffer { buffer: dirty, force: true }).is_err());
     assert_eq!(s.modified(dirty).unwrap(), true);
 }
+#[test]
+fn dirty_history_recaptures_explicit_clear_and_force_between_undo_cycles() {
+    let mut s = Session::new(StringDocument::empty(), 80, 24).unwrap();
+    let b = s.current_buffer();
+    s.execute(Command::Insert("x".into())).unwrap();
+    s.set_modified(b, false).unwrap();
+    for _ in 0..3 {
+        s.execute(Command::Undo).unwrap();
+        assert!(!s.modified(b).unwrap());
+        s.execute(Command::Redo).unwrap();
+        assert!(!s.modified(b).unwrap());
+    }
+    s.execute(Command::Undo).unwrap();
+    s.set_modified(b, true).unwrap();
+    s.execute(Command::Redo).unwrap();
+    assert!(!s.modified(b).unwrap());
+    s.execute(Command::Undo).unwrap();
+    assert!(s.modified(b).unwrap());
+}
+#[test]
+fn actual_savepoint_fences_old_dirty_records_unlike_explicit_flag_clear() {
+    let mut s = Session::new(StringDocument::empty(), 80, 24).unwrap();
+    let b = s.current_buffer();
+    s.execute(Command::Insert("x".into())).unwrap();
+    s.mark_saved(b).unwrap();
+    s.execute(Command::Undo).unwrap();
+    assert!(s.modified(b).unwrap());
+    s.execute(Command::Redo).unwrap();
+    assert!(!s.modified(b).unwrap());
+    s.execute(Command::Undo).unwrap();
+    assert!(s.modified(b).unwrap());
+    let mut explicit = Session::new(StringDocument::empty(), 80, 24).unwrap();
+    let b = explicit.current_buffer();
+    explicit.execute(Command::Insert("x".into())).unwrap();
+    explicit.set_modified(b, false).unwrap();
+    explicit.execute(Command::Undo).unwrap();
+    assert!(!explicit.modified(b).unwrap());
+}
