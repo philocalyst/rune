@@ -4,7 +4,7 @@
 //! Objects are deep-copied into the ChannelManager's block when sent,
 //! and deep-copied into the receiver's context when received.
 
-use super::{CloneIn, Gc, Object, Symbol, TagType};
+use super::{CloneIn, Gc, IntoObject, Object, Symbol, TagType};
 use crate::{
     channel_manager::{self, ChannelId, RecvError, SendError},
     core::{
@@ -215,20 +215,15 @@ impl Trace for ChannelReceiverInner {
 
 // CloneIn implementations for cross-context copying
 impl<'new> CloneIn<'new, &'new Self> for ChannelSender {
-    fn clone_in<const C: bool>(&self, _bk: &'new Block<C>) -> Gc<&'new Self> {
-        let new_sender = ChannelSender::new(self.0.channel_id, self.0.manager.clone(), false);
-
-        // SAFETY: Sender just holds an Arc and channel ID, safe to transmute
-        unsafe { std::mem::transmute::<Gc<&Self>, Gc<&'new Self>>((&new_sender).tag()) }
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
+        // The endpoint must live in the target arena, not in this stack frame.
+        ChannelSender::new(self.0.channel_id, self.0.manager.clone(), C).into_obj(bk)
     }
 }
 
 impl<'new> CloneIn<'new, &'new Self> for ChannelReceiver {
-    fn clone_in<const C: bool>(&self, _bk: &'new Block<C>) -> Gc<&'new Self> {
-        let new_receiver = ChannelReceiver::new(self.0.channel_id, self.0.manager.clone(), false);
-
-        // SAFETY: Receiver just holds an Arc and channel ID, safe to transmute
-        unsafe { std::mem::transmute::<Gc<&Self>, Gc<&'new Self>>((&new_receiver).tag()) }
+    fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
+        ChannelReceiver::new(self.0.channel_id, self.0.manager.clone(), C).into_obj(bk)
     }
 }
 
@@ -571,5 +566,117 @@ mod tests {
         // Verify all messages were sent and received
         assert_eq!(send_count.load(Ordering::SeqCst), 80);
         assert_eq!(recv_count.load(Ordering::SeqCst), 80);
+    }
+}
+
+#[cfg(test)]
+mod endpoint_ownership_tests {
+    use super::*;
+    use crate::core::{
+        env::INTERNED_SYMBOLS,
+        gc::{AllocState, RootSet},
+    };
+    use rune_core::macros::root;
+
+    fn assert_in_target_arena<T: Copy>(value: Gc<T>, block: &Block<false>, size: usize) {
+        // Decode the tagged address without creating/dereferencing a reference:
+        // the old dangling-stack implementation must fail this check safely.
+        let address = ((value.into_raw().addr() as isize) >> 8) as usize;
+        // SAFETY: No arena allocation occurs during this raw chunk iteration;
+        // only integer address ranges are inspected, never the chunk contents.
+        let owned = unsafe { block.objects.iter_allocated_chunks_raw() }.any(|(start, len)| {
+            let start = start as usize;
+            address >= start && address.checked_add(size).is_some_and(|end| end <= start + len)
+        });
+        assert!(owned, "cloned endpoint was not allocated in target arena");
+    }
+
+    #[test]
+    fn cloned_endpoints_are_arena_owned_and_survive_repeated_gc() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let (sender, receiver) = make_channel_pair(1);
+        let copied_sender = sender.clone_in(&cx.block);
+        let copied_receiver = receiver.clone_in(&cx.block);
+        assert_in_target_arena(copied_sender, &cx.block, size_of::<ChannelSender>());
+        assert_in_target_arena(copied_receiver, &cx.block, size_of::<ChannelReceiver>());
+        root!(copied_sender, cx);
+        root!(copied_receiver, cx);
+        for value in 0..10 {
+            cx.garbage_collect(true);
+            copied_sender.bind(cx).send(cx.add(value)).unwrap();
+            assert_eq!(copied_receiver.bind(cx).recv(cx).unwrap(), value);
+        }
+        // Native endpoint finalization is separate work; close explicitly so
+        // this ownership regression does not claim to cover GC channel closing.
+        copied_sender.bind(cx).close();
+        copied_receiver.bind(cx).close();
+        sender.close();
+        receiver.close();
+    }
+
+    #[test]
+    fn endpoint_payloads_roundtrip_through_channel_copy_domains() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let (sender, receiver) = make_channel_pair(1);
+        let (carrier_sender, carrier_receiver) = make_channel_pair(1);
+        let sender = sender.into_obj(&cx.block);
+        root!(sender, cx);
+        carrier_sender.send(cx.add(sender.bind(cx))).unwrap();
+        let copied = carrier_receiver.recv(cx).unwrap();
+        root!(copied, cx);
+        for value in 0..5 {
+            cx.garbage_collect(true);
+            let endpoint: Gc<&ChannelSender> = copied.bind(cx).try_into().unwrap();
+            endpoint.send(cx.add(value)).unwrap();
+            assert_eq!(receiver.recv(cx).unwrap(), value);
+        }
+        let receiver = receiver.into_obj(&cx.block);
+        root!(receiver, cx);
+        carrier_sender.send(cx.add(receiver.bind(cx))).unwrap();
+        let copied_receiver = carrier_receiver.recv(cx).unwrap();
+        root!(copied_receiver, cx);
+        for value in 5..10 {
+            cx.garbage_collect(true);
+            sender.bind(cx).send(cx.add(value)).unwrap();
+            let endpoint: Gc<&ChannelReceiver> = copied_receiver.bind(cx).try_into().unwrap();
+            assert_eq!(endpoint.recv(cx).unwrap(), value);
+        }
+        copied
+            .bind(cx)
+            .try_into()
+            .map(|endpoint: Gc<&ChannelSender>| endpoint.close())
+            .unwrap();
+        copied_receiver
+            .bind(cx)
+            .try_into()
+            .map(|endpoint: Gc<&ChannelReceiver>| endpoint.close())
+            .unwrap();
+        sender.bind(cx).close();
+        receiver.bind(cx).close();
+        // Until deferred native finalizers exist, explicitly close the manager's
+        // now-unrooted transit copies too. This is test cleanup, not GC behavior.
+        let endpoint = sender.bind(cx).untag();
+        endpoint.0.manager.close_sender(endpoint.0.channel_id);
+        let endpoint = receiver.bind(cx).untag();
+        endpoint.0.manager.close_receiver(endpoint.0.channel_id);
+        endpoint.0.manager.cleanup_channel(endpoint.0.channel_id);
+        carrier_sender.close();
+        carrier_receiver.close();
+    }
+
+    #[test]
+    fn owned_endpoint_conversion_uses_global_target_marker() {
+        let roots = RootSet::default();
+        let _cx = Context::new(&roots);
+        let (sender, receiver) = make_channel_pair(1);
+        let map = INTERNED_SYMBOLS.lock().unwrap();
+        let sender = sender.into_obj(map.global_block());
+        let receiver = receiver.into_obj(map.global_block());
+        assert!(matches!(sender.untag().0.allocation_state(), AllocState::Global));
+        assert!(matches!(receiver.untag().0.allocation_state(), AllocState::Global));
+        sender.close();
+        receiver.close();
     }
 }

@@ -551,7 +551,8 @@ impl IntoObject for ChannelSender {
     type Out<'ob> = &'ob ChannelSender;
 
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
-        let ptr = block.objects.alloc(self);
+        let ChannelSender(heap) = self;
+        let ptr = block.objects.alloc(ChannelSender(heap.for_block::<C>()));
         unsafe { <&ChannelSender>::tag_ptr(ptr) }
     }
 }
@@ -560,7 +561,8 @@ impl IntoObject for ChannelReceiver {
     type Out<'ob> = &'ob ChannelReceiver;
 
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
-        let ptr = block.objects.alloc(self);
+        let ChannelReceiver(heap) = self;
+        let ptr = block.objects.alloc(ChannelReceiver(heap.for_block::<C>()));
         unsafe { <&ChannelReceiver>::tag_ptr(ptr) }
     }
 }

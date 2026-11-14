@@ -83,6 +83,13 @@ impl<T> GcHeap<T> {
         }
     }
 
+    /// Rebuild a uniquely owned stack wrapper for its actual target arena.
+    /// Consuming self transfers native payload ownership without running its
+    /// destructor; an allocated wrapper cannot be moved out in safe Rust.
+    pub(in crate::core) fn for_block<const C: bool>(self) -> Self {
+        Self::new(self.data, C)
+    }
+
     /// Allocate a new object that is not managed by the garbage collector. This
     /// is used for "pure" storage of objects that are allocated at the start of
     /// the program and never freed. Only used for the Symbol map at the moment.
