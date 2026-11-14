@@ -57,6 +57,7 @@ impl RootedEnv<'_> {
             sym::DEFAULT_DIRECTORY,
             sym::FILL_COLUMN,
             sym::LOAD_PATH,
+            sym::EXECUTING_KBD_MACRO,
             sym::CURRENT_TIME_LIST,
             sym::CASE_FOLD_SEARCH,
         ]

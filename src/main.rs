@@ -39,6 +39,7 @@ mod fns;
 mod interpreter;
 mod intervals;
 mod keymap;
+mod keyboard_state;
 mod library;
 mod lisp;
 mod lread;
