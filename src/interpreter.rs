@@ -224,26 +224,53 @@ impl Interpreter<'_, '_> {
         };
         root!(func, cx);
 
-        match func.bind(cx).as_cons_pair() {
-            Ok((sym::AUTOLOAD, _)) => {
-                crate::eval::autoload_do_load(func.cast(), None, None, self.env, cx)
-                    .map_err(|e| add_trace(e, "autoload", &[]))?;
-                func.set(sym.bind(cx).follow_indirect(cx).unwrap());
-            }
-            Ok((sym::MACRO, mcro)) => {
-                let iter = args.bind(cx).into_list()?;
-                let mut frame = CallFrame::new(self.env);
-                for arg in iter {
-                    frame.push_arg(arg?);
+        let mut autoloads = 0usize;
+        loop {
+            match func.bind(cx).as_cons_pair() {
+                Ok((sym::AUTOLOAD, _)) => {
+                    if autoloads == 64 {
+                        let data = Cons::new1(cx.add("Autoload chain exceeds 64 loads"), cx).into();
+                        return Err(EvalError::signal(sym::ERROR.into(), data, cx));
+                    }
+                    autoloads += 1;
+                    crate::eval::autoload_do_load(func.cast(), None, None, self.env, cx)
+                        .map_err(|e| add_trace(e, "autoload", &[]))?;
+                    let Some(loaded) = sym.bind(cx).follow_indirect(cx) else {
+                        return Err(EvalError::signal(
+                            sym::VOID_FUNCTION.into(),
+                            Cons::new1(sym.bind(cx), cx).into(),
+                            cx,
+                        ));
+                    };
+                    if Object::from(func.bind(cx)).ptr_eq(Object::from(loaded)) {
+                        let message = cx.add(format!(
+                            "Autoload did not define function {}",
+                            sym.bind(cx).name()
+                        ));
+                        return Err(EvalError::signal(
+                            sym::ERROR.into(),
+                            Cons::new1(message, cx).into(),
+                            cx,
+                        ));
+                    }
+                    func.set(loaded);
+                    continue;
                 }
-                root!(mcro, mcro.tag(), cx);
-                let name = sym.bind(cx).name().to_owned();
-                let value = mcro.call(&mut frame, Some(&name), cx)?;
-                drop(frame);
-                root!(value, cx);
-                return self.eval_form(value, cx);
+                Ok((sym::MACRO, mcro)) => {
+                    let iter = args.bind(cx).into_list()?;
+                    let mut frame = CallFrame::new(self.env);
+                    for arg in iter {
+                        frame.push_arg(arg?);
+                    }
+                    root!(mcro, mcro.tag(), cx);
+                    let name = sym.bind(cx).name().to_owned();
+                    let value = mcro.call(&mut frame, Some(&name), cx)?;
+                    drop(frame);
+                    root!(value, cx);
+                    return self.eval_form(value, cx);
+                }
+                _ => break,
             }
-            _ => {}
         }
 
         // Native functions validate arity (and proper argument-list shape)
@@ -1917,5 +1944,130 @@ mod test {
         check_interpreter("(catch 1 (catch 2 (throw 1 3)))", 3, cx);
         check_error("(throw 1 2)", cx);
         check_error("(catch 2 (throw 3 4))", cx);
+    }
+}
+
+#[cfg(test)]
+mod autoload_definition_guard_tests {
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture {
+        directory: PathBuf,
+        function: String,
+        effect: String,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            for _ in 0..32 {
+                let id = NEXT.fetch_add(1, Ordering::Relaxed);
+                let name = format!("rune-autoload-guard-{}-{id}", std::process::id());
+                let directory = std::env::temp_dir().join(&name);
+                match std::fs::create_dir(&directory) {
+                    Ok(()) => {
+                        return Self {
+                            directory,
+                            function: name.clone(),
+                            effect: format!("{name}-effect"),
+                        };
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("Cannot create autoload fixture: {error}"),
+                }
+            }
+            panic!("Cannot allocate unique autoload fixture");
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Ok(map) = crate::core::env::INTERNED_SYMBOLS.lock()
+                && let Some(symbol) = map.get(&self.function)
+            {
+                symbol.unbind_func();
+            }
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+    fn quoted_path(path: &std::path::Path) -> String {
+        let mut encoded = String::from("\"");
+        for ch in path.to_str().unwrap().chars() {
+            match ch {
+                '\\' => encoded.push_str(r"\\"),
+                '"' => encoded.push_str(r#"\""#),
+                '\n' => encoded.push_str(r"\n"),
+                '\r' => encoded.push_str(r"\r"),
+                '\t' => encoded.push_str(r"\t"),
+                c if c.is_control() => encoded.push_str(&format!("\\u{:04x}", c as u32)),
+                c => encoded.push(c),
+            }
+        }
+        encoded.push('"');
+        encoded
+    }
+    fn compare(case: &str, expected: &str) {
+        let fixture = Fixture::new();
+        let function = &fixture.function;
+        let effect = &fixture.effect;
+        let main = fixture.directory.join("main.el");
+        let secondary = fixture.directory.join("secondary.el");
+        let quoted_main = quoted_path(&main);
+        let quoted_secondary = quoted_path(&secondary);
+        let real = format!("(setq {effect} 2) (fset '{function} (function (lambda (x) (+ x 1))))");
+        let source = match case {
+            "empty" => format!("(setq {effect} 1)"),
+            "unbind" => format!("(setq {effect} 1) (fmakunbound '{function})"),
+            "chain" => {
+                std::fs::write(&secondary, &real).unwrap();
+                format!(
+                    "(setq {effect} 1) (fset '{function} '(autoload {quoted_secondary} \"second doc\" nil nil))"
+                )
+            }
+            "real" => real,
+            "macro" => format!(
+                "(setq {effect} 4) (fset '{function} (cons 'macro (function (lambda (form) (list 'quote form)))))"
+            ),
+            "signal" => format!("(setq {effect} 3) (signal 'rune-autoload-source-error nil)"),
+            _ => unreachable!(),
+        };
+        std::fs::write(&main, source).unwrap();
+        let kind = if case == "macro" { "'macro" } else { "nil" };
+        let form = format!(
+            r#"(let ((seen nil)) (setq {effect} nil) (fmakunbound '{function}) (autoload '{function} {quoted_main} "documented" nil {kind}) (unwind-protect (list (condition-case e ({function} (setq seen 7)) (t (car e))) seen {effect}) (fmakunbound '{function})))"#
+        );
+        crate::library::elprop::start_emacs().unwrap();
+        let reference = crate::library::elprop::eval(&form).unwrap();
+        assert_eq!(reference, expected, "GNU reference case {case}");
+        super::assert_lisp(&form, &reference);
+    }
+    #[test]
+    fn endlessly_rewritten_autoload_stub_has_explicit_load_budget() {
+        let fixture = Fixture::new();
+        let function = &fixture.function;
+        let effect = &fixture.effect;
+        let main = fixture.directory.join("loop.el");
+        let path = quoted_path(&main);
+        std::fs::write(&main,format!("(setq {effect} (+ {effect} 1)) (fset '{function} '(autoload {path} \"rewritten\" nil nil))")).unwrap();
+        let form = format!(
+            r#"(let ((seen nil)) (setq {effect} 0) (fmakunbound '{function}) (autoload '{function} {path} "doc") (unwind-protect (list (condition-case e ({function} (setq seen t)) (error (car e))) seen {effect}) (fmakunbound '{function})))"#
+        );
+        // Profile resource policy, not a claim that GNU has this 64-load limit.
+        super::assert_lisp(&form, "(error nil 64)");
+    }
+    #[test]
+    fn missing_or_unbound_autoload_definition_does_not_evaluate_arguments() {
+        compare("empty", "(error nil 1)");
+        compare("unbind", "(void-function nil 1)");
+    }
+    #[test]
+    fn changed_autoload_stub_and_real_function_dispatch_match_gnu() {
+        compare("chain", "(8 7 2)");
+        compare("real", "(8 7 2)");
+    }
+    #[test]
+    fn autoloaded_macro_and_source_signal_preserve_dispatch_and_effects() {
+        compare("macro", "((setq seen 7) nil 4)");
+        compare("signal", "(rune-autoload-source-error nil 3)");
     }
 }
