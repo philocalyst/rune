@@ -10,10 +10,6 @@ fn make_char_table<'ob>(
     cx: &crate::core::gc::Context,
 ) -> Result<CharTableInner<'ob>> {
     // Extra-slot subtypes require representation not yet implemented here.
-    anyhow::ensure!(
-        purpose == crate::core::env::sym::NIL || purpose == crate::core::env::sym::SYNTAX_TABLE,
-        "unsupported char-table subtype"
-    );
     let extra = crate::data::get(purpose, crate::core::env::sym::CHAR_TABLE_EXTRA_SLOTS, env, cx);
     anyhow::ensure!(matches!(extra.untag(), crate::core::object::ObjectType::NIL | crate::core::object::ObjectType::Int(0)),
         "char-table extra slots are unsupported");
@@ -121,4 +117,21 @@ fn char_table_subtype(table: &CharTable) -> Object<'_> {
 #[defun]
 fn char_table_parent(table: &CharTable) -> Option<&CharTable> {
     table.parent()
+}
+
+#[cfg(test)]
+mod purpose_tests {
+    #[test]
+    fn generic_zero_extra_purposes_preserve_metadata_and_values_like_gnu() {
+        for source in [
+            "(let ((table (make-char-table 'regexp-opt-charset))) (list (char-table-subtype table) (aref table 97)))",
+            "(let* ((purpose (make-symbol \"rune-generic-table\")) (table (make-char-table purpose 'initial))) (garbage-collect) (list (eq purpose (char-table-subtype table)) (aref table 65)))",
+            "(let* ((purpose (make-symbol \"rune-zero-table\"))) (put purpose 'char-table-extra-slots 0) (let ((table (make-char-table purpose 7))) (list (eq purpose (char-table-subtype table)) (aref table 66))))",
+            "(let ((table (make-char-table 'regexp-opt-charset)) out) (aset table 65 t) (aset table 66 t) (map-char-table #'(lambda (key value) (setq out (cons (list (if (consp key) (cons (car key) (cdr key)) key) value) out))) table) out)",
+        ] {crate::assert_elprop!("{}",source);}
+    }
+    #[test]
+    fn unsupported_extra_slots_do_not_silently_drop_metadata() {
+        crate::interpreter::assert_lisp("(let ((purpose (make-symbol \"rune-extra-table\"))) (put purpose 'char-table-extra-slots 1) (condition-case nil (make-char-table purpose) (error t)))","t");
+    }
 }
