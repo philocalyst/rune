@@ -13,6 +13,16 @@ use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Read-only native witness of owner lifetime. Contains no Lisp pointers and
+/// grants no authority to access a heap; domain authentication is still required.
+#[derive(Clone, Debug)]
+pub(crate) struct OwnerLiveness(std::sync::Arc<AtomicBool>);
+impl OwnerLiveness {
+    pub(crate) fn is_live(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// A global store of all gc roots. This struct should be passed to the [Context]
 /// when it is created.
 #[derive(Default, Debug)]
@@ -130,6 +140,7 @@ pub(crate) struct Context<'rt> {
     root_set: &'rt RootSet,
     next_limit: usize,
     domain_id: u64,
+    owner_liveness: OwnerLiveness,
     buffer_properties: RefCell<Vec<WeakBufferPropertyRoot>>,
     // One owner-local Session for all Envs and native hosts in this Context.
     editor_gateway: OnceCell<crate::editor_document::RuntimeEditorGateway>,
@@ -139,6 +150,7 @@ pub(crate) struct Context<'rt> {
 
 impl Drop for Context<'_> {
     fn drop(&mut self) {
+        self.owner_liveness.0.store(false, Ordering::Release);
         self.frame_registry.get_mut().shutdown();
         self.process_registry.get_mut().shutdown();
         // Global buffer handles outlive the local heap: retire their Lisp
@@ -301,11 +313,17 @@ impl<'ob, 'rt> Context<'rt> {
             root_set: roots,
             next_limit: Self::MIN_GC_BYTES,
             domain_id,
+            owner_liveness: OwnerLiveness(std::sync::Arc::new(AtomicBool::new(true))),
             buffer_properties: RefCell::new(Vec::new()),
             editor_gateway: OnceCell::new(),
             process_registry: RefCell::new(ProcessRegistry::default()),
             frame_registry: RefCell::new(FrameRegistry::default()),
         }
+    }
+
+    /// Native observation only, not a root, heap borrow or access credential.
+    pub(crate) fn owner_liveness(&self) -> OwnerLiveness {
+        self.owner_liveness.clone()
     }
 
     /// The initializer stores no Context reference and never invokes Lisp.
@@ -622,5 +640,38 @@ mod shared_editor_gateway_tests {
         let roots = RootSet::default();
         let cx = Context::new(&roots);
         assert!(gateway.scratch(&cx).is_err());
+    }
+}
+
+#[cfg(test)]
+mod owner_liveness_tests {
+    use super::*;
+    #[test]
+    fn witness_is_native_send_sync_and_dies_before_new_owner() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<OwnerLiveness>();
+        let old = {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            let witness = cx.owner_liveness();
+            assert!(witness.is_live());
+            assert!(std::thread::scope(|scope| scope.spawn(|| witness.is_live()).join().unwrap()));
+            witness
+        };
+        assert!(!old.is_live());
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        assert!(cx.owner_liveness().is_live());
+        assert!(!old.is_live());
+    }
+    #[test]
+    fn retained_gateway_does_not_keep_owner_witness_alive() {
+        let (gateway, witness) = {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            (cx.editor_gateway().unwrap(), cx.owner_liveness())
+        };
+        assert!(!witness.is_live());
+        drop(gateway);
     }
 }
