@@ -233,7 +233,7 @@ mod test {
     use super::*;
 
     fn check_arg_spec(spec: i64) {
-        assert_eq!(spec, FnArgs::from_arg_spec(spec).unwrap().into_arg_spec().try_into().unwrap());
+        assert_eq!(spec, i64::try_from(FnArgs::from_arg_spec(spec).unwrap().into_arg_spec()).unwrap());
     }
 
     #[test]

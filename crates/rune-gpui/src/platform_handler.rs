@@ -71,7 +71,10 @@ impl FrameView {
         let mut state =
             PlatformInputState::new(platform, rune_display::FixedMetrics(font.metrics()))?;
         let prepared = state.sync().ok_or(PlatformError::Unavailable)?;
-        if state.selected_range().is_none() || prepared.generation < frame.generation {
+        // Startup evaluation may have invalidated writable context after the
+        // first frame woke the UI. Retain the valid matching frame and register
+        // a disabled handler until a new context arrives, rather than panic.
+        if prepared.generation < frame.generation {
             return Err(PlatformError::Unavailable);
         }
         let frame = prepared;
@@ -201,6 +204,12 @@ pub(crate) fn keydown(
         }
         ImeKey::Cancel => {
             ime.state.borrow_mut().cancel_preedit();
+            // Removing the floating preedit changes native candidate/caret
+            // geometry even when no owner edit or new frame follows.
+            window.invalidate_character_coordinates();
+            // Candidate invalidation only queues an on-next-frame callback.
+            // Redraw locally even when the owner is busy or disconnected.
+            window.refresh();
             FrameInput::submit(
                 input,
                 rune_display::InputEvent::Key {

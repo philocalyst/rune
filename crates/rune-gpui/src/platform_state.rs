@@ -675,4 +675,21 @@ mod tests {
         ui.sync();
         assert_eq!(worker.bridge().snapshot().unwrap().buffers[0].document.to_text(), "a🙂b");
     }
+    #[test]
+    fn construction_during_startup_tombstone_keeps_frame_disabled_then_recovers() {
+        let (state, publisher) = fixture();
+        let saved = state.bundle.as_ref().unwrap().clone();
+        publisher.invalidate().unwrap();
+        let mut startup =
+            PlatformInputState::new(state.reader.clone(), FixedMetrics::default()).unwrap();
+        assert!(startup.sync().is_some());
+        assert!(startup.selected_range().is_none());
+        assert!(startup.commit(Some(0..0), "stale").is_err());
+        assert!(startup.marked_range().is_none());
+        publisher
+            .publish(saved.frame.clone(), (**saved.input.as_ref().unwrap()).clone())
+            .unwrap();
+        assert!(startup.sync().is_some());
+        assert!(startup.selected_range().is_some());
+    }
 }

@@ -7,6 +7,7 @@ edition = { workspace = true }
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
+exclude = ["crates/rune-gpui"]
 members = [
   "crates/rune-tree",
   "crates/rune-text",
@@ -42,6 +43,9 @@ rune-macros = { version = "0.1.0", path = "crates/rune-macros" }
 interval-tree ={ version = "0.1.0", path = "crates/interval-tree" }
 
 [dependencies]
+gpui = { version = "=0.2.2", optional = true }
+rune-gpui = { path = "crates/rune-gpui", features = ["editor"], optional = true }
+rune-display = { path = "crates/rune-display", optional = true }
 rune-editor = { path = "crates/rune-editor", features = ["display"] }
 rune-text = { path = "crates/rune-text" }
 anyhow = { workspace = true }
@@ -61,7 +65,9 @@ text-buffer = { workspace = true }
 rune-macros = { workspace = true }
 rune-core = { workspace = true }
 bumpalo = { version = "3.15.3", features = ["collections"] }
-libc = "0.2.153"
+# xattr 0.2 (via official GPUI tar client) needs the Linux ENOATTR alias.
+# 0.2.182 satisfies rustix 1.1.6 while retaining that compatibility alias.
+libc = "=0.2.182"
 base64 = "0.22.1"
 num-bigint = "0.4.6"
 num-traits = "0.2.19"
@@ -85,6 +91,7 @@ opt-level = 3
 debug = true
 
 [features]
+native = ["dep:gpui", "dep:rune-gpui", "dep:rune-display"]
 default = []
 debug_bytecode = []
 

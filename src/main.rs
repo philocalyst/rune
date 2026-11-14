@@ -31,6 +31,8 @@ mod keymap;
 mod library;
 mod lisp;
 mod lread;
+#[cfg(feature = "native")]
+mod native;
 mod print;
 mod reader;
 mod search;
@@ -63,14 +65,44 @@ struct Args {
     dump: bool,
     #[arg(long, value_name = "FILE")]
     load_dump: Option<String>,
+    /// Launch the opt-in native editor with a minimal, unbootstrapped runtime.
+    #[arg(long, conflicts_with_all = ["load", "repl", "eval_stdin", "dump", "load_dump"])]
+    native: bool,
+    /// Evaluate startup source on the native owner, in input order.
+    #[arg(long, requires = "native", value_name = "SOURCE")]
+    native_eval: Vec<String>,
 }
 
 fn main() -> Result<(), ()> {
     let args = Args::parse();
+    if args.native {
+        if args.repl
+            || args.eval_stdin
+            || args.dump
+            || args.load_dump.is_some()
+            || !args.load.is_empty()
+        {
+            eprintln!(
+                "--native cannot be combined with --repl, --eval-stdin, --dump, --load-dump or --load"
+            );
+            return Err(());
+        }
+        #[cfg(feature = "native")]
+        return native::run(args.native_eval);
+        #[cfg(not(feature = "native"))]
+        {
+            eprintln!("--native requires building with --features native");
+            return Err(());
+        }
+    }
 
     let roots = &RootSet::default();
     let cx = &mut Context::new(roots);
-    root!(env, init(Env::new(cx).map_err(|error| eprintln!("Cannot initialize editor: {error}"))?), cx);
+    root!(
+        env,
+        init(Env::new(cx).map_err(|error| eprintln!("Cannot initialize editor: {error}"))?),
+        cx
+    );
 
     sym::init_symbols();
     crate::core::env::init_variables(cx, env);
@@ -388,5 +420,35 @@ mod command_line_load_tests {
         let library = format!("missing-library-{}", std::process::id());
         assert_eq!(command_line_load_name(&library).unwrap(), library);
         assert_eq!(command_line_load_name(&relative).unwrap(), relative);
+    }
+}
+
+#[cfg(test)]
+mod native_cli_args_tests {
+    use super::*;
+    #[test]
+    fn native_eval_requires_native_and_rejects_other_runtime_modes() {
+        assert!(Args::try_parse_from(["rune", "--native-eval", "(insert \"x\")"]).is_err());
+        for arguments in [
+            vec!["rune", "--native", "--repl"],
+            vec!["rune", "--native", "--eval-stdin"],
+            vec!["rune", "--native", "--dump"],
+            vec!["rune", "--native", "--load", "file.el"],
+            vec!["rune", "--native", "--load-dump", "file.pdmp"],
+        ] {
+            assert!(Args::try_parse_from(arguments).is_err());
+        }
+        let args = Args::try_parse_from([
+            "rune",
+            "--native",
+            "--native-eval",
+            "(setq x 1)",
+            "--native-eval",
+            "(insert \"λ\")",
+        ])
+        .unwrap();
+        assert!(args.native);
+        assert_eq!(args.native_eval, ["(setq x 1)", "(insert \"λ\")"]);
+        assert!(Args::try_parse_from(["rune", "--eval-stdin"]).unwrap().eval_stdin);
     }
 }

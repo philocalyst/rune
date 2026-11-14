@@ -1,0 +1,269 @@
+//! Opt-in shared-owner native editor. Window behavior remains unverified.
+use crate::editor_document::{LispRuntimeHost, with_lisp_runtime_owner};
+use gpui::{App, Application, WindowOptions, prelude::*, px, size};
+use rune_display::{FixedMetrics, Rect, host_updates};
+use rune_gpui::{
+    FrameView, NativeFont,
+    editor_bridge::EditorBridge,
+    editor_transport::{OwnerEvent, pending_editor_transport},
+    platform_context::platform_frames,
+};
+use std::{
+    rc::Rc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
+    if sources.len() > 64 || sources.iter().any(|s| s.len() > 65_536) {
+        eprintln!("native startup permits at most 64 sources of at most 65536 bytes each");
+        return Err(());
+    }
+    let failed = Arc::new(AtomicBool::new(false));
+    let startup_failed = failed.clone();
+    Application::new().run(move |cx: &mut App| {
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        let bounds = Rect { x: 0., y: 0., width: 900., height: 620. };
+        let font = match NativeFont::measure(gpui::font("monospace"), 17., 3., cx) {
+            Ok(font) => font,
+            Err(error) => {
+                eprintln!("native font calibration failed: {error}");
+                startup_failed.store(true, Ordering::Relaxed);
+                cx.quit();
+                return;
+            }
+        };
+        let metrics = FixedMetrics(font.metrics());
+        let quit = Arc::new(AtomicBool::new(false));
+        let (publisher, mut updates) = host_updates();
+        let (platform_publisher, platform_reader) = platform_frames();
+        let (sender, replies, owner) = pending_editor_transport(128, publisher.clone());
+        for (index, source) in sources.into_iter().enumerate() {
+            if let Err(error) =
+                sender.try_send(OwnerEvent::Evaluate { request_id: index as u64, source })
+            {
+                eprintln!("native startup evaluation admission failed: {error:?}");
+                startup_failed.store(true, Ordering::Relaxed);
+                cx.quit();
+                return;
+            }
+        }
+        let failure = Arc::new(Mutex::new(None::<(String, Vec<OwnerEvent>)>));
+        let report = failure.clone();
+        std::thread::spawn(move || {
+            // Context, one rooted Env, and the shared editor authority are created
+            // only here; nothing live crosses into the UI executor.
+            let keepalive = publisher;
+            let mut unbound = Some(owner);
+            let result = (|| -> Result<(), (String, Vec<OwnerEvent>)> {
+                with_lisp_runtime_owner(80, 24, |host| {
+                    let bridge = EditorBridge::new(host, metrics, bounds)
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    let owner = unbound.take().expect("owner binds once");
+                    let worker = match owner.bind_ime_initialized(bridge, platform_publisher) {
+                        Ok(worker) => worker,
+                        Err(error) => {
+                            *report.lock().expect("startup failure slot") =
+                                Some((format!("{:?}", error.error), error.undelivered));
+                            return Err(anyhow::anyhow!("native IME initialization failed"));
+                        }
+                    };
+                    worker
+                        .with_evaluator(evaluate_source)
+                        .run_with_outcome(|step| {
+                            if let Some(evaluation) = step.evaluation {
+                                if let Err(error) = evaluation.outcome {
+                                    eprintln!(
+                                        "native evaluation {}: {error}",
+                                        evaluation.request_id
+                                    );
+                                }
+                            }
+                            if let Err(error) = step.edit {
+                                eprintln!("native owner input: {error:?}");
+                            }
+                            if let Some(error) = step.render_error {
+                                eprintln!("native publication after input: {error:?}");
+                            }
+                        })
+                        .map_err(|error| {
+                            *report.lock().expect("startup failure slot") =
+                                Some((format!("{:?}", error.error), error.undelivered));
+                            anyhow::anyhow!("native owner stopped")
+                        })
+                })
+                .map_err(|error| (error.to_string(), vec![]))
+            })();
+            if let Err((error, mut rejected)) = result {
+                if let Some(owner) = unbound.take() {
+                    rejected.extend(owner.reject_unbound());
+                }
+                // Store failure before final publisher drop wakes the UI. No
+                // polling, blocking UI receive, or infinite first-frame await.
+                let mut slot = report.lock().expect("startup failure slot");
+                if let Some((_, events)) = slot.as_mut() {
+                    events.extend(rejected);
+                } else {
+                    *slot = Some((error, rejected));
+                }
+            }
+            drop(keepalive);
+        });
+        cx.spawn(async move |cx| {
+            let frame = loop {
+                match updates.next().await {
+                    Some(update) => {
+                        if let Some(frame) = update.frame {
+                            break frame;
+                        }
+                    }
+                    None => {
+                        let error = failure.lock().expect("startup failure slot").take();
+                        eprintln!("native editor startup failed: {error:?}");
+                        startup_failed.store(true, Ordering::Relaxed);
+                        let _ = cx.update(|cx| cx.quit());
+                        return;
+                    }
+                }
+            };
+            let _ = cx.update(move |cx| {
+                let opened = cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::centered(
+                            None,
+                            size(px(bounds.width), px(bounds.height)),
+                            cx,
+                        ))),
+                        ..Default::default()
+                    },
+                    move |window, cx| {
+                        let view = cx.new(|cx| {
+                            FrameView::watch_updates(updates, cx).detach();
+                            FrameView::new_ime(
+                                frame,
+                                font,
+                                sender,
+                                replies,
+                                platform_reader,
+                                quit,
+                                Rc::new(|e| eprintln!("editor input requires recovery: {e:?}")),
+                                Rc::new(|_| {}),
+                                Rc::new(|error| {
+                                    eprintln!("IME input requires resolution: {error:?}")
+                                }),
+                                window,
+                                cx,
+                            )
+                            .expect("prepared IME context")
+                        });
+                        window.focus(&view.read(cx).focus_handle());
+                        view
+                    },
+                );
+                if let Err(error) = opened {
+                    eprintln!("native editor window creation failed: {error:?}");
+                    startup_failed.store(true, Ordering::Relaxed);
+                    cx.quit();
+                    return;
+                }
+                cx.activate(true);
+            });
+        })
+        .detach();
+    });
+    if failed.load(Ordering::Relaxed) { Err(()) } else { Ok(()) }
+}
+fn evaluate_source(host: &mut LispRuntimeHost<'_, '_, '_>, source: &str) -> Result<(), String> {
+    host.evaluate_source(source)
+}
+#[cfg(test)]
+mod joined_owner_tests {
+    use super::*;
+    use rune_editor::Document;
+
+    #[test]
+    fn actual_persistent_lisp_host_runs_fifo_with_partial_error_and_native_undo() {
+        with_lisp_runtime_owner(80, 24, |host| {
+            let (publisher, updates) = host_updates();
+            let (sender, _replies, pending) = pending_editor_transport(8, publisher);
+            let bridge = EditorBridge::new(
+                host,
+                FixedMetrics::default(),
+                Rect { x: 0., y: 0., width: 640., height: 480. },
+            )
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let mut worker = pending
+                .bind_initialized(bridge)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?
+                .with_evaluator(evaluate_source);
+            sender
+                .try_send(OwnerEvent::Evaluate {
+                    request_id: 1,
+                    source: "(setq native-owner-value (list \"λ🙂\"))".into(),
+                })
+                .unwrap();
+            sender
+                .try_send(OwnerEvent::Evaluate {
+                    request_id: 2,
+                    source: "(insert (car native-owner-value))".into(),
+                })
+                .unwrap();
+            for expected in [1, 2] {
+                let step = worker.try_step().unwrap();
+                let evaluation = step.evaluation.unwrap();
+                assert_eq!(evaluation.request_id, expected);
+                assert!(evaluation.outcome.is_ok());
+                assert!(step.edit.is_ok());
+            }
+            let snapshot = worker.bridge().snapshot().unwrap();
+            let selected = snapshot
+                .views
+                .iter()
+                .find(|v| v.id == snapshot.selected_window)
+                .unwrap()
+                .view
+                .buffer;
+            assert_eq!(
+                snapshot.buffers.iter().find(|b| b.id == selected).unwrap().document.to_text(),
+                "λ🙂"
+            );
+            drop(snapshot);
+
+            // A signal can follow an applied edit. A later frame failure must
+            // neither roll that edit back nor replay the evaluation callback.
+            drop(updates);
+            sender
+                .try_send(OwnerEvent::Evaluate {
+                    request_id: 3,
+                    source: "(insert \"x\") (error \"signal after edit\")".into(),
+                })
+                .unwrap();
+            let step = worker.try_step().unwrap();
+            assert!(step.edit.unwrap());
+            assert!(step.evaluation.unwrap().outcome.is_err());
+            assert!(step.render_error.is_some());
+            assert!(worker.retry_frame().is_err());
+            let snapshot = worker.bridge().snapshot().unwrap();
+            assert_eq!(
+                snapshot.buffers.iter().find(|b| b.id == selected).unwrap().document.to_text(),
+                "λ🙂x"
+            );
+            drop(snapshot);
+            sender.try_send(OwnerEvent::Command(rune_editor::Command::Undo)).unwrap();
+            assert!(worker.try_step().unwrap().edit.unwrap());
+            let snapshot = worker.bridge().snapshot().unwrap();
+            assert_eq!(
+                snapshot.buffers.iter().find(|b| b.id == selected).unwrap().document.to_text(),
+                "λ🙂"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+}

@@ -200,7 +200,7 @@ impl LispHashTable {
         seen.insert(ptr);
 
         write!(f, "#s(hash-table (")?;
-        self.0.with(|x| {
+        self.0.with(|x| -> fmt::Result {
             for (i, (k, v)) in x.iter().enumerate() {
                 if i != 0 {
                     f.write_char(' ')?;
