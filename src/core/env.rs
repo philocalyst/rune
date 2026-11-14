@@ -198,6 +198,20 @@ impl<'a> RootedEnv<'a> {
         self.vars.insert(var, value);
     }
 
+    /// Save a dynamic-binding boundary for bytecode frames and handlers.
+    pub(crate) fn binding_depth(&self) -> usize {
+        self.binding_stack.len()
+    }
+
+    /// Restore a previously saved boundary without partially mutating on error.
+    pub(crate) fn unwind_bindings(&mut self, depth: usize, cx: &Context) -> Result<()> {
+        anyhow::ensure!(depth <= self.binding_depth(), "Invalid dynamic binding checkpoint");
+        while self.binding_depth() > depth {
+            self.unbind(1, cx);
+        }
+        Ok(())
+    }
+
     pub(crate) fn unbind(&mut self, count: u16, cx: &Context) {
         for _ in 0..count {
             match self.binding_stack.bind_mut(cx).pop() {

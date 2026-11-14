@@ -1,6 +1,6 @@
 use num_enum::TryFromPrimitive;
 
-#[derive(Copy, Clone, Debug, TryFromPrimitive)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, TryFromPrimitive)]
 #[repr(u8)]
 pub(crate) enum OpCode {
     StackRef0 = 0,

@@ -2,6 +2,7 @@ use crate::core::{
     gc::{Context, IntoRoot, Rt, Rto, Slot},
     object::{ByteFn, NIL, Object, WithLifetime},
 };
+use anyhow::{Result, ensure};
 use rune_macros::Trace;
 use std::ops::{Deref, DerefMut, Index, IndexMut, RangeBounds, RangeTo};
 
@@ -130,24 +131,45 @@ impl<'a> Index<RangeTo<usize>> for RootedLispStack<'a> {
 }
 
 impl<'a> RootedLispStack<'a> {
+    /// Enter bytecode with argument-only operands. Validate and reserve every
+    /// fallible storage change before consuming the target or publishing a frame.
     pub(crate) fn push_bytecode_frame(
         &mut self,
         start: usize,
         depth: usize,
         func: &ByteFn,
         pc: usize,
-    ) {
-        assert!(start <= self.len());
-        assert!(self.current.start <= start);
+        cx: &Context,
+    ) -> Result<()> {
+        ensure!(
+            self.current.start <= start && start < self.len(),
+            "Invalid bytecode frame boundary"
+        );
+        let end = start
+            .checked_add(depth)
+            .ok_or_else(|| anyhow::anyhow!("Bytecode stack depth overflow"))?;
+        self.reserve_to(end, cx)?;
+        self.frames
+            .bind_mut(cx)
+            .try_reserve(1)
+            .map_err(|error| anyhow::anyhow!("Cannot reserve bytecode frame: {error}"))?;
+        // start identifies the function immediately below its arguments. Vec
+        // removal preserves their order and leaves the caller prefix untouched.
+        self.vec.bind_mut(cx).remove(start);
         self.frames.push(FrameStore::new_bytecode(self.current, func, pc));
-        let end = start + depth;
-        // allocate space so that we don't have to reallocate later. This will
-        // also let us do unchecked pushes later.
-        if end > self.vec.capacity() {
-            assert!(end - self.vec.len() < 100); // make sure this doesn't blow up
-            self.vec.reserve(end - self.vec.len());
-        }
         self.current = Frame { start, end, ..Frame::default() };
+        Ok(())
+    }
+
+    fn reserve_to(&mut self, end: usize, cx: &Context) -> Result<()> {
+        if end > self.vec.capacity() {
+            let additional = end - self.len();
+            self.vec
+                .bind_mut(cx)
+                .try_reserve(additional)
+                .map_err(|error| anyhow::anyhow!("Cannot reserve bytecode stack: {error}"))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn push_frame(&mut self, arg_cnt: usize) {
@@ -205,14 +227,15 @@ impl<'a> RootedLispStack<'a> {
         self.len() < self.current.end
     }
 
-    pub(crate) fn set_depth(&mut self, depth: usize) {
-        let end = self.current.start + depth;
+    pub(crate) fn set_depth(&mut self, depth: usize, cx: &Context) -> Result<()> {
+        let end = self
+            .current
+            .start
+            .checked_add(depth)
+            .ok_or_else(|| anyhow::anyhow!("Bytecode stack depth overflow"))?;
+        self.reserve_to(end, cx)?;
         self.current.end = end;
-
-        if end > self.vec.capacity() {
-            assert!(end - self.vec.len() < 1000); // make sure this doesn't blow up if we have a bug
-            self.vec.reserve(end - self.vec.len());
-        }
+        Ok(())
     }
 
     pub(crate) fn set_arg_count(&mut self, arg_cnt: u16, rest: bool) {

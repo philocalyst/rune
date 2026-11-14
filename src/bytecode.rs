@@ -14,75 +14,8 @@ use rune_macros::{Trace, defun};
 
 mod opcode;
 
-/// An program counter. This is implemented as a bound checked range pointer.
-// TODO: If the GC moves the bytecode, this will be invalid. We need to fix this
-#[derive(Clone, Debug)]
-struct ProgramCounter {
-    /// Valid range for this instruction pointer.
-    range: std::ops::Range<*const u8>,
-    /// Points to the next instruction.
-    pc: *const u8,
-}
-
-impl ProgramCounter {
-    fn new(vec: &[u8]) -> Self {
-        ProgramCounter { range: vec.as_ptr_range(), pc: vec.as_ptr() }
-    }
-
-    fn with_offset(vec: &[u8], offset: usize) -> Self {
-        ProgramCounter { range: vec.as_ptr_range(), pc: vec.as_ptr().map_addr(|a| a + offset) }
-    }
-
-    fn as_offset(&self) -> usize {
-        self.pc.addr() - self.range.start.addr()
-    }
-
-    fn ensure_remaining(&self, bytes: usize) -> Result<()> {
-        let start = self.range.start.addr();
-        let end = self.range.end.addr();
-        let position = self.pc.addr();
-        ensure!(
-            position >= start && position <= end && bytes <= end.saturating_sub(position),
-            "Truncated bytecode instruction"
-        );
-        Ok(())
-    }
-
-    fn goto(&mut self, offset: usize) -> Result<()> {
-        let len = self.range.end.addr() - self.range.start.addr();
-        ensure!(offset < len, "Bytecode jump target {offset} is out of range");
-        // Validate before pointer arithmetic: even creating an out-of-allocation
-        // pointer with add() would violate its safety precondition.
-        self.pc = unsafe { self.range.start.add(offset) };
-        Ok(())
-    }
-
-    /// Take the next byte in the stream, validating before dereferencing.
-    fn next(&mut self) -> Result<u8> {
-        self.ensure_remaining(1)?;
-        let value = unsafe { *self.pc };
-        self.pc = unsafe { self.pc.add(1) };
-        Ok(value)
-    }
-
-    fn arg1(&mut self) -> Result<u16> {
-        let value = self.next()?;
-        if cfg!(feature = "debug_bytecode") && crate::debug::debug_enabled() {
-            println!("  arg: {value}");
-        }
-        Ok(value.into())
-    }
-
-    fn arg2(&mut self) -> Result<u16> {
-        self.ensure_remaining(2)?;
-        let value = unsafe { u16::from_le(self.pc.cast::<u16>().read_unaligned()) };
-        self.pc = unsafe { self.pc.add(2) };
-        if cfg!(feature = "debug_bytecode") && crate::debug::debug_enabled() {
-            println!("  arg: {value}");
-        }
-        Ok(value)
-    }
-}
+mod decoder;
+use decoder::{ProgramCache, ProgramCounter};
 
 #[derive(Debug, Trace)]
 /// A handler for a condition-case. These are stored in a vector in the VM and
@@ -94,6 +27,10 @@ struct Handler<'ob> {
     stack_size: usize,
     #[no_trace]
     stack_frame: usize,
+    #[no_trace]
+    binding_depth: usize,
+    #[no_trace]
+    binding_frames: usize,
     condition: Slot<Object<'ob>>,
 }
 
@@ -118,6 +55,10 @@ struct VM<'brw, 'env, 'rt> {
     #[no_trace]
     /// Current program counter
     pc: ProgramCounter,
+    #[no_trace]
+    programs: ProgramCache,
+    #[no_trace]
+    binding_frames: Vec<usize>,
     /// The current function being executed. Saved to ensure it is preserved by
     /// the garbage collector.
     func: Slot<&'rt ByteFn>,
@@ -171,6 +112,31 @@ impl<'ob> RootedVM<'_, '_, '_> {
         Ok(())
     }
 
+    fn check_instruction_stack(&self, instruction: decoder::Instruction) -> Result<()> {
+        if let Some(effect) = instruction.stack_effect() {
+            self.require_stack(effect.inputs)?;
+            // GNU instructions grow by at most one operand value. Indexed
+            // stack references count retained operands in their effect.
+            if effect.outputs > effect.inputs {
+                ensure!(self.env.stack.can_push(), "Bytecode stack depth exceeded");
+            }
+        }
+        Ok(())
+    }
+
+    fn concatenate(&mut self, count: usize, cx: &Context) -> Result<()> {
+        self.require_stack(count)?;
+        if count == 0 {
+            ensure!(self.env.stack.can_push(), "Bytecode stack depth exceeded");
+        }
+        let arguments = Rt::bind_slice(&self.env.stack[..count], cx);
+        let result = cx.add(crate::fns::concat(arguments)?);
+        let length = self.env.stack.len();
+        self.env.stack.truncate(length - count);
+        self.env.stack.push(result);
+        Ok(())
+    }
+
     fn varref(&mut self, idx: u16, cx: &'ob Context) -> Result<()> {
         let symbol: Symbol = self.get_const(idx as usize, cx)?.try_into()?;
         let Some(var) = self.env.vars.get(symbol) else { bail!("Void Variable: {symbol}") };
@@ -197,8 +163,14 @@ impl<'ob> RootedVM<'_, '_, '_> {
         Ok(())
     }
 
-    fn unbind(&mut self, idx: u16, cx: &'ob Context) {
-        self.env.unbind(idx, cx);
+    fn unbind(&mut self, idx: u16, cx: &'ob Context) -> Result<()> {
+        let floor = *self.binding_frames.last().expect("VM has a binding frame");
+        let depth = self.env.binding_depth();
+        ensure!(
+            usize::from(idx) <= depth.saturating_sub(floor),
+            "Bytecode binding stack underflow"
+        );
+        self.env.unwind_bindings(depth - usize::from(idx), cx)
     }
 
     fn get_const(&self, i: usize, cx: &'ob Context) -> Result<Object<'ob>> {
@@ -210,21 +182,24 @@ impl<'ob> RootedVM<'_, '_, '_> {
             .ok_or_else(|| anyhow::anyhow!("Invalid bytecode constant index: {i}"))
     }
 
-    fn set_current_frame(&mut self, f: &ByteFn, offset: usize) {
+    fn set_current_frame(&mut self, f: &ByteFn, offset: usize) -> Result<()> {
+        let cursor = self.programs.cursor(f.codes(), offset)?;
         self.func.set(f);
-        self.pc = ProgramCounter::with_offset(f.codes(), offset);
+        self.pc = cursor;
+        Ok(())
     }
 
-    fn unwind(&mut self, idx: usize, cx: &'ob Context) {
+    fn unwind(&mut self, idx: usize, cx: &'ob Context) -> Result<()> {
         if idx == self.env.stack.current_frame() {
-            return;
+            return Ok(());
         }
-        assert!(idx < self.env.stack.current_frame());
+        ensure!(idx < self.env.stack.current_frame(), "Invalid bytecode unwind frame");
         if let Some((f, offset)) = self.env.stack.get_bytecode_frame(idx) {
-            self.set_current_frame(f.bind(cx), offset);
+            self.set_current_frame(f.bind(cx), offset)?;
             self.env.stack.unwind_frames(idx);
+            Ok(())
         } else {
-            unreachable!("Unwind frame not found")
+            bail!("Bytecode unwind frame not found")
         }
     }
 
@@ -243,8 +218,12 @@ impl<'ob> RootedVM<'_, '_, '_> {
         name: &str,
         cx: &'ob Context,
     ) -> Result<()> {
-        let arg_cnt = arg_cnt as u16;
+        let arg_cnt = u16::try_from(arg_cnt)
+            .map_err(|_| anyhow::anyhow!("Bytecode argument count exceeds supported range"))?;
         let fill_args = num_of_fill_args(func.args, arg_cnt, name, cx)?;
+        let parameter_slots =
+            usize::from(func.args.required + func.args.optional) + usize::from(func.args.rest);
+        ensure!(parameter_slots <= func.depth, "Bytecode stack depth exceeded by arguments");
         self.env.stack.fill_extra_args(fill_args);
         let total_args = arg_cnt + fill_args;
         let rest_size = total_args - (func.args.required + func.args.optional);
@@ -277,11 +256,23 @@ impl<'ob> RootedVM<'_, '_, '_> {
             let len = self.env.stack.len();
             let pc_offset = self.pc.as_offset();
             let prev_fn = self.func.bind(cx);
-            self.set_current_frame(next_fn, 0);
+            let cursor = self.programs.cursor(next_fn.codes(), 0).map_err(anyhow::Error::from)?;
+            self.binding_frames.try_reserve(1).map_err(|error| {
+                anyhow::anyhow!("Cannot reserve bytecode binding frame: {error}")
+            })?;
             let frame_start = len - (arg_cnt + 1);
-            self.env
-                .stack
-                .push_bytecode_frame(frame_start, next_fn.depth, prev_fn, pc_offset);
+            self.env.stack.push_bytecode_frame(
+                frame_start,
+                next_fn.depth,
+                prev_fn,
+                pc_offset,
+                cx,
+            )?;
+            // All checked frame reservations succeeded. Publishing the new
+            // code/root/checkpoint now cannot expose a half-entered callee.
+            self.func.set(next_fn);
+            self.pc = cursor;
+            self.binding_frames.push(self.env.binding_depth());
             self.prepare_lisp_args(next_fn, arg_cnt, &name, cx)?;
         } else {
             // Otherwise, call the function directly.
@@ -302,6 +293,13 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 Err(e) => e,
             };
 
+            // A throw is a nonlocal exit to an outer catch, not a condition.
+            // In particular an installed condition-case must never intercept
+            // it or consume the environment's exception payload.
+            if matches!(&err.error, ErrorType::Throw(_)) {
+                return Err(err);
+            }
+
             // we will fix this once we can handle different error types
             #[expect(clippy::never_loop)]
             while let Some(handler) = self.handlers.bind_mut(cx).pop() {
@@ -319,20 +317,31 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     x => bail_err!("Invalid condition handler: {x}"),
                 }
 
-                let error = if let EvalError { error: ErrorType::Signal(id), .. } = err {
-                    let Some((sym, data)) = self.env.get_exception(id) else {
-                        unreachable!("Exception not found")
-                    };
-                    Cons::new(sym, data, cx)
-                } else {
-                    // TODO: Need to remove the anyhow branch once
-                    // full errors are implemented
-                    Cons::new(sym::ERROR, format!("{err}"), cx)
+                let rendered = format!("{err}");
+                let error = match err.error {
+                    ErrorType::Signal(id) => {
+                        let Some((sym, data)) = self.env.get_exception(id) else {
+                            unreachable!("Exception not found")
+                        };
+                        Cons::new(sym, data, cx)
+                    }
+                    ErrorType::Err(error) => {
+                        // Preserve the condition symbol and data just as the
+                        // interpreter does. LispError owns its GC-safe payload;
+                        // bind also handles foreign or retired owner domains.
+                        match error.downcast::<LispError>() {
+                            Ok(error) => error.bind(cx),
+                            Err(_) => Cons::new(sym::ERROR, rendered, cx),
+                        }
+                    }
+                    ErrorType::Throw(_) => Cons::new(sym::ERROR, rendered, cx),
                 };
-                self.unwind(handler.stack_frame, cx);
+                self.env.unwind_bindings(handler.binding_depth, cx)?;
+                self.binding_frames.truncate(handler.binding_frames);
+                self.unwind(handler.stack_frame, cx)?;
                 self.env.stack.truncate(handler.stack_size);
                 self.env.stack.push(Object::from(error));
-                self.pc.goto(usize::from(handler.jump_code))?;
+                self.pc.goto(usize::from(handler.jump_code)).map_err(anyhow::Error::from)?;
                 continue 'main;
             }
             return Err(err);
@@ -345,10 +354,9 @@ impl<'ob> RootedVM<'_, '_, '_> {
         use crate::{alloc, arith, data, fns};
         use opcode::OpCode as op;
         loop {
-            let op = match self.pc.next()?.try_into() {
-                Ok(x) => x,
-                Err(e) => bail_err!("Invalid Bytecode: {e}"),
-            };
+            let instruction = self.pc.fetch().map_err(anyhow::Error::from)?;
+            let op = instruction.opcode;
+            self.check_instruction_stack(instruction)?;
 
             if Self::debug_enabled() {
                 println!("[");
@@ -356,7 +364,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     println!("    {idx}: {x},");
                 }
                 println!("]");
-                let byte_offset = self.pc.pc as i64 - self.pc.range.start as i64 - 1;
+                let byte_offset = instruction.offset;
                 println!("op :{byte_offset}: {op:?}");
             }
             match op {
@@ -367,19 +375,19 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::StackRef4 => self.stack_ref(4, cx)?,
                 op::StackRef5 => self.stack_ref(5, cx)?,
                 op::StackRefN => {
-                    let idx = self.pc.arg1()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.stack_ref(idx, cx)?;
                 }
                 op::StackRefN2 => {
-                    let idx = self.pc.arg2()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.stack_ref(idx, cx)?;
                 }
                 op::StackSetN => {
-                    let idx = self.pc.arg1()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.stack_set(idx)?;
                 }
                 op::StackSetN2 => {
-                    let idx = self.pc.arg2()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.stack_set(idx)?;
                 }
                 op::VarRef0 => self.varref(0, cx)?,
@@ -389,11 +397,11 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::VarRef4 => self.varref(4, cx)?,
                 op::VarRef5 => self.varref(5, cx)?,
                 op::VarRefN => {
-                    let idx = self.pc.arg1()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.varref(idx, cx)?;
                 }
                 op::VarRefN2 => {
-                    let idx = self.pc.arg2()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.varref(idx, cx)?;
                 }
                 op::VarSet0 => self.varset(0, cx)?,
@@ -403,11 +411,11 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::VarSet4 => self.varset(4, cx)?,
                 op::VarSet5 => self.varset(5, cx)?,
                 op::VarSetN => {
-                    let idx = self.pc.arg1()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.varset(idx.into(), cx)?;
                 }
                 op::VarSetN2 => {
-                    let idx = self.pc.arg2()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.varset(idx.into(), cx)?;
                 }
                 op::VarBind0 => self.varbind(0, cx)?,
@@ -417,11 +425,11 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::VarBind4 => self.varbind(4, cx)?,
                 op::VarBind5 => self.varbind(5, cx)?,
                 op::VarBindN => {
-                    let idx = self.pc.arg1()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.varbind(idx, cx)?;
                 }
                 op::VarBindN2 => {
-                    let idx = self.pc.arg2()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.varbind(idx, cx)?;
                 }
                 op::Call0 => self.call(0, cx)?,
@@ -431,32 +439,42 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Call4 => self.call(4, cx)?,
                 op::Call5 => self.call(5, cx)?,
                 op::CallN => {
-                    let idx = self.pc.arg1()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.call(idx, cx)?;
                 }
                 op::CallN2 => {
-                    let idx = self.pc.arg2()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     self.call(idx, cx)?;
                 }
-                op::Unbind0 => self.unbind(0, cx),
-                op::Unbind1 => self.unbind(1, cx),
-                op::Unbind2 => self.unbind(2, cx),
-                op::Unbind3 => self.unbind(3, cx),
-                op::Unbind4 => self.unbind(4, cx),
-                op::Unbind5 => self.unbind(5, cx),
+                op::Unbind0 => self.unbind(0, cx)?,
+                op::Unbind1 => self.unbind(1, cx)?,
+                op::Unbind2 => self.unbind(2, cx)?,
+                op::Unbind3 => self.unbind(3, cx)?,
+                op::Unbind4 => self.unbind(4, cx)?,
+                op::Unbind5 => self.unbind(5, cx)?,
                 op::UnbindN => {
-                    let idx = self.pc.arg1()?;
-                    self.unbind(idx, cx);
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
+                    self.unbind(idx, cx)?;
                 }
                 op::UnbindN2 => {
-                    let idx = self.pc.arg2()?;
-                    self.unbind(idx, cx);
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
+                    self.unbind(idx, cx)?;
                 }
                 op::PopHandler => {
+                    let frame = self.env.stack.current_frame();
+                    if !self
+                        .handlers
+                        .bind_mut(cx)
+                        .last()
+                        .is_some_and(|handler| handler.stack_frame == frame)
+                    {
+                        bail_err!("Bytecode handler stack underflow");
+                    }
                     self.handlers.pop();
                 }
                 op::PushCondtionCase => {
-                    let jump_code = self.pc.arg2()?;
+                    let jump_code = instruction.operand().map_err(anyhow::Error::from)?;
+                    self.pc.validate_target(usize::from(jump_code)).map_err(anyhow::Error::from)?;
                     // pop before getting stack size, after validating operands
                     self.require_stack(1)?;
                     let condition = self.env.stack.pop(cx);
@@ -464,6 +482,8 @@ impl<'ob> RootedVM<'_, '_, '_> {
                         jump_code,
                         stack_size: self.env.stack.len(),
                         stack_frame: self.env.stack.current_frame(),
+                        binding_depth: self.env.binding_depth(),
+                        binding_frames: self.binding_frames.len(),
                         condition: Slot::new(condition),
                     };
                     self.handlers.push(handler);
@@ -581,9 +601,9 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     self.env.stack.top().set(value);
                 }
                 op::Substring => return Err(self.unsupported_opcode(op, cx)),
-                op::Concat2 => return Err(self.unsupported_opcode(op, cx)),
-                op::Concat3 => return Err(self.unsupported_opcode(op, cx)),
-                op::Concat4 => return Err(self.unsupported_opcode(op, cx)),
+                op::Concat2 => self.concatenate(2, cx)?,
+                op::Concat3 => self.concatenate(3, cx)?,
+                op::Concat4 => self.concatenate(4, cx)?,
                 op::Sub1 => {
                     let top = self.env.stack.top();
                     top.set(cx.add(arith::sub_one(top.bind_as(cx)?)));
@@ -617,7 +637,13 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let top = self.env.stack.top();
                     top.set(arith::greater_than_or_eq(top.bind_as(cx)?, v1));
                 }
-                op::Diff => return Err(self.unsupported_opcode(op, cx)),
+                op::Diff => {
+                    let right = self.env.stack[0].bind_as(cx)?;
+                    let left = self.env.stack[1].bind_as(cx)?;
+                    let result = arith::sub(Some(left), &[right]);
+                    self.env.stack.pop(cx);
+                    self.env.stack.top().set(cx.add(result));
+                }
                 op::Negate => {
                     let top = self.env.stack.top();
                     top.set(cx.add(arith::sub(top.bind_as(cx)?, &[])));
@@ -675,52 +701,60 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Widen => return Err(self.unsupported_opcode(op, cx)),
                 op::EndOfLine => return Err(self.unsupported_opcode(op, cx)),
                 op::ConstantN2 => {
-                    let idx = self.pc.arg2()?;
+                    let idx = instruction.operand().map_err(anyhow::Error::from)?;
                     let cnst = self.get_const(idx.into(), cx)?;
                     self.env.stack.push(cnst);
                 }
                 op::Goto => {
-                    let offset = self.pc.arg2()?;
-                    self.pc.goto(usize::from(offset))?;
+                    let offset = instruction.operand().map_err(anyhow::Error::from)?;
+                    self.pc.goto(usize::from(offset)).map_err(anyhow::Error::from)?;
                 }
                 op::GotoIfNil => {
-                    let offset = self.pc.arg2()?;
+                    let offset = instruction.operand().map_err(anyhow::Error::from)?;
                     self.require_stack(1)?;
                     let cond = self.env.stack.pop(cx);
                     if cond.is_nil() {
-                        self.pc.goto(usize::from(offset))?;
+                        self.pc.goto(usize::from(offset)).map_err(anyhow::Error::from)?;
                     }
                 }
                 op::GotoIfNonNil => {
-                    let offset = self.pc.arg2()?;
+                    let offset = instruction.operand().map_err(anyhow::Error::from)?;
                     self.require_stack(1)?;
                     let cond = self.env.stack.pop(cx);
                     if !cond.is_nil() {
-                        self.pc.goto(usize::from(offset))?;
+                        self.pc.goto(usize::from(offset)).map_err(anyhow::Error::from)?;
                     }
                 }
                 op::GotoIfNilElsePop => {
-                    let offset = self.pc.arg2()?;
+                    let offset = instruction.operand().map_err(anyhow::Error::from)?;
                     self.require_stack(1)?;
                     if self.env.stack[0].bind(cx).is_nil() {
-                        self.pc.goto(usize::from(offset))?;
+                        self.pc.goto(usize::from(offset)).map_err(anyhow::Error::from)?;
                     } else {
                         self.env.stack.pop(cx);
                     }
                 }
                 op::GotoIfNonNilElsePop => {
-                    let offset = self.pc.arg2()?;
+                    let offset = instruction.operand().map_err(anyhow::Error::from)?;
                     self.require_stack(1)?;
                     if self.env.stack[0].bind(cx).is_nil() {
                         self.env.stack.pop(cx);
                     } else {
-                        self.pc.goto(usize::from(offset))?;
+                        self.pc.goto(usize::from(offset)).map_err(anyhow::Error::from)?;
                     }
                 }
                 op::Return => {
                     self.require_stack(1)?;
+                    let depth = *self.binding_frames.last().expect("VM has a binding frame");
+                    self.env.unwind_bindings(depth, cx)?;
+                    // Malformed bytecode may return without PopHandler. Such
+                    // handlers must not outlive their frame and intercept a
+                    // later caller error; the caller's lower-depth handlers stay.
+                    let frame = self.env.stack.current_frame();
+                    self.handlers.bind_mut(cx).retain(|handler| handler.stack_frame < frame);
                     if let Some((f, offset)) = self.env.stack.prev_bytecode_frame() {
-                        self.set_current_frame(f.bind(cx), offset);
+                        self.binding_frames.pop();
+                        self.set_current_frame(f.bind(cx), offset)?;
                         let top = self.env.stack.top().bind(cx);
                         self.env.stack.pop_frame();
                         self.env.stack.push(top);
@@ -736,7 +770,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     self.env.stack.pop(cx);
                 }
                 op::DiscardN => {
-                    let arg = self.pc.arg1()?;
+                    let arg = instruction.operand().map_err(anyhow::Error::from)?;
                     let cur_len = self.env.stack.len();
                     let keep_tos = (arg & 0x80) != 0;
                     let count = (arg & 0x7F) as usize;
@@ -815,8 +849,17 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let top = self.env.stack.top();
                     top.set(fns::nconc(&[top.bind_as(cx)?, list2.try_into()?])?);
                 }
-                op::Quo => return Err(self.unsupported_opcode(op, cx)),
-                op::Rem => return Err(self.unsupported_opcode(op, cx)),
+                op::Quo | op::Rem => {
+                    let right = self.env.stack[0].bind_as(cx)?;
+                    let left = self.env.stack[1].bind_as(cx)?;
+                    let result = if op == op::Quo {
+                        arith::div(left, &[right])?
+                    } else {
+                        arith::remainder(left, right)?
+                    };
+                    self.env.stack.pop(cx);
+                    self.env.stack.top().set(cx.add(result));
+                }
                 op::Numberp => {
                     let top = self.env.stack.top();
                     top.set(data::numberp(top.bind(cx)));
@@ -826,7 +869,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     top.set(data::integerp(top.bind(cx)));
                 }
                 op::ListN => {
-                    let size = self.pc.arg1()? as usize;
+                    let size = instruction.operand().map_err(anyhow::Error::from)? as usize;
                     if size > self.env.stack.frame_len() {
                         bail_err!("Bytecode list count out of range");
                     }
@@ -843,7 +886,10 @@ impl<'ob> RootedVM<'_, '_, '_> {
                         self.env.stack.top().set(list);
                     }
                 }
-                op::ConcatN => return Err(self.unsupported_opcode(op, cx)),
+                op::ConcatN => self.concatenate(
+                    usize::from(instruction.operand().map_err(anyhow::Error::from)?),
+                    cx,
+                )?,
                 op::InsertN => return Err(self.unsupported_opcode(op, cx)),
                 op::Switch => {
                     self.require_stack(2)?;
@@ -864,7 +910,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                                 "Invalid bytecode switch target: negative or unrepresentable"
                             )
                         })?;
-                        self.pc.goto(offset)?;
+                        self.pc.goto(offset).map_err(anyhow::Error::from)?;
                     }
                     self.env.stack.pop(cx);
                     self.env.stack.pop(cx);
@@ -964,6 +1010,14 @@ fn byte_code<'ob>(
     Ok(call(fun, 0, "unnamed", &mut CallFrame::new(env), cx)?)
 }
 
+/// Structural verifier for future .elc loading and compiler diagnostics.
+/// This checks instruction encoding and static target boundaries only, not
+/// operand types, stack joins, dynamic switch tables or opcode availability.
+pub(crate) fn validate_bytecode(function: &ByteFn) -> Result<()> {
+    decoder::Program::decode(function.codes()).validate()?;
+    Ok(())
+}
+
 /// Number of arguments needed to fill out the remaining slots on the stack.
 /// If a function has 3 required args and 2 optional, and it is called with
 /// 4 arguments, then 1 will be returned. Indicating that 1 additional `nil`
@@ -991,17 +1045,31 @@ pub(crate) fn call<'ob>(
     frame: &mut CallFrame,
     cx: &'ob mut Context,
 ) -> EvalResult<'ob> {
-    frame.stack.set_depth(func.bind(cx).depth);
+    frame.stack.set_depth(func.bind(cx).depth, cx)?;
     let func = func.bind(cx);
+    let mut programs = ProgramCache::default();
+    let pc = programs.cursor(func.codes(), 0).map_err(anyhow::Error::from)?;
+    let binding_depth = frame.binding_depth();
+    let entry_frame = frame.stack.current_frame();
     let vm = VM {
-        pc: ProgramCounter::new(func.codes()),
+        pc,
+        programs,
+        binding_frames: vec![binding_depth],
         func: Slot::new(func),
         env: frame,
         handlers: Vec::new(),
     };
     root!(vm, cx);
     vm.prepare_lisp_args(func, arg_cnt, name, cx)?;
-    vm.run(cx).map_err(|e| e.add_trace(name, vm.env.stack.current_args()))
+    let result = rebind!(vm.run(cx)).map_err(|e| e.add_trace(name, vm.env.stack.current_args()));
+    // Uncaught failures can leave several optimized bytecode frames active.
+    // The external CallFrame guard only owns the entry frame: remove nested
+    // frames (and their operands) before its eventual single pop on Drop.
+    while vm.env.stack.current_frame() > entry_frame {
+        vm.env.stack.pop_frame();
+    }
+    vm.env.unwind_bindings(binding_depth, cx)?;
+    result
 }
 
 #[cfg(test)]
@@ -1177,6 +1245,109 @@ mod test {
         }
     }
 
+    fn depth_fixture<'ob>(depth: usize, cx: &'ob Context) -> &'ob ByteFn {
+        let constants: &LispVec = vec![cx.add(7)].into_obj(cx).untag();
+        let codes: &ByteString =
+            vec![OpCode::Constant0 as u8, OpCode::Return as u8].into_obj(cx).untag();
+        crate::alloc::make_byte_code(0, codes, constants, depth, None, None, &[], cx).unwrap()
+    }
+
+    #[test]
+    fn large_declared_depth_reserves_without_arbitrary_initial_or_nested_caps() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let inner = depth_fixture(4096, cx);
+        root!(inner, cx);
+        check_bytecode!(inner, [], 7, cx);
+        let target = cx.add(inner.bind(cx));
+        root!(target, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [O::Constant0, O::Constant1, O::Call0, O::Plus, O::Return],
+            [5, target.bind(cx)],
+            cx
+        );
+        check_bytecode!(outer, [], 12, cx);
+    }
+
+    #[test]
+    fn impossible_initial_depth_returns_error_without_mutating_stack() {
+        for depth in [usize::MAX, usize::MAX / 2] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            let function = depth_fixture(depth, cx);
+            root!(function, cx);
+            root!(env, new(Env), cx);
+            env.stack.push(Object::from(99));
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let before = frame.stack.len();
+            assert!(call(function, 0, "impossible-depth", frame, cx).is_err());
+            assert_eq!(frame.stack.len(), before);
+        }
+    }
+
+    #[test]
+    fn nested_reservation_failure_preserves_callers_frame_and_handler() {
+        use OpCode as O;
+        for depth in [usize::MAX, usize::MAX / 2] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            let bad = depth_fixture(depth, cx);
+            root!(bad, cx);
+            let condition = Cons::new1(sym::ERROR, cx);
+            // Keep a prefix so usize::MAX overflows the absolute frame end.
+            make_bytecode!(
+                outer,
+                0,
+                [
+                    O::Constant2,
+                    O::Constant0,
+                    O::PushCondtionCase,
+                    8,
+                    0,
+                    O::Constant1,
+                    O::Call0,
+                    O::Return,
+                    O::Discard,
+                    O::Return
+                ],
+                [condition, bad.bind(cx), 42],
+                cx
+            );
+            check_bytecode!(outer, [], 42, cx);
+        }
+    }
+
+    #[test]
+    fn argument_preparation_checks_depth_before_optional_or_rest_pushes() {
+        use OpCode as O;
+        // Both specs need eleven parameter slots but this fixture declares ten.
+        // Optional filling and a missing rest list must signal, not stack panic.
+        for spec in [11 << 8, (10 << 8) | 10 | 0x80] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            make_bytecode!(bytecode, spec, [O::Constant0, O::Return], [7], cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            let argc = if spec & 0x80 != 0 { 10 } else { 0 };
+            for _ in 0..argc {
+                frame.push_arg(Object::from(3));
+            }
+            frame.finalize_arguments();
+            let before = frame.stack.len();
+            let error = call(bytecode, argc, "argument-depth", frame, cx).unwrap_err();
+            assert!(error.to_string().contains("stack depth exceeded by arguments"));
+            assert_eq!(frame.stack.len(), before);
+        }
+    }
+
     #[test]
     fn m0_stack_growth_checks_declared_depth_before_mutation() {
         use OpCode as O;
@@ -1231,27 +1402,6 @@ mod test {
     }
 
     #[test]
-    fn m0_program_counter_checks_reads_and_jumps_before_access() {
-        let mut empty = ProgramCounter::new(&[]);
-        assert!(empty.next().is_err());
-        assert!(empty.arg1().is_err());
-        assert!(empty.arg2().is_err());
-        assert!(empty.goto(0).is_err());
-        let bytes = [0x34, 0x12];
-        let mut pc = ProgramCounter::new(&bytes);
-        assert_eq!(pc.arg2().unwrap(), 0x1234);
-        assert!(pc.next().is_err());
-        pc.goto(1).unwrap();
-        assert!(pc.arg2().is_err());
-        // Failed accesses/jumps leave the cursor unchanged.
-        assert_eq!(pc.as_offset(), 1);
-        assert!(pc.goto(2).is_err());
-        assert!(pc.goto(usize::from(u16::MAX)).is_err());
-        assert_eq!(pc.arg1().unwrap(), 0x12);
-        assert!(pc.arg1().is_err());
-    }
-
-    #[test]
     fn m0_truncated_bytecode_and_invalid_jumps_return_errors() {
         use OpCode as O;
         for bytes in [
@@ -1280,6 +1430,204 @@ mod test {
             frame.finalize_arguments();
             assert!(call(function, 0, "truncated-bytecode", frame, cx).is_err());
         }
+    }
+
+    #[test]
+    fn m3_fixed_primitive_opcodes_check_frame_local_stack_before_dispatch() {
+        use OpCode as O;
+        for opcode in [
+            O::Nth,
+            O::Symbolp,
+            O::Consp,
+            O::Stringp,
+            O::Listp,
+            O::Eq,
+            O::Memq,
+            O::Not,
+            O::Car,
+            O::Cdr,
+            O::Cons,
+            O::List1,
+            O::List2,
+            O::List3,
+            O::List4,
+            O::Length,
+            O::Aref,
+            O::Aset,
+            O::SymbolValue,
+            O::SymbolFunction,
+            O::Set,
+            O::Fset,
+            O::Get,
+            O::Sub1,
+            O::Add1,
+            O::EqlSign,
+            O::GreaterThan,
+            O::LessThan,
+            O::LessThanOrEqual,
+            O::GreaterThanOrEqual,
+            O::Diff,
+            O::Negate,
+            O::Plus,
+            O::Max,
+            O::Min,
+            O::Multiply,
+            O::Equal,
+            O::Nthcdr,
+            O::Elt,
+            O::Member,
+            O::Assq,
+            O::Nreverse,
+            O::Setcar,
+            O::Setcdr,
+            O::CarSafe,
+            O::CdrSafe,
+            O::Nconc,
+            O::Quo,
+            O::Rem,
+            O::Concat2,
+            O::Concat3,
+            O::Concat4,
+        ] {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            sym::init_symbols();
+            make_bytecode!(function, 0, [opcode], [], cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let error = call(function, 0, "empty-operands", frame, cx).unwrap_err();
+            assert!(error.to_string().contains("operand stack underflow"), "{opcode:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn m3_jump_to_operand_and_invalid_handler_target_signal_errors() {
+        use OpCode as O;
+        for code in [
+            vec![O::Goto as u8, 1, 0],
+            vec![O::Constant0 as u8, O::PushCondtionCase as u8, 2, 0],
+        ] {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            sym::init_symbols();
+            let constants: &LispVec = vec![cx.add(sym::ERROR)].into_obj(cx).untag();
+            let codes: &ByteString = code.into_obj(cx).untag();
+            let function =
+                crate::alloc::make_byte_code(0, codes, constants, 10, None, None, &[], cx).unwrap();
+            root!(function, cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            assert!(
+                call(function, 0, "operand-target", frame, cx)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("instruction boundary")
+            );
+        }
+    }
+
+    #[test]
+    fn m3_arithmetic_opcodes_share_checked_primitive_semantics() {
+        use OpCode as O;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        make_bytecode!(
+            difference,
+            0,
+            [O::Constant0, O::Constant1, O::Diff, O::Return],
+            [11, 4],
+            cx
+        );
+        check_bytecode!(difference, [], 7, cx);
+        make_bytecode!(quotient, 0, [O::Constant0, O::Constant1, O::Quo, O::Return], [-11, 4], cx);
+        check_bytecode!(quotient, [], -2, cx);
+        make_bytecode!(remainder, 0, [O::Constant0, O::Constant1, O::Rem, O::Return], [-11, 4], cx);
+        check_bytecode!(remainder, [], -3, cx);
+        make_bytecode!(floating, 0, [O::Constant0, O::Constant1, O::Quo, O::Return], [11, 4.0], cx);
+        check_bytecode!(floating, [], 2.75, cx);
+        for opcode in [O::Quo, O::Rem] {
+            make_bytecode!(zero, 0, [O::Constant0, O::Constant1, opcode, O::Return], [1, 0], cx);
+            root!(env, new(Env), cx);
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            assert!(
+                call(zero, 0, "zero-divisor", frame, cx)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("arith-error")
+            );
+        }
+    }
+
+    #[test]
+    fn m3_concat_opcodes_preserve_argument_order_and_unicode_characters() {
+        use OpCode as O;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        make_bytecode!(
+            two,
+            0,
+            [O::Constant0, O::Constant1, O::Concat2, O::Return],
+            ["a", "\u{e9}"],
+            cx
+        );
+        check_bytecode!(two, [], "a\u{e9}", cx);
+        make_bytecode!(
+            three,
+            0,
+            [O::Constant0, O::Constant1, O::Constant2, O::Concat3, O::Return],
+            ["a", NIL, "b"],
+            cx
+        );
+        check_bytecode!(three, [], "ab", cx);
+        make_bytecode!(
+            four,
+            0,
+            [O::Constant0, O::Constant1, O::Constant2, O::Constant3, O::Concat4, O::Return],
+            ["a", "b", "c", "d"],
+            cx
+        );
+        check_bytecode!(four, [], "abcd", cx);
+        make_bytecode!(
+            many,
+            0,
+            [O::Constant0, O::Constant1, O::ConcatN, 2, O::Return],
+            ["x", "y"],
+            cx
+        );
+        check_bytecode!(many, [], "xy", cx);
+        make_bytecode!(empty, 0, [O::ConcatN, 0, O::Return], [], cx);
+        check_bytecode!(empty, [], "", cx);
+    }
+
+    #[test]
+    fn m3_predecoded_pc_survives_explicit_collection_and_nested_resume() {
+        use OpCode as O;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        let collector = crate::core::env::intern("garbage-collect", cx);
+        make_bytecode!(
+            inner,
+            0,
+            [O::Constant0, O::Call0, O::Discard, O::Constant1, O::Return],
+            [collector, 7],
+            cx
+        );
+        let inner = cx.add(inner.bind(cx));
+        root!(inner, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [O::Constant0, O::Call0, O::Constant1, O::Plus, O::Return],
+            [inner.bind(cx), 5],
+            cx
+        );
+        check_bytecode!(outer, [], 12, cx);
     }
 
     #[test]
@@ -1341,6 +1689,505 @@ mod test {
     }
 
     #[test]
+    fn dynamic_bindings_restore_after_decoder_error_and_return() {
+        use OpCode as O;
+        for terminal in [51_u8, O::Return as u8] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            let variable = crate::core::env::intern("vm-binding-cleanup", cx);
+            make_bytecode!(
+                bytecode,
+                0,
+                [O::Constant1, O::VarBind0, O::Constant1, terminal],
+                [variable, 7],
+                cx
+            );
+            root!(env, new(Env), cx);
+            env.varbind(variable, Object::from(3), cx);
+            let initial = env.binding_depth();
+            let frame = &mut CallFrame::new(env);
+            frame.finalize_arguments();
+            let result = call(bytecode, 0, "binding-cleanup", frame, cx);
+            assert_eq!(result.is_err(), terminal == 51);
+            assert_eq!(frame.binding_depth(), initial);
+            assert_eq!(
+                frame
+                    .vars
+                    .get(crate::core::env::intern("vm-binding-cleanup", cx))
+                    .unwrap()
+                    .bind(cx),
+                Object::from(3)
+            );
+        }
+    }
+
+    #[test]
+    fn handler_restores_dynamic_binding_checkpoint() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let variable = crate::core::env::intern("vm-handler-binding", cx);
+        let condition = Cons::new1(sym::ERROR, cx);
+        make_bytecode!(
+            bytecode,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                7,
+                0,
+                O::Constant2,
+                O::VarBind1,
+                51_u8,
+                O::VarRef1,
+                O::Return
+            ],
+            [condition, variable, 7],
+            cx
+        );
+        root!(env, new(Env), cx);
+        env.varbind(variable, Object::from(3), cx);
+        let initial = env.binding_depth();
+        let frame = &mut CallFrame::new(env);
+        frame.finalize_arguments();
+        let result = call(bytecode, 0, "handler-bindings", frame, cx).unwrap();
+        assert_eq!(result, Object::from(3));
+        assert_eq!(frame.binding_depth(), initial);
+    }
+
+    #[test]
+    fn nested_decoder_error_unwinds_bindings_before_outer_handler() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let variable = crate::core::env::intern("vm-nested-handler-binding", cx);
+        make_bytecode!(
+            inner,
+            0,
+            [O::Constant1, O::VarBind0, O::Constant1, 51_u8],
+            [variable, 7],
+            cx
+        );
+        let inner = cx.add(inner.bind(cx));
+        root!(inner, cx);
+        let condition = Cons::new1(sym::ERROR, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                8,
+                0,
+                O::Constant1,
+                O::Call0,
+                O::PopHandler,
+                O::Return,
+                O::VarRef2,
+                O::Return
+            ],
+            [condition, inner.bind(cx), variable],
+            cx
+        );
+        root!(env, new(Env), cx);
+        env.varbind(variable, Object::from(3), cx);
+        let initial = env.binding_depth();
+        let frame = &mut CallFrame::new(env);
+        frame.finalize_arguments();
+        let result = call(outer, 0, "nested-handler-bindings", frame, cx).unwrap();
+        assert_eq!(result, Object::from(3));
+        assert_eq!(frame.binding_depth(), initial);
+    }
+
+    #[test]
+    fn malformed_unbind_cannot_remove_callers_dynamic_bindings() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let variable = crate::core::env::intern("vm-unbind-floor", cx);
+        make_bytecode!(bytecode, 0, [O::Unbind1], [], cx);
+        root!(env, new(Env), cx);
+        env.varbind(variable, Object::from(3), cx);
+        let initial = env.binding_depth();
+        let frame = &mut CallFrame::new(env);
+        frame.finalize_arguments();
+        assert!(call(bytecode, 0, "binding-floor", frame, cx).is_err());
+        assert_eq!(frame.binding_depth(), initial);
+        assert_eq!(
+            frame
+                .vars
+                .get(crate::core::env::intern("vm-unbind-floor", cx))
+                .unwrap()
+                .bind(cx),
+            Object::from(3)
+        );
+    }
+
+    #[test]
+    fn malformed_unbind_is_a_lisp_error_not_a_panic() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        make_bytecode!(bytecode, 0, [O::Unbind1], [], cx);
+        root!(env, new(Env), cx);
+        let frame = &mut CallFrame::new(env);
+        frame.finalize_arguments();
+        let error = call(bytecode, 0, "binding-underflow", frame, cx).unwrap_err();
+        assert!(error.to_string().contains("binding stack underflow"));
+    }
+
+    #[test]
+    fn condition_handler_does_not_intercept_throw_and_bindings_unwind() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let (closure, _) = crate::reader::read("(closure nil () (throw 17 7))", cx).unwrap();
+        root!(closure, cx);
+        let variable = crate::core::env::intern("vm-throw-binding", cx);
+        let condition = Cons::new1(sym::ERROR, cx);
+        make_bytecode!(
+            bytecode,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                10,
+                0,
+                O::Constant3,
+                O::VarBind2,
+                O::Constant1,
+                O::Call0,
+                O::PopHandler,
+                O::Return,
+                O::Constant3,
+                O::Return
+            ],
+            [condition, closure.bind(cx), variable, 7],
+            cx
+        );
+        root!(env, new(Env), cx);
+        env.varbind(variable, Object::from(3), cx);
+        env.catch_stack.push(Object::from(17));
+        let initial = env.binding_depth();
+        let frame = &mut CallFrame::new(env);
+        frame.finalize_arguments();
+        let error = call(bytecode, 0, "throw-through-condition", frame, cx).unwrap_err();
+        let ErrorType::Throw(id) = error.error else {
+            panic!("condition handler intercepted nonlocal throw");
+        };
+        let (actual_tag, data) = frame.get_exception(id).unwrap();
+        assert_eq!(actual_tag.bind(cx), Object::from(17));
+        assert_eq!(data.bind(cx), Object::from(7));
+        assert_eq!(frame.binding_depth(), initial);
+        assert_eq!(
+            frame
+                .vars
+                .get(crate::core::env::intern("vm-throw-binding", cx))
+                .unwrap()
+                .bind(cx),
+            Object::from(3)
+        );
+        assert_eq!(frame.catch_stack.len(), 1);
+    }
+
+    #[test]
+    fn malformed_pop_handler_cannot_remove_callers_handler() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        make_bytecode!(inner, 0, [O::PopHandler, O::Constant0, O::Return], [7], cx);
+        let inner = cx.add(inner.bind(cx));
+        root!(inner, cx);
+        let condition = Cons::new1(sym::ERROR, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                7,
+                0,
+                O::Constant1,
+                O::Call0,
+                O::Return,
+                O::Constant2,
+                O::Return
+            ],
+            [condition, inner.bind(cx), 42],
+            cx
+        );
+        check_bytecode!(outer, [], 42, cx);
+    }
+
+    #[test]
+    fn nested_return_drops_callee_handlers_but_preserves_callers() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let condition = Cons::new1(sym::ERROR, cx);
+        // Deliberately omit PopHandler in the callee. Its fallback value must
+        // never be used after it has returned to its caller.
+        make_bytecode!(
+            inner,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                6,
+                0,
+                O::Constant1,
+                O::Return,
+                O::Constant2,
+                O::Return
+            ],
+            [condition, 7, 99],
+            cx
+        );
+        let inner = cx.add(inner.bind(cx));
+        root!(inner, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                8,
+                0,
+                O::Constant1,
+                O::Call0,
+                O::Discard,
+                51_u8,
+                O::Constant2,
+                O::Return
+            ],
+            [condition, inner.bind(cx), 42],
+            cx
+        );
+        check_bytecode!(outer, [], 42, cx);
+    }
+
+    #[test]
+    fn handler_recovers_from_nested_argument_depth_error_and_calls_again() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        // Eleven optional parameters exceed the fixture's declared depth ten.
+        make_bytecode!(bad, 11 << 8, [O::Constant0, O::Return], [7], cx);
+        let bad = cx.add(bad.bind(cx));
+        root!(bad, cx);
+        make_bytecode!(good, 0, [O::Constant0, O::Return], [42], cx);
+        let good = cx.add(good.bind(cx));
+        root!(good, cx);
+        let condition = Cons::new1(sym::ERROR, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                7,
+                0,
+                O::Constant1,
+                O::Call0,
+                O::Return,
+                O::Discard,
+                O::Constant2,
+                O::Call0,
+                O::Return
+            ],
+            [condition, bad.bind(cx), good.bind(cx)],
+            cx
+        );
+        // The recovery call checks that both the current bytecode frame and
+        // binding-frame checkpoints were restored after failed argument setup.
+        check_bytecode!(outer, [], 42, cx);
+    }
+
+    #[test]
+    fn nested_callee_cannot_consume_its_call_target_as_an_operand() {
+        use OpCode as O;
+        for opcode in [O::Return, O::StackRef0, O::Duplicate] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            make_bytecode!(inner, 0, [opcode, O::Return], [], cx);
+            let inner = cx.add(inner.bind(cx));
+            root!(inner, cx);
+            let condition = Cons::new1(sym::ERROR, cx);
+            make_bytecode!(
+                outer,
+                0,
+                [
+                    O::Constant0,
+                    O::PushCondtionCase,
+                    7,
+                    0,
+                    O::Constant1,
+                    O::Call0,
+                    O::Return,
+                    O::Constant2,
+                    O::Return
+                ],
+                [condition, inner.bind(cx), 42],
+                cx
+            );
+            check_bytecode!(outer, [], 42, cx);
+        }
+    }
+
+    #[test]
+    fn nested_optional_arguments_use_full_depth_without_hidden_target_slot() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        // Ten nil-filled optionals exactly fill depth ten. The nested target
+        // must not take an eleventh slot or be visible beneath the arguments.
+        make_bytecode!(inner, 10 << 8, [O::Return], [], cx);
+        let inner = cx.add(inner.bind(cx));
+        root!(inner, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [O::Constant0, O::Constant1, O::Call0, O::Discard, O::Return],
+            [7, inner.bind(cx)],
+            cx
+        );
+        check_bytecode!(outer, [], 7, cx);
+    }
+
+    #[test]
+    fn nested_argument_removal_preserves_order_and_caller_prefix() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        // Three required parameters, maximum three. Returning stack-ref two
+        // proves target removal did not swap the last argument into first place.
+        make_bytecode!(inner, 771, [O::StackRef2, O::Return], [], cx);
+        let inner = cx.add(inner.bind(cx));
+        root!(inner, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [
+                O::Constant0,
+                O::Constant1,
+                O::Constant2,
+                O::Constant3,
+                O::Constant4,
+                O::Call3,
+                O::Plus,
+                O::Return
+            ],
+            [10, inner.bind(cx), 1, 2, 3],
+            cx
+        );
+        check_bytecode!(outer, [], 11, cx);
+    }
+
+    #[test]
+    fn nested_rest_arguments_exclude_target_and_preserve_unicode_values() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        // No fixed parameters and a rest list. Target removal must leave
+        // only the three argument values for rest-list construction.
+        make_bytecode!(inner, 128, [O::Return], [], cx);
+        let inner = cx.add(inner.bind(cx));
+        root!(inner, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [O::Constant0, O::Constant1, O::Constant2, O::Constant3, O::Call3, O::Return],
+            [inner.bind(cx), "λ", 2, "🙂"],
+            cx
+        );
+        let expected = list!["λ", 2, "🙂"; cx];
+        root!(expected, cx);
+        check_bytecode!(outer, [], expected, cx);
+    }
+
+    #[test]
+    fn uncaught_nested_errors_restore_frame_depth_for_repeated_env_reuse() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        make_bytecode!(bad, 0, [51_u8], [], cx);
+        let bad_target = cx.add(bad.bind(cx));
+        root!(bad_target, cx);
+        make_bytecode!(middle, 0, [O::Constant0, O::Call0, O::Return], [bad_target.bind(cx)], cx);
+        let middle_target = cx.add(middle.bind(cx));
+        root!(middle_target, cx);
+        make_bytecode!(outer, 0, [O::Constant0, O::Call0, O::Return], [middle_target.bind(cx)], cx);
+        make_bytecode!(good, 0, [O::Constant0, O::Return], [7], cx);
+        root!(env, new(Env), cx);
+        for _ in 0..4 {
+            {
+                let frame = &mut CallFrame::new(env);
+                frame.finalize_arguments();
+                let entry = frame.stack.current_frame();
+                let error = call(outer, 0, "uncaught-nested", frame, cx).unwrap_err();
+                assert!(error.to_string().contains("Invalid Bytecode:"));
+                assert_eq!(frame.stack.current_frame(), entry);
+                assert_eq!(frame.stack.frame_len(), 0);
+            }
+            assert_eq!(env.stack.current_frame(), 0);
+            assert_eq!(env.stack.len(), 0);
+            {
+                let frame = &mut CallFrame::new(env);
+                frame.finalize_arguments();
+                assert_eq!(call(good, 0, "reuse-after-error", frame, cx).unwrap(), Object::from(7));
+            }
+            assert_eq!(env.stack.current_frame(), 0);
+            assert_eq!(env.stack.len(), 0);
+        }
+    }
+
+    #[test]
+    fn handlers_preserve_structured_wrong_number_of_arguments() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        // A required argument is missing, so entering the nested bytecode
+        // function produces LispError rather than a generic anyhow diagnostic.
+        make_bytecode!(inner, 257, [O::Constant0, O::Return], [7], cx);
+        let inner = cx.add(inner.bind(cx));
+        root!(inner, cx);
+        let condition = Cons::new1(sym::ERROR, cx);
+        make_bytecode!(
+            outer,
+            0,
+            [
+                O::Constant0,
+                O::PushCondtionCase,
+                7,
+                0,
+                O::Constant1,
+                O::Call0,
+                O::Return,
+                O::Car,
+                O::Return
+            ],
+            [condition, inner.bind(cx)],
+            cx
+        );
+        check_bytecode!(outer, [], sym::WRONG_NUMBER_OF_ARGUMENTS, cx);
+    }
+
+    #[test]
     fn m0_unknown_opcode_uses_existing_error_handler() {
         use OpCode as O;
         let roots = &RootSet::default();
@@ -1375,10 +2222,6 @@ mod test {
         for opcode in [
             O::PushCatch,
             O::Substring,
-            O::Concat2,
-            O::Concat3,
-            O::Concat4,
-            O::Diff,
             O::Point,
             O::GotoChar,
             O::Insert,
@@ -1417,15 +2260,15 @@ mod test {
             O::Downcase,
             O::StringEqlSign,
             O::StringLessThan,
-            O::Quo,
-            O::Rem,
-            O::ConcatN,
             O::InsertN,
         ] {
             let roots = &RootSet::default();
             let cx = &mut Context::new(roots);
             sym::init_symbols();
-            make_bytecode!(bytecode, 0, [opcode, O::Return], [], cx);
+            // Include complete operands even for PushCatch (u16) and
+            // InsertN (u8): malformed encoding is a decoder error, not an
+            // unsupported-operation signal, and is tested separately.
+            make_bytecode!(bytecode, 0, [opcode, 0, 0, O::Return], [], cx);
             root!(env, new(Env), cx);
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments();
