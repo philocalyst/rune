@@ -53,6 +53,16 @@ impl Default for FontSelection {
     }
 }
 impl FontSelection {
+    pub(crate) fn next_generation(&self) -> Result<u64> {
+        self.generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("font selection generation exhausted"))
+    }
+    pub(crate) fn commit_generation(&mut self, generation: u64) {
+        debug_assert_eq!(self.generation.checked_add(1), Some(generation));
+        self.generation = generation;
+        self.cached = None;
+    }
     pub(crate) fn set_order(&mut self, order: [FontAttribute; 4]) -> Result<()> {
         if self.order == order {
             return Ok(());

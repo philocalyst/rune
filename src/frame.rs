@@ -46,6 +46,32 @@ fn display_graphic_p(frame: Option<Object>, cx: &Context) -> Result<bool> {
     let _frame = live_frame(frame, cx)?;
     Ok(false)
 }
+/// Read-only parameters of the real owner logical terminal. Geometry comes
+/// from its Session window tree; no physical display size is invented.
+#[defun]
+fn frame_parameter<'a>(
+    frame: Object<'a>,
+    parameter: crate::core::object::Symbol,
+    env: &crate::core::gc::Rt<crate::core::env::Env>,
+    cx: &'a Context,
+) -> Result<Object<'a>> {
+    let frame = live_frame(Some(frame), cx)?;
+    if !parameter.interned() {
+        return Ok(NIL);
+    }
+    Ok(match parameter.name() {
+        "window-system" | "reverse" => NIL,
+        "display-type" => crate::lread::intern("mono", cx).into(),
+        "background-mode" => crate::lread::intern("dark", cx).into(),
+        "font" => cx.add("tty"),
+        "foreground-color" => cx.add("unspecified-fg"),
+        "background-color" => cx.add("unspecified-bg"),
+        "name" => cx.add(format!("rune-terminal-{}", frame.id())),
+        "width" => i64::from(env.editor_gateway().frame_geometry(cx)?.0).into(),
+        "height" => i64::from(env.editor_gateway().frame_geometry(cx)?.1).into(),
+        _ => NIL,
+    })
+}
 #[cfg(test)]
 mod tests {
     #[test]

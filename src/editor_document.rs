@@ -686,6 +686,12 @@ impl RuntimeEditorGateway {
         }
         Ok(())
     }
+    /// Geometry of the same authoritative window tree, without cloning docs.
+    pub(crate) fn frame_geometry(&self,cx:&Context)->anyhow::Result<(u32,u32)> {
+        self.check(cx)?;let owner=self.inner.try_borrow()?;let tree=owner.session.window_tree();
+        let rect=tree.node(tree.root()).ok_or_else(||anyhow::anyhow!("Missing root window geometry"))?.rect;
+        Ok((rect.width,rect.height))
+    }
     pub(crate) fn scratch(&self, cx: &Context) -> anyhow::Result<OwnerBufferHandle> {
         self.check(cx)?;
         let owner = self.inner.try_borrow()?;
