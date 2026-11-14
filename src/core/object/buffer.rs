@@ -8,6 +8,7 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use rune_macros::Trace;
+use rune_text::{Bias, CharPos, EditDelta, MarkerId, PositionTree};
 use std::{
     fmt::Display,
     ops::{Deref, DerefMut},
@@ -37,6 +38,77 @@ impl OpenBuffer<'_> {
         self.data.is_some()
     }
 
+    /// Temporary markers contain no Lisp values. IDs are per-buffer and never reused.
+    pub(crate) fn save_excursion_marker(&mut self) -> Result<MarkerId> {
+        let data = self.get_mut();
+        let id = MarkerId(data.next_marker_id);
+        let next = data
+            .next_marker_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("buffer marker ID exhausted"))?;
+        let positions = if data.markers.marker_count() == 0 {
+            PositionTree::new(data.text.len_chars())
+        } else {
+            anyhow::ensure!(
+                data.markers.len_chars() == data.text.len_chars(),
+                "untracked text edit with live markers"
+            );
+            data.markers.clone()
+        };
+        let markers = positions.insert(id, CharPos(data.text.cursor().chars()), Bias::Left)?;
+        data.markers = markers;
+        data.next_marker_id = next;
+        Ok(id)
+    }
+    /// Prepare before any physical edit; publish after text/properties succeed.
+    pub(crate) fn prepare_marker_edit(
+        &self,
+        start: usize,
+        end: usize,
+        inserted: usize,
+    ) -> Result<PositionTree> {
+        let data = self.get();
+        let positions = if data.markers.marker_count() == 0 {
+            PositionTree::new(data.text.len_chars())
+        } else {
+            anyhow::ensure!(
+                data.markers.len_chars() == data.text.len_chars(),
+                "untracked text edit with live markers"
+            );
+            data.markers.clone()
+        };
+        Ok(positions.edit(&EditDelta::new(CharPos(start)..CharPos(end), inserted)?)?)
+    }
+    /// Equal-width case substitutions preserve interior boundaries. Expanded
+    /// casification still has coarse replacement mapping, not full GNU policy.
+    pub(crate) fn prepare_marker_substitution(
+        &self,
+        start: usize,
+        end: usize,
+        inserted: usize,
+    ) -> Result<PositionTree> {
+        anyhow::ensure!(
+            start <= end && end <= self.get().text.len_chars(),
+            "Invalid replacement range"
+        );
+        if inserted == end - start {
+            self.prepare_marker_edit(start, start, 0)
+        } else {
+            self.prepare_marker_edit(start, end, inserted)
+        }
+    }
+    /// Use an existing guard, do not relock or resurrect a killed saved buffer.
+    pub(crate) fn restore_excursion_marker(&mut self, id: MarkerId) -> bool {
+        if !self.is_live() {
+            return false;
+        }
+        let data = self.get_mut();
+        let Some((position, _)) = data.markers.get(id) else { return false };
+        data.markers = data.markers.remove(id);
+        data.text.set_cursor(position.0);
+        true
+    }
+
     pub(crate) fn get(&self) -> &BufferData {
         // buffer can never be none because we check it as part of `lock`.
         self.data.as_ref().unwrap()
@@ -63,17 +135,25 @@ impl OpenBuffer<'_> {
         let mut properties = metadata.lock(cx)?;
         let position = self.get().text.cursor().chars() + 1;
         let old_len = self.get().text.len_chars();
-        match arg.untag() {
+        let markers = match arg.untag() {
             ObjectType::Int(i) => {
                 let Ok(u_32) = i.try_into() else { bail!("{i} is an invalid char") };
                 let Some(chr) = char::from_u32(u_32) else { bail!("{i} is an Invalid char") };
+                let markers = self.prepare_marker_edit(position - 1, position - 1, 1)?;
                 self.get_mut().text.insert_char(chr);
+                markers
             }
-            ObjectType::String(s) => self.get_mut().text.insert(s),
+            ObjectType::String(s) => {
+                let markers =
+                    self.prepare_marker_edit(position - 1, position - 1, s.chars().count())?;
+                self.get_mut().text.insert(s);
+                markers
+            }
             x => bail!(TypeError::new(Type::String, x)),
-        }
+        };
         let chars = self.get().text.len_chars() - old_len;
         properties.insert_text(position, chars);
+        self.get_mut().markers = markers;
         Ok(())
     }
 
@@ -89,8 +169,10 @@ impl OpenBuffer<'_> {
         let beg = self.in_range(beg)?;
         let end = self.in_range(end)?;
         let (beg, end) = (beg.min(end), beg.max(end));
+        let markers = self.prepare_marker_edit(beg, end, 0)?;
         self.get_mut().text.delete_range(beg, end);
         properties.delete_text(beg + 1, end + 1);
+        self.get_mut().markers = markers;
         Ok(())
     }
 
@@ -108,16 +190,18 @@ impl OpenBuffer<'_> {
         if start > end || end > self.get().text.len_chars() {
             bail!("Invalid replacement range");
         }
+        let chars = replacement.chars().count();
+        let markers = self.prepare_marker_substitution(start, end, chars)?;
         self.get_mut().text.delete_range(start, end);
         self.get_mut().text.set_cursor(start);
         self.get_mut().text.insert(replacement);
-        let chars = replacement.chars().count();
         // A same-width substitution preserves the properties of every position.
         // Expansions use the same coordinate semantics as deletion + insertion.
         if chars != end - start {
             properties.delete_text(start + 1, end + 1);
             properties.insert_text(start + 1, chars);
         }
+        self.get_mut().markers = markers;
         Ok(())
     }
 
@@ -164,6 +248,8 @@ pub(crate) struct BufferData {
     pub(crate) name: String,
     pub(crate) text: TextBuffer,
     pub(crate) textprops: BufferProperties,
+    pub(crate) markers: PositionTree,
+    next_marker_id: u64,
 }
 
 #[derive(Debug)]
@@ -191,7 +277,13 @@ impl LispBuffer {
     pub(crate) unsafe fn new(name: String, _: &Block<true>) -> LispBuffer {
         let textprops = BufferProperties::new();
         let new = LispBufferInner {
-            text_buffer: Mutex::new(Some(BufferData { name, text: TextBuffer::new(), textprops })),
+            text_buffer: Mutex::new(Some(BufferData {
+                name,
+                text: TextBuffer::new(),
+                textprops,
+                markers: PositionTree::new(0),
+                next_marker_id: 1,
+            })),
         };
         Self(GcHeap::new(new, true))
     }
@@ -323,6 +415,56 @@ mod roadmap_m0_buffer_property_regressions {
             Some(cx.add(7))
         );
         assert!(buffer.textprops.lock(&cx).unwrap().find(3).is_none());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod excursion_marker_tests {
+    use super::*;
+    use crate::RootSet;
+    #[test]
+    fn marker_transactions_translate_validate_and_unregister() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let object =
+            crate::buffer::get_buffer_create(cx.add("recovery-marker-transaction"), None, &cx)?;
+        let mut buffer = object.buffer().unwrap().lock()?;
+        buffer.insert(cx.add("aé🙂z"), &cx)?;
+        buffer.text.set_cursor(2);
+        let saved = buffer.save_excursion_marker()?;
+        buffer.text.set_cursor(0);
+        buffer.insert(cx.add("λ"), &cx)?;
+        assert!(buffer.restore_excursion_marker(saved));
+        assert_eq!(buffer.text.cursor().chars(), 3);
+        assert_eq!(buffer.markers.marker_count(), 0);
+        let saved = buffer.save_excursion_marker()?;
+        assert!(buffer.insert(cx.add(-1_i64), &cx).is_err());
+        assert!(buffer.delete(0, 3, &cx).is_err());
+        assert!(buffer.delete(1, 99, &cx).is_err());
+        assert_eq!(buffer.markers.get(saved).unwrap().0, CharPos(3));
+        buffer.delete(1, 3, &cx)?;
+        assert!(buffer.restore_excursion_marker(saved));
+        assert_eq!(buffer.text.cursor().chars(), 1);
+        buffer.next_marker_id = u64::MAX;
+        assert!(buffer.save_excursion_marker().is_err());
+        assert_eq!(buffer.markers.marker_count(), 0);
+        Ok(())
+    }
+    #[test]
+    fn substitution_and_kill_preserve_liveness_contract() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let object =
+            crate::buffer::get_buffer_create(cx.add("recovery-marker-substitution"), None, &cx)?;
+        let mut buffer = object.buffer().unwrap().lock()?;
+        buffer.insert(cx.add("abcd"), &cx)?;
+        buffer.text.set_cursor(2);
+        let marker = buffer.save_excursion_marker()?;
+        buffer.replace_text(0, 4, "ABCD", &cx)?;
+        assert_eq!(buffer.markers.get(marker).unwrap().0, CharPos(2));
+        assert!(buffer.kill());
+        assert!(!buffer.restore_excursion_marker(marker));
         Ok(())
     }
 }

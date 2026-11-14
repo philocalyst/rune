@@ -192,6 +192,43 @@ impl Snapshot {
             record,
         ))
     }
+    /// Restore content, never historical marker registrations. The caller
+    /// validates history lineage and the common property-ID owner domain.
+    /// None means metadata-only publication and preserves current positions.
+    pub fn restore_content(&self, content: &Self, delta: Option<&EditDelta>) -> TextResult<Self> {
+        let version = Version(self.version.0.checked_add(1).ok_or(TextError::VersionOverflow)?);
+        let positions = match delta {
+            Some(delta) => self.positions.edit(delta)?,
+            None => self.positions.clone(),
+        };
+        if positions.len_chars() != content.len_chars() {
+            return Err(TextError::OutOfBounds);
+        }
+        Ok(Self { text: content.text.clone(), props: content.props.clone(), positions, version })
+    }
+    /// Undo OR redo a deletion/replacement with records for reinserted text.
+    /// Remove the current inserted span first, validate boundary eligibility,
+    /// reinsert old text, then correct surviving IDs. Hooks are not run here.
+    pub fn restore_content_with_marker_undo(
+        &self,
+        content: &Self,
+        inverse: &EditDelta,
+        records: &crate::DeletionMarkers,
+    ) -> TextResult<Self> {
+        if !records.matches_undo(inverse) {
+            return Err(TextError::OutOfBounds);
+        }
+        let version = Version(self.version.0.checked_add(1).ok_or(TextError::VersionOverflow)?);
+        let intermediate = self.positions.edit(&EditDelta::new(inverse.old.clone(), 0)?)?;
+        let prepared = records.prepare(&intermediate);
+        let inserted = intermediate
+            .edit(&EditDelta::new(inverse.old.start..inverse.old.start, inverse.inserted_chars)?)?;
+        let positions = prepared.apply(&inserted)?;
+        if positions.len_chars() != content.len_chars() {
+            return Err(TextError::OutOfBounds);
+        }
+        Ok(Self { text: content.text.clone(), props: content.props.clone(), positions, version })
+    }
     pub fn set_properties(&self, range: Range<CharPos>, properties: PropSetId) -> TextResult<Self> {
         Ok(Self {
             text: self.text.clone(),
@@ -284,5 +321,99 @@ mod adapter_tests {
             "é🙂\né🙂\né🙂\n"
         );
         assert_eq!(next.next_line_start(CharPos(59997)), Some(CharPos(60000)));
+    }
+}
+
+#[cfg(test)]
+mod recovered_history_tests {
+    use super::*;
+    use crate::{DeletionMarkers, MarkerId};
+    #[test]
+    fn history_and_metadata_preserve_current_marker_lifecycle() {
+        let before = Snapshot::new(Rope::from("abcd"))
+            .with_marker(MarkerId(1), CharPos(2), Bias::Left)
+            .unwrap();
+        let (after, _) = before.edit(CharPos(0)..CharPos(0), "λ", PropSetId(0)).unwrap();
+        let current = after
+            .without_marker(MarkerId(1))
+            .with_marker(MarkerId(2), CharPos(4), Bias::Left)
+            .unwrap();
+        let undone = current
+            .restore_content(&before, Some(&EditDelta::new(CharPos(0)..CharPos(1), 0).unwrap()))
+            .unwrap();
+        assert_eq!(undone.positions().get(MarkerId(1)), None);
+        assert_eq!(undone.positions().get(MarkerId(2)).unwrap().0, CharPos(3));
+        assert_eq!(undone.version(), Version(2));
+        let prepared = before.set_properties(CharPos(0)..CharPos(1), PropSetId(9)).unwrap();
+        let published = undone.restore_content(&prepared, None).unwrap();
+        assert_eq!(published.positions().get(MarkerId(1)), None);
+        assert_eq!(published.positions().get(MarkerId(2)).unwrap().0, CharPos(3));
+        assert_eq!(published.properties().at(CharPos(0)), Some(PropSetId(9)));
+        assert_eq!(published.version(), Version(3));
+        assert!(current.restore_content(&before, None).is_err());
+        assert_eq!(current.len_chars(), 5);
+    }
+    #[test]
+    fn replacement_and_dynamic_redo_restore_sparse_adjustments() {
+        let before = Snapshot::new(Rope::from("abcde"))
+            .with_marker(MarkerId(1), CharPos(2), Bias::Left)
+            .unwrap()
+            .with_marker(MarkerId(2), CharPos(3), Bias::Right)
+            .unwrap()
+            .with_marker(MarkerId(3), CharPos(4), Bias::Left)
+            .unwrap();
+        let records = DeletionMarkers::capture(before.positions(), CharPos(1)..CharPos(4)).unwrap();
+        let (after, _) = before.edit(CharPos(1)..CharPos(4), "XY", PropSetId(0)).unwrap();
+        let current = after
+            .without_marker(MarkerId(1))
+            .with_marker(MarkerId(4), CharPos(2), Bias::Left)
+            .unwrap();
+        let undone = current
+            .restore_content_with_marker_undo(
+                &before,
+                &EditDelta::new(CharPos(1)..CharPos(3), 3).unwrap(),
+                &records,
+            )
+            .unwrap();
+        assert_eq!(undone.positions().get(MarkerId(1)), None);
+        assert_eq!(undone.positions().get(MarkerId(2)).unwrap().0, CharPos(3));
+        assert_eq!(undone.positions().get(MarkerId(3)).unwrap().0, CharPos(4));
+        assert_eq!(undone.positions().get(MarkerId(4)).unwrap().0, CharPos(1));
+        let empty = Snapshot::new(Rope::new());
+        let (inserted, _) = empty.edit(CharPos(0)..CharPos(0), "λ🙂", PropSetId(0)).unwrap();
+        let current = inserted.with_marker(MarkerId(9), CharPos(2), Bias::Left).unwrap();
+        let redo_records =
+            DeletionMarkers::capture(current.positions(), CharPos(0)..CharPos(2)).unwrap();
+        let undone = current
+            .restore_content(&empty, Some(&EditDelta::new(CharPos(0)..CharPos(2), 0).unwrap()))
+            .unwrap();
+        let redone = undone
+            .restore_content_with_marker_undo(
+                &inserted,
+                &EditDelta::new(CharPos(0)..CharPos(0), 2).unwrap(),
+                &redo_records,
+            )
+            .unwrap();
+        assert_eq!(redone.positions().get(MarkerId(9)).unwrap().0, CharPos(2));
+    }
+    #[test]
+    fn empty_sparse_records_still_use_delete_then_insert_mapping() {
+        let before = Snapshot::new(Rope::from("abcd"))
+            .with_marker(MarkerId(1), CharPos(0), Bias::Left)
+            .unwrap()
+            .with_marker(MarkerId(2), CharPos(3), Bias::Right)
+            .unwrap();
+        let records = DeletionMarkers::capture(before.positions(), CharPos(0)..CharPos(3)).unwrap();
+        assert_eq!(records.record_count(), 0);
+        let (after, _) = before.edit(CharPos(0)..CharPos(3), "X", PropSetId(0)).unwrap();
+        let current = after.with_marker(MarkerId(3), CharPos(1), Bias::Left).unwrap();
+        let restored = current
+            .restore_content_with_marker_undo(
+                &before,
+                &EditDelta::new(CharPos(0)..CharPos(1), 3).unwrap(),
+                &records,
+            )
+            .unwrap();
+        assert_eq!(restored.positions().get(MarkerId(3)).unwrap().0, CharPos(0));
     }
 }

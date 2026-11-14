@@ -249,6 +249,29 @@ impl<'a> RootedEnv<'a> {
         CurrentBuffer::set(&mut self.current_buffer, buffer);
     }
 
+    /// Restore through a cached current guard or lock a noncurrent buffer once.
+    /// Native-only: never evaluate Lisp or allocate on the moving heap here.
+    pub(crate) fn restore_excursion_marker(
+        &mut self,
+        saved: &LispBuffer,
+        marker: rune_text::MarkerId,
+    ) -> bool {
+        if saved == self.current_buffer.buf_ref {
+            return self
+                .current_buffer
+                .try_get_mut()
+                .is_ok_and(|buffer| buffer.restore_excursion_marker(marker));
+        }
+        let restored = match saved.lock() {
+            Ok(mut buffer) => buffer.restore_excursion_marker(marker),
+            Err(_) => false,
+        };
+        if restored {
+            self.set_buffer(saved)
+        }
+        restored
+    }
+
     pub(crate) fn with_buffer<T>(
         &self,
         buffer: &LispBuffer,

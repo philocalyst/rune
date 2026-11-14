@@ -18,6 +18,12 @@ type BufferMap = HashMap<String, &'static LispBuffer>;
 // static hashmap containing all the buffers
 pub(crate) static BUFFERS: LazyLock<Mutex<BufferMap>> = LazyLock::new(Mutex::default);
 
+/// Return the existing stable buffer handle without acquiring its text mutex.
+#[defun]
+fn current_buffer<'ob>(env: &Rt<Env>, cx: &'ob Context) -> Object<'ob> {
+    cx.add(cx.bind(env.current_buffer.buf_ref))
+}
+
 #[defun]
 pub(crate) fn set_buffer<'ob>(
     buffer_or_name: Object<'ob>,

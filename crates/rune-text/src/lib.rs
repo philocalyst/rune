@@ -12,3 +12,6 @@ pub use document::*;
 pub use properties::*;
 mod positions;
 pub use positions::*;
+
+mod marker_undo;
+pub use marker_undo::*;

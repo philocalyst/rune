@@ -624,14 +624,13 @@ impl Interpreter<'_, '_> {
     }
 
     fn save_excursion<'ob>(&mut self, form: &Rto<Object>, cx: &'ob mut Context) -> EvalResult<'ob> {
-        let point = self.env.current_buffer.get().text.cursor();
-        let buffer = self.env.current_buffer.get().lisp_buffer(cx);
+        let buffer = self.env.current_buffer.try_get()?.lisp_buffer(cx);
         root!(buffer, cx);
-        let result = rebind!(self.eval_progn(form, cx)?);
-        self.env.set_buffer(buffer.bind(cx));
-        let buf = self.env.current_buffer.get_mut();
-        buf.text.set_cursor(point.chars());
-        Ok(result)
+        let marker = self.env.current_buffer.try_get_mut()?.save_excursion_marker()?;
+        // Capture errors/throws as well. Restoration performs no Lisp/GC work.
+        let result = rebind!(self.eval_progn(form, cx));
+        self.env.restore_excursion_marker(buffer.bind(cx), marker);
+        result
     }
 
     fn save_current_buffer<'ob>(
@@ -891,6 +890,80 @@ mod test {
         let compare = rebind!(eval(obj, None, env, cx).unwrap());
         let expect: Object = expect.into_obj(cx).as_obj_copy();
         assert_eq!(compare, expect);
+    }
+
+    #[test]
+    fn recovered_save_excursion_semantics() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        for (source, expected) in [
+            (
+                r#"(progn (insert "aé🙂z") (goto-char 3) (save-excursion (goto-char 1) (insert "λ")) (point))"#,
+                4,
+            ),
+            (
+                r#"(progn (insert "aé🙂z") (goto-char 3) (save-excursion (insert "λ")) (point))"#,
+                3,
+            ),
+            (
+                r#"(progn (insert "aé🙂z") (goto-char 3) (save-excursion (delete-region 1 4)) (point))"#,
+                1,
+            ),
+            (
+                r#"(progn (insert "abcdef") (goto-char 4) (save-excursion (goto-char 2) (save-excursion (goto-char 1) (insert "λ"))) (point))"#,
+                5,
+            ),
+            (
+                r#"(progn (insert "abcd") (goto-char 3) (save-excursion (goto-char 1) (upcase-word 1)) (point))"#,
+                3,
+            ),
+            (
+                r#"(progn (insert "abcd") (goto-char 3) (condition-case nil (save-excursion (goto-char 1) (if)) (error nil)) (point))"#,
+                3,
+            ),
+            (
+                r#"(progn (insert "abcd") (goto-char 3) (catch 'tag (save-excursion (goto-char 1) (throw 'tag 9))) (point))"#,
+                3,
+            ),
+            (r#"(save-excursion (kill-buffer) 7)"#, 7),
+        ] {
+            check_interpreter(source, expected, cx)
+        }
+        check_error("(progn (kill-buffer) (save-excursion 1))", cx);
+    }
+    #[test]
+    fn recovered_save_excursion_gc_cleanup() {
+        for source in [
+            r#"(progn (insert "aé🙂z") (goto-char 3) (save-excursion (goto-char 1) (garbage-collect) (insert "λ") (garbage-collect)) (point))"#,
+            r#"(progn (insert "abcd") (goto-char 3) (condition-case nil (save-excursion (goto-char 1) (garbage-collect) (if)) (error nil)) (+ 1 (point)))"#,
+            r#"(progn (insert "abcd") (goto-char 3) (+ 1 (length (catch 'tag (save-excursion (goto-char 1) (garbage-collect) (throw 'tag (list 1 2 3)))))))"#,
+        ] {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            sym::init_symbols();
+            root!(env, new(Env), cx);
+            let form = crate::reader::read(source, cx).unwrap().0;
+            root!(form, cx);
+            assert_eq!(eval(form, None, env, cx).unwrap(), Object::from(4_i64));
+            assert_eq!(env.current_buffer.get().markers.marker_count(), 0);
+            cx.garbage_collect(true);
+            assert_eq!(env.current_buffer.get().markers.marker_count(), 0)
+        }
+    }
+    #[test]
+    fn recovered_save_excursion_cross_buffer_identity() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        check_interpreter(
+            r#"(let ((saved (current-buffer)) (other (get-buffer-create "recovered-nested-other"))) (insert "aé🙂z") (goto-char 3) (set-buffer other) (insert "efgh") (goto-char 2) (set-buffer saved) (save-excursion (set-buffer other) (save-excursion (goto-char 1) (insert "x")) (set-buffer saved) (goto-char 1) (insert "λ") (set-buffer other)) (+ (point) (progn (set-buffer other) (point))))"#,
+            7,
+            cx,
+        );
+        check_interpreter(
+            r#"(let ((saved (current-buffer)) (other (get-buffer-create "recovered-killed-saved-other"))) (save-excursion (set-buffer other) (kill-buffer saved)) (eq (current-buffer) other))"#,
+            true,
+            cx,
+        );
     }
 
     fn check_error(test_str: &str, cx: &mut Context) {

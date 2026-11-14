@@ -52,6 +52,35 @@ impl PositionTree {
             (m.id, CharPos(position), m.bias)
         })
     }
+    /// Inclusive marker window; seeks by cached gaps rather than scanning the prefix.
+    pub fn markers_in(
+        &self,
+        range: std::ops::RangeInclusive<CharPos>,
+    ) -> TextResult<impl Iterator<Item = (MarkerId, CharPos, Bias)> + '_> {
+        let start = *range.start();
+        let end = *range.end();
+        if start > end {
+            return Err(TextError::ReversedRange);
+        }
+        if end.0 > self.text_len {
+            return Err(TextError::OutOfBounds);
+        }
+        let (index, before) = self
+            .tree
+            .seek_end(start.0, |s| s.chars)
+            .map(|(i, s, _)| (i, s.chars))
+            .unwrap_or((self.tree.len(), self.tree.summary().chars));
+        let mut position = before;
+        Ok(self
+            .tree
+            .iter_range(index..self.tree.len())
+            .unwrap()
+            .map(move |marker| {
+                position += marker.gap;
+                (marker.id, CharPos(position), marker.bias)
+            })
+            .take_while(move |(_, p, _)| *p <= end))
+    }
     /// ID lookup is linear in this initial index; position edits are indexed.
     pub fn get(&self, id: MarkerId) -> Option<(CharPos, Bias)> {
         self.markers().find(|(key, _, _)| *key == id).map(|(_, p, b)| (p, b))

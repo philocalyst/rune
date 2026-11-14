@@ -95,10 +95,11 @@ pub(crate) fn insert(args: ArgSlice, env: &mut Rt<Env>, cx: &Context) -> Result<
 
 // TODO: this should not throw and error. Buffer will always be present.
 #[defun]
-pub(crate) fn goto_char(position: usize, env: &mut Rt<Env>) -> Result<()> {
+pub(crate) fn goto_char(position: i64, env: &mut Rt<Env>) -> Result<i64> {
     let buffer = env.current_buffer.get_mut();
-    buffer.text.set_cursor(position);
-    Ok(())
+    let index = usize::try_from(position.max(1)).unwrap_or(usize::MAX);
+    buffer.text.set_cursor(index.saturating_sub(1));
+    Ok(position)
 }
 
 // TODO: this should not throw and error. Buffer will always be present.
@@ -118,7 +119,7 @@ pub(crate) fn point_min() -> usize {
 #[defun]
 pub(crate) fn point_marker(env: &mut Rt<Env>) -> usize {
     // TODO: Implement marker objects
-    env.current_buffer.get_mut().text.cursor().chars()
+    env.current_buffer.get_mut().text.cursor().chars() + 1
 }
 
 #[defun]
@@ -135,7 +136,7 @@ fn bolp(env: &Rt<Env>) -> bool {
 
 #[defun]
 fn point(env: &Rt<Env>) -> usize {
-    env.current_buffer.get().text.cursor().chars()
+    env.current_buffer.get().text.cursor().chars() + 1
 }
 
 #[defun]
@@ -272,5 +273,38 @@ mod test {
         assert_eq!(env.current_buffer.get(), "hello world");
         delete_region(2, 4, env, cx).unwrap();
         assert_eq!(env.current_buffer.get(), "hlo world");
+    }
+}
+
+#[cfg(test)]
+mod recovered_point_tests {
+    use super::*;
+    use crate::{
+        buffer::{get_buffer_create, set_buffer},
+        core::gc::RootSet,
+        sym::NIL,
+    };
+    use rune_core::macros::root;
+    #[test]
+    fn signed_one_based_points_are_character_offsets() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, new(Env), cx);
+        let buffer = get_buffer_create(cx.add("recovery-point-boundary"), Some(NIL.into()), cx)?;
+        set_buffer(buffer, env, cx)?;
+        assert_eq!(point(env), 1);
+        env.current_buffer.get_mut().insert(cx.add("aé🙂z"), cx)?;
+        for (requested, expected) in
+            [(-10, 1), (0, 1), (1, 1), (2, 2), (3, 3), (5, 5), (99, 5), (i64::MAX, 5)]
+        {
+            assert_eq!(goto_char(requested, env)?, requested);
+            assert_eq!(point(env), expected);
+            assert_eq!(point_marker(env), expected)
+        }
+        goto_char(1, env)?;
+        assert!(bolp(env));
+        goto_char(2, env)?;
+        assert!(!bolp(env));
+        Ok(())
     }
 }
