@@ -643,7 +643,17 @@ impl Rto<Function<'_>> {
                     .map_err(|e| e.add_trace(name, frame.arg_slice()))
             }
             FunctionType::SubrFn(f) => {
-                (*f).call(arg_cnt, frame, cx).map_err(|e| add_trace(e, name, frame.arg_slice()))
+                match (*f).call(arg_cnt, frame, cx) {
+                    Ok(value) => Ok(rune_core::macros::rebind!(value, cx)),
+                    Err(error) => {
+                        if error.downcast_ref::<rune_editor::EditorError>()
+                            .is_some_and(|error| matches!(error, rune_editor::EditorError::ReadOnly))
+                        {
+                            Err(EvalError::signal(sym::BUFFER_READ_ONLY.into(), NIL, cx)
+                                .add_trace(name, frame.arg_slice()))
+                        } else { Err(add_trace(error, name, frame.arg_slice())) }
+                    }
+                }
             }
             FunctionType::Cons(_) => {
                 crate::interpreter::call_closure(self.try_as().unwrap(), arg_cnt, name, frame, cx)

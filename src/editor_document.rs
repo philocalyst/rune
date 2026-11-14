@@ -282,6 +282,7 @@ pub(crate) struct RuntimeEditor {
     session: rune_editor::Session<RuntimeDocument>,
     properties: PropertyRegistry,
     disk_baselines: std::collections::BTreeMap<rune_editor::BufferId, save::guarded::Baseline>,
+    read_only_values: std::collections::BTreeMap<rune_editor::BufferId, Arc<crate::core::object::HeapDomainValue>>,
 }
 pub(crate) struct PreparedMetadata {
     buffer: rune_editor::BufferId,
@@ -293,10 +294,11 @@ impl RuntimeEditor {
         let properties = PropertyRegistry::new(cx);
         let session =
             rune_editor::Session::new(RuntimeDocument::new("", &properties, cx)?, width, height)?;
-        Ok(Self { session, properties, disk_baselines: Default::default() })
+        Ok(Self { session, properties, disk_baselines: Default::default(), read_only_values:Default::default() })
     }
     fn prune_disk_baselines(&mut self) {
         self.disk_baselines.retain(|id,_| self.session.buffer_live(*id));
+        self.read_only_values.retain(|id,_| self.session.buffer_snapshot(*id).is_ok_and(|b|b.read_only));
     }
     pub(crate) fn session(&self) -> &rune_editor::Session<RuntimeDocument> {
         &self.session
@@ -1039,6 +1041,7 @@ impl RuntimeEditorGateway {
         let id = owner.validate_handle(handle, cx)?;
         owner.session.execute(rune_editor::Command::KillBuffer { buffer: id, force })?;
         owner.disk_baselines.remove(&id);
+        owner.read_only_values.remove(&id);
         owner.buffer_handle(owner.session.current_buffer(), cx)
     }
 }
@@ -1919,10 +1922,102 @@ impl RuntimeEditorGateway {
     }
 }
 
-#[cfg(test)]
 impl RuntimeEditorGateway {
+    /// Native boolean policy writes canonical t/nil, never leaves an old raw
+    /// Lisp truthy value attached to the policy it superseded.
     pub(crate) fn set_read_only(&self,handle:OwnerBufferHandle,value:bool,cx:&Context)->anyhow::Result<()> {
-        self.check(cx)?;let mut owner=self.inner.try_borrow_mut()?;let id=owner.validate_handle(handle,cx)?;
-        owner.session.set_read_only(id,value)?;Ok(())
+        // SAFETY: bool conversion produces audited global t/nil only.
+        unsafe {self.set_read_only_value(handle,Object::from(value),cx)}
     }
+    pub(crate) fn read_only_value<'ob>(&self,handle:OwnerBufferHandle,cx:&'ob Context)->anyhow::Result<Object<'ob>> {
+        self.check(cx)?;let mut owner=self.inner.try_borrow_mut()?;let id=owner.validate_handle(handle,cx)?;
+        if !owner.session.buffer_snapshot(id)?.read_only {
+            owner.read_only_values.remove(&id);return Ok(Object::from(false));
+        }
+        match owner.read_only_values.get(&id) {Some(value)=>value.bind(cx),None=>Ok(Object::from(true))}
+    }
+    /// Restore one traced dynamic binding to its ORIGINAL target. Only a known
+    /// killed buffer is skipped; busy/foreign/unknown owner errors propagate.
+    /// SAFETY: same owned reachable-graph/rooting contract as set_read_only_value.
+    pub(crate) unsafe fn restore_read_only_value(&self,handle:OwnerBufferHandle,value:Object,cx:&Context)->anyhow::Result<()> {
+        self.check(cx)?;
+        {
+            let owner=self.inner.try_borrow()?;owner.properties.empty(cx)?;
+            anyhow::ensure!(handle.owner==cx.domain_id(),"Foreign readonly binding target");
+            if !owner.session.buffer_live(handle.buffer) {
+                owner.session.modified(handle.buffer)?; // Authenticated tombstone, not unknown ID.
+                return Ok(());
+            }
+        }
+        unsafe{self.set_read_only_value(handle,value,cx)}
+    }
+    /// SAFETY: every reachable local allocation in value belongs to cx (or
+    /// audited global storage) and is rooted by the caller until registration.
+    /// Domain checks authenticate destination, NOT arbitrary payload provenance.
+    pub(crate) unsafe fn set_read_only_value(&self,handle:OwnerBufferHandle,value:Object,cx:&Context)->anyhow::Result<()> {
+        unsafe {self.set_read_only_value_with_policy(handle,value,cx,|owner,id,enabled|owner.session.set_read_only(id,enabled))}
+    }
+    unsafe fn set_read_only_value_with_policy(&self,handle:OwnerBufferHandle,value:Object,cx:&Context,apply:impl FnOnce(&mut RuntimeEditor,rune_editor::BufferId,bool)->rune_editor::Result<()>)->anyhow::Result<()> {
+        self.check(cx)?;
+        {self.inner.try_borrow()?.validate_handle(handle,cx)?;}
+        let enabled=!value.is_nil();
+        // Mint before borrowing the owner; HeapDomainValue contains traced
+        // owner slots, never an unrooted Object<'static> in Session/snapshots.
+        let retained=if enabled {Some(Arc::new(unsafe{crate::core::object::HeapDomainValue::new(value,cx)}))}else{None};
+        let mut owner=self.inner.try_borrow_mut()?;let id=owner.validate_handle(handle,cx)?;
+        if let Some(retained)=retained {
+            // Allocate the native map entry before committing Session metadata.
+            // Checked sequence failure restores the prior root without callbacks.
+            let old=owner.read_only_values.insert(id,retained);
+            if let Err(error)=apply(&mut owner,id,true) {
+                if let Some(old)=old {owner.read_only_values.insert(id,old);}else{owner.read_only_values.remove(&id);}
+                return Err(error.into());
+            }
+        } else {
+            apply(&mut owner,id,false)?;
+            owner.read_only_values.remove(&id);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod raw_readonly_owner_tests {
+ use super::*;use crate::core::gc::RootSet;use rune_editor::{EditorHost,Command};
+ #[test]
+ fn raw_truthy_value_survives_gc_native_bool_canonicalizes_and_kill_releases() {
+  let roots=RootSet::default();let cx=&mut Context::new(&roots);let g=cx.editor_gateway().unwrap();let h=g.create("readonly-root","text",cx).unwrap();
+  // SAFETY: fresh owner allocation, retained before any GC.
+  unsafe{g.set_read_only_value(h,cx.add("original truthy"),cx)}.unwrap();cx.garbage_collect(true);
+  assert_eq!(g.read_only_value(h,cx).unwrap(),"original truthy");let before=g.read(h,cx).unwrap();assert!(g.splice(h,before.epoch,0..0,"blocked",cx).is_err());
+  g.set_read_only(h,true,cx).unwrap();assert_eq!(g.read_only_value(h,cx).unwrap(),Object::from(true));g.set_read_only(h,false,cx).unwrap();assert!(g.read_only_value(h,cx).unwrap().is_nil());assert!(!g.inner.borrow().read_only_values.contains_key(&h.buffer));
+  // Zero is non-nil in Lisp and must remain exact, not normalized to t.
+  unsafe{g.set_read_only_value(h,0i64.into(),cx)}.unwrap();assert_eq!(g.read_only_value(h,cx).unwrap(),Object::from(0i64));
+  g.host(cx).unwrap().execute(Command::KillBuffer{buffer:h.buffer,force:true}).unwrap();assert!(!g.inner.borrow().read_only_values.contains_key(&h.buffer));assert!(g.read_only_value(h,cx).is_err());
+ }
+ #[test]
+ fn foreign_owner_rejected_and_truthy_replacement_does_not_leak_old_root() {
+  let roots=RootSet::default();let cx=Context::new(&roots);let g=cx.editor_gateway().unwrap();let h=g.create("raw","",&cx).unwrap();
+  unsafe{g.set_read_only_value(h,cx.add("one"),&cx)}.unwrap();let old=Arc::downgrade(g.inner.borrow().read_only_values.get(&h.buffer).unwrap());unsafe{g.set_read_only_value(h,cx.add("two"),&cx)}.unwrap();assert!(old.upgrade().is_none());assert_eq!(g.read_only_value(h,&cx).unwrap(),"two");
+  drop(cx);let other_roots=RootSet::default();let other=Context::new(&other_roots);assert!(g.read_only_value(h,&other).is_err());assert!(g.set_read_only(h,false,&other).is_err());
+ }
+ #[test]
+ fn dynamic_restore_targets_original_live_buffer_and_only_skips_known_dead() {
+  let roots=RootSet::default();let cx=&mut Context::new(&roots);let g=cx.editor_gateway().unwrap();let a=g.create("binding-a","",cx).unwrap();let b=g.create("binding-b","",cx).unwrap();
+  unsafe{g.set_read_only_value(a,cx.add("original"),cx)}.unwrap();let saved=g.inner.borrow().read_only_values.get(&a.buffer).unwrap().clone();g.set_read_only(a,false,cx).unwrap();g.host(cx).unwrap().execute(Command::SwitchBuffer(b.buffer)).unwrap();cx.garbage_collect(true);unsafe{g.restore_read_only_value(a,saved.bind(cx).unwrap(),cx)}.unwrap();assert_eq!(g.read_only_value(a,cx).unwrap(),"original");assert!(g.read_only_value(b,cx).unwrap().is_nil());
+  {let _busy=g.inner.borrow_mut();assert!(unsafe{g.restore_read_only_value(a,Object::from(false),cx)}.is_err());}
+  g.kill(a,true,cx).unwrap();assert!(unsafe{g.restore_read_only_value(a,saved.bind(cx).unwrap(),cx)}.is_ok());
+  let other=RuntimeEditorGateway::new(cx,80,24).unwrap();let foreign=other.create("foreign","",cx).unwrap();assert!(unsafe{g.restore_read_only_value(foreign,Object::from(false),cx)}.is_err());
+ }
+
+ #[test]
+ fn checked_policy_failure_rolls_back_raw_root_and_nil_does_not_drop_original() {
+  let roots=RootSet::default();let cx=Context::new(&roots);let g=cx.editor_gateway().unwrap();let h=g.create("rollback","",&cx).unwrap();let seq=g.host(&cx).unwrap().snapshot().unwrap().sequence;
+  let fail=|_:&mut RuntimeEditor,_:rune_editor::BufferId,_:bool|Err(rune_editor::EditorError::IdExhausted);
+  assert!(unsafe{g.set_read_only_value_with_policy(h,cx.add("new"),&cx,fail)}.is_err());assert!(g.read_only_value(h,&cx).unwrap().is_nil());assert!(g.inner.borrow().read_only_values.is_empty());
+  unsafe{g.set_read_only_value(h,cx.add("original"),&cx)}.unwrap();let original=g.inner.borrow().read_only_values.get(&h.buffer).unwrap().clone();
+  assert!(unsafe{g.set_read_only_value_with_policy(h,cx.add("replacement"),&cx,fail)}.is_err());assert!(Arc::ptr_eq(&original,g.inner.borrow().read_only_values.get(&h.buffer).unwrap()));assert_eq!(g.read_only_value(h,&cx).unwrap(),"original");
+  assert!(unsafe{g.set_read_only_value_with_policy(h,Object::from(false),&cx,fail)}.is_err());assert_eq!(g.read_only_value(h,&cx).unwrap(),"original");assert_eq!(g.host(&cx).unwrap().snapshot().unwrap().sequence,seq+1);
+ }
+
 }

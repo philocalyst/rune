@@ -149,14 +149,13 @@ impl<'ob> RootedVM<'_, '_, '_> {
 
     fn varref(&mut self, idx: u16, cx: &'ob Context) -> Result<(), EvalError> {
         let symbol: Symbol = self.get_const(idx as usize, cx)?.try_into()?;
-        let Some(var) = self.env.vars.get(symbol) else {
+        let Some(var) = self.env.variable_value(symbol, cx)? else {
             return Err(EvalError::signal(
                 sym::VOID_VARIABLE.into(),
                 Cons::new1(symbol, cx).into(),
                 cx,
             ));
         };
-        let var = var.bind(cx);
         self.env.stack.push(var);
         Ok(())
     }
@@ -166,7 +165,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
         let symbol: Symbol = obj.try_into()?;
         self.require_stack(1)?;
         let value = self.env.stack.pop(cx);
-        crate::data::set(symbol, value, self.env)?;
+        crate::data::set(symbol, value, self.env, cx)?;
         Ok(())
     }
 
@@ -605,7 +604,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 }
                 op::SymbolValue => {
                     let top = self.env.stack.top().bind_as(cx)?;
-                    let value = data::symbol_value(top, self.env, cx).unwrap_or_default();
+                    let value = data::symbol_value(top, self.env, cx)?;
                     self.env.stack.top().set(value);
                 }
                 op::SymbolFunction => {
@@ -615,7 +614,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 op::Set => {
                     let newlet = self.env.stack.pop(cx);
                     let top = self.env.stack.top().bind_as(cx)?;
-                    let value = data::set(top, newlet, self.env)?;
+                    let value = data::set(top, newlet, self.env, cx)?;
                     self.env.stack.top().set(value);
                 }
                 op::Fset => {

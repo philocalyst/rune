@@ -34,6 +34,9 @@ pub(crate) struct Env<'a> {
     pub(crate) props: PropertyMap<'a>,
     pub(crate) catch_stack: Vec<Slot<Object<'a>>>,
     binding_stack: Vec<(Slot<Symbol<'a>>, Option<Slot<Object<'a>>>)>,
+    // Same-depth native target metadata. None denotes an ordinary Env binding.
+    #[no_trace]
+    binding_targets: Vec<Option<OwnerBufferHandle>>,
     pub(crate) match_data: Slot<Object<'a>>,
     features: Vec<Slot<Symbol<'a>>>,
     #[no_trace]
@@ -61,6 +64,7 @@ impl<'a> Env<'a> {
             props: Default::default(),
             catch_stack: Default::default(),
             binding_stack: Default::default(),
+            binding_targets: Default::default(),
             match_data: Default::default(),
             features: Default::default(),
             current_buffer,
@@ -100,6 +104,7 @@ impl<'a> RootedEnv<'a> {
             sym::VOID_FUNCTION,
             sym::INVALID_FUNCTION,
             sym::SETTING_CONSTANT,
+            sym::BUFFER_READ_ONLY,
             sym::ARITH_ERROR,
             sym::RUNE_UNIMPLEMENTED,
         ];
@@ -176,6 +181,36 @@ impl<'a> RootedEnv<'a> {
         Ok(())
     }
 
+    /// Read forwarded variables from the Context's single buffer authority.
+    pub(crate) fn variable_value<'cx>(
+        &self,
+        symbol: Symbol,
+        cx: &'cx Context,
+    ) -> Result<Option<Object<'cx>>> {
+        if symbol == crate::sym::BUFFER_READ_ONLY {
+            return self.editor_gateway.read_only_value(self.current_buffer, cx).map(Some);
+        }
+        Ok(self.vars.get(symbol).map(|value| value.bind(cx)))
+    }
+
+    /// Context-aware variable assignment. No buffer value is mirrored in vars.
+    pub(crate) fn set_var_context(
+        &mut self,
+        symbol: Symbol,
+        value: Object,
+        cx: &Context,
+    ) -> Result<()> {
+        Self::validate_variable_value(symbol, value)?;
+        if symbol == crate::sym::BUFFER_READ_ONLY {
+            // SAFETY: Env assignment callers supply values rooted in this owning
+            // Context (evaluation slots or Context-bound native primitive args).
+            return unsafe {
+                self.editor_gateway.set_read_only_value(self.current_buffer, value, cx)
+            };
+        }
+        self.set_var(symbol, value)
+    }
+
     pub(crate) fn set_var(&mut self, sym: Symbol, value: Object) -> Result<()> {
         Self::validate_variable_value(sym, value)?;
         if sym.is_const() {
@@ -200,9 +235,20 @@ impl<'a> RootedEnv<'a> {
 
     pub(crate) fn varbind(&mut self, var: Symbol, value: Object, cx: &Context) -> Result<()> {
         Self::validate_variable_value(var, value)?;
-        let prev_value = self.vars.get(var).map(|x| x.bind(cx));
+        assert_eq!(
+            self.binding_stack.len(),
+            self.binding_targets.len(),
+            "Dynamic binding target stack mismatch"
+        );
+        self.binding_stack.bind_mut(cx).try_reserve(1)?;
+        self.binding_targets.try_reserve(1)?;
+        let target = (var == crate::sym::BUFFER_READ_ONLY).then_some(self.current_buffer);
+        let prev_value = self.variable_value(var, cx)?;
+        // Prepare and publish the forwarded write before pushing its unwind record.
+        // No Lisp allocation or callback occurs between publication and both pushes.
+        self.set_var_context(var, value, cx)?;
         self.binding_stack.push((var, prev_value));
-        self.vars.insert(var, value);
+        self.binding_targets.push(target);
         Ok(())
     }
 
@@ -215,29 +261,58 @@ impl<'a> RootedEnv<'a> {
     pub(crate) fn unwind_bindings(&mut self, depth: usize, cx: &Context) -> Result<()> {
         anyhow::ensure!(depth <= self.binding_depth(), "Invalid dynamic binding checkpoint");
         while self.binding_depth() > depth {
-            self.unbind(1, cx);
+            self.try_unbind(1, cx)?;
+        }
+        Ok(())
+    }
+
+    /// Restore bindings without discarding an unwind record if the owner
+    /// rejects its restoration (busy, foreign Context, sequence exhaustion).
+    pub(crate) fn try_unbind(&mut self, count: u16, cx: &Context) -> Result<()> {
+        anyhow::ensure!(usize::from(count) <= self.binding_stack.len(), "Binding stack was empty");
+        for _ in 0..count {
+            assert_eq!(
+                self.binding_stack.len(),
+                self.binding_targets.len(),
+                "Dynamic binding target stack mismatch"
+            );
+            let target = *self.binding_targets.last().expect("Binding stack was empty");
+            let (symbol, value) = self
+                .binding_stack
+                .bind_ref(cx)
+                .last()
+                .map(|(symbol, value)| (**symbol, value.as_ref().map(|value| **value)))
+                .expect("Binding stack was empty");
+            if let Some(target) = target {
+                if let Some(value) = value {
+                    // SAFETY: value remains in its traced binding Slot until
+                    // restoration succeeds. No GC/callback occurs in the gateway.
+                    unsafe { self.editor_gateway.restore_read_only_value(target, value, cx) }?;
+                }
+            } else {
+                match value {
+                    Some(value) => self.vars.insert(symbol, value),
+                    None => self.vars.remove(symbol),
+                }
+            }
+            self.binding_stack.pop();
+            self.binding_targets.pop();
         }
         Ok(())
     }
 
     pub(crate) fn unbind(&mut self, count: u16, cx: &Context) {
-        for _ in 0..count {
-            match self.binding_stack.bind_mut(cx).pop() {
-                Some((sym, val)) => match val {
-                    Some(val) => self.vars.insert(*sym, *val),
-                    None => self.vars.remove(*sym),
-                },
-                None => panic!("Binding stack was empty"),
-            }
-        }
+        self.try_unbind(count, cx).expect("dynamic binding restoration failed");
     }
 
     pub(crate) fn toplevel_value<'ob>(&self, var: Symbol, cx: &'ob Context) -> Option<Object<'ob>> {
         if var.is_const() {
             return Some(var.into());
         }
-        for (symbol, saved) in self.binding_stack.bind_ref(cx) {
-            if **symbol == var {
+        for ((symbol, saved), target) in
+            self.binding_stack.bind_ref(cx).iter().zip(&self.binding_targets)
+        {
+            if target.is_none() && **symbol == var {
                 return saved.as_ref().map(|value| cx.bind(**value));
             }
         }
@@ -248,8 +323,8 @@ impl<'a> RootedEnv<'a> {
         if var.is_const() {
             return Err(anyhow!("Attempt to set a constant symbol"));
         }
-        for binding in &mut *self.binding_stack {
-            if binding.0 == var {
+        for (binding, target) in self.binding_stack.iter_mut().zip(&self.binding_targets) {
+            if target.is_none() && binding.0 == var {
                 binding.1.set(Some(value));
                 return Ok(());
             }
@@ -267,8 +342,8 @@ impl<'a> RootedEnv<'a> {
 
         // If this variable was unbound previously in the binding stack,
         // we will bind it to the new value
-        for binding in &mut *self.binding_stack {
-            if binding.0 == var && binding.1.is_none() {
+        for (binding, target) in self.binding_stack.iter_mut().zip(&self.binding_targets) {
+            if target.is_none() && binding.0 == var && binding.1.is_none() {
                 Self::validate_variable_value(var, value)?;
                 binding.1.set(Some(value));
             }
@@ -550,5 +625,92 @@ mod condition_bootstrap_tests {
         );
         assert!(!signal.matches_handler(sym::ERROR.into(), first, cx).unwrap());
         assert!(signal.matches_handler(sym::ERROR.into(), second, cx).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod forwarded_readonly_tests {
+    use super::*;
+    use crate::core::object::{NIL, TRUE};
+    use crate::sym;
+    use rune_core::macros::root;
+
+    #[test]
+    fn actual_lisp_readonly_blocks_insert_and_dynamic_override_restores_raw_value() -> Result<()> {
+        use rune_core::macros::rebind;
+        let roots = super::super::gc::RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        init_variables(cx, env);
+        let source = "(progn (insert \"initial\") (setq buffer-read-only 'raw) (list (condition-case nil (progn (insert \"FORBIDDEN\") nil) (buffer-read-only t)) (let ((buffer-read-only nil)) (insert \" allowed\") buffer-read-only) buffer-read-only (buffer-substring-no-properties (point-min) (point-max))))";
+        let form = crate::reader::read(source, cx)?.0;
+        root!(form, cx);
+        let result = rebind!(crate::interpreter::eval(form, None, env, cx)?, cx);
+        assert_eq!(result.to_string(), "(t nil raw \"initial allowed\")");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_foreign_gateway_unwind_retains_traced_binding_for_retry() -> Result<()> {
+        let roots = super::super::gc::RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        env.set_var_context(sym::BUFFER_READ_ONLY, TRUE, cx)?;
+        env.varbind(sym::BUFFER_READ_ONLY, NIL, cx)?;
+        let original = env.current_buffer_handle();
+        let other = RuntimeEditorGateway::new(cx, 80, 24)?;
+        let foreign = other.create("foreign-target", "", cx)?;
+        *env.binding_targets.last_mut().unwrap() = Some(foreign);
+        assert!(env.try_unbind(1, cx).is_err());
+        assert_eq!(env.binding_depth(), 1);
+        assert_eq!(env.variable_value(sym::BUFFER_READ_ONLY, cx)?, Some(NIL));
+        *env.binding_targets.last_mut().unwrap() = Some(original);
+        env.try_unbind(1, cx)?;
+        assert_eq!(env.binding_depth(), 0);
+        assert_eq!(env.variable_value(sym::BUFFER_READ_ONLY, cx)?, Some(TRUE));
+        Ok(())
+    }
+
+    #[test]
+    fn forwarded_heap_value_survives_gc_and_killed_binding_never_targets_current() -> Result<()> {
+        let roots = super::super::gc::RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        env.set_var_context(sym::BUFFER_READ_ONLY, cx.add("retained-raw"), cx)?;
+        cx.garbage_collect(true);
+        let raw = env.variable_value(sym::BUFFER_READ_ONLY, cx)?.unwrap();
+        assert_eq!(<&str>::try_from(raw)?, "retained-raw");
+        let original = env.current_buffer_handle();
+        env.varbind(sym::BUFFER_READ_ONLY, NIL, cx)?;
+        let other = env.editor_gateway().create(" *readonly-kill-other*", "", cx)?;
+        env.set_current_buffer(other, cx)?;
+        env.editor_gateway().kill(original, true, cx)?;
+        env.unbind(1, cx);
+        assert_eq!(env.variable_value(sym::BUFFER_READ_ONLY, cx)?, Some(NIL));
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_is_shared_per_buffer_and_dynamic_restore_targets_original_buffer() -> Result<()> {
+        let roots = super::super::gc::RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(first, init(Env::new_isolated(cx)?), cx);
+        root!(second, init(Env::new(cx)?), cx);
+        let original = first.current_buffer_handle();
+        second.set_current_buffer(original, &cx)?;
+        first.set_var_context(sym::BUFFER_READ_ONLY, TRUE, &cx)?;
+        assert_eq!(second.variable_value(sym::BUFFER_READ_ONLY, &cx)?, Some(TRUE));
+        first.varbind(sym::BUFFER_READ_ONLY, NIL, &cx)?;
+        assert_eq!(second.variable_value(sym::BUFFER_READ_ONLY, &cx)?, Some(NIL));
+        let other = first.editor_gateway().create(" *readonly-other*", "", &cx)?;
+        first.set_current_buffer(other, &cx)?;
+        first.unbind(1, &cx);
+        assert_eq!(first.variable_value(sym::BUFFER_READ_ONLY, &cx)?, Some(NIL));
+        assert_eq!(second.variable_value(sym::BUFFER_READ_ONLY, &cx)?, Some(TRUE));
+        Ok(())
     }
 }

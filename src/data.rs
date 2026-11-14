@@ -39,8 +39,9 @@ pub(crate) fn set<'ob>(
     place: Symbol,
     newlet: Object<'ob>,
     env: &mut Rt<Env>,
+    cx: &Context,
 ) -> Result<Object<'ob>> {
-    env.set_var(place, newlet)?;
+    env.set_var_context(place, newlet, cx)?;
     Ok(newlet)
 }
 
@@ -99,8 +100,10 @@ pub(crate) fn default_value<'ob>(
     env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
-    // TODO: Implement buffer locals
-    symbol_value(symbol, env, cx).ok_or_else(|| anyhow!("Void variable: {symbol}"))
+    if symbol == sym::BUFFER_READ_ONLY {
+        return env.toplevel_value(symbol, cx).ok_or_else(|| crate::eval::EvalError::signal(sym::VOID_VARIABLE.into(), Cons::new1(symbol, cx).into(), cx).into());
+    }
+    symbol_value(symbol, env, cx)
 }
 
 #[defun]
@@ -116,8 +119,9 @@ pub(crate) fn symbol_value<'ob>(
     symbol: Symbol,
     env: &Rt<Env>,
     cx: &'ob Context,
-) -> Option<Object<'ob>> {
-    env.vars.get(symbol).map(|x| x.bind(cx))
+) -> Result<Object<'ob>> {
+    if symbol.is_const() { return Ok(symbol.into()); }
+    env.variable_value(symbol, cx)?.ok_or_else(|| crate::eval::EvalError::signal(sym::VOID_VARIABLE.into(), Cons::new1(symbol, cx).into(), cx).into())
 }
 
 #[defun]
@@ -142,14 +146,15 @@ pub(crate) fn fmakunbound(symbol: Symbol) -> Symbol {
 }
 
 #[defun]
-pub(crate) fn boundp(symbol: Symbol, env: &Rt<Env>) -> bool {
-    env.vars.get(symbol).is_some()
+pub(crate) fn boundp(symbol: Symbol, env: &Rt<Env>, cx: &Context) -> Result<bool> {
+    Ok(symbol.is_const() || env.variable_value(symbol, cx)?.is_some())
 }
 
 #[defun]
-pub(crate) fn makunbound<'ob>(symbol: Symbol<'ob>, env: &mut Rt<Env>) -> Symbol<'ob> {
+pub(crate) fn makunbound<'ob>(symbol: Symbol<'ob>, env: &mut Rt<Env>) -> Result<Symbol<'ob>> {
+    anyhow::ensure!(symbol != sym::BUFFER_READ_ONLY, "Unbinding owner-forwarded buffer-read-only is not supported");
     env.vars.remove(symbol);
-    symbol
+    Ok(symbol)
 }
 
 #[defun]
@@ -412,9 +417,10 @@ pub(crate) fn defvar<'ob>(
     initvalue: Option<Object<'ob>>,
     _docstring: Option<&str>,
     env: &mut Rt<Env>,
+    cx: &Context,
 ) -> Result<Object<'ob>> {
     let value = initvalue.unwrap_or_default();
-    set(symbol, value, env)
+    set(symbol, value, env, cx)
 }
 
 #[defun]

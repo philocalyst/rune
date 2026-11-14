@@ -171,9 +171,9 @@ fn find_file_name_handler_internal<'ob>(
     env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Option<Symbol<'ob>> {
-    let file_name_handler_alist = symbol_value(FILE_NAME_HANDLER_ALIST, env, cx)?.as_list().ok()?;
+    let file_name_handler_alist = symbol_value(FILE_NAME_HANDLER_ALIST, env, cx).ok()?.as_list().ok()?;
     let inhibit_file_name_handlers =
-        symbol_value(INHIBIT_FILE_NAME_HANDLERS, env, cx).and_then(|sym| sym.as_list().ok());
+        symbol_value(INHIBIT_FILE_NAME_HANDLERS, env, cx).ok().and_then(|sym| sym.as_list().ok());
 
     file_name_handler_alist
         .filter_map(|elem| {
@@ -267,8 +267,7 @@ fn insert_file_contents<'ob>(
     let path = if Path::new(filename).is_absolute() {
         Path::new(filename).to_owned()
     } else {
-        let directory = symbol_value(sym::DEFAULT_DIRECTORY, env, cx)
-            .ok_or_else(|| anyhow::anyhow!("default-directory is unbound"))?;
+        let directory = symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?;
         let ObjectType::String(directory) = directory.untag() else {
             return Err(TypeError::new(Type::String, directory).into());
         };
@@ -478,7 +477,7 @@ mod tests {
             Cons::new("NEVER-MATCH", not_matching_handler, cx);
             cx
         ];
-        set(FILE_NAME_HANDLER_ALIST, file_name_handler_alist, env).unwrap();
+        set(FILE_NAME_HANDLER_ALIST, file_name_handler_alist, env, cx).unwrap();
 
         let test_txt_handler = find_file_name_handler("test.txt", NIL, env, cx);
         assert_eq!(test_txt_handler, handler);
@@ -499,8 +498,8 @@ mod tests {
             Cons::new(r"test\.txt", handler, cx);
             cx
         ];
-        set(FILE_NAME_HANDLER_ALIST, file_name_handler_alist, env).unwrap();
-        set(INHIBIT_FILE_NAME_HANDLERS, list![inhibit_handler; cx], env).unwrap();
+        set(FILE_NAME_HANDLER_ALIST, file_name_handler_alist, env, cx).unwrap();
+        set(INHIBIT_FILE_NAME_HANDLERS, list![inhibit_handler; cx], env, cx).unwrap();
 
         let result = find_file_name_handler("test.txt", NIL, env, cx);
         assert_eq!(result, inhibit_handler);
@@ -516,10 +515,10 @@ mod tests {
         let handler = Symbol::new_uninterned("handler", cx);
         root!(env, init(Env::new(cx).unwrap()), cx);
 
-        set(FILE_NAME_HANDLER_ALIST, list![Cons::new(NIL, handler, cx); cx], env).unwrap();
+        set(FILE_NAME_HANDLER_ALIST, list![Cons::new(NIL, handler, cx); cx], env, cx).unwrap();
         find_file_name_handler("example", NIL, env, cx);
 
-        set(FILE_NAME_HANDLER_ALIST, list![Cons::new(".*", NIL , cx); cx], env).unwrap();
+        set(FILE_NAME_HANDLER_ALIST, list![Cons::new(".*", NIL , cx); cx], env, cx).unwrap();
         find_file_name_handler("example", NIL, env, cx);
     }
 
@@ -537,6 +536,7 @@ mod tests {
             FILE_NAME_HANDLER_ALIST,
             list![Cons::new(r#"\(incorrect-regexp"#, handler, cx); cx],
             env,
+            cx,
         )
         .unwrap();
         find_file_name_handler("example", NIL, env, cx);

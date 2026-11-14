@@ -503,8 +503,8 @@ impl Interpreter<'_, '_> {
         } else {
             match self.binding_location(sym, cx) {
                 BindingLocation::Lexical(index) => Ok(self.vars[index].cdr(cx)),
-                BindingLocation::Dynamic => match self.env.vars.get(sym) {
-                    Some(v) => Ok(v.bind(cx)),
+                BindingLocation::Dynamic => match self.env.variable_value(sym, cx)? {
+                    Some(value) => Ok(value),
                     None => Err(EvalError::signal(
                         sym::VOID_VARIABLE.into(),
                         Cons::new1(sym, cx).into(),
@@ -524,7 +524,7 @@ impl Interpreter<'_, '_> {
                     .expect("variables should never be immutable");
                 Ok(())
             }
-            BindingLocation::Dynamic => self.env.set_var(name, new_value),
+            BindingLocation::Dynamic => self.env.set_var_context(name, new_value, cx),
         }
     }
 
@@ -565,7 +565,7 @@ impl Interpreter<'_, '_> {
         if let Some(depth) = self.declaration_scopes.pop().expect("let declaration scope") {
             self.local_specials.truncate(depth);
         }
-        self.env.unbind(varbind_count, cx);
+        self.env.try_unbind(varbind_count, cx)?;
         result
     }
 

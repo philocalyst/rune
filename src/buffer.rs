@@ -194,6 +194,7 @@ defvar!(TRUNCATE_LINES);
 defvar!(WORD_WRAP);
 defvar!(BIDI_DISPLAY_REORDERING);
 defvar!(BUFFER_FILE_NAME);
+defvar!(BUFFER_READ_ONLY);
 
 #[cfg(test)]
 mod test {
