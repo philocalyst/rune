@@ -322,6 +322,25 @@ impl<D: Document> Session<D> {
             Ok(())
         }
     }
+    pub fn buffer_point(&self, id: BufferId) -> Result<usize> {
+        let view = self.state.windows.view(self.selected_window())?;
+        if view.buffer == id {
+            Ok(view.point)
+        } else {
+            Ok(self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.saved_point)
+        }
+    }
+    pub fn set_buffer_point(&mut self, id: BufferId, point: usize) -> Result<()> {
+        if point > self.document(id)?.len_chars() {
+            return Err(EditorError::InvalidPosition);
+        }
+        if self.state.windows.view(self.selected_window())?.buffer == id {
+            self.move_point(point)
+        } else {
+            self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?.saved_point = point;
+            Ok(())
+        }
+    }
     pub fn last_command(&self) -> Option<CommandKind> {
         self.state.last_command
     }
@@ -338,11 +357,15 @@ impl<D: Document> Session<D> {
         Ok(&self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.document)
     }
     pub fn buffer_snapshot(&self, id: BufferId) -> Result<BufferSnapshot<D>> {
-        self.snapshot()
-            .buffers
-            .into_iter()
-            .find(|b| b.id == id)
-            .ok_or(EditorError::InvalidBuffer)
+        let b = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
+        Ok(BufferSnapshot {
+            id,
+            name: b.name.clone(),
+            document: b.document.clone(),
+            version: b.publication_epoch,
+            modified: b.version != b.saved_version,
+            read_only: b.read_only,
+        })
     }
     pub fn register_marker(
         &mut self,
@@ -866,7 +889,9 @@ impl<D: Document> Session<D> {
             return Err(EditorError::InvalidPosition);
         }
         // Record semantic intent, not an obsolete transport epoch, in macros.
-        self.execute(Command::PlaceCaret { window, buffer, position })
+        let outcome = self.execute(Command::PlaceCaret { window, buffer, position })?;
+        self.cancel_prefix();
+        Ok(outcome)
     }
     pub fn commit_replacement(
         &mut self,
@@ -974,9 +999,25 @@ impl<D: Document> Session<D> {
         range: Range<usize>,
         text: &str,
     ) -> Result<CommandOutcome> {
+        let id = self.state.current;
+        let epoch =
+            self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.publication_epoch;
+        self.replace_buffer(id, epoch, range, text)
+    }
+    pub fn replace_buffer(
+        &mut self,
+        id: BufferId,
+        expected_epoch: u64,
+        range: Range<usize>,
+        text: &str,
+    ) -> Result<CommandOutcome> {
+        if self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.publication_epoch
+            != expected_epoch
+        {
+            return Err(EditorError::StaleInput);
+        }
         let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
         let backup = self.state.clone();
-        let id = self.state.current;
         let result = catch_unwind(AssertUnwindSafe(|| self.edit_buffer(id, range, text)));
         match result {
             Ok(Ok(id)) => {

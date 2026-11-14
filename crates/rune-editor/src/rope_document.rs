@@ -89,10 +89,49 @@ impl crate::DisplayDocument for RopeDocument {
     }
 }
 impl crate::MarkerDocument for RopeDocument {
-    fn set_live_marker(&self,id:u64,position:usize,bias:crate::Bias)->Result<Self,Self::Error>{
-        let bias=match bias {crate::Bias::Left=>rune_text::Bias::Left,crate::Bias::Right=>rune_text::Bias::Right};
-        Ok(Self { snapshot:self.snapshot.with_marker(rune_text::MarkerId(id),CharPos(position),bias)?,insertion_properties:self.insertion_properties })
+    fn set_live_marker(
+        &self,
+        id: u64,
+        position: usize,
+        bias: crate::Bias,
+    ) -> Result<Self, Self::Error> {
+        let bias = match bias {
+            crate::Bias::Left => rune_text::Bias::Left,
+            crate::Bias::Right => rune_text::Bias::Right,
+        };
+        Ok(Self {
+            snapshot: self.snapshot.with_marker(
+                rune_text::MarkerId(id),
+                CharPos(position),
+                bias,
+            )?,
+            insertion_properties: self.insertion_properties,
+        })
     }
-    fn remove_live_marker(&self,id:u64)->Self {Self {snapshot:self.snapshot.without_marker(rune_text::MarkerId(id)),insertion_properties:self.insertion_properties}}
-    fn marker_position(&self,id:u64)->Option<usize>{self.snapshot.positions().get(rune_text::MarkerId(id)).map(|(p,_)|p.0)}
+    fn remove_live_marker(&self, id: u64) -> Self {
+        Self {
+            snapshot: self.snapshot.without_marker(rune_text::MarkerId(id)),
+            insertion_properties: self.insertion_properties,
+        }
+    }
+    fn marker_position(&self, id: u64) -> Option<usize> {
+        self.snapshot.positions().get(rune_text::MarkerId(id)).map(|(p, _)| p.0)
+    }
+}
+#[cfg(feature = "display")]
+impl crate::PlatformTextDocument for RopeDocument {
+    fn char_to_utf16(&self, p: usize) -> crate::Result<usize> {
+        self.snapshot
+            .text()
+            .char_to_utf16(CharPos(p))
+            .map(|p| p.0)
+            .map_err(|_| crate::EditorError::InvalidPosition)
+    }
+    fn utf16_to_char(&self, p: usize) -> crate::Result<usize> {
+        self.snapshot
+            .text()
+            .utf16_to_char(rune_text::Utf16Pos(p))
+            .map(|p| p.0)
+            .map_err(|_| crate::EditorError::InvalidPosition)
+    }
 }

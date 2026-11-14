@@ -36,3 +36,10 @@ impl<D: DisplayDocument> rune_display::TextSnapshot for PublishedDocument<D> {
         self.document.next_line_start(start)
     }
 }
+
+/// Indexed Unicode-scalar / UTF-16 boundary conversion for native IME opt-in.
+/// Invalid positions (including surrogate midpoints) reject without rounding.
+pub trait PlatformTextDocument: DisplayDocument {
+    fn char_to_utf16(&self, scalar: usize) -> crate::Result<usize>;
+    fn utf16_to_char(&self, utf16: usize) -> crate::Result<usize>;
+}

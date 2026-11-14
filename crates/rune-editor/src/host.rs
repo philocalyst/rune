@@ -6,10 +6,10 @@ use std::ops::Range;
 /// No Send bound: a runtime host borrows a thread-confined Context.
 pub trait EditorHost {
     type Doc: Document;
-    fn session(&self) -> &Session<Self::Doc>;
+    fn snapshot(&self) -> Result<crate::SessionSnapshot<Self::Doc>>;
     fn execute(&mut self, command: Command) -> Result<CommandOutcome>;
     fn dispatch_key(&mut self, key: Key) -> Result<Dispatch>;
-    fn cancel_prefix(&mut self);
+    fn cancel_prefix(&mut self) -> Result<()>;
     fn place_pointer(
         &mut self,
         window: WindowId,
@@ -28,8 +28,8 @@ pub trait EditorHost {
 }
 impl<D: Document> EditorHost for Session<D> {
     type Doc = D;
-    fn session(&self) -> &Self {
-        self
+    fn snapshot(&self) -> Result<crate::SessionSnapshot<D>> {
+        Ok(Session::snapshot(self))
     }
     fn execute(&mut self, c: Command) -> Result<CommandOutcome> {
         Session::execute(self, c)
@@ -37,8 +37,9 @@ impl<D: Document> EditorHost for Session<D> {
     fn dispatch_key(&mut self, k: Key) -> Result<Dispatch> {
         self.dispatch(k)
     }
-    fn cancel_prefix(&mut self) {
-        Session::cancel_prefix(self)
+    fn cancel_prefix(&mut self) -> Result<()> {
+        Session::cancel_prefix(self);
+        Ok(())
     }
     fn place_pointer(
         &mut self,

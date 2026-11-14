@@ -293,10 +293,15 @@ pub(crate) struct RuntimeEditorHost<'a, 'roots> {
     editor: &'a mut RuntimeEditor,
     cx: &'a mut Context<'roots>,
 }
-impl rune_editor::EditorHost for RuntimeEditorHost<'_, '_> {
-    type Doc = RuntimeDocument;
+impl RuntimeEditorHost<'_, '_> {
     fn session(&self) -> &rune_editor::Session<RuntimeDocument> {
         self.editor.session()
+    }
+}
+impl rune_editor::EditorHost for RuntimeEditorHost<'_, '_> {
+    type Doc = RuntimeDocument;
+    fn snapshot(&self) -> rune_editor::Result<rune_editor::SessionSnapshot<RuntimeDocument>> {
+        Ok(self.editor.session.snapshot())
     }
     fn execute(
         &mut self,
@@ -315,8 +320,13 @@ impl rune_editor::EditorHost for RuntimeEditorHost<'_, '_> {
             .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
         self.editor.session.dispatch(k)
     }
-    fn cancel_prefix(&mut self) {
-        self.editor.session.cancel_prefix()
+    fn cancel_prefix(&mut self) -> rune_editor::Result<()> {
+        self.editor
+            .properties
+            .empty(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
+        self.editor.session.cancel_prefix();
+        Ok(())
     }
     fn place_pointer(
         &mut self,
@@ -465,5 +475,427 @@ mod current_buffer_tests {
             Ok(())
         })
         .unwrap();
+    }
+}
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_editor::{Command, EditorHost};
+    #[test]
+    fn owner_metadata_preparation_rejects_stale_publish_after_native_edit() {
+        let roots = RootSet::default();
+        let mut cx = Context::new(&roots);
+        let mut editor = RuntimeEditor::new(&cx, 80, 24).unwrap();
+        let b = editor.create_buffer("target", "λ", &cx).unwrap();
+        // SAFETY: fresh scalar payload belongs to this Context.
+        let property = unsafe { editor.intern_property_set(cx.add("face"), &cx) }.unwrap();
+        let prepared =
+            editor.prepare_property_set(b, CharPos(0)..CharPos(1), &property, &cx).unwrap();
+        {
+            let mut host = RuntimeEditorHost { editor: &mut editor, cx: &mut cx };
+            host.execute(Command::SwitchBuffer(b)).unwrap();
+            host.execute(Command::Insert("x".into())).unwrap();
+        }
+        assert!(editor.publish_property_set(prepared, &cx).is_err());
+        assert_eq!(editor.session().document(b).unwrap().to_text(), "xλ");
+        assert!(editor.session().document(b).unwrap().resolve(property.id(), &cx).is_err());
+    }
+}
+
+/// Stable identifier for a future LispBuffer shell. No Context, GC pointer,
+/// mutable text or owner borrow crosses the shell boundary. Construction stays
+/// private to the authoritative runtime owner; numeric IDs are not adoption.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OwnerBufferHandle {
+    owner: u64,
+    buffer: rune_editor::BufferId,
+}
+impl RuntimeEditor {
+    pub(crate) fn buffer_handle(
+        &self,
+        buffer: rune_editor::BufferId,
+        cx: &Context,
+    ) -> anyhow::Result<OwnerBufferHandle> {
+        self.properties.empty(cx)?;
+        anyhow::ensure!(self.session.buffer_live(buffer), "Deleted editor buffer");
+        Ok(OwnerBufferHandle { owner: cx.domain_id(), buffer })
+    }
+    fn validate_handle(
+        &self,
+        handle: OwnerBufferHandle,
+        cx: &Context,
+    ) -> anyhow::Result<rune_editor::BufferId> {
+        self.properties.empty(cx)?;
+        anyhow::ensure!(handle.owner == cx.domain_id(), "Foreign editor owner");
+        anyhow::ensure!(self.session.buffer_live(handle.buffer), "Deleted editor buffer");
+        Ok(handle.buffer)
+    }
+    pub(crate) fn snapshot_handle(
+        &self,
+        handle: OwnerBufferHandle,
+        cx: &Context,
+    ) -> anyhow::Result<rune_editor::BufferSnapshot<RuntimeDocument>> {
+        Ok(self.session.buffer_snapshot(self.validate_handle(handle, cx)?)?)
+    }
+    pub(crate) fn select_lisp_handle(
+        &mut self,
+        handle: OwnerBufferHandle,
+        cx: &Context,
+    ) -> anyhow::Result<()> {
+        let id = self.validate_handle(handle, cx)?;
+        Ok(self.session.set_current_buffer(id)?)
+    }
+}
+#[cfg(test)]
+mod storage_boundary_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn stable_shell_selects_owner_storage_without_changing_selected_window() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let mut owner = RuntimeEditor::new(&cx, 80, 24).unwrap();
+        let selected = owner.session().selected_window();
+        let original = owner.session().snapshot().views[0].view.buffer;
+        let background = owner.create_buffer("background", "λ🙂", &cx).unwrap();
+        let handle = owner.buffer_handle(background, &cx).unwrap();
+        owner.select_lisp_handle(handle, &cx).unwrap();
+        owner.replace_current_lisp_range(2, 3, "界", &cx).unwrap();
+        assert_eq!(owner.snapshot_handle(handle, &cx).unwrap().document.to_text(), "λ界");
+        assert_eq!(owner.session().window_tree().view(selected).unwrap().buffer, original);
+        std::thread::spawn(move || {
+            let foreign_roots = RootSet::default();
+            let foreign = Context::new(&foreign_roots);
+            let other = RuntimeEditor::new(&foreign, 80, 24).unwrap();
+            assert!(other.snapshot_handle(handle, &foreign).is_err());
+        })
+        .join()
+        .unwrap();
+    }
+}
+
+/// Immutable owned read. No owner/Env/RefCell borrow survives a method return.
+#[derive(Clone, Debug)]
+pub(crate) struct BufferRead {
+    pub(crate) handle: OwnerBufferHandle,
+    pub(crate) epoch: u64,
+    pub(crate) document: RuntimeDocument,
+    pub(crate) point: usize,
+    pub(crate) name: String,
+}
+/// Explicit owner-local gateway for Env. Never put this Rc in global LispBuffer.
+/// No callback/Lisp evaluation occurs while a RefCell borrow is held.
+#[derive(Clone)]
+pub(crate) struct RuntimeEditorGateway {
+    owner: u64,
+    inner: std::rc::Rc<std::cell::RefCell<RuntimeEditor>>,
+}
+impl RuntimeEditorGateway {
+    pub(crate) fn new(cx: &Context, width: u32, height: u32) -> anyhow::Result<Self> {
+        Ok(Self {
+            owner: cx.domain_id(),
+            inner: std::rc::Rc::new(std::cell::RefCell::new(RuntimeEditor::new(
+                cx, width, height,
+            )?)),
+        })
+    }
+    fn check(&self, cx: &Context) -> anyhow::Result<()> {
+        anyhow::ensure!(self.owner == cx.domain_id(), "Foreign editor gateway");
+        Ok(())
+    }
+    pub(crate) fn scratch(&self, cx: &Context) -> anyhow::Result<OwnerBufferHandle> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        owner.buffer_handle(owner.session.current_buffer(), cx)
+    }
+    pub(crate) fn create(
+        &self,
+        name: &str,
+        text: &str,
+        cx: &Context,
+    ) -> anyhow::Result<OwnerBufferHandle> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.create_buffer(name, text, cx)?;
+        owner.buffer_handle(id, cx)
+    }
+    pub(crate) fn read(
+        &self,
+        handle: OwnerBufferHandle,
+        cx: &Context,
+    ) -> anyhow::Result<BufferRead> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        let id = owner.validate_handle(handle, cx)?;
+        let root = owner.session.buffer_snapshot(id)?;
+        Ok(BufferRead {
+            handle,
+            epoch: root.version,
+            document: root.document,
+            point: owner.session.buffer_point(id)?,
+            name: root.name,
+        })
+    }
+    pub(crate) fn set_point(
+        &self,
+        handle: OwnerBufferHandle,
+        point: usize,
+        cx: &Context,
+    ) -> anyhow::Result<()> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.set_buffer_point(id, point)?)
+    }
+    pub(crate) fn splice(
+        &self,
+        handle: OwnerBufferHandle,
+        epoch: u64,
+        range: Range<usize>,
+        text: &str,
+        cx: &Context,
+    ) -> anyhow::Result<rune_editor::CommandOutcome> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.replace_buffer(id, epoch, range, text)?)
+    }
+    pub(crate) fn register_marker(
+        &self,
+        handle: OwnerBufferHandle,
+        point: usize,
+        bias: Bias,
+        cx: &Context,
+    ) -> anyhow::Result<rune_editor::MarkerId> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.register_marker(id, point, bias)?)
+    }
+    pub(crate) fn marker_position(
+        &self,
+        handle: OwnerBufferHandle,
+        marker: rune_editor::MarkerId,
+        cx: &Context,
+    ) -> anyhow::Result<Option<usize>> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.marker_position(id, marker)?)
+    }
+    pub(crate) fn remove_marker(
+        &self,
+        handle: OwnerBufferHandle,
+        marker: rune_editor::MarkerId,
+        cx: &Context,
+    ) -> anyhow::Result<()> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        Ok(owner.session.remove_marker(id, marker)?)
+    }
+}
+#[cfg(test)]
+mod gateway_storage_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn cloned_gateway_has_one_storage_and_owned_reads_do_not_hold_borrows() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let gateway = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = gateway.create("background", "λ🙂", &cx).unwrap();
+        let old = gateway.read(h, &cx).unwrap();
+        let clone = gateway.clone();
+        clone.splice(h, old.epoch, 1..2, "界", &cx).unwrap();
+        assert_eq!(old.document.to_text(), "λ🙂");
+        assert_eq!(gateway.read(h, &cx).unwrap().document.to_text(), "λ界");
+        assert!(gateway.splice(h, old.epoch, 0..0, "stale", &cx).is_err());
+        let marker = clone.register_marker(h, 1, Bias::Right, &cx).unwrap();
+        assert_eq!(gateway.marker_position(h, marker, &cx).unwrap(), Some(1));
+        gateway.remove_marker(h, marker, &cx).unwrap();
+        assert_eq!(clone.marker_position(h, marker, &cx).unwrap(), None);
+    }
+}
+#[cfg(test)]
+mod gateway_lifecycle_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn retired_owner_gateway_rejects_rebinding_and_old_snapshot_ids() {
+        let roots = RootSet::default();
+        let (gateway, handle, old) = {
+            let cx = Context::new(&roots);
+            let gateway = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+            let h = gateway.create("retained", "λ", &cx).unwrap();
+            let old = gateway.read(h, &cx).unwrap();
+            (gateway, h, old)
+        };
+        let next_roots = RootSet::default();
+        let next = Context::new(&next_roots);
+        assert!(gateway.read(handle, &next).is_err());
+        assert!(gateway.set_point(handle, 0, &next).is_err());
+        assert!(gateway.splice(handle, old.epoch, 0..0, "bad", &next).is_err());
+        // Immutable Unicode content remains readable; no Lisp resolution is
+        // implied by retaining the native snapshot beyond Context teardown.
+        assert_eq!(old.document.to_text(), "λ");
+        assert!(old.document.resolve(0, &next).is_err());
+    }
+    #[test]
+    fn distinct_gateways_cannot_adopt_each_others_handles_in_same_context() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let first = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let second = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = first.create("private", "x", &cx).unwrap();
+        assert!(second.read(h, &cx).is_err());
+        let old = first.read(h, &cx).unwrap();
+        second.create("private", "other", &cx).unwrap();
+        assert!(second.splice(h, old.epoch, 0..1, "wrong", &cx).is_err());
+        assert_eq!(first.read(h, &cx).unwrap().document.to_text(), "x");
+    }
+}
+
+/// Native bridge over the SAME owner-local gateway Env uses. Each query returns
+/// owned roots; no RefCell guard or owner borrow crosses the API boundary.
+pub(crate) struct GatewayEditorHost<'a, 'roots> {
+    gateway: RuntimeEditorGateway,
+    cx: &'a Context<'roots>,
+}
+impl RuntimeEditorGateway {
+    pub(crate) fn host<'a, 'roots>(
+        &self,
+        cx: &'a Context<'roots>,
+    ) -> anyhow::Result<GatewayEditorHost<'a, 'roots>> {
+        self.check(cx)?;
+        Ok(GatewayEditorHost { gateway: self.clone(), cx })
+    }
+}
+impl GatewayEditorHost<'_, '_> {
+    fn mutate<R>(
+        &mut self,
+        run: impl FnOnce(&mut RuntimeEditor) -> rune_editor::Result<R>,
+    ) -> rune_editor::Result<R> {
+        self.gateway
+            .check(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
+        let mut owner = self
+            .gateway
+            .inner
+            .try_borrow_mut()
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
+        owner
+            .properties
+            .empty(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
+        run(&mut owner)
+    }
+}
+impl rune_editor::EditorHost for GatewayEditorHost<'_, '_> {
+    type Doc = RuntimeDocument;
+    fn snapshot(&self) -> rune_editor::Result<rune_editor::SessionSnapshot<RuntimeDocument>> {
+        self.gateway
+            .check(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
+        let owner = self
+            .gateway
+            .inner
+            .try_borrow()
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
+        Ok(owner.session.snapshot())
+    }
+    fn execute(
+        &mut self,
+        c: rune_editor::Command,
+    ) -> rune_editor::Result<rune_editor::CommandOutcome> {
+        self.mutate(|o| o.session.execute(c))
+    }
+    fn dispatch_key(&mut self, k: rune_editor::Key) -> rune_editor::Result<rune_editor::Dispatch> {
+        self.mutate(|o| o.session.dispatch(k))
+    }
+    fn cancel_prefix(&mut self) -> rune_editor::Result<()> {
+        self.mutate(|owner| {
+            owner.session.cancel_prefix();
+            Ok(())
+        })
+    }
+    fn place_pointer(
+        &mut self,
+        w: rune_editor::WindowId,
+        b: rune_editor::BufferId,
+        e: u64,
+        p: usize,
+    ) -> rune_editor::Result<rune_editor::CommandOutcome> {
+        self.mutate(|o| o.session.place_pointer(w, b, e, p))
+    }
+    fn commit_replacement(
+        &mut self,
+        w: rune_editor::WindowId,
+        b: rune_editor::BufferId,
+        e: u64,
+        r: Range<usize>,
+        t: String,
+    ) -> rune_editor::Result<rune_editor::CommandOutcome> {
+        self.mutate(|o| o.session.commit_replacement(w, b, e, r, t))
+    }
+}
+#[cfg(test)]
+mod shared_native_gateway_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_editor::{Command, EditorHost};
+    #[test]
+    fn native_and_lisp_gateway_share_authority_without_long_query_borrow() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let gateway = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let scratch = gateway.scratch(&cx).unwrap();
+        let mut native = gateway.host(&cx).unwrap();
+        let frame = native.snapshot().unwrap();
+        let read = gateway.read(scratch, &cx).unwrap();
+        gateway.splice(scratch, read.epoch, 0..0, "λ🙂", &cx).unwrap();
+        assert_eq!(frame.buffers[0].document.to_text(), "");
+        native.execute(Command::Undo).unwrap();
+        assert_eq!(gateway.read(scratch, &cx).unwrap().document.to_text(), "");
+        native.execute(Command::Redo).unwrap();
+        assert_eq!(gateway.read(scratch, &cx).unwrap().document.to_text(), "λ🙂");
+        let guard = gateway.inner.borrow_mut();
+        assert!(native.snapshot().is_err());
+        drop(guard);
+        assert!(native.snapshot().is_ok());
+    }
+}
+impl rune_editor::PlatformTextDocument for RuntimeDocument {
+    fn char_to_utf16(&self, p: usize) -> rune_editor::Result<usize> {
+        self.snapshot
+            .text()
+            .char_to_utf16(CharPos(p))
+            .map(|p| p.0)
+            .map_err(|_| rune_editor::EditorError::InvalidPosition)
+    }
+    fn utf16_to_char(&self, p: usize) -> rune_editor::Result<usize> {
+        self.snapshot
+            .text()
+            .utf16_to_char(rune_text::Utf16Pos(p))
+            .map(|p| p.0)
+            .map_err(|_| rune_editor::EditorError::InvalidPosition)
+    }
+}
+#[cfg(test)]
+mod platform_metric_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_editor::PlatformTextDocument;
+    #[test]
+    fn runtime_document_utf16_conversion_uses_scalar_boundaries() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let registry = PropertyRegistry::new(&cx);
+        let d = RuntimeDocument::new("a🙂λ", &registry, &cx).unwrap();
+        assert_eq!(d.char_to_utf16(2).unwrap(), 3);
+        assert_eq!(d.utf16_to_char(3).unwrap(), 2);
+        assert!(d.utf16_to_char(2).is_err());
+        assert!(d.char_to_utf16(4).is_err());
     }
 }

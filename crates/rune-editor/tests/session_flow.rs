@@ -127,7 +127,13 @@ fn renderer_reads_immutable_property_snapshot_after_later_edit() {
         Session::new(RopeDocument::new(Snapshot::new(Rope::from("aλ\n🙂")), PropSetId(3)), 80, 24)
             .unwrap();
     let id = session.current_buffer();
-    let published = session.snapshot().buffers.iter().find(|buffer| buffer.id == id).unwrap().display_snapshot();
+    let published = session
+        .snapshot()
+        .buffers
+        .iter()
+        .find(|buffer| buffer.id == id)
+        .unwrap()
+        .display_snapshot();
     session.execute(Command::Insert("中".into())).unwrap();
     assert_eq!(TextSnapshot::chars_from(&published, 1).collect::<String>(), "λ\n🙂");
     assert_eq!(TextSnapshot::next_line_start(&published, 0), Some(3));
@@ -232,7 +238,11 @@ fn queued_user_events_recover_after_failed_command_and_prefix() {
     session.enqueue(InputEvent::Command(Command::NextWindow));
     session.enqueue(InputEvent::Key(Key::Char('🙂')));
     let mut errors = 0;
-    while let Some(outcome) = session.step() { if outcome.is_err() { errors += 1; } }
+    while let Some(outcome) = session.step() {
+        if outcome.is_err() {
+            errors += 1;
+        }
+    }
     assert_eq!(errors, 1);
     assert_eq!(session.document(id).unwrap().to_text(), "λ🙂");
     assert_eq!(session.snapshot().views.len(), 2);
@@ -245,21 +255,31 @@ fn user_named_buffer_switch_restores_caret_and_independent_undo() {
     let mut session = Session::new(StringDocument::from("original"), 80, 24).unwrap();
     let original = session.current_buffer();
     session.execute(Command::GoTo(3)).unwrap();
-    session.execute(Command::SwitchToBuffer { name: "notes".into(), create: true }).unwrap();
+    session
+        .execute(Command::SwitchToBuffer { name: "notes".into(), create: true })
+        .unwrap();
     let notes = session.current_buffer();
     session.execute(Command::Insert("λ🙂".into())).unwrap();
-    session.execute(Command::SwitchToBuffer { name: "*scratch*".into(), create: false }).unwrap();
+    session
+        .execute(Command::SwitchToBuffer { name: "*scratch*".into(), create: false })
+        .unwrap();
     assert_eq!(session.current_buffer(), original);
     assert_eq!(session.point(), 3);
     assert_eq!(session.execute(Command::Undo), Err(EditorError::NoUndo));
-    session.execute(Command::SwitchToBuffer { name: "notes".into(), create: true }).unwrap();
+    session
+        .execute(Command::SwitchToBuffer { name: "notes".into(), create: true })
+        .unwrap();
     assert_eq!(session.current_buffer(), notes);
     assert_eq!(session.point(), 2);
     session.execute(Command::Undo).unwrap();
     assert_eq!(session.document(notes).unwrap().to_text(), "");
     assert_eq!(session.document(original).unwrap().to_text(), "original");
     assert_eq!(session.buffer_list().len(), 2);
-    assert!(session.execute(Command::SwitchToBuffer { name: "missing".into(), create: false }).is_err());
+    assert!(
+        session
+            .execute(Command::SwitchToBuffer { name: "missing".into(), create: false })
+            .is_err()
+    );
     assert_eq!(session.current_buffer(), notes);
     session.check_invariants().unwrap();
 }
@@ -271,10 +291,22 @@ fn branching_undo_publication_never_reuses_revision_for_different_text() {
     let mut session = Session::new(RopeDocument::empty(), 80, 24).unwrap();
     let id = session.current_buffer();
     session.execute(Command::Insert("a".into())).unwrap();
-    let first = session.snapshot().buffers.iter().find(|buffer| buffer.id == id).unwrap().display_snapshot();
+    let first = session
+        .snapshot()
+        .buffers
+        .iter()
+        .find(|buffer| buffer.id == id)
+        .unwrap()
+        .display_snapshot();
     session.execute(Command::Undo).unwrap();
     session.execute(Command::Insert("b".into())).unwrap();
-    let branch = session.snapshot().buffers.iter().find(|buffer| buffer.id == id).unwrap().display_snapshot();
+    let branch = session
+        .snapshot()
+        .buffers
+        .iter()
+        .find(|buffer| buffer.id == id)
+        .unwrap()
+        .display_snapshot();
     assert_ne!(TextSnapshot::revision(&first), TextSnapshot::revision(&branch));
     assert_eq!(TextSnapshot::chars_from(&first, 0).collect::<String>(), "a");
     assert_eq!(TextSnapshot::chars_from(&branch, 0).collect::<String>(), "b");
@@ -284,7 +316,15 @@ fn branching_undo_publication_never_reuses_revision_for_different_text() {
 fn publication_epoch_increases_on_undo_redo_without_breaking_savepoints() {
     let mut session = Session::new(StringDocument::empty(), 80, 24).unwrap();
     let id = session.current_buffer();
-    let epoch = |session: &Session<StringDocument>| session.snapshot().buffers.iter().find(|buffer| buffer.id == id).unwrap().version;
+    let epoch = |session: &Session<StringDocument>| {
+        session
+            .snapshot()
+            .buffers
+            .iter()
+            .find(|buffer| buffer.id == id)
+            .unwrap()
+            .version
+    };
     session.execute(Command::Insert("a".into())).unwrap();
     session.mark_saved(id).unwrap();
     let a = epoch(&session);
@@ -339,36 +379,79 @@ fn native_commit_rejects_same_window_after_buffer_switch() {
     let mut session = Session::new(StringDocument::empty(), 80, 24).unwrap();
     let window = session.selected_window();
     let buffer = session.current_buffer();
-    session.execute(Command::SwitchToBuffer { name: "other".into(), create: true }).unwrap();
+    session
+        .execute(Command::SwitchToBuffer { name: "other".into(), create: true })
+        .unwrap();
     let other = session.current_buffer();
-    assert_eq!(session.commit_text_for_buffer(window, buffer, "late".into()), Err(EditorError::StaleInput));
+    assert_eq!(
+        session.commit_text_for_buffer(window, buffer, "late".into()),
+        Err(EditorError::StaleInput)
+    );
     assert_eq!(session.document(buffer).unwrap().to_text(), "");
     assert_eq!(session.document(other).unwrap().to_text(), "");
     session.check_invariants().unwrap();
 }
 
-#[cfg(feature="rope")]
+#[cfg(feature = "rope")]
 #[test]
 fn marker_history_recaptures_live_ids_each_cycle() {
-    let mut s=Session::new(RopeDocument::empty(),80,24).unwrap();
-    let b=s.current_buffer();
+    let mut s = Session::new(RopeDocument::empty(), 80, 24).unwrap();
+    let b = s.current_buffer();
     s.execute(Command::Insert("λ🙂x".into())).unwrap();
-    let removed=s.register_marker(b,1,Bias::Left).unwrap();
-    s.execute(Command::Undo).unwrap();s.execute(Command::Redo).unwrap();
-    let fresh=s.register_marker(b,2,Bias::Left).unwrap();s.remove_marker(b,removed).unwrap();
+    let removed = s.register_marker(b, 1, Bias::Left).unwrap();
+    s.execute(Command::Undo).unwrap();
+    s.execute(Command::Redo).unwrap();
+    let fresh = s.register_marker(b, 2, Bias::Left).unwrap();
+    s.remove_marker(b, removed).unwrap();
     for _ in 0..3 {
-        s.execute(Command::Undo).unwrap();assert_eq!(s.marker_position(b,fresh).unwrap(),Some(0));
-        s.execute(Command::Redo).unwrap();assert_eq!(s.marker_position(b,fresh).unwrap(),Some(2));
-        assert_eq!(s.marker_position(b,removed).unwrap(),None);
+        s.execute(Command::Undo).unwrap();
+        assert_eq!(s.marker_position(b, fresh).unwrap(), Some(0));
+        s.execute(Command::Redo).unwrap();
+        assert_eq!(s.marker_position(b, fresh).unwrap(), Some(2));
+        assert_eq!(s.marker_position(b, removed).unwrap(), None);
     }
 }
-#[cfg(feature="rope")]
+#[cfg(feature = "rope")]
 #[test]
 fn empty_sparse_records_keep_delete_then_insert_marker_order() {
-    let d=RopeDocument::new(rune_text::Snapshot::new(rune_text::Rope::from("abc")),rune_text::PropSetId(0));
-    let mut s=Session::new(d,80,24).unwrap();let b=s.current_buffer();
-    s.register_marker(b,0,Bias::Left).unwrap();s.register_marker(b,3,Bias::Right).unwrap();
-    s.execute(Command::ReplaceRange {range:0..3,text:"X".into()}).unwrap();
-    let fresh=s.register_marker(b,1,Bias::Left).unwrap();s.execute(Command::Undo).unwrap();
-    assert_eq!(s.marker_position(b,fresh).unwrap(),Some(0));
+    let d = RopeDocument::new(
+        rune_text::Snapshot::new(rune_text::Rope::from("abc")),
+        rune_text::PropSetId(0),
+    );
+    let mut s = Session::new(d, 80, 24).unwrap();
+    let b = s.current_buffer();
+    s.register_marker(b, 0, Bias::Left).unwrap();
+    s.register_marker(b, 3, Bias::Right).unwrap();
+    s.execute(Command::ReplaceRange { range: 0..3, text: "X".into() }).unwrap();
+    let fresh = s.register_marker(b, 1, Bias::Left).unwrap();
+    s.execute(Command::Undo).unwrap();
+    assert_eq!(s.marker_position(b, fresh).unwrap(), Some(0));
+}
+#[cfg(feature = "display")]
+#[test]
+fn platform_text_offsets_reject_surrogate_midpoint_without_rounding() {
+    let d = RopeDocument::new(
+        rune_text::Snapshot::new(rune_text::Rope::from("a🙂λ")),
+        rune_text::PropSetId(0),
+    );
+    assert_eq!(d.char_to_utf16(2).unwrap(), 3);
+    assert_eq!(d.utf16_to_char(3).unwrap(), 2);
+    assert_eq!(d.utf16_to_char(2), Err(EditorError::InvalidPosition));
+    assert_eq!(d.char_to_utf16(4), Err(EditorError::InvalidPosition));
+}
+#[test]
+fn pointer_prefix_cancellation_is_success_only_in_owner_transaction() {
+    let mut s = Session::new(StringDocument::from("x"), 80, 24).unwrap();
+    let w = s.selected_window();
+    let b = s.current_buffer();
+    s.dispatch(Key::Control('x')).unwrap();
+    assert_eq!(s.place_pointer(w, b, 999, 0), Err(EditorError::StaleInput));
+    s.dispatch(Key::Char('2')).unwrap();
+    assert_eq!(s.snapshot().views.len(), 2);
+    s.dispatch(Key::Control('x')).unwrap();
+    let epoch = s.buffer_snapshot(b).unwrap().version;
+    s.place_pointer(w, b, epoch, 0).unwrap();
+    s.dispatch(Key::Char('2')).unwrap();
+    assert_eq!(s.snapshot().views.len(), 2);
+    assert_eq!(s.document(b).unwrap().to_text(), "2x");
 }
