@@ -1744,6 +1744,16 @@ impl rune_editor::EditorHost for LispRuntimeHost<'_, '_, '_> {
             spans: if len == 0 {vec![]} else {vec![rune_editor::display::FaceSpan { range: 0..len, face }]},
         })
     }
+    fn display_face_runs(&self, window: rune_editor::WindowId, buffer: rune_editor::BufferId, len: usize, visible: Range<usize>) -> rune_editor::Result<Option<Vec<rune_editor::display::FaceSpan>>> {
+        use rune_editor::EditorHost;
+        let snapshot = self.owner.snapshot()?;
+        let view = snapshot.views.iter().find(|v|v.id==window && v.view.buffer==buffer).ok_or(rune_editor::EditorError::InvalidWindow)?;
+        let doc = snapshot.buffers.iter().find(|b|b.id==view.view.buffer).ok_or(rune_editor::EditorError::InvalidBuffer)?.document.clone();
+        if doc.len_chars()!=len || visible.start>visible.end || visible.end>len { return Err(rune_editor::EditorError::InvalidPosition); }
+        drop(snapshot); // no editor RefCell guard or unrelated documents across resolution
+        crate::face_attributes::resolved_text_face_runs(&doc, visible, self.env, self.owner.cx)
+            .map(Some).map_err(|e|rune_editor::EditorError::Backend(e.into()))
+    }
     fn execute(
         &mut self,
         c: rune_editor::Command,

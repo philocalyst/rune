@@ -475,4 +475,4 @@ mod tests {
 }
 
 mod publication;
-pub(crate) use publication::default_face as resolved_default_face;
+pub(crate) use publication::{default_face as resolved_default_face, text_face_runs as resolved_text_face_runs};

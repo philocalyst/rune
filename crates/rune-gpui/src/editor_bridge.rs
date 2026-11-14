@@ -31,6 +31,16 @@ pub enum TextSource {
     KeyDown,
     CommittedText,
 }
+/// Exact, plain visible-style DTOs; errors remain data so corrective input runs.
+#[derive(Clone,Debug,PartialEq)]
+pub struct VisibleFaceRevision {
+    pub window_id: u64,
+    pub buffer_id: u64,
+    pub len: usize,
+    pub range: std::ops::Range<usize>,
+    pub faces: Result<Option<Vec<rune_display::FaceSpan>>,String>,
+}
+pub type PublicationRevision = (u64, rune_editor::DisplayStyleRevision, Vec<VisibleFaceRevision>);
 pub struct EditorBridge<H: EditorHost>
 where
     H::Doc: DisplayDocument,
@@ -43,6 +53,7 @@ where
     text_source: TextSource,
     anchors: BTreeMap<u64, (u64, usize)>,
     manual_scroll: Option<(u64, u64, usize)>,
+    visible_ranges: BTreeMap<u64, (rune_editor::WindowId, rune_editor::BufferId, usize, std::ops::Range<usize>)>,
 }
 impl<H: EditorHost> EditorBridge<H>
 where
@@ -93,13 +104,17 @@ where
             text_source: TextSource::KeyDown,
             anchors: BTreeMap::new(),
             manual_scroll: None,
+            visible_ranges: BTreeMap::new(),
         })
     }
     pub fn snapshot(&self) -> Result<rune_editor::SessionSnapshot<H::Doc>, BridgeError> {
         self.host.snapshot().map_err(Into::into)
     }
-    pub fn publication_revision(&self) -> Result<(u64, rune_editor::DisplayStyleRevision), BridgeError> {
-        Ok((self.host.snapshot()?.sequence, self.host.display_style_revision()?))
+    pub fn publication_revision(&self) -> Result<PublicationRevision, BridgeError> {
+        let runs = self.visible_ranges.iter().map(|(id,(window,buffer,len,range))| {
+            VisibleFaceRevision {window_id:*id,buffer_id:buffer.as_u64(),len:*len,range:range.clone(),faces:self.host.display_face_runs(*window,*buffer,*len,range.clone()).map_err(|e|e.to_string())}
+        }).collect();
+        Ok((self.host.snapshot()?.sequence, self.host.display_style_revision()?,runs))
     }
     pub fn with_text_source(mut self, source: TextSource) -> Result<Self, BridgeError> {
         self.host.cancel_prefix()?;
@@ -295,6 +310,7 @@ where
         let s = self.host.snapshot()?;
         let mut windows = Vec::with_capacity(s.views.len());
         let mut anchors = BTreeMap::new();
+        let mut visible_ranges = BTreeMap::new();
         for view in &s.views {
             let buffer = s
                 .buffers
@@ -328,6 +344,16 @@ where
                 spec.anchor = spec.point;
                 window = layout_window(&published, &spec, &style.spans, &self.metrics)?;
             }
+            // Derive the visible scalar slice from bounded layout, not a full
+            // document property scan. Colors cannot alter geometry in this slice.
+            let visible = match (window.rows.first(),window.rows.last()) {
+                (Some(first),Some(last)) => first.source.start..last.source.end,
+                _ => spec.anchor..spec.anchor,
+            };
+            if let Some(spans) = self.host.display_face_runs(view.id,buffer.id,published.len_chars(),visible.clone())? {
+                window = layout_window(&published,&spec,&spans,&self.metrics)?;
+            }
+            visible_ranges.insert(spec.window_id,(view.id,buffer.id,published.len_chars(),visible));
             if view.id != s.selected_window {
                 window.cursor = None;
             }
@@ -343,6 +369,7 @@ where
         });
         self.generation = generation;
         self.anchors = anchors;
+        self.visible_ranges = visible_ranges;
         Ok(frame)
     }
 }

@@ -15,6 +15,10 @@ pub trait EditorHost {
     fn display_window_style(&self, _window: WindowId, _buffer: BufferId, _len: usize) -> Result<crate::WindowStyle> {
         Ok(crate::WindowStyle::default())
     }
+    #[cfg(feature = "display")]
+    fn display_face_runs(&self, _window: WindowId, _buffer: BufferId, _len: usize, _visible: Range<usize>) -> Result<Option<Vec<rune_display::FaceSpan>>> {
+        Ok(None)
+    }
     fn execute(&mut self, command: Command) -> Result<CommandOutcome>;
     fn dispatch_key(&mut self, key: Key) -> Result<Dispatch>;
     fn cancel_prefix(&mut self) -> Result<()>;
