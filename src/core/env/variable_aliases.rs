@@ -57,6 +57,7 @@ impl RootedEnv<'_> {
             sym::DEFAULT_DIRECTORY,
             sym::FILL_COLUMN,
             sym::LOAD_PATH,
+            sym::DATA_DIRECTORY,
             sym::OVERLAY_ARROW_POSITION,
             sym::OVERLAY_ARROW_STRING,
             sym::OVERLAY_ARROW_VARIABLE_LIST,

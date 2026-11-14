@@ -5,6 +5,7 @@ mod process_transport;
 mod process;
 mod readonly;
 mod shell_startup;
+mod resources;
 mod process_events;
 #[macro_use]
 mod core;

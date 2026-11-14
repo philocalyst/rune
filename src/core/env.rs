@@ -40,6 +40,8 @@ pub(crate) struct Env<'a> {
     pub(crate) startup_system_type: &'static str,
     #[no_trace]
     pub(crate) startup_shell_file_name: std::ffi::OsString,
+    #[no_trace]
+    pub(crate) startup_data_directory: Option<std::ffi::OsString>,
     pub(crate) props: PropertyMap<'a>,
     pub(crate) catch_stack: Vec<Slot<Object<'a>>>,
     binding_stack: Vec<(Slot<Symbol<'a>>, Option<Slot<Object<'a>>>)>,
@@ -88,12 +90,14 @@ impl<'a> Env<'a> {
         }
         let editor_gateway = cx.editor_gateway()?;
         let current_buffer = editor_gateway.scratch(cx)?;
+        let startup_data_directory = crate::resources::capture_data_directory()?;
         Ok(Self {
             vars: Default::default(),
             variable_aliases: Default::default(),
             startup_default_directory,
             startup_system_type,
             startup_shell_file_name,
+            startup_data_directory,
             props: Default::default(),
             catch_stack: Default::default(),
             binding_stack: Default::default(),
