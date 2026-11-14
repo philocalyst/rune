@@ -724,6 +724,9 @@ defsym!(DEBUG);
 defsym!(VOID_VARIABLE);
 
 defvar!(DEBUG_ON_ERROR, false);
+// GNU startup.el declares this object-valued startup flag nil. Rune owns its
+// startup driver; no interactive Lisp debugger is fabricated by this flag.
+defvar!(INIT_FILE_DEBUG, false);
 defvar!(INTERNAL_MAKE_INTERPRETED_CLOSURE_FUNCTION);
 
 #[cfg(test)]
@@ -988,3 +991,26 @@ defsym!(SETTING_CONSTANT);
 defsym!(ARITH_ERROR);
 defsym!(RANGE_ERROR);
 defsym!(OVERFLOW_ERROR);
+
+#[cfg(test)]
+mod startup_debug_state_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn init_file_debug_has_gnu_default_and_real_dynamic_lisp_value() {
+        let source = "(list (boundp 'init-file-debug) init-file-debug (let ((init-file-debug t)) init-file-debug) init-file-debug)";
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let form = crate::reader::read(source, cx).unwrap().0;
+        root!(form, cx);
+        assert_eq!(
+            format!("{}", crate::interpreter::eval(form, None, env, cx).unwrap()),
+            "(t nil t nil)"
+        );
+        crate::library::elprop::start_emacs().unwrap();
+        assert_eq!(crate::library::elprop::eval(source).unwrap(), "(t nil t nil)");
+    }
+}
