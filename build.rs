@@ -246,7 +246,9 @@ mod generated_symbol_manifest_tests {{
         for index in 0..BUILTIN_SYMBOLS.len() {{
             assert!(names.insert(Symbol::new_builtin(index).get().name()));
         }}
+        let mut subr_names = std::collections::BTreeSet::new();
         for (index, function) in SUBR_SYMBOL_INDICES.iter().zip(SUBR_DEFS.iter()) {{
+            assert!(subr_names.insert(function.name), "duplicate native Lisp function");
             assert_eq!(Symbol::new_builtin(*index).get().name(), function.name);
         }}
     }}

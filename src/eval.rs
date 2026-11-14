@@ -614,16 +614,6 @@ fn special_variable_p(symbol: Symbol) -> bool {
 }
 
 #[defun]
-fn set_default_toplevel_value<'ob>(
-    symbol: Symbol,
-    value: Object,
-    env: &'ob mut Rt<Env>,
-) -> Result<Object<'ob>> {
-    env.set_var(symbol, value)?;
-    Ok(NIL)
-}
-
-#[defun]
 fn set_default<'ob>(
     symbol: Symbol,
     value: Object<'ob>,
