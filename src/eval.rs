@@ -133,9 +133,91 @@ fn diagnostic_trace(name: &str, arguments: &[Rto<Object>]) -> Box<str> {
     format!("{} {}", diagnostic_text(name), diagnostic_arguments(arguments)).into_boxed_str()
 }
 
+fn condition_any(
+    mut tail: Object<'_>,
+    mut predicate: impl FnMut(Object<'_>) -> Result<bool>,
+) -> Result<bool> {
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        match tail.untag() {
+            ObjectType::NIL => return Ok(false),
+            ObjectType::Cons(pair) => {
+                ensure!(seen.insert(pair as *const Cons as usize), "Cyclic condition list");
+                if predicate(pair.car())? {
+                    return Ok(true);
+                }
+                tail = pair.cdr();
+            }
+            _ => bail!("Condition metadata must be a proper list"),
+        }
+    }
+}
+
 impl EvalError {
     pub(crate) fn new_error(error: anyhow::Error) -> Self {
         Self { backtrace: Vec::new(), error: ErrorType::Err(error) }
+    }
+
+    /// Callback-free condition matching. Property lists are scanned with cycle
+    /// detection; no Lisp graph is rendered while selecting a handler.
+    pub(crate) fn matches_handler(
+        &self,
+        handler: Object,
+        env: &Rt<Env>,
+        cx: &Context,
+    ) -> Result<bool> {
+        if matches!(self.error, ErrorType::Throw(_)) {
+            return Ok(false);
+        }
+        if handler.is_nil() {
+            return Ok(false);
+        }
+        if handler == crate::core::object::TRUE {
+            return Ok(true);
+        }
+        if matches!(handler.untag(), ObjectType::Cons(_))
+            && condition_any(handler, |item| Ok(item == crate::core::object::TRUE))?
+        {
+            return Ok(true);
+        }
+        let condition = match &self.error {
+            ErrorType::Signal(exit) => exit.condition(cx).car(),
+            ErrorType::Err(error) => error
+                .downcast_ref::<LispError>()
+                .map_or(sym::ERROR.into(), |e| e.bind(cx).car()),
+            ErrorType::Throw(_) => unreachable!(),
+        };
+        let ObjectType::Symbol(symbol) = condition.untag() else {
+            bail!("Signal condition must be a symbol");
+        };
+        let metadata = env.props.get(symbol).and_then(|properties| {
+            properties.iter().find(|p| p.0 == sym::ERROR_CONDITIONS).map(|p| p.1.bind(cx))
+        });
+        let mut matches = |requested: Object| -> Result<bool> {
+            if requested == crate::core::object::TRUE {
+                return Ok(true);
+            }
+            if requested == sym::DEBUG {
+                return Ok(false);
+            }
+            if let Some(metadata) = metadata {
+                return condition_any(metadata, |class| Ok(class.ptr_eq(requested)));
+            }
+            if symbol == sym::QUIT {
+                return Ok(requested == sym::QUIT);
+            }
+            if symbol == sym::ERROR
+                || symbol == sym::RUNE_UNIMPLEMENTED
+                || matches!(self.error, ErrorType::Err(_))
+            {
+                return Ok(requested == symbol || requested == sym::ERROR);
+            }
+            Ok(false)
+        };
+        match handler.untag() {
+            ObjectType::Symbol(_) => matches(handler),
+            _ => condition_any(handler, &mut matches),
+        }
     }
 
     pub(crate) fn is_quit(&self, cx: &Context) -> bool {
@@ -755,6 +837,9 @@ mod exit_diagnostic_tests {
         root!(function, cx);
         constants.bind(cx).untag().try_mut().unwrap()[0].set(function.bind(cx).into());
         root!(env, init(Env::new(cx).unwrap()), cx);
+        let invalid = EvalError::signal(function.bind(cx).into(), NIL, cx);
+        let error = invalid.matches_handler(sym::ERROR.into(), env, cx).unwrap_err();
+        assert_eq!(error.to_string(), "Signal condition must be a symbol");
         let mut frame = CallFrame::new(env);
         frame.push_arg(Object::from(function.bind(cx)));
         frame.finalize_arguments().unwrap();
@@ -891,3 +976,5 @@ mod checked_argument_tests {
 // QUIT is not an ERROR subtype.
 defsym!(QUIT);
 defvar!(INHIBIT_QUIT);
+
+defsym!(ERROR_CONDITIONS);

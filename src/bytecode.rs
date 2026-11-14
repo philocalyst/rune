@@ -338,52 +338,8 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 if matches!(&err.error, ErrorType::Throw(_)) {
                     continue;
                 }
-                if err.is_quit(cx) {
-                    let accepts = match handler.condition.untag() {
-                        ObjectType::Symbol(sym::QUIT) => true,
-                        ObjectType::Cons(list) => {
-                            list.into_iter().any(|c| c.is_ok_and(|c| c == sym::QUIT))
-                        }
-                        _ => false,
-                    };
-                    if !accepts {
-                        continue;
-                    }
-                } else {
-                    let quit_only = match handler.condition.untag() {
-                        ObjectType::Cons(list) => {
-                            let mut any = false;
-                            let mut other = false;
-                            for item in list {
-                                let item = item?;
-                                any |= item == sym::QUIT;
-                                other |= item != sym::QUIT;
-                            }
-                            any && !other
-                        }
-                        _ => false,
-                    };
-                    if quit_only {
-                        continue;
-                    }
-                }
-                match handler.condition.untag() {
-                    ObjectType::Symbol(sym::QUIT) if err.is_quit(cx) => {}
-                    ObjectType::Symbol(sym::QUIT) => continue,
-                    ObjectType::Symbol(sym::ERROR) => {}
-                    ObjectType::Cons(conditions) => {
-                        for condition in conditions {
-                            let condition = condition?;
-                            // TODO: Handle different error symbols
-                            if condition != sym::DEBUG
-                                && condition != sym::ERROR
-                                && condition != sym::QUIT
-                            {
-                                bail_err!("non-error conditions {condition} not yet supported")
-                            }
-                        }
-                    }
-                    x => bail_err!("Invalid condition handler: {x}"),
+                if !err.matches_handler(*handler.condition, self.env, cx)? {
+                    continue;
                 }
 
                 let rendered = format!("{err}");
@@ -2096,6 +2052,45 @@ mod test {
             frame.finalize_arguments().unwrap();
             let error = call(bytecode, 0, "nonsymbol-constant", frame, cx).unwrap_err();
             assert!(matches!(error.error, ErrorType::Err(_)));
+        }
+    }
+
+    #[test]
+    fn vm_metadata_inheritance_and_catch_all_share_interpreter_matcher() {
+        use OpCode as O;
+        for handler_source in ["vm-parent", "error", "t"] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            root!(env, init(Env::new(cx).unwrap()), cx);
+            let source = crate::reader::read("(progn (put 'vm-child 'error-conditions '(vm-child vm-parent error)) (function (lambda () (signal 'vm-child '(7)))))", cx).unwrap().0;
+            root!(source, cx);
+            let closure = crate::interpreter::eval(source, None, env, cx).unwrap();
+            root!(closure, cx);
+            let condition = crate::reader::read(handler_source, cx).unwrap().0;
+            root!(condition, cx);
+            make_bytecode!(
+                bytecode,
+                0,
+                [
+                    O::Constant0,
+                    O::PushCondtionCase,
+                    8,
+                    0,
+                    O::Constant1,
+                    O::Call0,
+                    O::PopHandler,
+                    O::Return,
+                    O::Constant3,
+                    O::Return
+                ],
+                [condition.bind(cx), closure.bind(cx), NIL, 7],
+                cx
+            );
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments().unwrap();
+            assert_eq!(call(bytecode, 0, "metadata-vm", &mut frame, cx).unwrap(), Object::from(7));
+            assert_eq!(frame.binding_depth(), 0);
         }
     }
 

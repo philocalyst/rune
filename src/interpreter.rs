@@ -697,54 +697,8 @@ impl Interpreter<'_, '_> {
                 ObjectType::Cons(cons) => {
                     // Check that conditions match
                     let condition = cons.car();
-                    if err.is_quit(cx) {
-                        let accepts = match condition.untag() {
-                            ObjectType::Symbol(sym::QUIT) => true,
-                            ObjectType::Cons(list) => {
-                                list.into_iter().any(|c| c.is_ok_and(|c| c == sym::QUIT))
-                            }
-                            _ => false,
-                        };
-                        if !accepts {
-                            continue;
-                        }
-                    } else {
-                        let quit_only = match condition.untag() {
-                            ObjectType::Cons(list) => {
-                                let mut any = false;
-                                let mut other = false;
-                                for item in list {
-                                    let item = item?;
-                                    any |= item == sym::QUIT;
-                                    other |= item != sym::QUIT;
-                                }
-                                any && !other
-                            }
-                            _ => false,
-                        };
-                        if quit_only {
-                            continue;
-                        }
-                    }
-                    match condition.untag() {
-                        ObjectType::Symbol(sym::QUIT) if err.is_quit(cx) => {}
-                        ObjectType::Symbol(sym::QUIT) => continue,
-                        ObjectType::Symbol(sym::ERROR | sym::VOID_VARIABLE) => {}
-                        // TODO: Remove this once error handling is correctly implemented
-                        ObjectType::Symbol(s) if s.name() == "cl--generic-cyclic-definition" => {}
-                        ObjectType::Cons(conditions) => {
-                            for condition in conditions {
-                                let condition = condition?;
-                                // TODO: Handle different error symbols
-                                if condition != sym::DEBUG
-                                    && condition != sym::ERROR
-                                    && condition != sym::QUIT
-                                {
-                                    bail_err!("non-error conditions {condition} not yet supported")
-                                }
-                            }
-                        }
-                        _ => bail_err!("Invalid condition handler: {condition}"),
+                    if !err.matches_handler(condition, self.env, cx)? {
+                        continue;
                     }
 
                     // Call handlers with error
@@ -1040,6 +994,64 @@ mod test {
         let obj = crate::reader::read(test_str, cx).unwrap().0;
         root!(obj, cx);
         assert!(eval(obj, None, env, cx).is_err());
+    }
+
+    #[test]
+    fn metadata_conditions_match_gnu_inheritance_and_unknown_symbols() {
+        for (source, expected) in [
+            (
+                "(condition-case e (signal 'vm-unknown nil) (vm-unknown 'wrong) (error 'wrong) (t 'all))",
+                "all",
+            ),
+            (
+                "(progn (put 'vm-child 'error-conditions '(vm-child error)) (condition-case e (signal 'vm-child '(7)) (error e)))",
+                "(vm-child 7)",
+            ),
+            (
+                "(progn (put 'vm-child 'error-conditions nil) (condition-case e (signal 'vm-child nil) (vm-child 'wrong) (error 'wrong) (t 'all)))",
+                "all",
+            ),
+            (
+                "(condition-case e (signal 'quit '(x)) ((debug error) 'wrong) ((quit) e))",
+                "(quit x)",
+            ),
+            (
+                "(progn (put 'vm-bad-t 'error-conditions 'broken) (condition-case nil (signal 'vm-bad-t nil) (t 'all)))",
+                "all",
+            ),
+            (
+                "(progn (put 'vm-dotted 'error-conditions '(vm-dotted . broken)) (condition-case nil (signal 'vm-dotted nil) (vm-dotted 'self)))",
+                "self",
+            ),
+            ("(condition-case nil (signal 'quit nil) ((t) 'all))", "all"),
+            (
+                "(progn (put 'vm-nil-handler 'error-conditions 'broken) (condition-case nil (signal 'vm-nil-handler nil) (nil 'wrong) (t 'all)))",
+                "all",
+            ),
+            (
+                "(progn (put 'vm-late-t 'error-conditions '(vm-late-t . broken)) (condition-case nil (signal 'vm-late-t nil) ((nomatch t) 'all)))",
+                "all",
+            ),
+            ("(condition-case e (signal 'quit nil) (t e))", "(quit)"),
+            (
+                "(progn (put 'vm-nonsymbol 'error-conditions '(vm-nonsymbol 3 error)) (condition-case e (signal 'vm-nonsymbol nil) (error e)))",
+                "(vm-nonsymbol)",
+            ),
+            (
+                "(progn (put 'vm-badmetadata 'error-conditions 'broken) (condition-case nil (condition-case nil (signal 'vm-badmetadata nil) (error 'wrong)) (error 'caught)))",
+                "caught",
+            ),
+            (
+                "(let ((metadata (list 'vm-cycle))) (setcdr metadata metadata) (put 'vm-cycle 'error-conditions metadata) (condition-case nil (condition-case nil (signal 'vm-cycle nil) (error 'wrong)) (error 'caught)))",
+                "caught",
+            ),
+            (
+                "(progn (put 'vm-multi 'error-conditions '(vm-multi vm-parent error)) (condition-case e (signal 'vm-multi nil) (vm-parent 'parent) (error 'wrong)))",
+                "parent",
+            ),
+        ] {
+            assert_lisp(source, expected);
+        }
     }
 
     #[test]
