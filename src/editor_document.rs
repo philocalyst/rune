@@ -596,11 +596,14 @@ pub(crate) struct BufferRead {
 pub(crate) struct RuntimeEditorGateway {
     owner: u64,
     inner: std::rc::Rc<std::cell::RefCell<RuntimeEditor>>,
+    abandoned_markers:
+        std::rc::Rc<std::cell::RefCell<Vec<(OwnerBufferHandle, rune_editor::MarkerId)>>>,
 }
 impl RuntimeEditorGateway {
     pub(crate) fn new(cx: &Context, width: u32, height: u32) -> anyhow::Result<Self> {
         Ok(Self {
             owner: cx.domain_id(),
+            abandoned_markers: Default::default(),
             inner: std::rc::Rc::new(std::cell::RefCell::new(RuntimeEditor::new(
                 cx, width, height,
             )?)),
@@ -608,6 +611,17 @@ impl RuntimeEditorGateway {
     }
     fn check(&self, cx: &Context) -> anyhow::Result<()> {
         anyhow::ensure!(self.owner == cx.domain_id(), "Foreign editor gateway");
+        if !self.abandoned_markers.borrow().is_empty() {
+            // Acquire owner before taking queue, so busy-owner errors retain all
+            // cleanup records for the next entry rather than losing them.
+            let mut owner = self.inner.try_borrow_mut()?;
+            let abandoned = std::mem::take(&mut *self.abandoned_markers.borrow_mut());
+            for (handle, marker) in abandoned {
+                if owner.validate_handle(handle, cx).is_ok() {
+                    owner.session.remove_marker(handle.buffer, marker)?;
+                }
+            }
+        }
         Ok(())
     }
     pub(crate) fn scratch(&self, cx: &Context) -> anyhow::Result<OwnerBufferHandle> {
@@ -1110,5 +1124,324 @@ mod property_batch_tests {
         assert_eq!(now.document.properties().at(CharPos(0)), Some(PropSetId(a.id())));
         assert_eq!(now.document.properties().at(CharPos(1)), Some(PropSetId(b.id())));
         assert_eq!(now.document.properties().at(CharPos(2)), Some(PropSetId(a.id())));
+    }
+}
+/// Production owner-thread factory: obtains the Context's sole gateway, exactly
+/// the same store Env::new(cx) uses. No second RuntimeEditor is constructed.
+/// It still installs no legacy Lisp primitive bindings or native platform loop.
+pub(crate) fn with_shared_runtime_owner<R>(
+    width: u32,
+    height: u32,
+    run: impl for<'a, 'roots> FnOnce(GatewayEditorHost<'a, 'roots>) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    use rune_editor::EditorHost;
+    let roots = crate::core::gc::RootSet::default();
+    let cx = Context::new(&roots);
+    let gateway = cx.editor_gateway()?;
+    let mut host = gateway.host(&cx)?;
+    host.execute(rune_editor::Command::Resize { width, height })?;
+    run(host)
+}
+#[cfg(test)]
+mod shared_factory_tests {
+    use super::*;
+    use rune_editor::{Document, EditorHost};
+    #[test]
+    fn production_factory_native_and_context_accessor_have_identical_storage() {
+        with_shared_runtime_owner(90, 30, |mut host| {
+            let env_gateway = host.cx.editor_gateway()?;
+            let scratch = env_gateway.scratch(host.cx)?;
+            let read = env_gateway.read(scratch, host.cx)?;
+            env_gateway.splice(scratch, read.epoch, 0..0, "λ🙂", host.cx)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "λ🙂");
+            host.execute(rune_editor::Command::Undo)?;
+            assert_eq!(env_gateway.read(scratch, host.cx)?.document.to_text(), "");
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+#[cfg(test)]
+mod session_identity_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn same_context_foreign_session_rejects_all_shell_operations() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let first = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let second = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let foreign = first.scratch(&cx).unwrap();
+        let local = second.scratch(&cx).unwrap();
+        let epoch = second.read(local, &cx).unwrap().epoch;
+        for handle in [foreign] {
+            assert!(second.read(handle, &cx).is_err());
+            assert!(second.rename(handle, "wrong", false, &cx).is_err());
+            assert!(second.kill(handle, true, &cx).is_err());
+            assert!(second.splice(handle, epoch, 0..0, "wrong", &cx).is_err());
+        }
+        assert_eq!(second.read(local, &cx).unwrap().document.to_text(), "");
+        assert_eq!(second.read(local, &cx).unwrap().name, "*scratch*");
+    }
+}
+
+/// Mutable Context owner for future evaluator dispatch. The native trait still
+/// receives owned snapshots; shared edit hosts are constructed only per call.
+/// This avoids an immutable Context borrow spanning the worker's entire life.
+pub(crate) struct MutableGatewayEditorHost<'a, 'roots> {
+    gateway: RuntimeEditorGateway,
+    cx: &'a mut Context<'roots>,
+}
+impl MutableGatewayEditorHost<'_, '_> {
+    /// Evaluator work runs with NO editor RefCell borrow held. Env must obtain
+    /// this Context's gateway, never construct another authoritative Session.
+    /// This is an ownership boundary, NOT a whole-evaluation transaction: Lisp
+    /// may edit before signalling an error. Never retry the callback to recover
+    /// later failures; each gateway mutation already owns its undo transaction.
+    pub(crate) fn with_context<R>(
+        &mut self,
+        run: impl FnOnce(&mut Context, &RuntimeEditorGateway) -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        self.gateway.check(self.cx)?;
+        run(self.cx, &self.gateway)
+    }
+}
+impl rune_editor::EditorHost for MutableGatewayEditorHost<'_, '_> {
+    type Doc = RuntimeDocument;
+    fn snapshot(&self) -> rune_editor::Result<rune_editor::SessionSnapshot<RuntimeDocument>> {
+        use rune_editor::EditorHost;
+        self.gateway
+            .host(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?
+            .snapshot()
+    }
+    fn execute(
+        &mut self,
+        c: rune_editor::Command,
+    ) -> rune_editor::Result<rune_editor::CommandOutcome> {
+        use rune_editor::EditorHost;
+        self.gateway
+            .host(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?
+            .execute(c)
+    }
+    fn dispatch_key(&mut self, k: rune_editor::Key) -> rune_editor::Result<rune_editor::Dispatch> {
+        use rune_editor::EditorHost;
+        self.gateway
+            .host(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?
+            .dispatch_key(k)
+    }
+    fn cancel_prefix(&mut self) -> rune_editor::Result<()> {
+        use rune_editor::EditorHost;
+        self.gateway
+            .host(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?
+            .cancel_prefix()
+    }
+    fn place_pointer(
+        &mut self,
+        w: rune_editor::WindowId,
+        b: rune_editor::BufferId,
+        e: u64,
+        p: usize,
+    ) -> rune_editor::Result<rune_editor::CommandOutcome> {
+        use rune_editor::EditorHost;
+        self.gateway
+            .host(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?
+            .place_pointer(w, b, e, p)
+    }
+    fn commit_replacement(
+        &mut self,
+        w: rune_editor::WindowId,
+        b: rune_editor::BufferId,
+        e: u64,
+        r: Range<usize>,
+        t: String,
+    ) -> rune_editor::Result<rune_editor::CommandOutcome> {
+        use rune_editor::EditorHost;
+        self.gateway
+            .host(self.cx)
+            .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?
+            .commit_replacement(w, b, e, r, t)
+    }
+}
+pub(crate) fn with_evaluator_runtime_owner<R>(
+    width: u32,
+    height: u32,
+    run: impl for<'a, 'roots> FnOnce(MutableGatewayEditorHost<'a, 'roots>) -> anyhow::Result<R>,
+) -> anyhow::Result<R> {
+    use rune_editor::EditorHost;
+    let roots = crate::core::gc::RootSet::default();
+    let mut cx = Context::new(&roots);
+    let gateway = cx.editor_gateway()?;
+    let mut host = MutableGatewayEditorHost { gateway, cx: &mut cx };
+    host.execute(rune_editor::Command::Resize { width, height })?;
+    run(host)
+}
+#[cfg(test)]
+mod mutable_owner_tests {
+    use super::*;
+    use rune_editor::{Command, Document, EditorHost};
+    #[test]
+    fn evaluator_context_gc_and_gateway_edits_run_without_retained_owner_borrow() {
+        with_evaluator_runtime_owner(80, 24, |mut host| {
+            let old = host.snapshot()?;
+            host.with_context(|cx, gateway| {
+                let h = gateway.scratch(cx)?;
+                let read = gateway.read(h, cx)?;
+                gateway.splice(h, read.epoch, 0..0, "λ🙂", cx)?;
+                cx.garbage_collect(true);
+                Ok(())
+            })?;
+            assert_eq!(old.buffers[0].document.to_text(), "");
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "λ🙂");
+            host.execute(Command::Undo)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "");
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+#[cfg(test)]
+mod evaluator_partial_effect_tests {
+    use super::*;
+    use rune_editor::{Command, Document, EditorHost};
+    #[test]
+    fn evaluator_error_does_not_claim_rollback_or_replay_applied_edit() {
+        with_evaluator_runtime_owner(80, 24, |mut host| {
+            let outcome = host.with_context(|cx, gateway| -> anyhow::Result<()> {
+                let h = gateway.scratch(cx)?;
+                let read = gateway.read(h, cx)?;
+                gateway.splice(h, read.epoch, 0..0, "once", cx)?;
+                anyhow::bail!("Lisp signal after edit")
+            });
+            assert!(outcome.is_err());
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "once");
+            host.execute(Command::Undo)?;
+            assert_eq!(host.snapshot()?.buffers[0].document.to_text(), "");
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+/// Native-only unwind cleanup. Drop never resolves Lisp values, borrows Session,
+/// restores point, or claims rollback; it merely queues exact unregister intent.
+pub(crate) struct MarkerCleanupGuard {
+    record: Option<(OwnerBufferHandle, rune_editor::MarkerId)>,
+    pending: std::rc::Rc<std::cell::RefCell<Vec<(OwnerBufferHandle, rune_editor::MarkerId)>>>,
+}
+impl MarkerCleanupGuard {
+    pub(crate) fn disarm(mut self) {
+        self.record = None;
+    }
+}
+impl Drop for MarkerCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(record) = self.record.take() {
+            self.pending.borrow_mut().push(record);
+        }
+    }
+}
+impl RuntimeEditorGateway {
+    pub(crate) fn register_temporary_marker(
+        &self,
+        handle: OwnerBufferHandle,
+        point: usize,
+        bias: Bias,
+        cx: &Context,
+    ) -> anyhow::Result<(rune_editor::MarkerId, MarkerCleanupGuard)> {
+        let marker = self.register_marker(handle, point, bias, cx)?;
+        Ok((
+            marker,
+            MarkerCleanupGuard {
+                record: Some((handle, marker)),
+                pending: self.abandoned_markers.clone(),
+            },
+        ))
+    }
+}
+#[cfg(test)]
+mod marker_unwind_cleanup_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn abandoned_marker_cleanup_never_locks_owner_during_unwind_and_preserves_unrelated_ids() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let g = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = g.scratch(&cx).unwrap();
+        let unrelated = g.register_marker(h, 0, Bias::Right, &cx).unwrap();
+        let (temporary, guard) = g.register_temporary_marker(h, 0, Bias::Left, &cx).unwrap();
+        let owner_guard = g.inner.borrow_mut();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _cleanup = guard;
+            panic!("test evaluator unwind");
+        }));
+        assert!(panic.is_err());
+        assert_eq!(g.abandoned_markers.borrow().len(), 1);
+        assert!(g.read(h, &cx).is_err());
+        assert_eq!(g.abandoned_markers.borrow().len(), 1);
+        drop(owner_guard);
+        assert_eq!(g.marker_position(h, temporary, &cx).unwrap(), None);
+        assert_eq!(g.marker_position(h, unrelated, &cx).unwrap(), Some(0));
+        assert!(g.abandoned_markers.borrow().is_empty());
+        let (normal, guard) = g.register_temporary_marker(h, 0, Bias::Left, &cx).unwrap();
+        g.remove_marker(h, normal, &cx).unwrap();
+        guard.disarm();
+        assert!(g.abandoned_markers.borrow().is_empty());
+    }
+}
+#[cfg(test)]
+mod cleanup_retirement_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn stable_shell_is_send_sync_but_cleanup_is_owner_local_and_skips_killed_buffer() {
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<OwnerBufferHandle>();
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let g = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = g.create("temporary", "λ", &cx).unwrap();
+        let (_, guard) = g.register_temporary_marker(h, 1, Bias::Right, &cx).unwrap();
+        let fallback = g.kill(h, true, &cx).unwrap();
+        drop(guard);
+        assert_eq!(g.abandoned_markers.borrow().len(), 1);
+        assert!(g.read(fallback, &cx).is_ok());
+        assert!(g.abandoned_markers.borrow().is_empty());
+        assert!(g.read(h, &cx).is_err());
+    }
+    #[test]
+    fn cleanup_drop_after_context_retirement_never_resolves_lisp_or_adopts_new_owner() {
+        let roots = RootSet::default();
+        let (g, guard) = {
+            let cx = Context::new(&roots);
+            let g = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+            let h = g.scratch(&cx).unwrap();
+            let (_, guard) = g.register_temporary_marker(h, 0, Bias::Left, &cx).unwrap();
+            (g, guard)
+        };
+        drop(guard);
+        assert_eq!(g.abandoned_markers.borrow().len(), 1);
+        let next_roots = RootSet::default();
+        let next = Context::new(&next_roots);
+        assert!(g.scratch(&next).is_err());
+        drop(g); // Native queue/session teardown only; no old Context exists.
+    }
+}
+impl std::fmt::Debug for RuntimeEditorGateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never borrow the live editor for debugging (including during unwind).
+        f.debug_struct("RuntimeEditorGateway").finish_non_exhaustive()
+    }
+}
+impl std::fmt::Debug for MarkerCleanupGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarkerCleanupGuard")
+            .field("armed", &self.record.is_some())
+            .finish_non_exhaustive()
     }
 }
