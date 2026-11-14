@@ -623,6 +623,7 @@ pub(crate) struct BufferRead {
     pub(crate) document: RuntimeDocument,
     pub(crate) point: usize,
     pub(crate) name: String,
+    pub(crate) file: rune_editor::FileAssociation,
 }
 /// Explicit owner-local gateway for Env. Never put this Rc in global LispBuffer.
 /// No callback/Lisp evaluation occurs while a RefCell borrow is held.
@@ -689,6 +690,7 @@ impl RuntimeEditorGateway {
             document: root.document,
             point: owner.session.buffer_point(id)?,
             name: root.name,
+            file: root.file,
         })
     }
     pub(crate) fn set_point(
@@ -1827,3 +1829,6 @@ mod persistent_lisp_quit_adapter_tests {
         .unwrap();
     }
 }
+
+mod save;
+pub(crate) use save::{PendingSave, SaveMode, SaveOutcome, WrittenSave};

@@ -174,17 +174,23 @@ struct Buffer<D: Document> {
     saved_version: u64,
     forced_dirty: bool,
     save_generation: u64,
+    file: crate::FileAssociation,
     next_version: u64,
     publication_epoch: u64,
     undo: Option<Arc<History<D>>>,
     redo: Option<Arc<History<D>>>,
 }
 #[derive(Clone)]
+struct DeadBufferMetadata {
+    modified: bool,
+    file_name: Option<std::sync::Arc<std::path::Path>>,
+}
+#[derive(Clone)]
 struct State<D: Document> {
     buffers: BTreeMap<BufferId, Buffer<D>>,
     // Killed shells retain only this native metadata bit, never text/history,
     // property leases or any GC-owned value.
-    dead_modified: BTreeMap<BufferId, bool>,
+    dead_buffers: BTreeMap<BufferId, DeadBufferMetadata>,
     mru: Vec<BufferId>,
     current: BufferId,
     windows: WindowTree,
@@ -207,6 +213,7 @@ pub struct BufferSnapshot<D> {
     /// Monotonic publication epoch, independent of undo/savepoint content identity.
     pub version: u64,
     pub modified: bool,
+    pub file: crate::FileAssociation,
     pub read_only: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +257,7 @@ impl<D: Document> Session<D> {
             saved_version: 0,
             forced_dirty: false,
             save_generation: 0,
+            file: Default::default(),
             next_version: 1,
             publication_epoch: 0,
             undo: None,
@@ -259,7 +267,7 @@ impl<D: Document> Session<D> {
             owner: crate::allocate_id()?,
             state: State {
                 buffers: [(id, buffer)].into(),
-                dead_modified: BTreeMap::new(),
+                dead_buffers: BTreeMap::new(),
                 mru: vec![id],
                 current: id,
                 windows,
@@ -374,6 +382,7 @@ impl<D: Document> Session<D> {
             document: b.document.clone(),
             version: b.publication_epoch,
             modified: b.forced_dirty || b.version != b.saved_version,
+            file: b.file.clone(),
             read_only: b.read_only,
         })
     }
@@ -440,6 +449,7 @@ impl<D: Document> Session<D> {
                 saved_version: 0,
                 forced_dirty: false,
                 save_generation: 0,
+                file: Default::default(),
                 next_version: 1,
                 publication_epoch: 0,
                 undo: None,
@@ -468,20 +478,76 @@ impl<D: Document> Session<D> {
     /// Explicit Lisp set_modified(false) is different and keeps their validity.
     pub fn mark_saved(&mut self, id: BufferId) -> Result<()> {
         let b = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
+        self.complete_save(id, b.publication_epoch, b.file.revision, None).map(|_| ())
+    }
+    pub fn file_name(&self, id: BufferId) -> Result<Option<std::sync::Arc<std::path::Path>>> {
+        if let Some(b) = self.state.buffers.get(&id) {
+            return Ok(b.file.path.clone());
+        }
+        self.state
+            .dead_buffers
+            .get(&id)
+            .map(|b| b.file_name.clone())
+            .ok_or(EditorError::InvalidBuffer)
+    }
+    /// Association changes survive text Undo and invalidate all old save tokens,
+    /// including None→path→None ABA. Caller authenticates/normalizes the path.
+    pub fn set_file_association(
+        &mut self,
+        id: BufferId,
+        expected_revision: u64,
+        path: Option<std::sync::Arc<std::path::Path>>,
+    ) -> Result<crate::FileAssociation> {
+        let b = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
+        if b.file.revision != expected_revision {
+            return Err(EditorError::StaleInput);
+        }
+        let revision = b.file.revision.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let b = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
+        b.file = crate::FileAssociation { revision, path };
+        self.state.sequence = sequence;
+        Ok(b.file.clone())
+    }
+    /// Commit real save metadata and optional SaveAs binding atomically, after
+    /// I/O. No text/history is replaced and no dead shell gains write authority.
+    pub fn complete_save(
+        &mut self,
+        id: BufferId,
+        expected_epoch: u64,
+        expected_file_revision: u64,
+        new_path: Option<std::sync::Arc<std::path::Path>>,
+    ) -> Result<crate::FileAssociation> {
+        let b = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
+        if b.publication_epoch != expected_epoch || b.file.revision != expected_file_revision {
+            return Err(EditorError::StaleInput);
+        }
         let generation = b.save_generation.checked_add(1).ok_or(EditorError::IdExhausted)?;
         let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let revision = if new_path.is_some() {
+            b.file.revision.checked_add(1).ok_or(EditorError::IdExhausted)?
+        } else {
+            b.file.revision
+        };
         let b = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
         b.saved_version = b.version;
         b.forced_dirty = false;
         b.save_generation = generation;
+        if let Some(path) = new_path {
+            b.file = crate::FileAssociation { revision, path: Some(path) };
+        }
         self.state.sequence = sequence;
-        Ok(())
+        Ok(b.file.clone())
     }
     pub fn modified(&self, id: BufferId) -> Result<bool> {
         if let Some(b) = self.state.buffers.get(&id) {
             return Ok(b.forced_dirty || b.version != b.saved_version);
         }
-        self.state.dead_modified.get(&id).copied().ok_or(EditorError::InvalidBuffer)
+        self.state
+            .dead_buffers
+            .get(&id)
+            .map(|b| b.modified)
+            .ok_or(EditorError::InvalidBuffer)
     }
     /// Explicit dirty metadata never fabricates text versions or undo entries.
     /// A forced clean baseline remains dirty through text history until saved.
@@ -803,8 +869,10 @@ impl<D: Document> Session<D> {
                 view.hscroll = 0;
             }
         }
-        self.state.buffers.remove(&id);
-        self.state.dead_modified.insert(id, modified);
+        let removed = self.state.buffers.remove(&id).ok_or(EditorError::InvalidBuffer)?;
+        self.state
+            .dead_buffers
+            .insert(id, DeadBufferMetadata { modified, file_name: removed.file.path });
         self.state.mru.retain(|old| *old != id);
         if self.state.current == id {
             self.state.current = fallback;
@@ -1359,6 +1427,7 @@ impl<D: Document> Session<D> {
                     document: b.document.clone(),
                     version: b.publication_epoch,
                     modified: b.forced_dirty || b.version != b.saved_version,
+                    file: b.file.clone(),
                     read_only: b.read_only,
                 })
                 .collect(),
@@ -1461,5 +1530,34 @@ mod direct_scope_sequence_tests {
         let view = s.state.windows.view(w).unwrap();
         assert_eq!((view.point, view.start), (0, 0));
         assert!(!s.state.buffers.get(&b).unwrap().read_only);
+    }
+}
+#[cfg(test)]
+mod file_association_tests {
+    use super::*;
+    use crate::StringDocument;
+    use std::{path::Path, sync::Arc};
+    #[test]
+    fn failed_save_cas_or_counter_exhaustion_never_changes_path_or_dirty_state() {
+        let mut s = Session::new(StringDocument::empty(), 80, 24).unwrap();
+        let b = s.current_buffer();
+        s.set_modified(b, true).unwrap();
+        let before = s.snapshot().sequence;
+        s.state.sequence = u64::MAX;
+        assert_eq!(
+            s.set_file_association(b, 0, Some(Arc::<Path>::from(Path::new("/native/a")))),
+            Err(EditorError::IdExhausted)
+        );
+        assert!(s.file_name(b).unwrap().is_none());
+        assert!(s.modified(b).unwrap());
+        s.state.sequence = before;
+        s.state.buffers.get_mut(&b).unwrap().file.revision = u64::MAX;
+        assert_eq!(
+            s.complete_save(b, 0, u64::MAX, Some(Arc::<Path>::from(Path::new("/native/a")))),
+            Err(EditorError::IdExhausted)
+        );
+        assert!(s.file_name(b).unwrap().is_none());
+        assert!(s.modified(b).unwrap());
+        assert_eq!(s.snapshot().sequence, before);
     }
 }

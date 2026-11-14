@@ -210,6 +210,20 @@ impl FrameView {
             FrameInput::Legacy(_) => Err("evaluator quit requires an editor owner view"),
         }
     }
+    /// Submit one UI-owned evaluator request through the same ordered FIFO.
+    /// True means admitted or retained in the UI backlog; never resend it.
+    /// On false the caller keeps its draft; mandatory rejection reporting also
+    /// receives the original event. Legacy fixture views return false.
+    #[cfg(feature = "editor")]
+    pub fn submit_evaluation(&self, request_id: u64, source: String) -> bool {
+        match &self.input {
+            FrameInput::Owner(input) => owner_input::OwnerInput::submit(
+                input,
+                editor_transport::OwnerEvent::Evaluate { request_id, source },
+            ),
+            FrameInput::Legacy(_) => false,
+        }
+    }
     /// Consume explicit composition outcomes before retrying the owner FIFO.
     /// This order frees its reserved reply slot without letting input overtake.
     pub fn retry_input(&mut self) -> Result<(), std::sync::mpsc::TrySendError<()>> {
@@ -383,7 +397,10 @@ impl FrameView {
                     break;
                 }
             }
-            let _ = view.update(cx, |view, _| view.shutdown_input());
+            let _ = view.update(cx, |view, cx| {
+                view.shutdown_input();
+                cx.notify();
+            });
         })
     }
 

@@ -68,6 +68,19 @@ fn buffer_name(
         None => Ok(Some(env.buffer_read(cx)?.name)),
     }
 }
+/// Return the authoritative visited path, not the legacy global variable.
+#[defun]
+fn buffer_file_name(
+    buffer: Option<Gc<&LispBuffer>>,
+    env: &Rt<Env>,
+    cx: &Context,
+) -> Result<Option<String>> {
+    let handle = buffer.map_or_else(|| env.current_buffer_handle(), |buffer| buffer.untag().handle());
+    env.editor_gateway().file_name(handle, cx)?.map(|path| {
+        path.into_os_string().into_string()
+            .map_err(|_| anyhow::anyhow!("Non-UTF8 visited file names are not supported by Lisp strings"))
+    }).transpose()
+}
 #[defun]
 fn rename_buffer(name: &str, unique: OptionalFlag, env: &Rt<Env>, cx: &Context) -> Result<String> {
     env.editor_gateway()
@@ -330,5 +343,75 @@ mod owner_modified_primitive_tests {
             (set-buffer a) (set-buffer-modified-p t)
             (set-buffer b) (set-buffer-modified-p nil)
             (list (buffer-modified-p a) (buffer-modified-p b) (buffer-modified-p))))"#);
+    }
+}
+
+#[cfg(test)]
+mod visited_file_getter_tests {
+    use super::*;
+    use crate::{core::gc::RootSet, editor_document::SaveMode};
+    use rune_core::macros::root;
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Result<Self> {
+            let path = std::env::temp_dir().join(format!("rune-visit-getter-{}-{}", std::process::id(), rand::random::<u64>()));
+            std::fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+    }
+    impl Drop for Directory { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    #[test]
+    fn lisp_getter_observes_save_completion_live_dead_and_distinct_recreation() -> Result<()> {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        crate::sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        assert_eq!(crate::core::env::intern("buffer-file-name", cx), crate::sym::BUFFER_FILE_NAME);
+        assert!(crate::sym::BUFFER_FILE_NAME.is_special());
+        let g = env.editor_gateway();
+        let h = env.current_buffer_handle();
+        assert_eq!(buffer_file_name(None, env, cx)?, None);
+        let empty = env.buffer_read(cx)?;
+        g.splice(h, empty.epoch, 0..0, "é🙂", cx)?;
+        let read = env.buffer_read(cx)?;
+        let dir = Directory::new()?;
+        let path = dir.0.join("visited-a");
+        let written = g.prepare_save_as(h, read.epoch, &path, 100, cx)?.write(SaveMode::CreateNew)?;
+        // Disk success alone never binds the path or clears modified state.
+        assert_eq!(buffer_file_name(None, env, cx)?, None);
+        assert!(g.modified(h, cx)?);
+        g.finish_save(written, cx)?;
+        assert_eq!(std::fs::read(&path)?, "é🙂".as_bytes());
+        assert_eq!(buffer_file_name(None, env, cx)?, path.to_str().map(str::to_owned));
+        crate::lread::load_internal(&format!("(if (equal (buffer-file-name) {:?}) nil (error \"wrong current visit\"))", path.to_str().unwrap()), cx, env)?;
+        let other = g.create("visited-other", "", cx)?;
+        let other_path = dir.0.join("other-name");
+        let other_read = g.read(other, cx)?;
+        g.set_file_association(other, other_read.file.revision(), Some(&other_path), cx)?;
+        crate::lread::load_internal(&format!("(setq visited-dead (get-buffer \"visited-other\")) (if (equal (buffer-file-name visited-dead) {:?}) nil (error \"wrong other visit\")) (kill-buffer visited-dead)", other_path.to_str().unwrap()), cx, env)?;
+        let replacement = g.create("visited-other", "", cx)?;
+        assert_ne!(replacement, other);
+        cx.garbage_collect(true);
+        crate::lread::load_internal(&format!("(if (equal (buffer-file-name visited-dead) {:?}) nil (error \"lost dead visit\")) (if (buffer-file-name (get-buffer \"visited-other\")) (error \"inherited dead visit\"))", other_path.to_str().unwrap()), cx, env)?;
+        g.rename(h, "renamed-visited", false, cx)?;
+        assert_eq!(buffer_file_name(None, env, cx)?, path.to_str().map(str::to_owned));
+        assert_eq!(env.current_buffer_handle(), h);
+        assert!(!other_path.exists());
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn lisp_getter_rejects_non_utf8_without_lossy_path_identity() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let g = env.editor_gateway();
+        let read = env.buffer_read(cx)?;
+        let path = std::env::temp_dir().join(std::ffi::OsString::from_vec(vec![b'r', 0xff]));
+        g.set_file_association(read.handle, read.file.revision(), Some(&path), cx)?;
+        assert!(buffer_file_name(None, env, cx).is_err());
+        assert_eq!(g.file_name(read.handle, cx)?, Some(path));
+        Ok(())
     }
 }

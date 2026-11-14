@@ -33,6 +33,10 @@ mod lisp;
 mod lread;
 #[cfg(feature = "native")]
 mod native;
+#[cfg(feature = "native")]
+mod native_command;
+#[cfg(any(feature = "native", test))]
+mod native_command_model;
 mod print;
 mod reader;
 mod search;

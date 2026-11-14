@@ -83,3 +83,5 @@ pub use publication::*;
 
 mod host;
 pub use host::*;
+mod file_association;
+pub use file_association::FileAssociation;

@@ -1,5 +1,6 @@
 //! Opt-in shared-owner native editor. Window behavior remains unverified.
 use crate::editor_document::{LispRuntimeHost, with_lisp_runtime_owner};
+use crate::native_command::{NativeShell, Reports};
 use gpui::{App, Application, WindowOptions, prelude::*, px, size};
 use rune_display::{FixedMetrics, Rect, host_updates};
 use rune_gpui::{
@@ -57,6 +58,8 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
         }
         let failure = Arc::new(Mutex::new(None::<(String, Vec<OwnerEvent>)>));
         let report = failure.clone();
+        let (reports, report_updates) = Reports::channel();
+        let owner_reports = reports.clone();
         let evaluation_quit = EvaluationQuit::default();
         let owner_quit = evaluation_quit.clone();
         std::thread::spawn(move || {
@@ -81,18 +84,22 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                         .with_interruptible_evaluator(evaluate_source_with_quit, owner_quit)
                         .run_with_outcome(|step| {
                             if let Some(evaluation) = step.evaluation {
-                                if let Err(error) = evaluation.outcome {
+                                if let Err(error) = &evaluation.outcome {
                                     eprintln!(
                                         "native evaluation {}: {error}",
                                         evaluation.request_id
                                     );
                                 }
+                                owner_reports.evaluation(evaluation);
                             }
                             if let Err(error) = step.edit {
                                 eprintln!("native owner input: {error:?}");
+                                owner_reports.notice(format!("Owner input: {error:?}"));
                             }
                             if let Some(error) = step.render_error {
                                 eprintln!("native publication after input: {error:?}");
+                                owner_reports
+                                    .notice(format!("Publication after input failed: {error:?}"));
                             }
                         })
                         .map_err(|error| {
@@ -146,6 +153,9 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                         ..Default::default()
                     },
                     move |window, cx| {
+                        let rejected_reports = reports.clone();
+                        let composition_reports = reports.clone();
+                        let ime_reports = reports.clone();
                         let view = cx.new(|cx| {
                             FrameView::watch_updates(updates, cx).detach();
                             let mut view = FrameView::new_ime(
@@ -155,20 +165,47 @@ pub(crate) fn run(sources: Vec<String>) -> Result<(), ()> {
                                 replies,
                                 platform_reader,
                                 quit,
-                                Rc::new(|e| eprintln!("editor input requires recovery: {e:?}")),
-                                Rc::new(|_| {}),
-                                Rc::new(|error| {
-                                    eprintln!("IME input requires resolution: {error:?}")
+                                Rc::new(move |e| {
+                                    let message = format!("Input not delivered: {:?}", e.reason);
+                                    if let OwnerEvent::Evaluate { request_id, .. } = e.event {
+                                        rejected_reports.evaluation(
+                                            rune_gpui::editor_transport::EvaluationOutcome {
+                                                request_id,
+                                                outcome: Err(message),
+                                            },
+                                        );
+                                    } else {
+                                        rejected_reports.notice(message);
+                                    }
+                                }),
+                                Rc::new(move |ack| {
+                                    if let Err(error) = ack.outcome {
+                                        composition_reports
+                                            .notice(format!("Composition rejected: {error:?}"));
+                                    }
+                                }),
+                                Rc::new(move |error| {
+                                    ime_reports.notice(format!("IME input: {error:?}"));
                                 }),
                                 window,
                                 cx,
                             )
                             .expect("prepared IME context");
-                            view.set_evaluation_quit(evaluation_quit).expect("editor owner view");
+                            view.set_evaluation_quit(evaluation_quit.clone())
+                                .expect("editor owner view");
                             view
                         });
                         window.focus(&view.read(cx).focus_handle());
-                        view
+                        cx.new(|cx| {
+                            NativeShell::new(
+                                view,
+                                reports,
+                                report_updates,
+                                evaluation_quit,
+                                window,
+                                cx,
+                            )
+                        })
                     },
                 );
                 if let Err(error) = opened {
