@@ -390,6 +390,25 @@ fn internal__define_uninitialized_variable<'ob>(
     NIL
 }
 
+/// Shared nonlocal-exit semantics for evaluated native arguments.
+pub(crate) fn throw_value(
+    tag: Object,
+    value: Object,
+    env: &mut Rt<Env>,
+    cx: &Context,
+) -> EvalError {
+    if env.catch_stack.iter().any(|entry| entry.bind(cx).ptr_eq(tag)) {
+        EvalError::throw(tag, value, env)
+    } else {
+        EvalError::new_error(anyhow!("No catch for {tag}"))
+    }
+}
+
+#[defun]
+fn throw(tag: Object, value: Object, env: &mut Rt<Env>, cx: &Context) -> Result<bool> {
+    Err(throw_value(tag, value, env, cx).into())
+}
+
 #[defun]
 fn signal(mut error_symbol: Object, data: Object, env: &mut Rt<Env>) -> Result<bool> {
     if error_symbol.is_nil() && data.is_nil() {
@@ -508,7 +527,7 @@ defsym!(AND);
 defsym!(OR);
 defsym!(INTERACTIVE);
 defsym!(CATCH);
-defsym!(THROW);
+
 defsym!(ERROR);
 defsym!(DEBUG);
 defsym!(VOID_VARIABLE);

@@ -157,7 +157,7 @@ impl Instruction {
             | O::Integerp => (1, 1),
             O::List3 | O::Aset | O::Concat3 => (3, 1),
             O::List4 | O::Concat4 => (4, 1),
-            O::GotoIfNil | O::GotoIfNonNil | O::Discard | O::Return => (1, 0),
+            O::GotoIfNil | O::GotoIfNonNil | O::Discard | O::Return | O::PushCatch => (1, 0),
             O::GotoIfNilElsePop | O::GotoIfNonNilElsePop => (1, 1),
             O::Duplicate => (1, 2),
             O::StackSetN | O::StackSetN2 => (operand + 1, operand),

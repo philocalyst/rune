@@ -31,6 +31,10 @@ struct Handler<'ob> {
     binding_depth: usize,
     #[no_trace]
     binding_frames: usize,
+    #[no_trace]
+    is_catch: bool,
+    #[no_trace]
+    catch_depth: usize,
     condition: Slot<Object<'ob>>,
 }
 
@@ -48,6 +52,12 @@ impl<'old, 'new> WithLifetime<'new> for Handler<'old> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FrameCheckpoint {
+    binding_depth: usize,
+    catch_depth: usize,
+}
+
 /// The bytecode VM. This hold all the current call frames and handlers. The
 /// execution stack is part of the Environment.
 #[derive(Trace)]
@@ -58,7 +68,7 @@ struct VM<'brw, 'env, 'rt> {
     #[no_trace]
     programs: ProgramCache,
     #[no_trace]
-    binding_frames: Vec<usize>,
+    binding_frames: Vec<FrameCheckpoint>,
     /// The current function being executed. Saved to ensure it is preserved by
     /// the garbage collector.
     func: Slot<&'rt ByteFn>,
@@ -164,7 +174,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
     }
 
     fn unbind(&mut self, idx: u16, cx: &'ob Context) -> Result<()> {
-        let floor = *self.binding_frames.last().expect("VM has a binding frame");
+        let floor = self.binding_frames.last().expect("VM has a binding frame").binding_depth;
         let depth = self.env.binding_depth();
         ensure!(
             usize::from(idx) <= depth.saturating_sub(floor),
@@ -272,7 +282,10 @@ impl<'ob> RootedVM<'_, '_, '_> {
             // code/root/checkpoint now cannot expose a half-entered callee.
             self.func.set(next_fn);
             self.pc = cursor;
-            self.binding_frames.push(self.env.binding_depth());
+            self.binding_frames.push(FrameCheckpoint {
+                binding_depth: self.env.binding_depth(),
+                catch_depth: self.env.catch_stack.len(),
+            });
             self.prepare_lisp_args(next_fn, arg_cnt, &name, cx)?;
         } else {
             // Otherwise, call the function directly.
@@ -286,6 +299,22 @@ impl<'ob> RootedVM<'_, '_, '_> {
         Ok(())
     }
 
+    fn resume_handler(
+        &mut self,
+        handler: &Handler<'_>,
+        value: Object<'ob>,
+        cx: &'ob Context,
+    ) -> Result<()> {
+        self.env.unwind_bindings(handler.binding_depth, cx)?;
+        self.env.catch_stack.truncate(handler.catch_depth);
+        self.binding_frames.truncate(handler.binding_frames);
+        self.unwind(handler.stack_frame, cx)?;
+        self.env.stack.truncate(handler.stack_size);
+        self.env.stack.push(value);
+        self.pc.goto(usize::from(handler.jump_code)).map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
     fn run(&mut self, cx: &'ob mut Context) -> EvalResult<'ob> {
         'main: loop {
             let err = match self.execute_bytecode(cx) {
@@ -293,16 +322,24 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 Err(e) => e,
             };
 
-            // A throw is a nonlocal exit to an outer catch, not a condition.
-            // In particular an installed condition-case must never intercept
-            // it or consume the environment's exception payload.
-            if matches!(&err.error, ErrorType::Throw(_)) {
-                return Err(err);
-            }
-
-            // we will fix this once we can handle different error types
-            #[expect(clippy::never_loop)]
             while let Some(handler) = self.handlers.bind_mut(cx).pop() {
+                self.env.catch_stack.truncate(handler.catch_depth);
+                if handler.is_catch {
+                    let ErrorType::Throw(id) = &err.error else { continue };
+                    let Some((tag, value)) = self.env.get_exception(*id) else {
+                        bail_err!("Exception not found");
+                    };
+                    if !handler.condition.ptr_eq(tag.bind(cx)) {
+                        continue;
+                    }
+                    let value = value.bind(cx);
+                    self.resume_handler(&handler, value, cx)?;
+                    continue 'main;
+                }
+                // Conditions never intercept a nonlocal throw.
+                if matches!(&err.error, ErrorType::Throw(_)) {
+                    continue;
+                }
                 match handler.condition.untag() {
                     ObjectType::Symbol(sym::ERROR) => {}
                     ObjectType::Cons(conditions) => {
@@ -321,7 +358,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 let error = match err.error {
                     ErrorType::Signal(id) => {
                         let Some((sym, data)) = self.env.get_exception(id) else {
-                            unreachable!("Exception not found")
+                            bail_err!("Exception not found")
                         };
                         Cons::new(sym, data, cx)
                     }
@@ -336,12 +373,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     }
                     ErrorType::Throw(_) => Cons::new(sym::ERROR, rendered, cx),
                 };
-                self.env.unwind_bindings(handler.binding_depth, cx)?;
-                self.binding_frames.truncate(handler.binding_frames);
-                self.unwind(handler.stack_frame, cx)?;
-                self.env.stack.truncate(handler.stack_size);
-                self.env.stack.push(Object::from(error));
-                self.pc.goto(usize::from(handler.jump_code)).map_err(anyhow::Error::from)?;
+                self.resume_handler(&handler, Object::from(error), cx)?;
                 continue 'main;
             }
             return Err(err);
@@ -470,15 +502,23 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     {
                         bail_err!("Bytecode handler stack underflow");
                     }
-                    self.handlers.pop();
+                    let handler = self.handlers.bind_mut(cx).pop().expect("checked handler");
+                    self.env.catch_stack.truncate(handler.catch_depth);
                 }
-                op::PushCondtionCase => {
+                op::PushCondtionCase | op::PushCatch => {
                     let jump_code = instruction.operand().map_err(anyhow::Error::from)?;
                     self.pc.validate_target(usize::from(jump_code)).map_err(anyhow::Error::from)?;
                     // pop before getting stack size, after validating operands
                     self.require_stack(1)?;
                     let condition = self.env.stack.pop(cx);
+                    let catch_depth = self.env.catch_stack.len();
+                    let is_catch = op == op::PushCatch;
+                    if is_catch {
+                        self.env.catch_stack.push(condition);
+                    }
                     let handler = Handler {
+                        is_catch,
+                        catch_depth,
                         jump_code,
                         stack_size: self.env.stack.len(),
                         stack_frame: self.env.stack.current_frame(),
@@ -488,7 +528,6 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     };
                     self.handlers.push(handler);
                 }
-                op::PushCatch => return Err(self.unsupported_opcode(op, cx)),
                 op::Nth => {
                     let list = self.env.stack.pop(cx);
                     let top = self.env.stack.top();
@@ -745,8 +784,9 @@ impl<'ob> RootedVM<'_, '_, '_> {
                 }
                 op::Return => {
                     self.require_stack(1)?;
-                    let depth = *self.binding_frames.last().expect("VM has a binding frame");
-                    self.env.unwind_bindings(depth, cx)?;
+                    let checkpoint = *self.binding_frames.last().expect("VM has a binding frame");
+                    self.env.unwind_bindings(checkpoint.binding_depth, cx)?;
+                    self.env.catch_stack.truncate(checkpoint.catch_depth);
                     // Malformed bytecode may return without PopHandler. Such
                     // handlers must not outlive their frame and intercept a
                     // later caller error; the caller's lower-depth handlers stay.
@@ -1050,11 +1090,12 @@ pub(crate) fn call<'ob>(
     let mut programs = ProgramCache::default();
     let pc = programs.cursor(func.codes(), 0).map_err(anyhow::Error::from)?;
     let binding_depth = frame.binding_depth();
+    let catch_depth = frame.catch_stack.len();
     let entry_frame = frame.stack.current_frame();
     let vm = VM {
         pc,
         programs,
-        binding_frames: vec![binding_depth],
+        binding_frames: vec![FrameCheckpoint { binding_depth, catch_depth }],
         func: Slot::new(func),
         env: frame,
         handlers: Vec::new(),
@@ -1068,6 +1109,7 @@ pub(crate) fn call<'ob>(
     while vm.env.stack.current_frame() > entry_frame {
         vm.env.stack.pop_frame();
     }
+    vm.env.catch_stack.truncate(catch_depth);
     vm.env.unwind_bindings(binding_depth, cx)?;
     result
 }
@@ -1158,6 +1200,260 @@ mod test {
     }
 
     #[test]
+    fn pushcatch_handles_native_call2_and_preserves_external_catches() {
+        // GNU byte-compile of (lambda () (catch 'tag (throw 'tag 7))).
+        // Replace the tag constant by self-evaluating 17; actual depth is 3.
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let constants =
+            vec![Object::from(17), sym::THROW.into(), Object::from(7)].into_obj(&cx.block);
+        let codes = vec![192u8, 50, 9, 0, 193, 192, 194, 34, 48, 135].into_obj(&cx.block);
+        let bytecode = crate::alloc::make_byte_code(
+            0,
+            &codes.untag(),
+            constants.untag(),
+            3,
+            None,
+            None,
+            &[],
+            cx,
+        )
+        .unwrap();
+        root!(bytecode, cx);
+        root!(env, new(Env), cx);
+        env.catch_stack.push(Object::from(29));
+        for _ in 0..3 {
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments();
+            assert_eq!(call(bytecode, 0, "native-catch", &mut frame, cx).unwrap(), Object::from(7));
+            assert_eq!(frame.catch_stack.len(), 1);
+            assert_eq!(frame.catch_stack[0].bind(cx), Object::from(29));
+        }
+    }
+
+    #[test]
+    fn pushcatch_popped_or_returned_handlers_do_not_leak_tags() {
+        use OpCode as O;
+        for pop in [false, true] {
+            let roots = &RootSet::default();
+            let cx = &mut Context::new(roots);
+            sym::init_symbols();
+            let codes = if pop {
+                vec![
+                    O::Constant0 as u8,
+                    O::PushCatch as u8,
+                    7,
+                    0,
+                    O::PopHandler as u8,
+                    O::Constant1 as u8,
+                    O::Return as u8,
+                    O::Return as u8,
+                ]
+            } else {
+                vec![
+                    O::Constant0 as u8,
+                    O::PushCatch as u8,
+                    6,
+                    0,
+                    O::Constant1 as u8,
+                    O::Return as u8,
+                    O::Return as u8,
+                ]
+            };
+            let codes = codes.into_obj(&cx.block);
+            let constants = vec![Object::from(17), Object::from(7)].into_obj(&cx.block);
+            let bytecode = crate::alloc::make_byte_code(
+                0,
+                &codes.untag(),
+                constants.untag(),
+                1,
+                None,
+                None,
+                &[],
+                cx,
+            )
+            .unwrap();
+            root!(bytecode, cx);
+            root!(env, new(Env), cx);
+            env.catch_stack.push(Object::from(29));
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments();
+            assert_eq!(call(bytecode, 0, "retire-catch", &mut frame, cx).unwrap(), Object::from(7));
+            assert_eq!(frame.catch_stack.len(), 1);
+            assert_eq!(frame.catch_stack[0].bind(cx), Object::from(29));
+        }
+    }
+
+    #[test]
+    fn pushcatch_skips_mismatched_tag_and_condition_handler() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        // Outer catch17; inner catch19; condition-case ERROR must skip throw.
+        make_bytecode!(
+            bytecode,
+            0,
+            [
+                O::Constant0,
+                O::PushCatch,
+                19,
+                0,
+                O::Constant1,
+                O::PushCatch,
+                18,
+                0,
+                O::Constant2,
+                O::PushCondtionCase,
+                18,
+                0,
+                O::Constant3,
+                O::Constant0,
+                O::Constant4,
+                O::Call2,
+                O::PopHandler,
+                O::PopHandler,
+                O::Return,
+                O::Return
+            ],
+            [17, 19, sym::ERROR, sym::THROW, 7],
+            cx
+        );
+        check_bytecode!(bytecode, [], 7, cx);
+    }
+
+    #[test]
+    fn pushcatch_does_not_intercept_errors_and_uncaught_exit_cleans_tags() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        make_bytecode!(
+            bytecode,
+            0,
+            [O::Constant0, O::PushCatch, 5, 0, O::Car, O::Return],
+            [17],
+            cx
+        );
+        root!(env, new(Env), cx);
+        for _ in 0..3 {
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments();
+            assert!(call(bytecode, 0, "catch-error", &mut frame, cx).is_err());
+            assert!(frame.catch_stack.is_empty());
+        }
+    }
+
+    #[test]
+    fn pushcatch_unwinds_optimized_callee_and_dynamic_bindings() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let variable = crate::core::env::intern("pushcatch-nested-variable", cx);
+        make_bytecode!(
+            inner,
+            0,
+            [
+                O::Constant1,
+                O::VarBind0,
+                O::Constant2,
+                O::Constant3,
+                O::Constant1,
+                O::Call2,
+                O::Return
+            ],
+            [variable, 7, sym::THROW, 17],
+            cx
+        );
+        root!(inner_obj, cx.add(inner.bind(cx)), cx);
+        make_bytecode!(
+            outer,
+            0,
+            [
+                O::Constant0,
+                O::PushCatch,
+                7,
+                0,
+                O::Constant1,
+                O::Call0,
+                O::Return,
+                O::Discard,
+                O::VarRef2,
+                O::Return
+            ],
+            [17, inner_obj.bind(cx), variable],
+            cx
+        );
+        root!(env, new(Env), cx);
+        let variable = crate::core::env::intern("pushcatch-nested-variable", cx);
+        env.varbind(variable, Object::from(3), cx);
+        let initial = env.binding_depth();
+        for _ in 0..3 {
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments();
+            assert_eq!(call(outer, 0, "nested-catch", &mut frame, cx).unwrap(), Object::from(3));
+            assert_eq!(frame.binding_depth(), initial);
+            assert!(frame.catch_stack.is_empty());
+        }
+    }
+
+    #[test]
+    fn pushcatch_allocated_tag_is_rooted_across_interpreted_collection() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let tag = Cons::new1(17, cx);
+        root!(tag, cx);
+        let form =
+            crate::reader::read("(function (lambda (tag) (garbage-collect) (throw tag 7)))", cx)
+                .unwrap()
+                .0;
+        root!(form, cx);
+        root!(env, new(Env), cx);
+        let closure = crate::interpreter::eval(form, None, env, cx).unwrap();
+        root!(closure, cx);
+        make_bytecode!(
+            bytecode,
+            0,
+            [
+                O::Constant0,
+                O::PushCatch,
+                9,
+                0,
+                O::Constant1,
+                O::Constant0,
+                O::Call1,
+                O::PopHandler,
+                O::Return,
+                O::Return
+            ],
+            [tag.bind(cx), closure.bind(cx)],
+            cx
+        );
+        let mut frame = CallFrame::new(env);
+        frame.finalize_arguments();
+        assert_eq!(call(bytecode, 0, "allocated-catch", &mut frame, cx).unwrap(), Object::from(7));
+        assert!(frame.catch_stack.is_empty());
+    }
+
+    #[test]
+    fn pushcatch_rejects_operand_target_before_registering_tag() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        make_bytecode!(bytecode, 0, [O::Constant0, O::PushCatch, 2, 0, O::Return], [17], cx);
+        root!(env, new(Env), cx);
+        let mut frame = CallFrame::new(env);
+        frame.finalize_arguments();
+        assert!(call(bytecode, 0, "bad-catch-target", &mut frame, cx).is_err());
+        assert!(frame.catch_stack.is_empty());
+    }
+
+    #[test]
     fn m0_control_opcodes_reject_missing_operands_without_using_caller_values() {
         use OpCode as O;
         for opcode in [
@@ -1171,6 +1467,7 @@ mod test {
             O::GotoIfNilElsePop,
             O::GotoIfNonNilElsePop,
             O::PushCondtionCase,
+            O::PushCatch,
             O::Switch,
             O::VarSet0,
             O::VarBind0,
@@ -2220,7 +2517,6 @@ mod test {
     fn m0_unimplemented_opcodes_signal_instead_of_panicking() {
         use OpCode as O;
         for opcode in [
-            O::PushCatch,
             O::Substring,
             O::Point,
             O::GotoChar,

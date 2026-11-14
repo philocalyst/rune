@@ -81,7 +81,6 @@ impl Interpreter<'_, '_> {
                 sym::FUNCTION => self.eval_function(forms, cx),
                 sym::INTERACTIVE => Ok(NIL), // TODO: implement
                 sym::CATCH => self.catch(forms, cx),
-                sym::THROW => self.throw(forms, cx),
                 sym::CONDITION_CASE => self.condition_case(forms, cx),
                 sym::SAVE_CURRENT_BUFFER => self.save_current_buffer(forms, cx),
                 sym::SAVE_EXCURSION => self.save_excursion(forms, cx),
@@ -125,29 +124,6 @@ impl Interpreter<'_, '_> {
         // pop this tag from the catch stack
         self.env.catch_stack.pop();
         result
-    }
-
-    fn throw<'ob>(&mut self, obj: &Rto<Object>, cx: &'ob mut Context) -> EvalResult<'ob> {
-        let [tag, value] = match obj.bind(cx).into_array()? {
-            Ok(x) => x,
-            Err(e) => bail_err!(LispError::arg_cnt(sym::THROW, 2, e, cx)),
-        };
-        root!(tag, cx);
-        root!(value, cx);
-        // Both forms are evaluated exactly once, left to right. Root the
-        // evaluated tag while the value expression can collect or throw.
-        let tag = rebind!(self.eval_form(tag, cx)?);
-        root!(tag, cx);
-        let value = rebind!(self.eval_form(value, cx)?);
-        let tag = tag.bind(cx);
-
-        // Determine whether an eq-identical catch exists before crossing any
-        // condition-case along the nonlocal unwind path.
-        if self.env.catch_stack.iter().any(|x| x.bind(cx).ptr_eq(tag)) {
-            Err(EvalError::throw(tag, value, self.env))
-        } else {
-            Err(error!("No catch for {tag}"))
-        }
     }
 
     fn defvar<'ob>(&mut self, obj: &Rto<Object>, cx: &'ob mut Context) -> EvalResult<'ob> {
@@ -199,6 +175,25 @@ impl Interpreter<'_, '_> {
                 return self.eval_form(value, cx);
             }
             _ => {}
+        }
+
+        // Native functions validate arity (and proper argument-list shape)
+        // before evaluating any argument, including throw's tag/value forms.
+        if let crate::core::object::FunctionType::SubrFn(subr) = func.bind(cx).untag() {
+            let mut count = 0usize;
+            for argument in args.bind(cx).into_list()? {
+                argument?;
+                count += 1;
+            }
+            let required = usize::from(subr.args.required);
+            let maximum = required + usize::from(subr.args.optional);
+            if count < required || (!subr.args.rest && count > maximum) {
+                let expected = if count < required { required } else { maximum };
+                let expected =
+                    u16::try_from(expected).context("Native arity exceeds supported range")?;
+                let count = u16::try_from(count).context("Too many native arguments")?;
+                bail_err!(LispError::arg_cnt(sym.bind(cx), expected, count, cx));
+            }
         }
 
         rooted_iter!(iter, args, cx);
@@ -1267,6 +1262,30 @@ mod test {
             "7",
         );
         assert_lisp("(condition-case nil (catch (list 1) (throw (list 1) 7)) (error 9))", "9");
+    }
+
+    #[test]
+    fn throw_is_an_ordinary_callable_native_function() {
+        assert_lisp("(functionp 'throw)", "t");
+        assert_lisp("(subrp (symbol-function 'throw))", "t");
+        assert_lisp("(func-arity 'throw)", "(2 . 2)");
+        assert_lisp("(catch 17 (funcall 'throw 17 7))", "7");
+        assert_lisp("(catch 17 (apply 'throw '(17 7)))", "7");
+        assert_lisp("(condition-case e (throw 1) (error (eq (car (cdr e)) 'throw)))", "t");
+        for source in [
+            "(let ((n 0)) (condition-case nil (car (setq n 1) 2) (error n)))",
+            "(let ((n 0)) (condition-case nil (cons (setq n 1)) (error n)))",
+            "(let ((n 0)) (condition-case nil (identity (setq n 1) 2) (error n)))",
+            "(let ((n 0)) (condition-case nil (aref (setq n 1)) (error n)))",
+            "(let ((n 0)) (condition-case nil (stringp (setq n 1) 2) (error n)))",
+            "(let ((n 0)) (condition-case nil (car (setq n 1) . 2) (error n)))",
+        ] {
+            assert_lisp(source, "0");
+        }
+        assert_lisp(
+            "(let ((n 0)) (condition-case nil (funcall 'throw (setq n 1)) (error n)))",
+            "1",
+        );
     }
 
     #[test]
