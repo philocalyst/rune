@@ -26,6 +26,7 @@ mod editor_document;
 mod emacs;
 mod eval;
 mod fileio;
+mod face;
 mod filelock;
 mod floatfns;
 mod fns;

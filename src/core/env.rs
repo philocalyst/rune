@@ -45,6 +45,8 @@ pub(crate) struct Env<'a> {
     pub(crate) keymap_functions: ObjectMap<Slot<Symbol<'a>>,Slot<Object<'a>>>,
     #[no_trace]
     pub(crate) native_key_sequence: Option<u64>,
+    #[no_trace]
+    pub(crate) font_selection: crate::face::FontSelection,
     features: Vec<Slot<Symbol<'a>>>,
     #[no_trace]
     pub(crate) current_buffer: OwnerBufferHandle,
@@ -84,6 +86,7 @@ impl<'a> Env<'a> {
             native_key_prefix: Default::default(),
             keymap_functions: Default::default(),
             native_key_sequence: None,
+            font_selection: Default::default(),
             features: Default::default(),
             current_buffer,
             editor_gateway,
