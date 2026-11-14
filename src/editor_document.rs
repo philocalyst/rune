@@ -19,6 +19,12 @@ pub(crate) struct RuntimeDocument {
     binding: Option<Binding>,
 }
 impl RuntimeDocument {
+    pub(crate) fn text(&self) -> &Rope {
+        self.snapshot.text()
+    }
+    pub(crate) fn properties(&self) -> &rune_text::PropRuns {
+        self.snapshot.properties()
+    }
     fn new(text: &str, registry: &PropertyRegistry, cx: &Context) -> anyhow::Result<Self> {
         let insertion = registry.empty(cx)?;
         let lease = registry.prepare_lease([], &insertion, [], [], cx)?;
@@ -53,7 +59,7 @@ impl RuntimeDocument {
             binding: Some(Binding { lease, insertion }),
         })
     }
-    fn resolve<'a>(&self, id: u32, cx: &'a Context) -> anyhow::Result<Object<'a>> {
+    pub(crate) fn resolve<'a>(&self, id: u32, cx: &'a Context) -> anyhow::Result<Object<'a>> {
         self.binding
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Unbound nil-only document"))?
@@ -506,7 +512,7 @@ mod gateway_tests {
 /// Stable identifier for a future LispBuffer shell. No Context, GC pointer,
 /// mutable text or owner borrow crosses the shell boundary. Construction stays
 /// private to the authoritative runtime owner; numeric IDs are not adoption.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct OwnerBufferHandle {
     owner: u64,
     buffer: rune_editor::BufferId,
@@ -897,5 +903,212 @@ mod platform_metric_tests {
         assert_eq!(d.utf16_to_char(3).unwrap(), 2);
         assert!(d.utf16_to_char(2).is_err());
         assert!(d.char_to_utf16(4).is_err());
+    }
+}
+impl RuntimeEditorGateway {
+    pub(crate) fn lookup(
+        &self,
+        name: &str,
+        cx: &Context,
+    ) -> anyhow::Result<Option<OwnerBufferHandle>> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        owner.session.get_buffer(name).map(|id| owner.buffer_handle(id, cx)).transpose()
+    }
+    pub(crate) fn list(&self, cx: &Context) -> anyhow::Result<Vec<OwnerBufferHandle>> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        owner
+            .session
+            .buffer_list()
+            .iter()
+            .map(|id| owner.buffer_handle(*id, cx))
+            .collect()
+    }
+    pub(crate) fn rename(
+        &self,
+        handle: OwnerBufferHandle,
+        name: &str,
+        unique: bool,
+        cx: &Context,
+    ) -> anyhow::Result<String> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        owner.session.execute(rune_editor::Command::RenameBuffer {
+            buffer: id,
+            name: name.into(),
+            unique,
+        })?;
+        Ok(owner
+            .session
+            .buffer_name(id)
+            .ok_or_else(|| anyhow::anyhow!("Deleted editor buffer"))?
+            .into())
+    }
+    /// Return the surviving fallback handle after kill; Env selects it only if
+    /// its own current binding was killed. Other Env bindings stay unchanged.
+    pub(crate) fn kill(
+        &self,
+        handle: OwnerBufferHandle,
+        force: bool,
+        cx: &Context,
+    ) -> anyhow::Result<OwnerBufferHandle> {
+        self.check(cx)?;
+        let mut owner = self.inner.try_borrow_mut()?;
+        let id = owner.validate_handle(handle, cx)?;
+        owner.session.execute(rune_editor::Command::KillBuffer { buffer: id, force })?;
+        owner.buffer_handle(owner.session.current_buffer(), cx)
+    }
+}
+#[cfg(test)]
+mod gateway_registry_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn owner_lookup_rename_and_kill_preserve_handle_identity_and_reject_stale_shell() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let g = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = g.create("owned", "λ", &cx).unwrap();
+        assert_eq!(g.lookup("owned", &cx).unwrap(), Some(h));
+        assert!(g.list(&cx).unwrap().contains(&h));
+        assert_eq!(g.rename(h, "renamed", false, &cx).unwrap(), "renamed");
+        assert_eq!(g.lookup("owned", &cx).unwrap(), None);
+        assert_eq!(g.lookup("renamed", &cx).unwrap(), Some(h));
+        let fallback = g.kill(h, true, &cx).unwrap();
+        assert_ne!(fallback, h);
+        assert!(g.read(h, &cx).is_err());
+        assert!(g.read(fallback, &cx).is_ok());
+    }
+}
+impl RuntimeEditorGateway {
+    /// All reachable local payload values must belong to cx/audited global
+    /// storage and remain rooted. Destination checks do not prove provenance.
+    pub(crate) unsafe fn intern_property(
+        &self,
+        value: Object,
+        cx: &Context,
+    ) -> anyhow::Result<PropertySetHandle> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        // SAFETY: forwarded caller's reachable-graph provenance/rooting contract.
+        unsafe { owner.intern_property_set(value, cx) }
+    }
+    /// Prepare from the exact immutable read used for owner-side plist merging.
+    /// No Lisp callbacks run under this short allocator borrow.
+    pub(crate) fn prepare_properties(
+        &self,
+        read: &BufferRead,
+        range: Range<CharPos>,
+        handle: &PropertySetHandle,
+        cx: &Context,
+    ) -> anyhow::Result<PreparedMetadata> {
+        self.check(cx)?;
+        let owner = self.inner.try_borrow()?;
+        let buffer = owner.validate_handle(read.handle, cx)?;
+        let document = read.document.set_properties(range, handle, &owner.properties, cx)?;
+        Ok(PreparedMetadata { buffer, epoch: read.epoch, document })
+    }
+    pub(crate) fn publish_properties(
+        &self,
+        prepared: PreparedMetadata,
+        cx: &Context,
+    ) -> anyhow::Result<rune_editor::CommandOutcome> {
+        self.check(cx)?;
+        self.inner.try_borrow_mut()?.publish_property_set(prepared, cx)
+    }
+}
+#[cfg(test)]
+mod property_gateway_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_editor::{Command, EditorHost};
+    #[test]
+    fn captured_property_preparation_preserves_live_markers_and_rejects_old_epoch() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let g = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = g.create("styled", "λ🙂", &cx).unwrap();
+        let removed = g.register_marker(h, 1, Bias::Left, &cx).unwrap();
+        let read = g.read(h, &cx).unwrap();
+        // SAFETY: scalar string is allocated in exactly this Context.
+        let style = unsafe { g.intern_property(cx.add("face"), &cx) }.unwrap();
+        let prepared = g.prepare_properties(&read, CharPos(0)..CharPos(2), &style, &cx).unwrap();
+        g.remove_marker(h, removed, &cx).unwrap();
+        let fresh = g.register_marker(h, 2, Bias::Right, &cx).unwrap();
+        g.publish_properties(prepared, &cx).unwrap();
+        assert_eq!(g.marker_position(h, removed, &cx).unwrap(), None);
+        assert_eq!(g.marker_position(h, fresh, &cx).unwrap(), Some(2));
+        let stale = g.prepare_properties(&read, CharPos(0)..CharPos(1), &style, &cx).unwrap();
+        assert!(g.publish_properties(stale, &cx).is_err());
+        let mut native = g.host(&cx).unwrap();
+        native.execute(Command::SwitchBuffer(h.buffer)).unwrap();
+        native.execute(Command::Undo).unwrap();
+        assert_eq!(g.marker_position(h, removed, &cx).unwrap(), None);
+        assert_eq!(g.marker_position(h, fresh, &cx).unwrap(), Some(2));
+        native.execute(Command::Redo).unwrap();
+        assert_eq!(g.marker_position(h, removed, &cx).unwrap(), None);
+        assert_eq!(g.read(h, &cx).unwrap().document.resolve(style.id(), &cx).unwrap(), "face");
+    }
+}
+impl RuntimeEditorGateway {
+    /// Ordered updates use last-write-wins for overlaps. Preparation is local:
+    /// any invalid range/foreign handle rejects the whole prepared root. Caller
+    /// compares Lisp values and skips no-effective-change before calling this.
+    pub(crate) fn prepare_property_runs(
+        &self,
+        read: &BufferRead,
+        updates: impl IntoIterator<Item = (Range<CharPos>, PropertySetHandle)>,
+        cx: &Context,
+    ) -> anyhow::Result<PreparedMetadata> {
+        self.check(cx)?;
+        // User-supplied iterator code runs before any owner borrow.
+        let updates: Vec<_> = updates.into_iter().collect();
+        let owner = self.inner.try_borrow()?;
+        let buffer = owner.validate_handle(read.handle, cx)?;
+        let mut document = read.document.clone();
+        for (range, handle) in updates {
+            document = document.set_properties(range, &handle, &owner.properties, cx)?;
+        }
+        Ok(PreparedMetadata { buffer, epoch: read.epoch, document })
+    }
+}
+#[cfg(test)]
+mod property_batch_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn property_run_batch_publishes_once_and_failure_leaves_owner_unchanged() {
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let g = RuntimeEditorGateway::new(&cx, 80, 24).unwrap();
+        let h = g.create("batch", "abc", &cx).unwrap();
+        let read = g.read(h, &cx).unwrap();
+        // SAFETY: freshly allocated scalar strings in the same Context.
+        let a = unsafe { g.intern_property(cx.add("a"), &cx) }.unwrap();
+        let b = unsafe { g.intern_property(cx.add("b"), &cx) }.unwrap();
+        assert!(
+            g.prepare_property_runs(
+                &read,
+                [(CharPos(0)..CharPos(1), a.clone()), (CharPos(2)..CharPos(4), b.clone())],
+                &cx
+            )
+            .is_err()
+        );
+        assert_eq!(g.read(h, &cx).unwrap().epoch, read.epoch);
+        let prepared = g
+            .prepare_property_runs(
+                &read,
+                [(CharPos(0)..CharPos(3), a.clone()), (CharPos(1)..CharPos(2), b.clone())],
+                &cx,
+            )
+            .unwrap();
+        g.publish_properties(prepared, &cx).unwrap();
+        let now = g.read(h, &cx).unwrap();
+        assert_eq!(now.epoch, read.epoch + 1);
+        assert_eq!(now.document.properties().at(CharPos(0)), Some(PropSetId(a.id())));
+        assert_eq!(now.document.properties().at(CharPos(1)), Some(PropSetId(b.id())));
+        assert_eq!(now.document.properties().at(CharPos(2)), Some(PropSetId(a.id())));
     }
 }

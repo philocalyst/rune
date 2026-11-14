@@ -5,7 +5,7 @@ use crate::core::object::WeakBufferPropertyRoot;
 use crate::core::object::{ChannelReceiver, ChannelSender, CharTable, LispHashTable};
 use crate::core::object::{Gc, IntoObject, Object, UninternedSymbolMap, WithLifetime};
 use bumpalo::collections::Vec as GcVec;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -103,6 +103,8 @@ pub(crate) struct Context<'rt> {
     next_limit: usize,
     domain_id: u64,
     buffer_properties: RefCell<Vec<WeakBufferPropertyRoot>>,
+    // One owner-local Session for all Envs and native hosts in this Context.
+    editor_gateway: OnceCell<crate::editor_document::RuntimeEditorGateway>,
 }
 
 impl Drop for Context<'_> {
@@ -247,7 +249,25 @@ impl<'ob, 'rt> Context<'rt> {
             next_limit: Self::MIN_GC_BYTES,
             domain_id,
             buffer_properties: RefCell::new(Vec::new()),
+            editor_gateway: OnceCell::new(),
         }
+    }
+
+    /// The initializer stores no Context reference and never invokes Lisp.
+    /// Return an owned clone, never an owner/RefCell borrow across callbacks.
+    /// Context teardown tombstones property stores before this native-only
+    /// gateway/session is dropped; escaped clones reject every foreign owner.
+    pub(crate) fn editor_gateway(
+        &self,
+    ) -> anyhow::Result<crate::editor_document::RuntimeEditorGateway> {
+        if let Some(gateway) = self.editor_gateway.get() {
+            return Ok(gateway.clone());
+        }
+        let gateway = crate::editor_document::RuntimeEditorGateway::new(self, 80, 24)?;
+        self.editor_gateway
+            .set(gateway)
+            .map_err(|_| anyhow::anyhow!("Reentrant editor gateway initialization"))?;
+        Ok(self.editor_gateway.get().expect("editor gateway just initialized").clone())
     }
 
     pub(crate) fn domain_id(&self) -> u64 {
@@ -510,5 +530,42 @@ mod domain_constructor_tests {
         assert!(second.is_err());
         assert_eq!(cx.add(7), 7);
         cx.garbage_collect(true);
+    }
+}
+
+#[cfg(test)]
+mod shared_editor_gateway_tests {
+    use super::*;
+    use rune_editor::{Document, EditorHost};
+    #[test]
+    fn context_clones_one_authoritative_gateway_for_env_and_native_views() {
+        let roots = RootSet::default();
+        let mut cx = Context::new(&roots);
+        let first = cx.editor_gateway().unwrap();
+        let second = cx.editor_gateway().unwrap();
+        let handle = first.scratch(&cx).unwrap();
+        let old = first.read(handle, &cx).unwrap();
+        let host = second.host(&cx).unwrap();
+        second.splice(handle, old.epoch, 0..0, "λ🙂", &cx).unwrap();
+        assert_eq!(first.read(handle, &cx).unwrap().document.to_text(), "λ🙂");
+        assert_eq!(old.document.to_text(), "");
+        assert!(host.snapshot().unwrap().buffers.iter().any(|b| b.document.to_text() == "λ🙂"));
+        drop(host);
+        cx.garbage_collect(true);
+        assert_eq!(
+            cx.editor_gateway().unwrap().read(handle, &cx).unwrap().document.to_text(),
+            "λ🙂"
+        );
+    }
+    #[test]
+    fn escaped_gateway_clone_rejects_next_context_without_adoption() {
+        let gateway = {
+            let roots = RootSet::default();
+            let cx = Context::new(&roots);
+            cx.editor_gateway().unwrap()
+        };
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        assert!(gateway.scratch(&cx).is_err());
     }
 }
