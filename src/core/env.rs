@@ -42,6 +42,8 @@ pub(crate) struct Env<'a> {
     binding_targets: Vec<Option<OwnerBufferHandle>>,
     pub(crate) match_data: Slot<Object<'a>>,
     pub(crate) native_key_prefix: Slot<Object<'a>>,
+    // Active keyboard map is distinct from the Lisp global-map variable.
+    pub(crate) active_global_map: Slot<Object<'a>>,
     pub(crate) keymap_functions: ObjectMap<Slot<Symbol<'a>>,Slot<Object<'a>>>,
     #[no_trace]
     pub(crate) native_key_sequence: Option<u64>,
@@ -87,6 +89,7 @@ impl<'a> Env<'a> {
             binding_targets: Default::default(),
             match_data: Default::default(),
             native_key_prefix: Default::default(),
+            active_global_map: Default::default(),
             keymap_functions: Default::default(),
             native_key_sequence: None,
             font_selection: Default::default(),

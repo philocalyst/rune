@@ -265,12 +265,12 @@ pub(crate) fn define_key<'a>(
 fn use_global_map(map: Object, env: &mut Rt<Env>, cx: &Context) -> Result<()> {
     let map = map_object(map, env, cx)?.ok_or_else(|| anyhow!("expected keymap"))?;
     cancel_native_prefix(env);
-    env.vars.insert(sym::GLOBAL_MAP, map);
+    env.active_global_map.set(map);
     Ok(())
 }
 #[defun]
 fn current_global_map<'a>(env: &Rt<Env>, cx: &'a Context) -> Object<'a> {
-    env.vars.get(sym::GLOBAL_MAP).map(|v| v.bind(cx)).unwrap_or(NIL)
+    env.active_global_map.bind(cx)
 }
 
 #[cfg(test)]
@@ -311,6 +311,31 @@ mod tests {
         );
         crate::lread::load_internal("(setq global-startup-initializer-ran nil) (defvar global-map (progn (setq global-startup-initializer-ran t) (make-keymap))) (use-global-map global-map) (if global-startup-initializer-ran nil (error \"skipped actual Lisp initializer\"))",cx,env).unwrap();
         assert!(keymapp(current_global_map(env, cx), env, cx).unwrap());
+    }
+    #[test]
+    fn active_global_map_is_not_the_global_map_variable() {
+        crate::assert_elprop!("(let* ((before (make-sparse-keymap)) (global-map before) (m (make-sparse-keymap))) (use-global-map before) (use-global-map m) (list (eq (current-global-map) m) (eq global-map before)))");
+        assert_lisp("(let* ((a (make-sparse-keymap)) (b (make-sparse-keymap))) (use-global-map a) (setq global-map b) (list (eq (current-global-map) a) (eq global-map b) (eq (current-global-map) global-map)))", "(t t nil)");
+    }
+    #[test]
+    fn active_global_map_survives_moving_gc_without_variable_root() {
+        use super::*;
+        use crate::core::gc::RootSet;
+        use rune_core::macros::root;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        let map = make_sparse_keymap(None, cx);
+        let key = cx.add("x");
+        let command = crate::lread::intern("active-map-command", cx);
+        define_key(map, key, command.into(), env, cx).unwrap();
+        use_global_map(map, env, cx).unwrap();
+        for _ in 0..3 { cx.garbage_collect(true); }
+        let key = cx.add("x");
+        let result = lookup_key(current_global_map(env, cx), key, None, env, cx).unwrap();
+        assert_eq!(crate::core::object::Symbol::try_from(result).unwrap().name(), "active-map-command");
+        assert!(env.vars.get(sym::GLOBAL_MAP).is_none());
     }
     #[test]
     fn sparse_prefix_lookup_and_inherited_prefixes_match_gnu() {
