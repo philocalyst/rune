@@ -47,6 +47,13 @@ impl<H: EditorHost> EditorBridge<H>
 where
     H::Doc: DisplayDocument,
 {
+    pub(crate) fn evaluate_with(
+        &mut self,
+        evaluate: fn(&mut H, &str) -> Result<(), String>,
+        source: &str,
+    ) -> Result<(), String> {
+        evaluate(&mut self.host, source)
+    }
     pub fn new(mut host: H, metrics: FixedMetrics, bounds: Rect) -> Result<Self, BridgeError> {
         if !bounds.valid() || !metrics.0.valid() {
             return Err(LayoutError("invalid editor geometry").into());

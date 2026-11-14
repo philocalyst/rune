@@ -18,6 +18,11 @@ pub struct CompositionRequest {
 #[derive(Debug)]
 pub enum OwnerEvent {
     Input(InputEvent),
+    /// Owned source only: no runtime Object, Context or gateway crosses threads.
+    Evaluate {
+        request_id: u64,
+        source: String,
+    },
     Command(rune_editor::Command),
     TextInsertion {
         window_id: u64,
@@ -58,6 +63,7 @@ where
     reply: Arc<Mutex<ReplyState>>,
     publisher: HostPublisher,
     initialized: bool,
+    evaluator: Option<fn(&mut H, &str) -> Result<(), String>>,
     platform: Option<crate::platform_context::PlatformPublisher>,
     prepare_input: Option<
         fn(
@@ -79,7 +85,13 @@ pub struct InitializationFailure {
 #[derive(Debug)]
 pub struct OwnerStep {
     pub edit: Result<bool, BridgeError>,
+    pub evaluation: Option<EvaluationOutcome>,
     pub render_error: Option<BridgeError>,
+}
+#[derive(Debug)]
+pub struct EvaluationOutcome {
+    pub request_id: u64,
+    pub outcome: Result<(), String>,
 }
 fn close_and_drain(receiver: &Receiver<OwnerEvent>, reply: &Mutex<ReplyState>) -> Vec<OwnerEvent> {
     // Same lock as admission: previously admitted sends finish before closure,
@@ -115,6 +127,7 @@ impl NativeEditorOwner {
             reply: self.reply,
             publisher: self.publisher,
             initialized: false,
+            evaluator: None,
             platform: None,
             prepare_input: None,
         }
@@ -230,17 +243,41 @@ where
     /// Dedicated std::thread only. Initial errors/undelivered inputs must reach
     /// caller's UI failure path; no success ack is manufactured on setup failure.
     pub fn run(self) -> Result<(), InitializationFailure> {
-        let mut w = self.initialize()?;
-        while let Ok(e) = w.receiver.recv() {
-            let step = w.process(e);
+        self.run_with_outcome(|step| {
+            if let Some(evaluation) = step.evaluation {
+                if let Err(error) = evaluation.outcome {
+                    eprintln!("native evaluation {} failed: {error}", evaluation.request_id);
+                }
+            }
             if let Err(e) = step.edit {
                 eprintln!("native owner input rejected: {e:?}");
             }
             if let Some(e) = step.render_error {
                 eprintln!("native layout after edit failed: {e:?}");
             }
+        })
+    }
+    /// Report every completed event once on the owner thread, including ordinary
+    /// command/text failures that have no composition ACK. A root application can
+    /// publish these plain outcomes to its visible status UI instead of relying
+    /// on stderr. The callback runs after reply locks are dropped; it must not
+    /// block the owner or replay an event after edit/render failure.
+    /// Initialization failure still returns its error and undelivered events.
+    pub fn run_with_outcome(
+        self,
+        mut report: impl FnMut(OwnerStep),
+    ) -> Result<(), InitializationFailure> {
+        let mut worker = self.initialize()?;
+        while let Ok(event) = worker.receiver.recv() {
+            report(worker.process(event));
         }
         Ok(())
+    }
+    /// Install an owner-only evaluator. Any persistent rooted evaluator state
+    /// belongs in H, not a UI closure. Absent adapters explicitly reject source.
+    pub fn with_evaluator(mut self, evaluate: fn(&mut H, &str) -> Result<(), String>) -> Self {
+        self.evaluator = Some(evaluate);
+        self
     }
     /// Retry preparation/publication only. Never replay a committed command or
     /// composition request to recover a later rendering failure.
@@ -253,7 +290,41 @@ where
         self.publisher.publish(frame).map_err(BridgeError::Publish)
     }
     fn process(&mut self, event: OwnerEvent) -> OwnerStep {
+        let mut evaluation = None;
         let edit = match event {
+            OwnerEvent::Evaluate { request_id, source } => {
+                let before = self.bridge.snapshot().map(|s| s.sequence);
+                match before {
+                    Err(error) => {
+                        evaluation = Some(EvaluationOutcome {
+                            request_id,
+                            outcome: Err(format!("owner snapshot before evaluation: {error:?}")),
+                        });
+                        Err(error)
+                    }
+                    Ok(before) => {
+                        let outcome = if source.len() > 65_536 {
+                            Err("evaluation source exceeds 65536-byte limit".into())
+                        } else if let Some(evaluate) = self.evaluator {
+                            self.bridge.evaluate_with(evaluate, &source)
+                        } else {
+                            Err("no owner evaluator configured".into())
+                        };
+                        evaluation = Some(EvaluationOutcome { request_id, outcome });
+                        // Evaluation may edit and then signal. Never replay it;
+                        // publication follows owner sequence, not its Result.
+                        match self.bridge.snapshot() {
+                            Ok(after) => Ok(after.sequence != before),
+                            Err(error) => {
+                                if let Some(platform) = &self.platform {
+                                    let _ = platform.invalidate();
+                                }
+                                Err(error)
+                            }
+                        }
+                    }
+                }
+            }
             OwnerEvent::Input(e) => self.bridge.apply(&e),
             OwnerEvent::Command(command) => self.bridge.execute_command(command),
             OwnerEvent::TextInsertion { window_id, buffer_id, text } => {
@@ -284,7 +355,7 @@ where
                 render_error = Some(error);
             }
         }
-        OwnerStep { edit, render_error }
+        OwnerStep { edit, evaluation, render_error }
     }
 }
 #[cfg(test)]
@@ -433,5 +504,75 @@ mod tests {
             .document;
         assert_eq!(doc.to_text(), "a🙂b");
         assert!(replies.take().is_none());
+    }
+    fn edit_then_signal(host: &mut Session<RopeDocument>, source: &str) -> Result<(), String> {
+        host.execute(rune_editor::Command::Insert(source.into()))
+            .map_err(|e| e.to_string())?;
+        Err("evaluation signalled after edit".into())
+    }
+    #[test]
+    fn evaluation_error_after_edit_publishes_and_never_replays_on_frame_failure() {
+        let (p, updates) = host_updates();
+        let (sender, _replies, worker) = editor_transport(bridge(), 2, p);
+        let mut worker = worker.with_evaluator(edit_then_signal);
+        drop(updates);
+        sender
+            .try_send(OwnerEvent::Evaluate { request_id: 41, source: "λ".into() })
+            .unwrap();
+        let step = worker.try_step().unwrap();
+        assert_eq!(step.edit.unwrap(), true);
+        let outcome = step.evaluation.unwrap();
+        assert_eq!(outcome.request_id, 41);
+        assert_eq!(outcome.outcome.unwrap_err(), "evaluation signalled after edit");
+        assert!(matches!(step.render_error, Some(BridgeError::Publish(_))));
+        assert!(worker.retry_frame().is_err());
+        let snapshot = worker.bridge().snapshot().unwrap();
+        assert_eq!(snapshot.buffers[0].document.to_text(), "λ");
+        sender.try_send(OwnerEvent::Command(rune_editor::Command::Undo)).unwrap();
+        worker.try_step().unwrap().edit.unwrap();
+        assert_eq!(worker.bridge().snapshot().unwrap().buffers[0].document.to_text(), "");
+    }
+    #[test]
+    fn owner_outcome_reports_unconfigured_evaluation_once_without_edit() {
+        let (p, _updates) = host_updates();
+        let (sender, _replies, worker) = editor_transport(bridge(), 2, p);
+        sender
+            .try_send(OwnerEvent::Evaluate { request_id: 7, source: "ignored".into() })
+            .unwrap();
+        drop(sender);
+        let mut seen = 0;
+        worker
+            .run_with_outcome(|step| {
+                seen += 1;
+                assert!(!step.edit.unwrap());
+                assert!(step.render_error.is_none());
+                let evaluation = step.evaluation.unwrap();
+                assert_eq!(evaluation.request_id, 7);
+                assert_eq!(evaluation.outcome.unwrap_err(), "no owner evaluator configured");
+            })
+            .unwrap();
+        assert_eq!(seen, 1);
+    }
+    #[test]
+    fn evaluation_error_edit_precedes_and_stales_captured_composition_in_same_fifo() {
+        let b = bridge();
+        let captured = request(&b);
+        let (publisher, _updates) = host_updates();
+        let (sender, mut replies, worker) = editor_transport(b, 2, publisher);
+        let mut worker = worker.with_evaluator(edit_then_signal);
+        sender
+            .try_send(OwnerEvent::Evaluate { request_id: 9, source: "before".into() })
+            .unwrap();
+        sender.try_send(OwnerEvent::Composition(captured)).unwrap();
+        let evaluation = worker.try_step().unwrap();
+        assert!(evaluation.edit.unwrap());
+        assert!(evaluation.evaluation.unwrap().outcome.is_err());
+        let composition = worker.try_step().unwrap();
+        assert!(matches!(
+            composition.edit,
+            Err(BridgeError::Editor(rune_editor::EditorError::StaleInput))
+        ));
+        assert!(replies.take().unwrap().outcome.is_err());
+        assert_eq!(worker.bridge().snapshot().unwrap().buffers[0].document.to_text(), "before");
     }
 }
