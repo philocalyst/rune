@@ -9,7 +9,74 @@ use fallible_iterator::FallibleIterator;
 use fancy_regex::Regex;
 use rune_macros::defun;
 
-#[defun]
+/// Unicode strings keep the existing character-based engine. Unibyte RPC
+/// strings use a real byte regex engine and byte (Lisp unibyte character) indices.
+#[defun(name = "string-match")]
+fn string_match_value<'ob>(
+    regexp: Object,
+    string: Object,
+    start: Option<i64>,
+    inhibit_modify: OptionalFlag,
+    env: &mut Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    match (regexp.untag(), string.untag()) {
+        (ObjectType::String(pattern), ObjectType::String(text)) => {
+            string_match(pattern, text, start, inhibit_modify, env, cx)
+        }
+        (ObjectType::ByteString(pattern), ObjectType::ByteString(text)) => {
+            byte_string_match(&pattern, &text, start, env, cx)
+        }
+        (ObjectType::String(pattern), ObjectType::ByteString(text)) if pattern.is_ascii() => {
+            byte_string_match(pattern.as_bytes(), &text, start, env, cx)
+        }
+        _ => bail!(
+            "string-match requires two text strings or a byte string with a byte/ASCII pattern"
+        ),
+    }
+}
+fn byte_string_match<'ob>(
+    pattern: &[u8],
+    text: &[u8],
+    start: Option<i64>,
+    env: &mut Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    // Preserve syntax bytes and escape only high-bit literal bytes. Never turn
+    // FE/FF wire cookies into their two-byte Unicode UTF8 encodings.
+    let mut escaped = String::new();
+    for byte in pattern {
+        if *byte >= 128 {
+            use std::fmt::Write;
+            write!(&mut escaped, "\\x{byte:02X}")?;
+        } else {
+            escaped.push(char::from(*byte));
+        }
+    }
+    let pattern = lisp_regex_to_rust(&escaped);
+    let regex = regex::bytes::RegexBuilder::new(&pattern).unicode(false).build()?;
+    let start = start.unwrap_or(0);
+    let start = if start < 0 { text.len() as i128 + start as i128 } else { start as i128 };
+    ensure!(start >= 0 && start <= text.len() as i128, "string-match start out of range");
+    if let Some(matches) = regex.captures_at(text, start as usize) {
+        let mut positions: Vec<Object> = Vec::new();
+        for group in matches.iter() {
+            if let Some(group) = group {
+                positions.push(group.start().into());
+                positions.push(group.end().into());
+            } else {
+                positions.push(NIL);
+                positions.push(NIL);
+            }
+        }
+        let result = positions.first().copied().unwrap_or(NIL);
+        env.match_data.set(crate::fns::slice_into_list(&positions, None, cx));
+        Ok(result)
+    } else {
+        Ok(NIL)
+    }
+}
+
 fn string_match<'ob>(
     regexp: &str,
     string: &str,
@@ -312,5 +379,50 @@ mod test {
         string_match("bar", string, None, None, env, cx).unwrap();
         let result = replace_match(newtext, None, None, Some(string), None, env, cx).unwrap();
         assert_eq!(result, "foo quux baz");
+    }
+}
+
+#[cfg(test)]
+mod raw_byte_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+    #[test]
+    fn mu_wire_cookies_match_exact_bytes_and_report_byte_capture_offsets() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        crate::core::env::sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        let pattern = cx.add(vec![
+            254, b'\\', b'(', b'[', b'0', b'-', b'9', b'a', b'-', b'f', b']', b'+', b'\\', b')',
+            255,
+        ]);
+        let bytes = cx.add(vec![128, b'x', 254, b'a', b'1', b'f', 255, 0]);
+        assert_eq!(
+            string_match_value(pattern, bytes, None, None, env, cx).unwrap(),
+            Object::from(2)
+        );
+        assert_eq!(match_beginning(1, env, cx).unwrap(), Object::from(3));
+        assert_eq!(match_end(1, env, cx).unwrap(), Object::from(6));
+        assert_eq!(
+            string_match_value(cx.add("x"), bytes, Some(-7), None, env, cx).unwrap(),
+            Object::from(1)
+        );
+        assert!(string_match_value(pattern, bytes, Some(i64::MIN), None, env, cx).is_err());
+        crate::library::elprop::start_emacs().unwrap();
+        assert_eq!(crate::library::elprop::eval(r#"(let ((s (unibyte-string 128 120 254 97 49 102 255 0)) (p (concat (unibyte-string 254) "\\([0-9a-f]+\\)" (unibyte-string 255)))) (list (string-match p s) (match-beginning 1) (match-end 1)))"#).unwrap(), "(2 3 6)");
+    }
+    #[test]
+    fn binary_dot_nul_high_bytes_and_anchors_are_not_unicode_expanded() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        assert_eq!(byte_string_match(b".", &[255], None, env, cx).unwrap(), Object::from(0));
+        assert_eq!(
+            byte_string_match(&[0], &[255, 0, 254], None, env, cx).unwrap(),
+            Object::from(1)
+        );
+        assert_eq!(byte_string_match(b"^x", b"ax", Some(1), env, cx).unwrap(), NIL);
+        assert!(byte_string_match(b"x", b"x", Some(2), env, cx).is_err());
     }
 }

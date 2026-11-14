@@ -52,6 +52,7 @@ anyhow = { workspace = true }
 bytecount = "0.6.3"
 clap = { workspace = true }
 fancy-regex = "0.16.2"
+regex = "1.13.1"
 float-cmp = { workspace = true }
 hostname = "0.4.0"
 memoffset = { workspace = true }

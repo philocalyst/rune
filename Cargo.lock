@@ -4982,6 +4982,7 @@ dependencies = [
  "proptest-derive",
  "quote",
  "rand 0.9.5",
+ "regex",
  "rune-core",
  "rune-display",
  "rune-editor",
