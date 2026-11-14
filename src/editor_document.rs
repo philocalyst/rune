@@ -1840,6 +1840,37 @@ impl RuntimeEditorGateway {
 }
 
 impl LispRuntimeHost<'_, '_, '_> {
+    /// Drain only currently queued native process events on this owner thread.
+    /// Unlike a user command, polling preserves the evaluator's current-buffer
+    /// binding. Filters select their own destination; no editor borrow spans Lisp.
+    /// The bool reports output delivery, not pending work or process readiness.
+    /// Callback effects survive errors: callers must publish changed snapshots
+    /// even on Err and must never replay a consumed event.
+    pub(crate) fn poll_process_events(&mut self) -> Result<bool, String> {
+        crate::process_events::poll_process_events(self.env, self.owner.cx).map_err(|error| {
+            if let Some(error) = error.downcast_ref::<crate::eval::EvalError>() {
+                if let crate::eval::ErrorType::Signal(exit) = &error.error {
+                    if exit
+                        .bind(self.owner.cx)
+                        .is_ok_and(|condition| condition.car() == crate::core::env::sym::QUIT)
+                    {
+                        return "quit".to_owned();
+                    }
+                }
+            }
+            error.to_string()
+        })
+    }
+
+    /// Scoped token applies to Lisp callback safe points, not blocking foreign IO.
+    pub(crate) fn poll_process_events_with_quit(
+        &mut self,
+        token: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<bool, String> {
+        let _quit = self.env.install_quit_token(token);
+        self.poll_process_events()
+    }
+
     /// Fresh request-scoped interruption token. Guard installation owns no Env
     /// borrow and restores the previous token on success, signal or Rust unwind.
     /// This does not roll back earlier Lisp effects or bound blocking foreign calls.
@@ -2077,5 +2108,73 @@ impl LispRuntimeHost<'_, '_, '_> {
     ) -> Result<bool, String> {
         let _scope = self.env.install_quit_token(token);
         self.dispatch_native_key(window, buffer, key, control, meta, shift)
+    }
+}
+
+#[cfg(test)]
+mod owner_process_poll_adapter_tests {
+    use super::*;
+    use rune_editor::EditorHost;
+    #[test]
+    fn real_filter_partial_effects_survive_error_without_replay() {
+        use rune_editor::Document;
+        with_lisp_runtime_owner(80, 24, |mut host| {
+            host.evaluate_source(r#"(setq poll-bg (get-buffer-create "poll-callback"))
+                (set-buffer poll-bg)
+                (setq poll-process (start-process "poll-host-child" nil "/usr/bin/python3" "-c" "import os; os.write(1,b'x')"))
+                (set-process-coding-system poll-process 'utf-8-unix 'utf-8-unix)
+                (set-process-filter poll-process #'(lambda (p text) (insert text) (garbage-collect) (error "poll-filter-failed")))"#)
+                .map_err(anyhow::Error::msg)?;
+            let before = host.snapshot()?.sequence;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let error = loop {
+                match host.poll_process_events() {
+                    Err(error) => break error,
+                    Ok(_) => {
+                        anyhow::ensure!(std::time::Instant::now() < deadline, "child output deadline");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            };
+            assert!(error.contains("poll-filter-failed") || error.contains("Signal"), "{error}");
+            let after = host.snapshot()?;
+            assert!(after.sequence > before);
+            assert_eq!(after.buffers.iter().find(|b| b.name == "poll-callback").unwrap().document.to_text(), "x");
+            drop(after);
+            for _ in 0..4 { let _ = host.poll_process_events(); }
+            assert_eq!(host.snapshot()?.buffers.iter().find(|b| b.name == "poll-callback").unwrap().document.to_text(), "x");
+            host.evaluate_source("(insert \"next\")").map_err(anyhow::Error::msg)?;
+            Ok(())
+        }).unwrap();
+    }
+    #[test]
+    fn idle_poll_preserves_evaluator_binding_and_releases_scoped_token() {
+        with_lisp_runtime_owner(80, 24, |mut host| {
+            host.evaluate_source(
+                "(setq poll-bg (get-buffer-create \"poll-background\")) (set-buffer poll-bg)",
+            )
+            .map_err(anyhow::Error::msg)?;
+            let before = host.snapshot()?.sequence;
+            assert!(!host.poll_process_events().map_err(anyhow::Error::msg)?);
+            assert!(
+                !host
+                    .poll_process_events_with_quit(Arc::new(std::sync::atomic::AtomicBool::new(
+                        false
+                    )))
+                    .map_err(anyhow::Error::msg)?
+            );
+            assert_eq!(host.poll_process_events_with_quit(Arc::new(
+                std::sync::atomic::AtomicBool::new(true))).unwrap_err(), "quit");
+            assert!(!host.poll_process_events().map_err(anyhow::Error::msg)?);
+            assert_eq!(host.snapshot()?.sequence, before);
+            crate::lread::load_internal(
+                "(if (eq (current-buffer) poll-bg) t (error \"poll retargeted Env\"))",
+                host.owner.cx,
+                host.env,
+            )?;
+            host.evaluate_source("(insert \"next-request\")").map_err(anyhow::Error::msg)?;
+            Ok(())
+        })
+        .unwrap();
     }
 }

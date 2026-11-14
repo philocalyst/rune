@@ -13,10 +13,13 @@ use rune_macros::defun;
 
 defsym!(KEYMAP);
 defsym!(GLOBAL_MAP);
-defsym!(MINIBUFFER_LOCAL_MAP);
+// GNU Emacs 30.1 src/keymap.c::syms_of_keymap creates this real sparse
+// map before Lisp subr.el adds bindings. Unlike global-map it has no Lisp
+// initializer before minibuffer-local-password-map inherits it.
+defvar!(MINIBUFFER_LOCAL_MAP, crate::keymap::make_sparse_keymap(None, cx));
 
 #[defun]
-fn make_sparse_keymap<'a>(string: Option<&str>, cx: &'a Context) -> Object<'a> {
+pub(crate) fn make_sparse_keymap<'a>(string: Option<&str>, cx: &'a Context) -> Object<'a> {
     let tail = string.map(|s| Cons::new(s, NIL, cx).into()).unwrap_or(NIL);
     Cons::new(sym::KEYMAP, tail, cx).into()
 }
@@ -280,6 +283,34 @@ mod tests {
                 symbol.unbind_func();
             }
         }
+    }
+    #[test]
+    fn native_startup_preserves_real_lisp_global_initializer_and_real_c_minibuffer_map() {
+        use super::*;
+        use crate::core::gc::RootSet;
+        use rune_core::macros::root;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        assert!(
+            env.vars.get(sym::GLOBAL_MAP).is_none(),
+            "native nil must not suppress Lisp defvar initializer"
+        );
+        let mini = env.vars.get(sym::MINIBUFFER_LOCAL_MAP).unwrap().bind(cx);
+        root!(mini, cx);
+        assert!(keymapp(mini.bind(cx), env, cx).unwrap());
+        let key = cx.add("x");
+        let command = crate::lread::intern("startup-map-command", cx);
+        define_key(mini.bind(cx), key, command.into(), env, cx).unwrap();
+        assert!(
+            lookup_key(mini.bind(cx), key, None, env, cx)
+                .unwrap()
+                .ptr_eq(Object::from(command))
+        );
+        crate::lread::load_internal("(setq global-startup-initializer-ran nil) (defvar global-map (progn (setq global-startup-initializer-ran t) (make-keymap))) (use-global-map global-map) (if global-startup-initializer-ran nil (error \"skipped actual Lisp initializer\"))",cx,env).unwrap();
+        assert!(keymapp(current_global_map(env, cx), env, cx).unwrap());
     }
     #[test]
     fn sparse_prefix_lookup_and_inherited_prefixes_match_gnu() {
