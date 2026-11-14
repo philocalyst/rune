@@ -456,10 +456,15 @@ pub(crate) fn autoload_do_load<'ob>(
         Some(x) => x?.try_into()?,
         None => bail!("Malformed autoload"),
     };
-    ensure!(
-        iter.fallible().all(|x| Ok(x.is_nil()))?,
-        "autoload arguments are not yet implemented"
-    );
+    // DOCSTRING, INTERACTIVE, and TYPE are stored metadata, not forms to
+    // evaluate. Official generated catalogs normally contain non-nil docs.
+    // Bound traversal also rejects a malformed/cyclic tail before file I/O.
+    let mut metadata_count = 0;
+    for metadata in iter {
+        metadata?;
+        metadata_count += 1;
+        ensure!(metadata_count <= 3, "Malformed autoload metadata tail");
+    }
     root!(file, cx);
     crate::lread::load(file, None, None, cx, env)?;
     match funname {
@@ -1016,4 +1021,40 @@ mod startup_debug_state_tests {
         crate::library::elprop::start_emacs().unwrap();
         assert_eq!(crate::library::elprop::eval(source).unwrap(), "(t nil t nil)");
     }
+}
+
+#[cfg(test)]
+mod autoload_metadata_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn documented_autoload_loads_real_source_without_evaluating_metadata() {
+        let directory = std::env::temp_dir().join(format!("rune-autoload-metadata-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("documented.el");
+        std::fs::write(&file, "(fset 'rune-documented-autoload '(lambda () 42))").unwrap();
+        sym::init_symbols();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let metadata = list![sym::AUTOLOAD, file.to_str().unwrap(), "Official-style documentation", true, NIL; cx];
+        root!(metadata, cx);
+        autoload_do_load(metadata, None, None, env, cx).unwrap();
+        let loaded: Object = crate::core::env::intern("rune-documented-autoload", cx).func(cx).unwrap().into();
+        assert!(!loaded.is_nil());
+        assert_ne!(loaded.as_cons_pair().unwrap().0, sym::AUTOLOAD);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn malformed_autoload_metadata_rejects_before_io() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        let malformed = list![sym::AUTOLOAD, "/nonexistent/rune-autoload", NIL, NIL, NIL, true; cx];
+        root!(malformed, cx);
+        let error = autoload_do_load(malformed, None, None, env, cx).unwrap_err();
+        assert_eq!(error.to_string(), "Malformed autoload metadata tail");
+    }
+
 }
