@@ -99,7 +99,11 @@ fn rounding_driver(
     };
 
     match (n, d) {
-        (NumberValue::Int(n), NumberValue::Int(d)) => Ok(NumberValue::Int(int_divide(n, d))),
+        // The owned domain includes every i64, regardless of today's narrower
+        // immediate payload. Avoid MIN/-1 division and abs(MIN) in round2.
+        (NumberValue::Int(n), NumberValue::Int(d)) if n != i64::MIN && d != i64::MIN => {
+            Ok(NumberValue::Int(int_divide(n, d)))
+        }
         (n, d) => {
             let dscale = match d {
                 NumberValue::Float(f) => double_integer_scale(f),
@@ -424,6 +428,34 @@ fn frexp_f(f: f64) -> (f64, i64) {
 mod m0_rounding_regressions {
     use super::*;
     use crate::interpreter::assert_lisp;
+
+    #[test]
+    fn owned_integer_rounding_covers_full_signed_machine_domain_without_panics() {
+        type MachineDivide = fn(i64, i64) -> i64;
+        type BigDivide = fn(BigInt, BigInt) -> BigInt;
+        let operations: [(fn(f64) -> f64, MachineDivide, BigDivide); 4] = [
+            (f64::floor, |n, d| n.div_floor(&d), |n, d| n.div_floor(&d)),
+            (f64::ceil, |n, d| n.div_ceil(&d), |n, d| n.div_ceil(&d)),
+            (f64::round_ties_even, round2, round2),
+            (f64::trunc, |n, d| n / d, |n, d| n / d),
+        ];
+        for (float_round, machine_divide, big_divide) in operations {
+            for numerator in [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX] {
+                for denominator in [i64::MIN, -2, -1, 1, 2, i64::MAX] {
+                    let expected = big_divide(BigInt::from(numerator), BigInt::from(denominator));
+                    let actual = rounding_driver(
+                        NumberValue::Int(numerator),
+                        Some(NumberValue::Int(denominator)),
+                        float_round,
+                        machine_divide,
+                        big_divide,
+                    )
+                    .unwrap();
+                    assert_eq!(actual.into_integer().unwrap(), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn allocating_rounding_and_absolute_value_obey_integer_width() {

@@ -11,11 +11,12 @@ use num_bigint::BigInt;
 use rune_macros::defun;
 
 pub(crate) fn add_value(vars: &[Number]) -> NumberValue {
-    // No arithmetic for one operand: adding a synthetic zero loses -0.0.
-    if let [one] = vars {
-        return one.val();
+    // Seed a nonempty sum from its first operand. A synthetic +0 loses
+    // negative zero even in multi-operand sums such as (+ -0.0 -0.0).
+    match vars.split_first() {
+        Some((first, rest)) => rest.iter().fold(first.val(), |acc, x| acc + x.val()),
+        None => NumberValue::Int(0),
     }
-    vars.iter().fold(NumberValue::Int(0), |acc, x| acc + x.val())
 }
 
 #[defun(name = "+")]
@@ -46,10 +47,10 @@ pub(crate) fn sub_value(number: Option<Number>, numbers: &[Number]) -> NumberVal
 }
 
 pub(crate) fn mul_value(numbers: &[Number]) -> NumberValue {
-    if let [one] = numbers {
-        return one.val();
+    match numbers.split_first() {
+        Some((first, rest)) => rest.iter().fold(first.val(), |acc, x| acc * x.val()),
+        None => NumberValue::Int(1),
     }
-    numbers.iter().fold(NumberValue::Int(1), |acc, x| acc * x.val())
 }
 
 #[defun(name = "*")]
@@ -892,6 +893,33 @@ mod test {
                 ),
                 expected,
             );
+        }
+    }
+
+    #[test]
+    fn sums_and_products_preserve_zero_sign_without_synthetic_operands() {
+        for length in 1..=4 {
+            for mut encoded in 0..3_usize.pow(length) {
+                let mut arguments = Vec::new();
+                for _ in 0..length {
+                    arguments.push(["0", "0.0", "-0.0"][encoded % 3]);
+                    encoded /= 3;
+                }
+                if arguments.iter().all(|value| *value == "0") {
+                    continue;
+                }
+                for operation in ["+", "*"] {
+                    let negative = if operation == "+" {
+                        arguments.iter().all(|value| *value == "-0.0")
+                    } else {
+                        arguments.iter().filter(|value| **value == "-0.0").count() % 2 != 0
+                    };
+                    crate::interpreter::assert_lisp(
+                        &format!("(copysign 1.0 ({operation} {}))", arguments.join(" ")),
+                        if negative { "-1.0" } else { "1.0" },
+                    );
+                }
+            }
         }
     }
 

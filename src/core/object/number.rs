@@ -510,6 +510,36 @@ fn integer_float(integer: &BigInt, float: f64) -> Option<Ordering> {
     }
     Some(if float.is_sign_positive() { Ordering::Less } else { Ordering::Greater })
 }
+/// Compare a signed machine integer without allocating a temporary BigInt.
+/// The f64 endpoints are exact powers of two; only cast after proving that
+/// truncation lies in i64's domain (including its asymmetric lower endpoint).
+fn machine_integer_float(integer: i64, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    const UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    if float >= UPPER_EXCLUSIVE {
+        return Some(Ordering::Less);
+    }
+    if float < -UPPER_EXCLUSIVE {
+        return Some(Ordering::Greater);
+    }
+    let truncated = float as i64;
+    let order = integer.cmp(&truncated);
+    if order != Ordering::Equal || float.fract() == 0.0 {
+        return Some(order);
+    }
+    Some(if float.is_sign_positive() { Ordering::Less } else { Ordering::Greater })
+}
+
+fn machine_integer_bigint(integer: i64, big: &BigInt) -> Ordering {
+    match big.to_i64() {
+        Some(big) => integer.cmp(&big),
+        None if big.sign() == Sign::Minus => Ordering::Greater,
+        None => Ordering::Less,
+    }
+}
+
 fn bigint_float(value: &BigInt) -> f64 {
     value.to_f64().unwrap_or_else(|| {
         if value.sign() == Sign::Minus { f64::NEG_INFINITY } else { f64::INFINITY }
@@ -520,12 +550,12 @@ fn compare_refs(left: NumericRef<'_>, right: NumericRef<'_>) -> Option<Ordering>
     match (left, right) {
         (Int(a), Int(b)) => a.partial_cmp(&b),
         (Big(a), Big(b)) => Some(a.cmp(b)),
-        (Int(a), Big(b)) => Some(BigInt::from(a).cmp(b)),
-        (Big(a), Int(b)) => Some(a.cmp(&BigInt::from(b))),
+        (Int(a), Big(b)) => Some(machine_integer_bigint(a, b)),
+        (Big(a), Int(b)) => Some(machine_integer_bigint(b, a).reverse()),
         (Float(a), Float(b)) => a.partial_cmp(&b),
-        (Int(a), Float(b)) => integer_float(&BigInt::from(a), b),
+        (Int(a), Float(b)) => machine_integer_float(a, b),
         (Big(a), Float(b)) => integer_float(a, b),
-        (Float(a), Int(b)) => integer_float(&BigInt::from(b), a).map(Ordering::reverse),
+        (Float(a), Int(b)) => machine_integer_float(b, a).map(Ordering::reverse),
         (Float(a), Big(b)) => integer_float(b, a).map(Ordering::reverse),
     }
 }
@@ -1090,7 +1120,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mixed_comparison_boundary_matrix_matches_gnu() {
+        let integers = [i64::MIN, i64::MIN + 1, MIN_FIXNUM - 1, MIN_FIXNUM,
+            -1, 0, 1, MAX_FIXNUM, MAX_FIXNUM + 1, i64::MAX - 1, i64::MAX];
+        let floats = ["-1.0e+INF", "-9223372036854775808.0", "-36028797018963968.0",
+            "-1.5", "-5.0e-324", "-0.0", "0.0", "5.0e-324", "1.5",
+            "36028797018963968.0", "9223372036854775808.0", "1.0e+INF", "0.0e+NaN"];
+        for integer in integers {
+            let mut form = String::from("(list");
+            for float in floats {
+                for operation in ["<", "<=", ">", ">=", "=", "/="] {
+                    form.push_str(&format!(" ({operation} {integer} {float}) ({operation} {float} {integer})"));
+                }
+            }
+            form.push(')');
+            assert!(form.len() < 16 * 1024);
+            crate::assert_elprop!("{}", form);
+        }
+    }
+
+    #[test]
+    fn machine_mixed_comparison_handles_exact_bounds_and_fractional_neighbors() {
+        for integer in [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX] {
+            for float in [
+                f64::NEG_INFINITY,
+                -9_223_372_036_854_775_808.0,
+                -1.5,
+                -f64::from_bits(1),
+                -0.0,
+                0.0,
+                f64::from_bits(1),
+                1.5,
+                9_223_372_036_854_775_808.0,
+                f64::INFINITY,
+                f64::NAN,
+            ] {
+                assert_eq!(
+                    machine_integer_float(integer, float),
+                    integer_float(&BigInt::from(integer), float)
+                );
+            }
+        }
+    }
+
     proptest! {
+        #[test]
+        fn machine_float_comparison_matches_arbitrary_precision_reference(integer in any::<i64>(), bits in any::<u64>()) {
+            let float = f64::from_bits(bits);
+            prop_assert_eq!(machine_integer_float(integer, float), integer_float(&BigInt::from(integer), float));
+        }
+        #[test]
+        fn machine_bigint_comparison_matches_arbitrary_precision_reference(integer in any::<i64>(), negative in any::<bool>(), bytes in proptest::collection::vec(any::<u8>(), 0..128)) {
+            let big = BigInt::from_bytes_le(if negative { Sign::Minus } else { Sign::Plus }, &bytes);
+            prop_assert_eq!(machine_integer_bigint(integer, &big), BigInt::from(integer).cmp(&big));
+        }
         #[test]
         fn machine_powers_match_bigint(base in any::<i64>(), power in 0_u32..130, limit in 128_u64..257) {
             let expected = BigInt::from(base).pow(power);
