@@ -1080,11 +1080,39 @@ fn fetch_bytecode(_object: Object) {
     // TODO: Implement
 }
 
+/// Keep the supplied argument frame stable even when the VM consumes arguments,
+/// repacks &rest, or exits with operand temporaries. Diagnostics and a retained
+/// CallFrame must never inspect a dirty VM operand span as caller arguments.
 pub(crate) fn call<'ob>(
+    func: &Rto<&ByteFn>, arg_cnt: usize, name: &str,
+    frame: &mut CallFrame, cx: &'ob mut Context,
+) -> EvalResult<'ob> {
+    if frame.stack.frame_len() != arg_cnt {
+        return Err(anyhow::anyhow!("Bytecode entry argument span mismatch").into());
+    }
+    // Direct native callers may not have finalized metadata yet. The supplied
+    // span is now validated; normalize it before retaining a reusable frame.
+    frame.finalize_arguments()?;
+    let entry = frame.stack.call_entry();
+    root!(arguments, new(Vec), cx);
+    arguments.bind_mut(cx).try_reserve(arg_cnt).map_err(anyhow::Error::from)?;
+    for argument in frame.stack.current_args() {
+        arguments.push(argument.bind(cx));
+    }
+    let result = rebind!(call_inner(func, arg_cnt, name, frame, arguments, cx));
+    // A successful result can be one of the VM operands we are about to remove.
+    // Retain it independently before cleanup; failures own their PendingExit.
+    root!(returned, result.as_ref().ok().copied().unwrap_or(NIL), cx);
+    frame.stack.restore_call_entry(entry, Rt::bind_slice(arguments, cx));
+    result.map(|_| returned.bind(cx))
+}
+
+fn call_inner<'ob>(
     func: &Rto<&ByteFn>,
     arg_cnt: usize,
     name: &str,
     frame: &mut CallFrame,
+    original_arguments: &[Rto<Object>],
     cx: &'ob mut Context,
 ) -> EvalResult<'ob> {
     frame.stack.set_depth(func.bind(cx).depth, cx)?;
@@ -1104,7 +1132,7 @@ pub(crate) fn call<'ob>(
     };
     root!(vm, cx);
     vm.prepare_lisp_args(func, arg_cnt, name, cx)?;
-    let result = rebind!(vm.run(cx)).map_err(|e| e.add_trace(name, vm.env.stack.current_args()));
+    let result = rebind!(vm.run(cx)).map_err(|e| e.add_trace(name, original_arguments));
     // Uncaught failures can leave several optimized bytecode frames active.
     // The external CallFrame guard only owns the entry frame: remove nested
     // frames (and their operands) before its eventual single pop on Drop.
@@ -1306,6 +1334,7 @@ mod test {
 
     #[test]
     fn invalid_forwarded_varbind_preserves_operand_and_binding_depth() {
+        // Inspect the internal VM failure span before external-frame restoration.
         use OpCode as O;
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
@@ -1323,7 +1352,7 @@ mod test {
             let initial = env.binding_depth();
             let mut frame = CallFrame::new(env);
             frame.finalize_arguments().unwrap();
-            assert!(call(bytecode, 0, "invalid-forwarded-bind", &mut frame, cx).is_err());
+            assert!(call_inner(bytecode, 0, "invalid-forwarded-bind", &mut frame, &[], cx).is_err());
             assert_eq!(frame.binding_depth(), initial);
             assert_eq!(frame.vars.get(sym::INTEGER_WIDTH).unwrap().bind(cx), Object::from(128));
             assert_eq!(frame.stack.frame_len(), 1);
@@ -1694,6 +1723,7 @@ mod test {
 
     #[test]
     fn m0_calls_validate_argument_count_before_reading_target() {
+        // Inspect the internal VM failure span before external-frame restoration.
         use OpCode as O;
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
@@ -1704,7 +1734,7 @@ mod test {
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             let before = frame.stack.len();
-            assert!(call(missing_argument, 0, "missing-call-argument", frame, cx).is_err());
+            assert!(call_inner(missing_argument, 0, "missing-call-argument", frame, &[], cx).is_err());
             assert_eq!(frame.stack.len(), before + 1);
         }
         make_bytecode!(
@@ -1824,6 +1854,112 @@ mod test {
             );
             check_bytecode!(outer, [], 42, cx);
         }
+    }
+
+    fn assert_original_car_error(error:&EvalError,cx:&Context) {
+        match &error.error {
+            ErrorType::Err(error)=>assert!(error.to_string().contains('7'),"underlying CAR error must survive"),
+            ErrorType::Signal(payload)=>{
+                let condition=payload.condition(cx);
+                assert_eq!(condition.car(),sym::WRONG_TYPE_ARGUMENT);
+                let data=condition.cdr().cons().unwrap();assert_eq!(data.car(),sym::LISTP);
+                assert_eq!(data.cdr().cons().unwrap().car(),Object::from(7));
+            },
+            _=>panic!("unexpected non-CAR exit"),
+        }
+    }
+    #[test]
+    fn external_error_restores_supplied_required_optional_and_rest_arguments() {
+        use OpCode as O;
+        for (spec, supplied) in [(514,vec![7,8]),(513,vec![7]),(513,vec![7,8]),(385,vec![7,8,9]),(385,vec![7])] {
+            let roots=RootSet::default();let cx=&mut Context::new(&roots);
+            sym::init_symbols();
+            make_bytecode!(bad,spec,[O::StackRef1,O::Car,O::Return],[],cx);
+            root!(callable,Function::from(bad.bind(cx)),cx);
+            root!(env,init(Env::new(cx).unwrap()),cx);
+            let mut frame=CallFrame::new(env);
+            for value in &supplied {frame.push_arg(Object::from(*value));}
+            frame.finalize_arguments().unwrap();
+            let error=callable.call(&mut frame,Some("real-car-error"),cx).unwrap_err();
+            assert_original_car_error(&error,cx);
+            assert_eq!(frame.arg_count(),supplied.len());
+            for (value,expected) in frame.arg_slice().iter().zip(&supplied) {
+                assert_eq!(value.bind(cx),Object::from(*expected));
+            }
+            assert!(frame.stack.can_push(),"original external frame depth restored");
+        }
+    }
+    #[test]
+    fn external_error_snapshot_survives_gc_cyclic_unused_args_and_retained_frame_reuse() {
+        use OpCode as O;
+        let roots=RootSet::default();let cx=&mut Context::new(&roots);
+        sym::init_symbols();
+        make_bytecode!(bad,514,[O::Constant0,O::Call0,O::Discard,O::StackRef1,O::Car,O::Return],[sym::GARBAGE_COLLECT],cx);
+        make_bytecode!(next,514,[O::StackRef1,O::Return],[],cx);
+        root!(bad,Function::from(bad.bind(cx)),cx);
+        root!(next,Function::from(next.bind(cx)),cx);
+        root!(cycle,cx.add(vec![NIL]),cx);
+        let ObjectType::Vec(vector)=cycle.bind(cx).untag() else{unreachable!()};
+        vector.try_mut().unwrap()[0].set(cycle.bind(cx));
+        root!(env,init(Env::new(cx).unwrap()),cx);
+        env.stack.push(Object::from(42));
+        let baseline=env.stack.len();let frames=env.stack.current_frame();
+        let bindings=env.binding_depth();let catches=env.catch_stack.len();
+        {
+            let mut frame=CallFrame::new(env);frame.push_arg(Object::from(7));frame.push_arg(cycle.bind(cx));frame.finalize_arguments().unwrap();
+            let error=bad.call(&mut frame,Some("cyclic-unused-arg"),cx).unwrap_err();
+            assert_original_car_error(&error,cx);
+            assert_eq!(frame.arg_count(),2);
+            assert!(frame.arg_slice()[1].bind(cx).ptr_eq(cycle.bind(cx)));
+            assert_eq!(next.call(&mut frame,Some("next-after-error"),cx).unwrap(),Object::from(7));
+            assert_eq!(frame.arg_count(),2);
+        }
+        assert_eq!(env.stack.len(),baseline);assert_eq!(env.stack.current_frame(),frames);
+        assert_eq!(env.binding_depth(),bindings);assert_eq!(env.catch_stack.len(),catches);
+        assert_eq!(env.stack[0].bind(cx),Object::from(42));
+    }
+
+    #[test]
+    fn external_setup_errors_restore_frame_and_success_result_remains_rootable() {
+        use OpCode as O;
+        let roots=RootSet::default();let cx=&mut Context::new(&roots);sym::init_symbols();
+        make_bytecode!(truncated,514,[O::ConstantN2],[],cx);
+        make_bytecode!(bad_depth,11<<8,[O::Constant0,O::Return],[7],cx);
+        make_bytecode!(success,514,[O::Constant0,O::List1,O::Return],[sym::QUOTE],cx);
+        root!(env,init(Env::new(cx).unwrap()),cx);
+        let mut frame=CallFrame::new(env);frame.push_arg(Object::from(7));frame.push_arg(Object::from(8));
+        // Deliberately exercise a direct native caller without finalization.
+        assert!(call(truncated,2,"setup-decode",&mut frame,cx).is_err());
+        assert_eq!(frame.arg_count(),2);assert!(frame.stack.can_push());
+        assert!(call(bad_depth,2,"setup-depth",&mut frame,cx).is_err());
+        assert_eq!(frame.arg_count(),2);assert!(frame.stack.can_push());
+        let result=call(success,2,"fresh-result",&mut frame,cx).unwrap();root!(result,cx);
+        cx.garbage_collect(true);
+        assert_eq!(result.bind(cx).cons().unwrap().car(),sym::QUOTE);
+        assert_eq!(frame.arg_count(),2);
+    }
+    #[test]
+    fn external_structured_signal_preserves_payload_and_unwinds_dynamic_binding() {
+        use OpCode as O;
+        let roots=RootSet::default();let cx=&mut Context::new(&roots);sym::init_symbols();
+        let variable=crate::lread::intern("entry-checkpoint-dynamic",cx);root!(variable,cx);
+        root!(payload,cx.add(vec![Object::from(19)]),cx);
+        make_bytecode!(function,514,[O::Constant1,O::VarBind0,O::Constant2,O::Constant3,O::Constant4,O::Call2,O::Return],[variable.bind(cx),7,sym::SIGNAL,sym::ERROR,payload.bind(cx)],cx);
+        root!(callable,Function::from(function.bind(cx)),cx);
+        root!(env,init(Env::new(cx).unwrap()),cx);env.set_var(variable.bind(cx),Object::from(41)).unwrap();
+        let depth=env.binding_depth();let catches=env.catch_stack.len();
+        let mut frame=CallFrame::new(env);frame.push_arg(Object::from(7));frame.push_arg(Object::from(8));frame.finalize_arguments().unwrap();
+        let error=callable.call(&mut frame,Some("signal-with-binding"),cx).unwrap_err();
+        assert_eq!(frame.arg_count(),2);assert_eq!(frame.binding_depth(),depth);assert_eq!(frame.catch_stack.len(),catches);
+        assert_eq!(frame.variable_value(variable.bind(cx),cx).unwrap().unwrap(),Object::from(41));
+        cx.garbage_collect(true);
+        let ErrorType::Signal(exit)=&error.error else{panic!("structured signal lost")};
+        assert_eq!(exit.condition(cx).car(),sym::ERROR);
+        assert!(exit.condition(cx).cdr().ptr_eq(payload.bind(cx)));
+    }
+    #[test]
+    fn external_nested_bytecode_failure_is_catchable_and_next_lisp_call_runs() {
+        crate::assert_elprop!(r#"(let ((inner (make-byte-code 514 "\1@\207" [] 3)) (outer (make-byte-code 257 "\211\300\301\"\207" [7 8] 4))) (list (condition-case nil (funcall outer inner) (error t)) (+ 20 22)))"#);
     }
 
     #[test]
@@ -3032,6 +3168,7 @@ mod test {
 
     #[test]
     fn m0_switch_rejects_invalid_tables_and_targets() {
+        // Inspect the internal VM failure span before external-frame restoration.
         use OpCode as O;
         for offset in [-1_i64, 65_536] {
             let roots = &RootSet::default();
@@ -3050,7 +3187,7 @@ mod test {
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             let before = frame.stack.len();
-            assert!(call(bytecode, 0, "invalid-switch-target", frame, cx).is_err());
+            assert!(call_inner(bytecode, 0, "invalid-switch-target", frame, &[], cx).is_err());
             assert_eq!(frame.stack.len(), before + 2);
         }
         let roots = &RootSet::default();
@@ -3064,14 +3201,14 @@ mod test {
             let frame = &mut CallFrame::new(env);
             frame.finalize_arguments().unwrap();
             let before = frame.stack.len();
-            assert!(call(bad_target, 0, "invalid-switch-type", frame, cx).is_err());
+            assert!(call_inner(bad_target, 0, "invalid-switch-type", frame, &[], cx).is_err());
             assert_eq!(frame.stack.len(), before + 2);
         }
         make_bytecode!(bad_table, 0, [O::Constant0, O::Constant1, O::Switch], [1, 7], cx);
         let frame = &mut CallFrame::new(env);
         frame.finalize_arguments().unwrap();
         let before = frame.stack.len();
-        assert!(call(bad_table, 0, "invalid-switch-table", frame, cx).is_err());
+        assert!(call_inner(bad_table, 0, "invalid-switch-table", frame, &[], cx).is_err());
         assert_eq!(frame.stack.len(), before + 2);
     }
 

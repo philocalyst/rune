@@ -37,6 +37,14 @@ struct Frame {
     arg_cnt: (u16, bool),
 }
 
+/// Native call-entry metadata only; Lisp arguments are retained separately in
+/// rooted slots by the bytecode caller. No raw Lisp values cross collection.
+#[derive(Clone, Copy)]
+pub(crate) struct CallEntry {
+    frame: Frame,
+    frames: usize,
+}
+
 impl Default for Frame {
     fn default() -> Self {
         Self { start: 0, end: usize::MAX, arg_cnt: (0, false) }
@@ -233,6 +241,22 @@ impl<'a> RootedLispStack<'a> {
     /// Operand values accessible in this frame, excluding its caller's stack.
     pub(crate) fn frame_len(&self) -> usize {
         self.len().saturating_sub(self.current.start)
+    }
+
+    pub(crate) fn call_entry(&self) -> CallEntry {
+        CallEntry { frame: self.current, frames: self.frames.len() }
+    }
+
+    /// Restore an external argument frame after bytecode consumed/repacked its
+    /// operands. Original capacity suffices: the VM never shrinks Vec capacity.
+    /// This performs no callback, collection, or fallible allocation.
+    pub(crate) fn restore_call_entry(&mut self, entry: CallEntry, args: &[Object]) {
+        assert_eq!(self.frames.len(), entry.frames, "nested bytecode frames not unwound");
+        assert!(entry.frame.start <= self.vec.len(), "bytecode consumed caller prefix");
+        assert!(entry.frame.start + args.len() <= self.vec.capacity());
+        self.vec.truncate(entry.frame.start);
+        self.vec.extend_from_slice(args);
+        self.current = entry.frame;
     }
 
     pub(crate) fn can_push(&self) -> bool {
