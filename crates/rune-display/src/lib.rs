@@ -19,3 +19,6 @@ mod host_wake;
 pub use host_wake::*;
 
 pub mod first_light_host;
+
+mod font_capabilities;
+pub use font_capabilities::{MeasuredFontCapabilities, MeasuredFontVariant};
