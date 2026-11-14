@@ -1,9 +1,8 @@
 //! Minimal real pipe subprocess primitives; native I/O and GC registry are separate.
 use crate::core::{
     env::{Env, intern},
-    error::{Type, TypeError},
     gc::{Context, Rt},
-    object::{Function, Gc, LispProcess, NIL, Object, ObjectType, ProcessCoding, Symbol},
+    object::{Gc, LispProcess, NIL, Object, ObjectType, ProcessCoding, Symbol},
 };
 use crate::process_transport::{ProcessStatus, ProcessTransport, SpawnSpec};
 use anyhow::{Result, bail};
@@ -14,11 +13,48 @@ use std::ffi::OsString;
 // GNU resolves bare program names through owner `exec-path`, not the child
 // PATH. Until that owner variable is supported, reject relative programs
 // instead of allowing Command's platform/ambient search to execute another file.
-fn absolute_program(program: &str) -> Result<OsString> {
-    if program.as_bytes().contains(&0) || !std::path::Path::new(program).is_absolute() {
+const MAX_NAME_BYTES:usize=65536;
+const MAX_ARGUMENT_BYTES:usize=1024*1024;
+fn type_error(predicate: Symbol, value: Object, cx: &Context) -> anyhow::Error {
+    crate::eval::EvalError::signal(crate::sym::WRONG_TYPE_ARGUMENT.into(),list!(predicate,value;cx),cx).into()
+}
+fn string_bytes<'a>(value:Object<'a>,limit:usize,cx:&Context)->Result<&'a [u8]> {
+    let bytes=match value.untag(){ObjectType::String(s)=>s.as_bytes(),ObjectType::ByteString(s)=>&s,_=>return Err(type_error(crate::sym::STRINGP,value,cx))};
+    anyhow::ensure!(bytes.len()<=limit,"Native process string exceeds byte limit");
+    Ok(bytes)
+}
+fn process_name_text<'a>(value:Object<'a>,cx:&Context)->Result<&'a str> {
+    Ok(std::str::from_utf8(string_bytes(value,MAX_NAME_BYTES,cx)?)?)
+}
+fn absolute_program(program:Object,cx:&Context)->Result<OsString> {
+    let program=native_string(program,MAX_NAME_BYTES,cx)?;
+    if !std::path::Path::new(&program).is_absolute() {
         bail!("Subprocess program must be an absolute path; owner exec-path search is not implemented");
     }
-    Ok(program.into())
+    Ok(program)
+}
+fn native_string(value:Object,limit:usize,cx:&Context)->Result<OsString> {
+    let bytes=string_bytes(value,limit,cx)?;
+    anyhow::ensure!(!bytes.contains(&0),"Native process argument contains NUL");
+    #[cfg(unix)] { use std::os::unix::ffi::OsStringExt; Ok(OsString::from_vec(bytes.to_vec())) }
+    #[cfg(not(unix))] { Ok(OsString::from(std::str::from_utf8(bytes)?)) }
+}
+fn arguments(values:&[Object],cx:&Context)->Result<Vec<OsString>> {
+    anyhow::ensure!(values.len()<=4096,"Native process argument count exceeds limit");
+    let mut size=0usize;
+    // Validate the entire borrowed argv before allocating native copies.
+    for &value in values { let bytes=string_bytes(value,MAX_ARGUMENT_BYTES,cx)?;anyhow::ensure!(!bytes.contains(&0),"Native process argument contains NUL");size=size.checked_add(bytes.len()).ok_or_else(||anyhow::anyhow!("Native argv size overflow"))?;anyhow::ensure!(size<=16*1024*1024,"Native argv exceeds 16 MiB limit"); }
+    let mut output=Vec::new();output.try_reserve_exact(values.len())?;
+    for &value in values { output.push(native_string(value,MAX_ARGUMENT_BYTES,cx)?); }
+    Ok(output)
+}
+fn buffer_operand<'a>(value:Object<'a>,cx:&'a Context)->Result<Object<'a>> {
+    match value.untag() {
+        ObjectType::NIL | ObjectType::Buffer(_)=>Ok(value),
+        ObjectType::String(_)=>{process_name_text(value,cx)?;Ok(value)},
+        ObjectType::ByteString(_)=>Ok(cx.add(process_name_text(value,cx)?.to_owned())),
+        _=>Err(type_error(crate::sym::STRINGP,value,cx)),
+    }
 }
 
 // Copy owner variable storage before starting workers; never mutate host cwd.
@@ -40,34 +76,21 @@ fn owner_working_directory(env: &Rt<Env>, cx: &Context) -> Result<std::path::Pat
     Ok(path)
 }
 
-fn argument(object: Object) -> Result<OsString> {
-    match object.untag() {
-        ObjectType::String(value) => Ok(OsString::from(&**value)),
-        ObjectType::ByteString(value) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStringExt;
-                Ok(OsString::from_vec(value.to_vec()))
-            }
-            #[cfg(not(unix))]
-            {
-                Ok(OsString::from(std::str::from_utf8(&value)?))
-            }
-        }
-        other => Err(TypeError::new(Type::String, other).into()),
-    }
-}
-fn resolve<'ob>(object: Object<'ob>, cx: &'ob Context) -> Result<Gc<&'ob LispProcess>> {
-    let value = match object.untag() {
-        ObjectType::String(name) => cx
-            .find_process(name)
-            .ok_or_else(|| anyhow::anyhow!("No process named {name}"))?
-            .bind(cx)?,
-        _ => object,
+fn resolve<'ob>(object:Object<'ob>,cx:&'ob Context)->Result<Gc<&'ob LispProcess>> {
+    let value=match object.untag(){
+        ObjectType::Process(_)=>object,
+        ObjectType::String(_) | ObjectType::ByteString(_)=>{
+            let name=process_name_text(object,cx)?;
+            let root=cx.find_process(name).ok_or_else(||anyhow::anyhow!("No process with requested name"))?;
+            let value=root.bind(cx)?;
+            if !matches!(value.untag(),ObjectType::Process(_)) {bail!("Process registry contains a non-process")};
+            value
+        },
+        _=>return Err(type_error(crate::sym::PROCESSP,object,cx)),
     };
-    let process: Gc<&LispProcess> = value.try_into()?;
-    process.transport(cx)?;
-    Ok(process)
+    // Tag checked before conversion: its diagnostic fallback is unreachable.
+    let process:Gc<&LispProcess>=value.try_into()?;
+    process.transport(cx)?;Ok(process)
 }
 fn coding(object: Option<Object>) -> Result<ProcessCoding> {
     match object.map(Object::untag) {
@@ -94,20 +117,27 @@ fn coding_symbol<'ob>(value: ProcessCoding, cx: &'ob Context) -> Symbol<'ob> {
 
 #[defun]
 fn start_process<'ob>(
-    name: &str,
+    name: Object,
     buffer: Object<'ob>,
-    program: &str,
+    program: Object,
     args: &[Object],
     env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
+    let buffer=buffer_operand(buffer,cx)?;
+    if !matches!(name.untag(),ObjectType::String(_) | ObjectType::ByteString(_)) {
+        return Err(crate::eval::EvalError::signal(crate::sym::ERROR.into(),list!(cx.add(":name value not a string");cx),cx).into());
+    }
+    let name=process_name_text(name,cx)?;
+    let program=absolute_program(program,cx)?;
+    let args=arguments(args,cx)?;
     let cwd=owner_working_directory(env,cx)?;
     let buffer = if buffer.is_nil() {
         NIL
     } else {
-        crate::buffer::get_buffer_create(buffer, None, cx)?
+        crate::buffer::get_buffer_create(buffer_operand(buffer,cx)?, None, cx)?
     };
-    let args = args.iter().copied().map(argument).collect::<Result<Vec<_>>>()?;
+
     let mut actual = name.to_owned();
     let mut suffix = 1_u64;
     while cx.find_process(&actual).is_some() {
@@ -117,7 +147,7 @@ fn start_process<'ob>(
             .ok_or_else(|| anyhow::anyhow!("Process name space exhausted"))?;
     }
     let native = ProcessTransport::spawn_exact_environment(SpawnSpec {
-        program: absolute_program(program)?,
+        program,
         args,
         cwd: Some(cwd),
         env: crate::emacs::process_environment_snapshot(env, cx)?,
@@ -137,8 +167,8 @@ fn get_process<'ob>(name: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> 
             resolve(name, cx)?;
             Ok(name)
         }
-        ObjectType::String(value) => cx.find_process(value).map_or(Ok(NIL), |root| root.bind(cx)),
-        other => Err(TypeError::new(Type::String, other).into()),
+        ObjectType::String(_) | ObjectType::ByteString(_)=>cx.find_process(process_name_text(name,cx)?).map_or(Ok(NIL),|root|root.bind(cx)),
+        _=>Err(type_error(crate::sym::STRINGP,name,cx)),
     }
 }
 #[defun]
@@ -182,8 +212,8 @@ fn process_live_p(process: Object, cx: &Context) -> Result<bool> {
     if process.is_nil() {
         return Ok(false);
     }
-    if let ObjectType::String(name) = process.untag() {
-        if cx.find_process(name).is_none() {
+    if matches!(process.untag(),ObjectType::String(_) | ObjectType::ByteString(_)) {
+        if cx.find_process(process_name_text(process,cx)?).is_none() {
             return Ok(false);
         }
     }
@@ -204,7 +234,7 @@ fn get_buffer_process<'ob>(
     let handle = if buffer.is_nil() {
         env.current_buffer_handle()
     } else {
-        let value = crate::buffer::get_buffer(buffer, cx)?;
+        let value = crate::buffer::get_buffer(buffer_operand(buffer,cx)?, cx)?;
         if value.is_nil() {
             return Ok(NIL);
         }
@@ -252,9 +282,6 @@ fn set_process_filter<'ob>(
     filter: Object<'ob>,
     cx: &Context,
 ) -> Result<Object<'ob>> {
-    if !filter.is_nil() {
-        let _: Function = filter.try_into()?;
-    }
     let process = resolve(process, cx)?;
     // SAFETY: arguments were evaluated in this owner Context and remain live;
     // only the registry receives Lisp values, never native worker threads.
@@ -273,9 +300,6 @@ fn set_process_sentinel<'ob>(
     sentinel: Object<'ob>,
     cx: &Context,
 ) -> Result<Object<'ob>> {
-    if !sentinel.is_nil() {
-        let _: Function = sentinel.try_into()?;
-    }
     let process = resolve(process, cx)?;
     // SAFETY: same-owner evaluated argument; stable registry root before return.
     unsafe {
@@ -297,7 +321,7 @@ fn set_process_buffer<'ob>(
     let buffer = if buffer.is_nil() {
         NIL
     } else {
-        crate::buffer::get_buffer_create(buffer, None, cx)?
+        crate::buffer::get_buffer_create(buffer_operand(buffer,cx)?, None, cx)?
     };
     // SAFETY: newly resolved owner buffer or NIL, no callback/collection here.
     unsafe {
@@ -384,6 +408,7 @@ fn process_query_on_exit_flag(process: Object, cx: &Context) -> Result<bool> {
 }
 #[defun]
 fn process_send_string(process: Object, string: Object, cx: &Context) -> Result<()> {
+    string_bytes(string,MAX_ARGUMENT_BYTES,cx)?;
     let process = resolve(process, cx)?;
     let coding = cx.process_state(&process)?.write_coding;
     match string.untag() {
@@ -399,7 +424,7 @@ fn process_send_string(process: Object, string: Object, cx: &Context) -> Result<
             }
             process.transport(cx)?.send(&value)?;
         }
-        other => return Err(TypeError::new(Type::String, other).into()),
+        _ => return Err(type_error(crate::sym::STRINGP,string,cx)),
     }
     Ok(())
 }
@@ -424,6 +449,7 @@ pub(crate) fn internal_default_process_filter(
     cx: &Context,
 ) -> Result<()> {
     let process = resolve(process, cx)?;
+    string_bytes(string,MAX_ARGUMENT_BYTES,cx)?;
     let snapshot = process.callback_snapshot(cx)?;
     let buffer = snapshot.buffer.bind(cx)?;
     if buffer.is_nil() {
@@ -435,14 +461,19 @@ pub(crate) fn internal_default_process_filter(
     let text = match string.untag() {
         ObjectType::String(value) => (**value).to_owned(),
         ObjectType::ByteString(value) => std::str::from_utf8(&value)?.to_owned(),
-        other => return Err(TypeError::new(Type::String, other).into()),
+        _ => return Err(type_error(crate::sym::STRINGP,string,cx)),
     };
     let read = buffer.read(cx)?;
     let end = read.document.text().len_chars();
     cx.editor_gateway()?.splice(read.handle, read.epoch, end..end, &text, cx)?;
     Ok(())
 }
-#[defun]
+#[defun(name = "internal-default-process-sentinel")]
+fn internal_default_process_sentinel_lisp(process:Object,event:Object,cx:&Context)->Result<()> {
+    resolve(process,cx)?;
+    let event=process_name_text(event,cx)?;
+    internal_default_process_sentinel(process,event,cx)
+}
 pub(crate) fn internal_default_process_sentinel(
     process: Object,
     event: &str,
@@ -457,7 +488,7 @@ pub(crate) fn internal_default_process_sentinel(
 /// No shell is introduced here: a shell runs only when explicitly PROGRAM.
 #[defun]
 fn call_process<'ob>(
-    program: &str,
+    program: Object,
     infile: Option<Object>,
     destination: Option<Object<'ob>>,
     _display: Option<Object>,
@@ -467,11 +498,15 @@ fn call_process<'ob>(
 ) -> Result<Object<'ob>> {
     use crate::process_transport::ProcessEvent;
     use std::time::{Duration, Instant};
-    if infile.is_some_and(|value| !value.is_nil()) {
+    let program=absolute_program(program,cx)?;
+    if let Some(value)=infile.filter(|v|!v.is_nil()) {
+        string_bytes(value,MAX_NAME_BYTES,cx)?;
         bail!("call-process input files are not implemented; stdin must be nil");
     }
+    let args=arguments(args,cx)?;
     let cwd=owner_working_directory(env,cx)?;
-    let destination = destination.unwrap_or(NIL);
+    let destination=destination.unwrap_or(NIL);
+    let destination=if matches!(destination.untag(),ObjectType::TRUE){destination}else{buffer_operand(destination,cx)?};
     // Validate destination before starting a real executable.
     let output_buffer = match destination.untag() {
         ObjectType::NIL => None,
@@ -487,9 +522,9 @@ fn call_process<'ob>(
         }
         _ => bail!("call-process destination must be nil, t, a buffer or a buffer name"),
     };
-    let args = args.iter().copied().map(argument).collect::<Result<Vec<_>>>()?;
+
     let native = ProcessTransport::spawn_merged_exact_environment(SpawnSpec {
-        program: absolute_program(program)?,
+        program,
         args,
         cwd: Some(cwd),
         env: crate::emacs::process_environment_snapshot(env, cx)?,
@@ -816,5 +851,67 @@ mod owner_cwd_tests {
     #[test]
     fn asynchronous_owner_directory_reaches_real_child() {
         crate::interpreter::assert_lisp(r#"(progn (erase-buffer) (let ((default-directory "/tmp/") (process-environment nil) (done nil) (p nil) (attempts 0)) (setq p (start-process "cwd-async" (current-buffer) "/bin/pwd")) (set-process-sentinel p #'(lambda (process event) (setq done t))) (unwind-protect (progn (while (and (null done) (< attempts 200)) (setq attempts (+ attempts 1)) (accept-process-output p 0.01)) (list done (process-exit-status p) (buffer-substring-no-properties 1 (point-max)))) (delete-process p))))"#,"(t 0 \"/tmp\\n\")");
+    }
+}
+
+#[cfg(test)]
+mod structured_process_boundary_tests {
+    #[test]
+    fn cyclic_invalid_process_arguments_retain_identity_without_formatting() {
+        for graph in ["(vector nil)","(list nil)","(make-byte-code 0 (make-string 0 0) (vector nil) 0)"] {
+            let mutate=if graph.starts_with("(list") {"(setcar v v)"} else if graph.starts_with("(vector") {"(aset v 0 v)"} else {"(aset (aref v 2) 0 v)"};
+            for (call,predicate) in [
+                ("(get-process v)","stringp"),("(process-status v)","processp"),
+                ("(process-name v)","processp"),("(process-send-string v v)","stringp"),
+                ("(process-send-string v \"x\")","processp"),
+                ("(internal-default-process-filter v v)","processp"),
+                ("(internal-default-process-sentinel v v)","processp"),
+                ("(start-process \"x\" v 42)","stringp"),
+                ("(start-process \"x\" nil v)","stringp"),
+                ("(start-process \"x\" nil \"/bin/true\" v)","stringp"),
+                ("(call-process v nil nil nil v)","stringp"),
+                ("(call-process \"/bin/true\" v nil nil v)","stringp"),
+                ("(get-buffer-process v)","stringp"),
+            ] {
+                let source=format!("(let ((v {})) {} (condition-case e {} (wrong-type-argument (list (car e) (car (cdr e)) (eq v (car (cdr (cdr e))))))))",graph,mutate,call);
+                crate::interpreter::assert_lisp(&source,&format!("(wrong-type-argument {predicate} t)"));
+            }
+            crate::interpreter::assert_lisp(&format!("(let ((v {})) {} (condition-case e (start-process v nil 42) (error e)))",graph,mutate),"(error \":name value not a string\")");
+        }
+    }
+    #[test]
+    fn process_type_order_matches_gnu_probed_controls() {
+        for (form,result) in [
+            ("(get-process 42)","(wrong-type-argument stringp 42)"),
+            ("(process-send-string 42 17)","(wrong-type-argument stringp 17)"),
+            ("(start-process 42 43 44)","(wrong-type-argument stringp 43)"),
+            ("(start-process 42 nil 44)","(error \":name value not a string\")"),
+            ("(start-process \"x\" nil 17 44)","(wrong-type-argument stringp 17)"),
+            ("(call-process 42 nil 43 nil 44)","(wrong-type-argument stringp 42)"),
+            ("(call-process \"/bin/true\" nil 43 nil 44)","(wrong-type-argument stringp 44)"),
+        ] { crate::interpreter::assert_lisp(&format!("(condition-case e {form} (error e))"),result); }
+    }
+    #[test]
+    fn arbitrary_callback_values_are_rooted_without_eager_function_conversion() {
+        crate::interpreter::assert_lisp(r#"(let ((p (start-process "callback-boundary" nil "/bin/cat")) (v (vector nil))) (aset v 0 v) (unwind-protect (progn (set-process-filter p v) (set-process-sentinel p v) (garbage-collect) (list (eq v (process-filter p)) (eq v (process-sentinel p)) (eq 42 (set-process-filter p 42)) (eq 42 (set-process-sentinel p 42)))) (set-process-filter p nil) (set-process-sentinel p nil) (delete-process p)))"#,"(t t t t)");
+    }
+    #[test]
+    fn invalid_callback_delivery_signals_original_graph_after_moving_gc() {
+        for setter in ["set-process-filter","set-process-sentinel"] {
+            let source=format!(r#"(let ((p (start-process "callback-delivery-boundary" nil "/usr/bin/python3" "-c" "print('x')")) (v (vector nil)) (observed nil) (n 0)) (aset v 0 v) ({} p v) (garbage-collect) (unwind-protect (progn (while (and (null observed) (< n 200)) (setq n (+ n 1)) (setq observed (condition-case e (progn (accept-process-output p 0.01) nil) (invalid-function (eq v (car (cdr e))))))) (list observed (processp p))) (set-process-filter p nil) (set-process-sentinel p nil) (delete-process p)))"#,setter);
+            crate::interpreter::assert_lisp(&source,"(t t)");
+        }
+    }
+
+    #[test]
+    fn native_argument_budgets_reject_before_copy_or_spawn() {
+        use crate::core::gc::{Context,RootSet};
+        let roots=RootSet::default();let cx=Context::new(&roots);
+        let large=cx.add(vec![b'x';super::MAX_ARGUMENT_BYTES+1]);
+        assert!(super::native_string(large,super::MAX_ARGUMENT_BYTES,&cx).is_err());
+        let one=cx.add(vec![b'x';super::MAX_ARGUMENT_BYTES]);
+        assert!(super::arguments(&vec![one;17],&cx).is_err());
+        assert!(super::arguments(&vec![one;4097],&cx).is_err());
+        assert!(super::native_string(cx.add(vec![0]),super::MAX_ARGUMENT_BYTES,&cx).is_err());
     }
 }

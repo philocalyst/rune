@@ -15,6 +15,17 @@ use rune_core::macros::root;
 use rune_macros::defun;
 use std::time::{Duration, Instant};
 
+// Match only runtime function tags before converting: TypeError's generic
+// formatter must never inspect a cyclic invalid callback graph.
+fn callback_function<'a>(callback: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Function<'a>> {
+    if !matches!(callback.untag(), ObjectType::Symbol(_) | ObjectType::Cons(_) | ObjectType::SubrFn(_) | ObjectType::ByteFn(_)) {
+        env.initialize_condition_metadata(cx);
+        let data = crate::core::cons::Cons::new1(callback, cx).into();
+        return Err(crate::eval::EvalError::signal(crate::sym::INVALID_FUNCTION.into(), data, cx).into());
+    }
+    Ok(callback.try_into().expect("function tag preflight"))
+}
+
 fn invoke(
     snapshot: &ProcessCallbackSnapshot,
     sentinel: bool,
@@ -43,7 +54,7 @@ fn invoke(
         }
         return Ok(());
     }
-    let callback: Function = callback.try_into()?;
+    let callback = callback_function(callback, env, cx)?;
     root!(callback, cx);
     let mut frame = CallFrame::new(env);
     frame.push_arg(process.bind(cx));
@@ -393,5 +404,31 @@ mod tests {
             (list pump-signals (process-name p) (functionp (process-sentinel p))))))"#,
             "(1 \"rune-signalling-sentinel\" t)",
         );
+    }
+}
+
+#[cfg(test)]
+mod callback_tag_boundary_tests {
+    use super::*;
+    use crate::core::{gc::RootSet,object::IntoObject};
+    #[test]
+    fn cyclic_composite_callback_signals_original_identity_across_collection() {
+        let roots=RootSet::default();let cx=&mut Context::new(&roots);
+        crate::sym::init_symbols();root!(env,init(Env::new_isolated(cx).unwrap()),cx);
+        crate::core::env::init_variables(cx,env);
+        let constants=vec![NIL].into_obj(&cx.block);
+        let codes=vec![135_u8].into_obj(&cx.block);
+        let function=crate::alloc::make_byte_code(0,codes.untag(),constants.untag(),1,None,None,&[],cx).unwrap();
+        constants.untag().try_mut().unwrap()[0].set(function.into());
+        root!(callback,Object::from(constants),cx);
+        let error=callback_function(callback.bind(cx),env,cx).err().expect("invalid vector tag");
+        let error=error.downcast::<crate::eval::EvalError>().unwrap();
+        let crate::eval::ErrorType::Signal(payload)=&error.error else{panic!("expected signal")};
+        for _ in 0..3 {
+            cx.garbage_collect(true);
+            let condition=payload.condition(cx);
+            assert_eq!(condition.car(),crate::sym::INVALID_FUNCTION);
+            assert!(condition.cdr().cons().unwrap().car().ptr_eq(callback.bind(cx)));
+        }
     }
 }
