@@ -24,6 +24,7 @@ mod chartab;
 mod obarray;
 mod syntax;
 mod coding;
+mod cl_type;
 mod completion;
 mod data;
 mod dired;
