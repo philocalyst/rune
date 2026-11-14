@@ -978,3 +978,11 @@ defsym!(QUIT);
 defvar!(INHIBIT_QUIT);
 
 defsym!(ERROR_CONDITIONS);
+
+defsym!(WRONG_TYPE_ARGUMENT);
+defsym!(VOID_FUNCTION);
+defsym!(INVALID_FUNCTION);
+defsym!(SETTING_CONSTANT);
+defsym!(ARITH_ERROR);
+defsym!(RANGE_ERROR);
+defsym!(OVERFLOW_ERROR);

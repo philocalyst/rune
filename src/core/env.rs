@@ -90,6 +90,42 @@ impl<'a> Env<'a> {
 
 // RootedEnv created by #[derive(Trace)]
 impl<'a> RootedEnv<'a> {
+    pub(crate) fn initialize_condition_metadata(&mut self, cx: &Context) {
+        use super::cons::Cons;
+        use super::object::NIL;
+        let simple = [
+            sym::WRONG_NUMBER_OF_ARGUMENTS,
+            sym::WRONG_TYPE_ARGUMENT,
+            sym::VOID_VARIABLE,
+            sym::VOID_FUNCTION,
+            sym::INVALID_FUNCTION,
+            sym::SETTING_CONSTANT,
+            sym::ARITH_ERROR,
+            sym::RUNE_UNIMPLEMENTED,
+        ];
+        let mut entries = vec![(sym::ERROR, vec![sym::ERROR]), (sym::QUIT, vec![sym::QUIT])];
+        entries.extend(simple.into_iter().map(|symbol| (symbol, vec![symbol, sym::ERROR])));
+        entries.push((sym::RANGE_ERROR, vec![sym::RANGE_ERROR, sym::ARITH_ERROR, sym::ERROR]));
+        entries.push((
+            sym::OVERFLOW_ERROR,
+            vec![sym::OVERFLOW_ERROR, sym::RANGE_ERROR, sym::ARITH_ERROR, sym::ERROR],
+        ));
+        for (symbol, classes) in entries {
+            if self
+                .props
+                .get(symbol)
+                .is_some_and(|properties| properties.iter().any(|p| p.0 == sym::ERROR_CONDITIONS))
+            {
+                continue;
+            }
+            let mut list = NIL;
+            for class in classes.into_iter().rev() {
+                list = Cons::new(class, list, cx).into();
+            }
+            self.set_prop(symbol, sym::ERROR_CONDITIONS, list);
+        }
+    }
+
     pub(crate) fn install_quit_token(
         &self,
         token: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -438,5 +474,56 @@ mod builtin_value_constant_tests {
             assert_eq!(result, Object::from(2_i64));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod condition_bootstrap_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+    #[test]
+    fn builtin_condition_metadata_is_rooted_per_env_and_keeps_explicit_overrides() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(first, init(Env::new(cx).unwrap()), cx);
+        root!(second, init(Env::new(cx).unwrap()), cx);
+        init_variables(cx, first);
+        init_variables(cx, second);
+        for (symbol, expected) in [
+            (sym::ERROR, "(error)"),
+            (sym::QUIT, "(quit)"),
+            (sym::WRONG_TYPE_ARGUMENT, "(wrong-type-argument error)"),
+            (sym::WRONG_NUMBER_OF_ARGUMENTS, "(wrong-number-of-arguments error)"),
+            (sym::VOID_VARIABLE, "(void-variable error)"),
+            (sym::VOID_FUNCTION, "(void-function error)"),
+            (sym::INVALID_FUNCTION, "(invalid-function error)"),
+            (sym::SETTING_CONSTANT, "(setting-constant error)"),
+            (sym::ARITH_ERROR, "(arith-error error)"),
+            (sym::RANGE_ERROR, "(range-error arith-error error)"),
+            (sym::OVERFLOW_ERROR, "(overflow-error range-error arith-error error)"),
+        ] {
+            let expected = crate::reader::read(expected, cx).unwrap().0;
+            assert_eq!(crate::data::get(symbol, sym::ERROR_CONDITIONS, first, cx), expected);
+        }
+        first.set_prop(sym::WRONG_TYPE_ARGUMENT, sym::ERROR_CONDITIONS, crate::core::object::NIL);
+        first.initialize_condition_metadata(cx);
+        for _ in 0..5 {
+            cx.garbage_collect(true);
+        }
+        assert!(
+            crate::data::get(sym::WRONG_TYPE_ARGUMENT, sym::ERROR_CONDITIONS, first, cx).is_nil()
+        );
+        assert!(
+            !crate::data::get(sym::WRONG_TYPE_ARGUMENT, sym::ERROR_CONDITIONS, second, cx).is_nil()
+        );
+        let signal = crate::eval::EvalError::signal(
+            sym::WRONG_TYPE_ARGUMENT.into(),
+            crate::core::object::NIL,
+            cx,
+        );
+        assert!(!signal.matches_handler(sym::ERROR.into(), first, cx).unwrap());
+        assert!(signal.matches_handler(sym::ERROR.into(), second, cx).unwrap());
     }
 }

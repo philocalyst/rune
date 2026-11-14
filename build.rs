@@ -254,6 +254,7 @@ pub(crate) fn init_variables(
 ) {{
 use crate::core::object;
 use rune_core::macros::list;
+env.initialize_condition_metadata(cx);
 "
     )
     .unwrap();
