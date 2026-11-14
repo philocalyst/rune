@@ -46,6 +46,21 @@ fn display_graphic_p(frame: Option<Object>, cx: &Context) -> Result<bool> {
     let _frame = live_frame(frame, cx)?;
     Ok(false)
 }
+/// Whether this frame can faithfully realize the requested face attributes.
+/// The only current backend is a logical headless terminal, with no terminal
+/// capability driver or graphical renderer attached. GNU's batch terminal
+/// likewise reports no supported face attributes, including an empty request.
+#[defun]
+fn display_supports_face_attributes_p(
+    _attributes: Object,
+    frame: Option<Object>,
+    cx: &Context,
+) -> Result<bool> {
+    let frame = live_frame(frame, cx)?;
+    match frame.backend() {
+        crate::core::object::FrameBackend::Terminal => Ok(false),
+    }
+}
 /// Read-only parameters of the real owner logical terminal. Geometry comes
 /// from its Session window tree; no physical display size is invented.
 #[defun]
@@ -74,6 +89,20 @@ fn frame_parameter<'a>(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn headless_face_capabilities_match_gnu_batch() {
+        crate::assert_elprop!(
+            "(list (display-supports-face-attributes-p nil) (display-supports-face-attributes-p '(:weight bold)) (display-supports-face-attributes-p '(:slant italic) (selected-frame)) (display-supports-face-attributes-p 42))"
+        );
+    }
+    #[test]
+    fn face_capability_query_rejects_non_frame() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = &crate::core::gc::Context::new(&roots);
+        {
+            assert!(super::display_supports_face_attributes_p(crate::core::object::NIL, Some(42_i64.into()), cx).is_err());
+        }
+    }
     #[test]
     fn headless_frame_identity_and_capabilities_match_gnu_batch() {
         crate::assert_elprop!(
