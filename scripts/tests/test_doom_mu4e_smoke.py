@@ -10,7 +10,11 @@ class DoomSourcesTests(unittest.TestCase):
   self.assertIn('mu4e-view-auto-mark-as-read nil',prelude)
   self.assertEqual(len(gates),4)
   forms='\n'.join(form for _,form in gates)
+  self.assertIn('(doom-startup)',forms)
+  self.assertIn('(doom-finalize)',forms)
   self.assertIn('(modulep! :email mu4e)',forms)
+  self.assertIn('(key-binding [escape])',forms)
+  self.assertIn('(call-interactively command)',forms)
   self.assertIn('(make-sparse-keymap)',forms)
   self.assertIn('(lookup-key',forms)
   self.assertIn('(org-todo "DONE")',forms)
@@ -21,4 +25,12 @@ class DoomSourcesTests(unittest.TestCase):
  def test_fixture_contains_only_synthetic_content(self):
   self.assertIn('Synthetic Doom benchmark',smoke.ORG)
   self.assertIn('TODO',smoke.ORG)
+class SummaryTests(unittest.TestCase):
+ def test_not_run_is_not_a_failed_execution(self):
+  rows=[{'id':'boot','runtimes':{'rune':{'passed':False,'status':'not-run','first_error':None},'gnu':{'passed':True,'first_error':None}}}]
+  result=smoke.summarize(rows)
+  self.assertEqual(result['rune']['executed'],0)
+  self.assertEqual(result['rune']['not_run'],1)
+  self.assertIsNone(result['rune']['first_failure'])
+  self.assertEqual(result['gnu']['passed'],1)
 if __name__=='__main__':unittest.main()

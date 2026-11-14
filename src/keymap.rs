@@ -12,8 +12,8 @@ use anyhow::{Result, anyhow, bail, ensure};
 use rune_macros::defun;
 
 defsym!(KEYMAP);
-defvar!(GLOBAL_MAP);
-defvar!(MINIBUFFER_LOCAL_MAP);
+defsym!(GLOBAL_MAP);
+defsym!(MINIBUFFER_LOCAL_MAP);
 
 #[defun]
 fn make_sparse_keymap<'a>(string: Option<&str>, cx: &'a Context) -> Object<'a> {

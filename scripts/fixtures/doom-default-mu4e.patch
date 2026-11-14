@@ -1,0 +1,35 @@
+--- a/init.el
++++ b/init.el
+@@ -185,7 +185,7 @@
+        ;;zig               ; C, but simpler
+ 
+        :email
+-       ;;(mu4e +org +gmail)
++       mu4e
+        ;;notmuch
+        ;;(wanderlust +gmail)
+ 
+--- a/config.el
++++ b/config.el
+@@ -1,4 +1,5 @@
+ ;;; $DOOMDIR/config.el -*- lexical-binding: t; -*-
++(setq user-full-name "Synthetic Benchmark" user-mail-address "reader@example.invalid")
+ 
+ ;; Place your private configuration here! Remember, you do not need to run 'doom
+ ;; sync' after modifying this file!
+@@ -80,3 +81,15 @@
+ ;;
+ ;; You can also try 'gd' (or 'C-c c d') to jump to their definition and see how
+ ;; they are implemented.
++
++;; Synthetic benchmark only. No SMTP credentials/provider or retrieval command.
++;; Use Doom's documented real context setup, not a replacement helper function.
++(set-email-account! "Synthetic"
++  '((user-mail-address . "reader@example.test")
++    (user-full-name . "Synthetic Reader"))
++  t)
++(after! mu4e
++  (setq mu4e-context-policy 'pick-first
++        mu4e-compose-context-policy 'pick-first
++        mu4e-get-mail-command nil
++        mu4e-update-interval nil))

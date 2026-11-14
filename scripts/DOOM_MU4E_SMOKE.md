@@ -18,7 +18,7 @@ Pinned reference acquired locally:
 
 Clone official Doom with its pinned submodules. Keep all HOME, DOOMDIR and
 DOOMLOCALDIR state in a dedicated benchmark directory, never the user's setup.
-Copy the official config/package examples; enable bare mu4e in the init example.
+Copy the official config/package examples, then apply `scripts/fixtures/doom-default-mu4e.patch` in that dedicated config directory. It enables bare mu4e and a documented synthetic context only (reserved test address, no SMTP or retrieval); it does not modify Doom or mu4e package source.
 Then run the real official installer, preserving a bounded log:
 
 ```
@@ -55,10 +55,10 @@ python3 scripts/doom_mu4e_smoke.py \
 
 Every gate starts a fresh process with an isolated HOME and explicit EMACSDIR,
 DOOMDIR and DOOMLOCALDIR. Rune uses its **real bootstrap**, not raw-core mode.
-Both runtimes must actually load the installed profile and enabled mu4e module.
+Both runtimes must actually load the installed profile, invoke official `doom-startup` (fully loads enabled modules/config) and `doom-finalize`, then exercise the enabled mu4e module. Loading a profile descriptor alone is insufficient. Success/failure uses the existing `message` primitive; no extra `prin1` dependency or fake feature is introduced. Failure is reported and re-signalled, never caught and counted as success.
 The tested observable workflows are:
 1. Real Doom profile/module boot.
-2. Real sparse keymap definition/lookup and loaded Evil command availability.
+2. Real sparse keymap definition/lookup and actual local Evil escape key binding dispatched through `call-interactively`, restoring normal state.
 3. Actual `.org` file: Org mode, heading TODO change, save, reopen, exact text.
 4. Actual mu4e synthetic Maildir search/next/previous/body view/read-only checks,
    with source files unchanged. The passed-in driver is trusted executable test
@@ -76,15 +76,32 @@ responsiveness. GNU successes are reference results only, never Rune results.
 
 ## Current measured status and next blockers
 
-The qualified primitive checkpoint improved Rune **1/9 -> 3/9** after actual
-bounded file import; GNU is **9/9**. Next primitive failure is read-only variable
-forwarding. Separately, real full-Doom tests are **0/4 Rune, 0/4 GNU** while the
-reference installer is incomplete (`doom-nosync-error`). Rune's latest separate
-instrumented bootstrap diagnosis is `void-variable cl--loop-args`: file-local
-special declarations were lost between freshly created interpreters. A rooted
-per-load scope fix is in progress; rerun the actual benchmark after it lands.
+These are separate checkpoints, not interchangeable scores:
+- Raw-core prerequisite smoke improved Rune **1/9 -> 3/9 -> 4/9** with actual
+  bounded file import and owner-enforced read-only state; GNU is **9/9**.
+  Raw stdin bypasses bootstrap. Its source-mirrored package `defmacro` failure
+  is NOT evidence that bootstrapped Rune lacks that macro.
+- Official Doom installation and rebuild completed exit 0. This alone proves no
+  workflow. Corrected **real `doom-startup`** reference tests reached GNU **3/4**:
+  profile startup, actual Evil dispatch, and Org edit/save/reopen passed; mu4e
+  exposed a missing Doom helper when no account context was configured. The
+  profile now uses Doom's documented synthetic context and is being requalified.
+- Earlier descriptor-only GNU "boot" passes were explicitly withdrawn and old
+  JSON reports annotated. They are not full startup evidence.
+- Real Rune bootstrap passed in the separate loader candidate (~128 seconds).
+  The current combined keymap candidate regressed during subr initialization
+  (`use-global-map nil`): native bound-nil initialization skipped real Lisp
+  keymap construction. Until repaired, no Doom gate is reached. The separate
+  pre-keymap loader candidate reached real Doom and failed at
+  `locate-file-internal`; its bounded implementation is now under qualification.
+- Standalone **actual GNU mu4e** navigation/body/read-only tests passed, with all
+  synthetic mail unchanged. This is a reference only, never Rune or Doom success.
 
-The standalone GNU mu4e reference already passed real navigation, plain view and
-read-only checks with immutable synthetic mail. That does **not** turn either
-Doom or Rune green. End-to-end Doom+mu4e success by a next-day deadline remains
-unestablished until these real gates execute successfully.
+Run a single first-failure stage with `--runtime rune --gate doom-profile-boot
+--timeout 300` before spending four full bootstraps. Default timeout is 300s
+(maximum 600s); the observed 128s real bootstrap cannot be tested honestly with a
+short timeout. A runtime excluded by `--runtime` is `not-run`, not a failed run.
+
+Fresh reports and named conditions drive the next fix. End-to-end Doom+mu4e
+success by a next-day deadline remains unestablished until the actual gates pass.
+Batch results still do not establish native OS key/window behavior.
