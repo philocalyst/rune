@@ -220,6 +220,7 @@ impl DumpState {
             ObjectType::ChannelSender(_) => DumpedObject::ChannelSender,
             ObjectType::ChannelReceiver(_) => DumpedObject::ChannelReceiver,
             ObjectType::Process(_) => DumpedObject::Nil,
+            ObjectType::Frame(_) => DumpedObject::Nil,
         };
 
         // Overwrite the Nil placeholder with the real object

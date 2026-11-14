@@ -3,7 +3,8 @@ use super::Trace;
 use crate::core::object::GcString;
 use crate::core::object::WeakBufferPropertyRoot;
 use crate::core::object::{
-    ChannelReceiver, ChannelSender, CharTable, LispHashTable, LispProcess, ProcessRegistry,
+    ChannelReceiver, ChannelSender, CharTable, FrameRegistry, LispFrame, LispHashTable,
+    LispProcess, ProcessRegistry,
 };
 use crate::core::object::{Gc, IntoObject, Object, UninternedSymbolMap, WithLifetime};
 use bumpalo::collections::Vec as GcVec;
@@ -65,6 +66,7 @@ pub(crate) struct Block<const CONST: bool> {
     pub(in crate::core) lisp_chartables: RefCell<Vec<*const CharTable>>,
     pub(in crate::core) lisp_senders: RefCell<Vec<*const ChannelSender>>,
     pub(in crate::core) lisp_receivers: RefCell<Vec<*const ChannelReceiver>>,
+    pub(in crate::core) lisp_frames: RefCell<Vec<*const LispFrame>>,
     pub(in crate::core) lisp_processes: RefCell<Vec<*const LispProcess>>,
     pub(in crate::core) uninterned_symbol_map: UninternedSymbolMap,
 }
@@ -79,6 +81,7 @@ pub(crate) struct DeferredEndpointFinalizers {
     senders: Vec<ChannelSender>,
     receivers: Vec<ChannelReceiver>,
     processes: Vec<LispProcess>,
+    frames: Vec<LispFrame>,
 }
 fn collect_endpoint_finalizers(block: &Block<false>, deferred: &mut DeferredEndpointFinalizers) {
     block.lisp_senders.borrow_mut().retain_mut(|pointer| {
@@ -108,6 +111,15 @@ fn collect_endpoint_finalizers(block: &Block<false>, deferred: &mut DeferredEndp
             false
         }
     });
+    block.lisp_frames.borrow_mut().retain_mut(|pointer| {
+        if let Some(new) = unsafe { &**pointer }.forwarding_ptr() {
+            *pointer = new.as_ptr().cast();
+            true
+        } else {
+            deferred.frames.push(unsafe { std::ptr::read(*pointer) });
+            false
+        }
+    });
 }
 
 /// Owns all allocations and creates objects. All objects have
@@ -121,11 +133,13 @@ pub(crate) struct Context<'rt> {
     buffer_properties: RefCell<Vec<WeakBufferPropertyRoot>>,
     // One owner-local Session for all Envs and native hosts in this Context.
     editor_gateway: OnceCell<crate::editor_document::RuntimeEditorGateway>,
+    pub(in crate::core) frame_registry: RefCell<FrameRegistry>,
     pub(in crate::core) process_registry: RefCell<ProcessRegistry>,
 }
 
 impl Drop for Context<'_> {
     fn drop(&mut self) {
+        self.frame_registry.get_mut().shutdown();
         self.process_registry.get_mut().shutdown();
         // Global buffer handles outlive the local heap: retire their Lisp
         // metadata before releasing any allocation in this domain.
@@ -207,6 +221,7 @@ impl<const CONST: bool> Block<CONST> {
             lisp_senders: RefCell::default(),
             lisp_receivers: RefCell::default(),
             lisp_processes: RefCell::default(),
+            lisp_frames: RefCell::default(),
             uninterned_symbol_map: UninternedSymbolMap::default(),
         }
     }
@@ -289,6 +304,7 @@ impl<'ob, 'rt> Context<'rt> {
             buffer_properties: RefCell::new(Vec::new()),
             editor_gateway: OnceCell::new(),
             process_registry: RefCell::new(ProcessRegistry::default()),
+            frame_registry: RefCell::new(FrameRegistry::default()),
         }
     }
 

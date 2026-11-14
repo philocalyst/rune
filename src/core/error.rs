@@ -24,6 +24,7 @@ pub(crate) enum Type {
     ChannelSender,
     ChannelReceiver,
     Process,
+    Frame,
 }
 
 /// Error provided if object was the wrong type
