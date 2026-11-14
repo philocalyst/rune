@@ -114,11 +114,28 @@ impl NativeFont {
     }
 }
 
+#[derive(Clone)]
+enum FrameInput {
+    Legacy(Rc<RefCell<NativeInput>>),
+    #[cfg(feature = "editor")]
+    Owner(Rc<RefCell<owner_input::OwnerInput>>),
+}
+impl FrameInput {
+    fn submit(input: &Self, event: InputEvent) -> bool {
+        match input {
+            Self::Legacy(input) => NativeInput::submit(input, event),
+            #[cfg(feature = "editor")]
+            Self::Owner(input) => {
+                owner_input::OwnerInput::submit(input, editor_transport::OwnerEvent::Input(event))
+            }
+        }
+    }
+}
 pub struct FrameView {
     frame: Arc<FrameDisplay>,
     font: NativeFont,
     focus: FocusHandle,
-    input: Rc<RefCell<NativeInput>>,
+    input: FrameInput,
     resize: ResizeTracker,
 }
 impl FrameView {
@@ -138,55 +155,141 @@ impl FrameView {
             frame,
             font,
             focus: cx.focus_handle(),
-            input: Rc::new(RefCell::new(NativeInput {
+            input: FrameInput::Legacy(Rc::new(RefCell::new(NativeInput {
                 backlog: InputBacklog::new(input, 256),
                 policy: InputPolicy::default(),
                 rejected,
                 quit,
-            })),
+            }))),
             resize: ResizeTracker::default(),
         }
     }
-    /// Host calls this after the editor signals downstream channel capacity.
+    /// Editor-host constructor. Ordinary input and captured composition requests
+    /// share one bounded ordered FIFO; a separate explicit reply slot reports edits.
+    /// This does not register an IME InputHandler or invent platform text context.
+    #[cfg(feature = "editor")]
+    pub fn new_editor(
+        frame: Arc<FrameDisplay>,
+        font: NativeFont,
+        sender: editor_transport::NativeEditorSender,
+        replies: editor_transport::NativeEditorReplies,
+        quit: Arc<AtomicBool>,
+        rejected: owner_input::RejectedOwnerInput,
+        outcome: owner_input::CompositionOutcome,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.on_release(|view, _| view.shutdown_input()).detach();
+        Self {
+            frame,
+            font,
+            focus: cx.focus_handle(),
+            input: FrameInput::Owner(owner_input::OwnerInput::new(
+                sender, replies, quit, rejected, outcome,
+            )),
+            resize: ResizeTracker::default(),
+        }
+    }
+    /// Consume explicit composition outcomes before retrying the owner FIFO.
+    /// This order frees its reserved reply slot without letting input overtake.
     pub fn retry_input(&mut self) -> Result<(), std::sync::mpsc::TrySendError<()>> {
-        let result = self.input.borrow_mut().backlog.flush();
+        let result = match &self.input {
+            FrameInput::Legacy(input) => input.borrow_mut().backlog.flush(),
+            #[cfg(feature = "editor")]
+            FrameInput::Owner(input) => owner_input::OwnerInput::on_wake(input),
+        };
         if matches!(result, Err(std::sync::mpsc::TrySendError::Disconnected(()))) {
             self.shutdown_input();
         }
         result
     }
+    /// Legacy FIFO only. Editor hosts must recover the complete OwnerEvent FIFO
+    /// with take_pending_owner_input, not extract keys around a composition.
     pub fn take_pending_input(&mut self) -> Vec<InputEvent> {
-        self.input.borrow_mut().backlog.drain_pending().collect()
+        match &self.input {
+            FrameInput::Legacy(input) => input.borrow_mut().backlog.drain_pending().collect(),
+            #[cfg(feature = "editor")]
+            FrameInput::Owner(_) => Vec::new(),
+        }
     }
     pub fn input_readiness(&self) -> InputReadiness {
-        self.input.borrow().policy.state()
-    }
-    /// Replay rejected events in original order while physical input is paused.
-    /// Ownership returns to the caller when capacity is still insufficient.
-    pub fn replay_input(&mut self, event: InputEvent) -> Result<(), InputEvent> {
-        let mut input = self.input.borrow_mut();
-        if input.policy.state() == InputReadiness::Disconnected {
-            return Err(event);
+        match &self.input {
+            FrameInput::Legacy(input) => input.borrow().policy.state(),
+            #[cfg(feature = "editor")]
+            FrameInput::Owner(input) => input.borrow().readiness(),
         }
-        input.backlog.submit(event)
     }
-    /// Host calls only after all rejected events have been replayed/reported.
-    /// Accepted backlog must drain first, preventing later physical input from
-    /// overtaking recovery events. Disconnection can never be resumed.
+    pub fn replay_input(&mut self, event: InputEvent) -> Result<(), InputEvent> {
+        match &self.input {
+            FrameInput::Legacy(input) => {
+                let mut input = input.borrow_mut();
+                if input.policy.state() == InputReadiness::Disconnected {
+                    return Err(event);
+                }
+                input.backlog.submit(event)
+            }
+            #[cfg(feature = "editor")]
+            FrameInput::Owner(input) => input
+                .borrow_mut()
+                .replay(editor_transport::OwnerEvent::Input(event))
+                .map_err(|event| match event {
+                    editor_transport::OwnerEvent::Input(event) => event,
+                    _ => unreachable!("replay returns its same input ownership"),
+                }),
+        }
+    }
     pub fn resume_input(&mut self) -> bool {
-        let mut input = self.input.borrow_mut();
-        let pending = input.backlog.pending_len();
-        input.policy.resume(pending)
+        match &self.input {
+            FrameInput::Legacy(input) => {
+                let mut input = input.borrow_mut();
+                let n = input.backlog.pending_len();
+                input.policy.resume(n)
+            }
+            #[cfg(feature = "editor")]
+            FrameInput::Owner(input) => input.borrow_mut().resume(),
+        }
     }
-    /// Call before releasing the view/window to return accepted undelivered
-    /// events through the host rejection callback. A dropped view cannot replay.
+    /// Returns Err unchanged on a legacy view. In editor mode rejected ownership
+    /// goes to its mandatory callback; never re-emit an accepted composition.
+    #[cfg(feature = "editor")]
+    pub fn submit_composition(
+        &mut self,
+        request: editor_transport::CompositionRequest,
+    ) -> Result<bool, editor_transport::CompositionRequest> {
+        match &self.input {
+            FrameInput::Legacy(_) => Err(request),
+            FrameInput::Owner(input) => Ok(owner_input::OwnerInput::submit(
+                input,
+                editor_transport::OwnerEvent::Composition(request),
+            )),
+        }
+    }
+    #[cfg(feature = "editor")]
+    pub fn take_pending_owner_input(&mut self) -> Option<Vec<editor_transport::OwnerEvent>> {
+        match &self.input {
+            FrameInput::Legacy(_) => None,
+            FrameInput::Owner(input) => Some(input.borrow_mut().take_pending()),
+        }
+    }
+    #[cfg(feature = "editor")]
+    pub fn replay_owner_input(
+        &mut self,
+        event: editor_transport::OwnerEvent,
+    ) -> Result<(), editor_transport::OwnerEvent> {
+        match &self.input {
+            FrameInput::Legacy(_) => Err(event),
+            FrameInput::Owner(input) => input.borrow_mut().replay(event),
+        }
+    }
     pub fn shutdown_input(&mut self) {
+        let input = match &self.input {
+            FrameInput::Legacy(input) => input,
+            #[cfg(feature = "editor")]
+            FrameInput::Owner(input) => return owner_input::OwnerInput::shutdown(input),
+        };
         let (callback, pending) = {
-            let mut input = self.input.borrow_mut();
+            let mut input = input.borrow_mut();
             input.policy.disconnect();
-            let callback = input.rejected.clone();
-            let pending: Vec<_> = input.backlog.drain_pending().collect();
-            (callback, pending)
+            (input.rejected.clone(), input.backlog.drain_pending().collect::<Vec<_>>())
         };
         for event in pending {
             callback(InputRejection { event, reason: RejectionReason::HostDisconnected });
@@ -265,7 +368,7 @@ impl Render for FrameView {
             viewport.height.into(),
             window.scale_factor(),
         ) {
-            if NativeInput::submit(&self.input, event.clone()) {
+            if FrameInput::submit(&self.input, event.clone()) {
                 self.resize.acknowledge(&event);
             }
         }
@@ -283,7 +386,7 @@ impl Render for FrameView {
             .track_focus(&self.focus)
             .on_key_down(move |event: &KeyDownEvent, _window, cx| {
                 let key = &event.keystroke;
-                NativeInput::submit(
+                FrameInput::submit(
                     &input,
                     rune_display::InputEvent::Key {
                         key: key.key.clone(),
@@ -305,14 +408,14 @@ impl Render for FrameView {
                         MouseButton::Right => 3,
                         _ => return,
                     };
-                    NativeInput::submit(&pointer_input, InputEvent::PointerHit { hit, button });
+                    FrameInput::submit(&pointer_input, InputEvent::PointerHit { hit, button });
                     window.focus(&pointer_focus);
                     cx.stop_propagation();
                 }
             })
             .on_scroll_wheel(move |event: &ScrollWheelEvent, _, cx| {
                 let delta = event.delta.pixel_delta(px(metrics.line_height()));
-                NativeInput::submit(
+                FrameInput::submit(
                     &wheel_input,
                     InputEvent::Scroll { dx: delta.x.into(), dy: delta.y.into() },
                 );
@@ -410,3 +513,18 @@ impl PaintTarget for GpuiTarget<'_> {
         }
     }
 }
+
+#[cfg(feature = "editor")]
+pub mod composition;
+#[cfg(feature = "editor")]
+pub mod editor_bridge;
+#[cfg(feature = "editor")]
+pub mod editor_transport;
+#[cfg(feature = "editor")]
+pub mod ime_context;
+
+#[cfg(feature = "editor")]
+pub mod owner_input;
+
+#[cfg(feature = "editor")]
+pub mod platform_context;

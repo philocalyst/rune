@@ -53,3 +53,12 @@ fixture host. Scalar/expansion-cluster painting is not full complex shaping.
 There is no Lisp runtime/GC integration, editor-backed example, platform IME
 InputHandler, preedit or composition transport in this minimal package. Those
 remain separately staged and must not be inferred from this fixture.
+
+
+## Optional recovered editor-host path
+
+Feature `editor` adds the sole-owner bridge, bounded ordered view input/explicit
+acknowledgment transport, prepared UTF-16 context and `editor_first_light` example.
+See OWNER-EDITOR.md for freshly checked scope, recovery staging paths and the
+remaining platform/runtime gates. This does not install an IME InputHandler or
+turn the fixture's historical native-link evidence into a GUI test.

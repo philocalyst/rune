@@ -9,5 +9,20 @@ description = "Standalone GPUI native first-light adapter for Rune's immutable d
 [workspace]
 
 [dependencies]
+# Recovery staging: share publication trait identity; unified integration uses ../rune-display.
 rune-display = { path = "../rune-display" }
 gpui = "=0.2.2"
+
+[features]
+default = []
+editor = ["dep:rune-editor"]
+
+[dependencies.rune-editor]
+# Source-recovery staging. Integrate owner APIs before changing to ../rune-editor.
+path = "../rune-editor"
+features = ["display"]
+optional = true
+
+[[example]]
+name = "editor_first_light"
+required-features = ["editor"]

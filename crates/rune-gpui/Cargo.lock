@@ -4159,12 +4159,32 @@ name = "rune-display"
 version = "0.1.0"
 
 [[package]]
+name = "rune-editor"
+version = "0.1.0"
+dependencies = [
+ "rune-display",
+ "rune-text",
+]
+
+[[package]]
 name = "rune-gpui"
 version = "0.1.0"
 dependencies = [
  "gpui",
  "rune-display",
+ "rune-editor",
 ]
+
+[[package]]
+name = "rune-text"
+version = "0.1.0"
+dependencies = [
+ "rune-tree",
+]
+
+[[package]]
+name = "rune-tree"
+version = "0.1.0"
 
 [[package]]
 name = "rust-embed"
