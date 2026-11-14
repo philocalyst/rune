@@ -282,6 +282,7 @@ pub(crate) struct Context<'rt> {
     pub(in crate::core) marker_registry: RefCell<MarkerRegistry>,
     pub(in crate::core) frame_registry: RefCell<FrameRegistry>,
     echo_state: RefCell<crate::echo::EchoState>,
+    standard_syntax: RefCell<Option<crate::core::object::HeapDomainValue>>,
     pub(in crate::core) process_registry: RefCell<ProcessRegistry>,
 }
 
@@ -543,6 +544,7 @@ impl<'ob, 'rt> Context<'rt> {
             buffer_properties: RefCell::new(Vec::new()),
             editor_gateway: OnceCell::new(),
             process_registry: RefCell::new(ProcessRegistry::default()),
+            standard_syntax: RefCell::new(None),
             frame_registry: RefCell::new(FrameRegistry::default()),
             echo_state: RefCell::new(crate::echo::EchoState::default()),
             overlay_registry: RefCell::new(OverlayRegistry::default()),
@@ -919,5 +921,17 @@ mod owner_liveness_tests {
         };
         assert!(!witness.is_live());
         drop(gateway);
+    }
+}
+
+impl Context<'_> {
+    pub(crate) fn standard_syntax_table(&self) -> anyhow::Result<Object<'_>> {
+        if let Some(value) = self.standard_syntax.borrow().as_ref() { return value.bind(self); }
+        let value = crate::syntax::create_standard_syntax_table(self)?;
+        // Fresh table and every descriptor were allocated in this Context; no
+        // callbacks or mutable Context collection occur before root publication.
+        let root = unsafe { crate::core::object::HeapDomainValue::new(value, self) };
+        *self.standard_syntax.borrow_mut() = Some(root);
+        Ok(value)
     }
 }

@@ -3,8 +3,21 @@ use anyhow::Result;
 use rune_macros::defun;
 
 #[defun]
-fn make_char_table<'ob>(_purpose: Symbol<'ob>, init: Option<Object<'ob>>) -> CharTableInner<'ob> {
-    CharTableInner::new(init)
+fn make_char_table<'ob>(
+    purpose: Symbol<'ob>,
+    init: Option<Object<'ob>>,
+    env: &crate::core::gc::Rt<crate::core::env::Env>,
+    cx: &crate::core::gc::Context,
+) -> Result<CharTableInner<'ob>> {
+    // Extra-slot subtypes require representation not yet implemented here.
+    anyhow::ensure!(
+        purpose == crate::core::env::sym::NIL || purpose == crate::core::env::sym::SYNTAX_TABLE,
+        "unsupported char-table subtype"
+    );
+    let extra = crate::data::get(purpose, crate::core::env::sym::CHAR_TABLE_EXTRA_SLOTS, env, cx);
+    anyhow::ensure!(matches!(extra.untag(), crate::core::object::ObjectType::NIL | crate::core::object::ObjectType::Int(0)),
+        "char-table extra slots are unsupported");
+    Ok(CharTableInner::new(init).with_purpose(purpose.into()))
 }
 
 #[defun]
@@ -12,6 +25,7 @@ fn set_char_table_parent<'ob>(
     table: &'ob CharTable,
     parent: Option<&'ob CharTable>,
 ) -> Result<Option<&'ob CharTable>> {
+    table.validate_parent(parent)?;
     table.set_parent(parent)?;
     Ok(parent)
 }
@@ -26,12 +40,17 @@ fn map_char_table(
     env: &mut crate::core::gc::Rt<crate::core::env::Env>,
     cx: &mut crate::core::gc::Context,
 ) -> Result<()> {
-    use crate::core::{env::sym, object::{Function, ObjectType}};
-    use rune_core::macros::{root, call, list};
+    use crate::core::{
+        env::sym,
+        object::{Function, ObjectType},
+    };
+    use rune_core::macros::{call, list, root};
     if !matches!(table.bind(cx).untag(), ObjectType::CharTable(_)) {
         env.initialize_condition_metadata(cx);
         let data = list![sym::CHAR_TABLE_P, table.bind(cx); cx];
-        return Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into());
+        return Err(
+            crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into()
+        );
     }
     root!(range, Object::from(crate::core::cons::Cons::new(0, 0, cx)), cx);
     let mut start = 0usize;
@@ -53,15 +72,26 @@ fn map_char_table(
             range.bind(cx)
         };
         root!(key, cx);
-        if !matches!(function.bind(cx).untag(), ObjectType::NIL | ObjectType::Symbol(_) | ObjectType::Cons(_) | ObjectType::SubrFn(_) | ObjectType::ByteFn(_)) {
+        if !matches!(
+            function.bind(cx).untag(),
+            ObjectType::NIL
+                | ObjectType::Symbol(_)
+                | ObjectType::Cons(_)
+                | ObjectType::SubrFn(_)
+                | ObjectType::ByteFn(_)
+        ) {
             env.initialize_condition_metadata(cx);
             let data = list![function.bind(cx); cx];
-            return Err(crate::eval::EvalError::signal(sym::INVALID_FUNCTION.into(), data, cx).into());
+            return Err(
+                crate::eval::EvalError::signal(sym::INVALID_FUNCTION.into(), data, cx).into()
+            );
         }
         let callable: Function = function.bind(cx).try_into().expect("function tag preflight");
         root!(callable, cx);
         call!(callable, key.bind(cx), value.bind(cx); env, cx)?;
-        if last == 0x3fffff { return Ok(()) }
+        if last == 0x3fffff {
+            return Ok(());
+        }
         start = last + 1;
     }
 }
@@ -77,6 +107,18 @@ mod mapping_tests {
             "(map-char-table 42 (make-char-table nil nil))",
             "(let ((m (make-char-table nil nil)) out) (aset m 65 m) (map-char-table #'(lambda (k v) (garbage-collect) (setq out (eq v m))) m) out)",
             "(let ((m (make-char-table nil nil)) out) (aset m 65 (list 'a)) (aset m 90 (list 'b)) (map-char-table #'(lambda (k v) (garbage-collect) (setq out (cons (list k (car v)) out))) m) (nreverse out))",
-        ] { eprintln!("map-char-table oracle: {source}"); crate::assert_elprop!("{}", source); }
+        ] {
+            eprintln!("map-char-table oracle: {source}");
+            crate::assert_elprop!("{}", source);
+        }
     }
+}
+
+#[defun]
+fn char_table_subtype(table: &CharTable) -> Object<'_> {
+    table.purpose()
+}
+#[defun]
+fn char_table_parent(table: &CharTable) -> Option<&CharTable> {
+    table.parent()
 }

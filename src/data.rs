@@ -645,7 +645,7 @@ pub(crate) fn aref<'ob>(array: Object<'ob>, idx: usize, cx: &'ob Context) -> Res
             Some(x) => Ok(x),
             None => Err(anyhow!("index {idx} is out of bounds")),
         },
-        ObjectType::CharTable(chartable) => Ok(chartable.get(idx)),
+        ObjectType::CharTable(chartable) => chartable.get(idx),
         x => Err(TypeError::new(Type::Sequence, x).into()),
     }
 }

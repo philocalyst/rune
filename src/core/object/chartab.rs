@@ -15,6 +15,8 @@ pub struct CharTableInner<'ob> {
     parent: Mutex<Option<Slot<&'ob CharTable>>>,
     data: Mutex<HashMap<usize, Slot<Object<'ob>>>>,
     init: Slot<Object<'ob>>,
+    purpose: Slot<Object<'ob>>,
+    seed: Option<(usize, usize, Slot<Object<'ob>>)>,
 }
 
 #[cfg(test)]
@@ -46,6 +48,10 @@ impl TraceTrait for CharTableInner<'_> {
         lock(&self.parent).trace(state);
         lock(&self.data).trace(state);
         self.init.trace(state);
+        self.purpose.trace(state);
+        if let Some((_, _, value)) = &self.seed {
+            value.trace(state);
+        }
     }
 }
 
@@ -55,7 +61,23 @@ impl<'ob> CharTableInner<'ob> {
             parent: Mutex::new(None),
             data: Mutex::new(HashMap::default()),
             init: Slot::new(init.unwrap_or(NIL)),
+            purpose: Slot::new(NIL),
+            seed: None,
         }
+    }
+    pub(crate) fn with_purpose(mut self, purpose: Object<'ob>) -> Self {
+        self.purpose = Slot::new(purpose);
+        self
+    }
+    pub(crate) fn with_seed(
+        mut self,
+        start: usize,
+        end: usize,
+        value: Object<'ob>,
+    ) -> Result<Self> {
+        ensure!(start <= end && end <= 0x3fffff, "invalid char-table seed range");
+        self.seed = Some((start, end, Slot::new(value)));
+        Ok(self)
     }
 }
 
@@ -96,7 +118,14 @@ impl<'new> CloneIn<'new, &'new Self> for CharTable {
         }
         let data = Mutex::new(data);
         let init = Slot::new(self.0.init.clone_in(bk)?);
-        Ok(CharTableInner { parent, data, init }.into_obj(bk))
+        let purpose = Slot::new(self.0.purpose.clone_in(bk)?);
+        let seed = self
+            .0
+            .seed
+            .as_ref()
+            .map(|(a, b, v)| Ok::<_, anyhow::Error>((*a, *b, Slot::new(v.clone_in(bk)?))))
+            .transpose()?;
+        Ok(CharTableInner { parent, data, init, purpose, seed }.into_obj(bk))
     }
 }
 
@@ -109,20 +138,29 @@ impl CharTable {
     /// Cost counts the bounded snapshot scan, including an empty result, so a
     /// caller can cap cumulative work rather than only each individual query.
     pub(crate) fn mapping_next(
-        &self, start: usize, remaining: usize,
+        &self,
+        start: usize,
+        remaining: usize,
     ) -> Result<(Option<(usize, usize, Object<'_>)>, usize)> {
         const MAX_CHARACTER: usize = 0x3f_ffff;
         const MAX_ENTRIES: usize = 65_536;
-        if start > MAX_CHARACTER { return Ok((None, 0)); }
+        if start > MAX_CHARACTER {
+            return Ok((None, 0));
+        }
         let mut entries = {
             let parent = lock(&self.0.parent);
             ensure!(parent.is_none(), "map-char-table parent inheritance is unsupported");
+            ensure!(self.0.seed.is_none(), "map-char-table seeded ranges are unsupported");
             ensure!(self.0.init.is_nil(), "map-char-table non-NIL defaults are unsupported");
             let data = lock(&self.0.data);
-            let cost = data.len().checked_add(1)
+            let cost = data
+                .len()
+                .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("map-char-table scan cost overflow"))?;
-            ensure!(data.len() <= MAX_ENTRIES && cost <= remaining,
-                "map-char-table scan budget exceeded");
+            ensure!(
+                data.len() <= MAX_ENTRIES && cost <= remaining,
+                "map-char-table scan budget exceeded"
+            );
             let mut entries = Vec::new();
             entries.try_reserve_exact(data.len())?;
             for (&key, value) in data.iter() {
@@ -135,11 +173,15 @@ impl CharTable {
         entries.sort_unstable_by_key(|(key, _)| *key);
         let mut entries = entries.into_iter().filter(|(key, _)| *key >= start);
         while let Some((first, value)) = entries.next() {
-            if value.is_nil() { continue; }
+            if value.is_nil() {
+                continue;
+            }
             let mut end = first;
             for (key, next) in entries {
                 // Identity, never structural equality of arbitrary/cyclic values.
-                if key != end + 1 || !next.ptr_eq(value) { break; }
+                if key != end + 1 || !next.ptr_eq(value) {
+                    break;
+                }
                 end = key;
             }
             return Ok((Some((first, end, value)), cost));
@@ -153,7 +195,7 @@ impl CharTable {
         let data = lock(&self.0.data);
         let count = data
             .len()
-            .checked_add(1 + usize::from(parent.is_some()))
+            .checked_add(2 + usize::from(parent.is_some()) + usize::from(self.0.seed.is_some()))
             .ok_or_else(|| anyhow::anyhow!("char-table clone edge count overflow"))?;
         ensure!(count <= limit, "char-table clone edge budget exceeded");
         let mut children = Vec::new();
@@ -162,6 +204,10 @@ impl CharTable {
             children.push(Object::from(**parent));
         }
         children.push(*self.0.init);
+        children.push(*self.0.purpose);
+        if let Some((_, _, value)) = &self.0.seed {
+            children.push(**value);
+        }
         children.extend(data.values().map(|value| **value));
         Ok(children)
     }
@@ -180,11 +226,51 @@ impl CharTable {
         }
     }
 
-    pub fn get(&self, idx: usize) -> Object<'_> {
-        match lock(&self.0.data).get(&idx) {
-            Some(x) => **x,
-            None => *self.0.init,
+    pub fn get(&self, idx: usize) -> Result<Object<'_>> {
+        ensure!(idx <= 0x3fffff, "char-table character is out of range");
+        let mut current = self;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            ensure!(seen.insert(current as *const Self as usize), "cyclic char-table parent");
+            let explicit = lock(&current.0.data).get(&idx).map(|v| **v);
+            let value = explicit.unwrap_or_else(|| {
+                current
+                    .0
+                    .seed
+                    .as_ref()
+                    .filter(|(a, b, _)| *a <= idx && idx <= *b)
+                    .map_or(*current.0.init, |(_, _, v)| **v)
+            });
+            let value = if value.is_nil() { *current.0.init } else { value };
+            if !value.is_nil() {
+                return Ok(value);
+            }
+            let parent = lock(&current.0.parent).as_ref().map(|v| **v);
+            match parent {
+                Some(parent) => current = parent,
+                None => return Ok(NIL),
+            }
         }
+        anyhow::bail!("char-table parent depth exceeded")
+    }
+    pub(crate) fn purpose(&self) -> Object<'_> {
+        *self.0.purpose
+    }
+    pub(crate) fn parent(&self) -> Option<&Self> {
+        lock(&self.0.parent).as_ref().map(|v| **v)
+    }
+    pub(crate) fn validate_parent(&self, parent: Option<&Self>) -> Result<()> {
+        let mut current = parent;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let Some(table) = current else { return Ok(()) };
+            ensure!(
+                !std::ptr::eq(table, self) && seen.insert(table as *const Self as usize),
+                "cyclic char-table parent"
+            );
+            current = table.parent();
+        }
+        anyhow::bail!("char-table parent depth exceeded")
     }
 
     fn check_writable(&self) -> Result<()> {
@@ -256,10 +342,10 @@ mod ownership_tests {
         for _ in 0..10 {
             cx.garbage_collect(true);
             let table = table.bind(cx).untag();
-            assert_eq!(table.get(65), "entry-only");
-            assert_eq!(table.get(0), "default");
+            assert_eq!(table.get(65).unwrap(), "entry-only");
+            assert_eq!(table.get(0).unwrap(), "default");
             let parent = lock(&table.0.parent).as_ref().map(|parent| **parent).unwrap();
-            assert_eq!(parent.get(66), "parent-only");
+            assert_eq!(parent.get(66).unwrap(), "parent-only");
         }
     }
 
@@ -275,7 +361,7 @@ mod ownership_tests {
             for _ in 0..5 {
                 cx.garbage_collect(true);
                 assert_eq!(cx.block.lisp_chartables.borrow().len(), 1);
-                assert_eq!(table.bind(cx).untag().get(1), "native map entry");
+                assert_eq!(table.bind(cx).untag().get(1).unwrap(), "native map entry");
             }
         }
         cx.garbage_collect(true);
@@ -334,12 +420,12 @@ mod ownership_tests {
                         let ObjectType::CharTable(table) = definition.car().untag() else {
                             panic!("table expected")
                         };
-                        assert_eq!(table.get(42), "global-entry");
-                        assert_eq!(table.get(0), "global-default");
+                        assert_eq!(table.get(42).unwrap(), "global-entry");
+                        assert_eq!(table.get(0).unwrap(), "global-default");
                         assert!(table.set(42, cx.add("foreign-local")).is_err());
                         assert!(table.set_parent(None).is_err());
                         assert!(format!("{table}").contains("global-entry"));
-                        assert_eq!(table.get(42), "global-entry");
+                        assert_eq!(table.get(42).unwrap(), "global-entry");
                     }
                 })
             })
@@ -364,9 +450,9 @@ mod ownership_tests {
 #[cfg(test)]
 mod parent_copy_guard_tests {
     use super::*;
+    use crate::channel_manager::{ChannelManager, RecvError, SendError};
     use crate::core::gc::{Context, RootSet};
     use crate::core::object::make_channel_pair_for_test;
-    use crate::channel_manager::{ChannelManager, SendError, RecvError};
     #[test]
     fn self_parent_channel_copy_fails_and_following_plain_copy_succeeds() {
         let roots = RootSet::default();
@@ -379,7 +465,8 @@ mod parent_copy_guard_tests {
         assert!(matches!(receiver.try_recv(cx), Err(RecvError::Empty)));
         sender.try_send(cx.add(42)).unwrap();
         assert_eq!(receiver.try_recv(cx).unwrap(), cx.add(42));
-        sender.close(); receiver.close();
+        sender.close();
+        receiver.close();
     }
 }
 
@@ -389,31 +476,50 @@ mod live_mapping_tests {
     use crate::core::gc::{Context, RootSet};
     #[test]
     fn mapping_is_sorted_identity_coalesced_and_requeries_live_values() {
-        let roots=RootSet::default();let cx=&Context::new(&roots);
-        let table=CharTableInner::new(None).into_obj(&cx.block);let table=table.untag();
-        let value=cx.add(vec![NIL]);let equal_but_distinct=cx.add(vec![NIL]);
-        table.set(100,value).unwrap();table.set(98,value).unwrap();table.set(99,value).unwrap();
-        table.set(101,equal_but_distinct).unwrap();table.set(97,NIL).unwrap();
-        let (run,cost)=table.mapping_next(0,65536).unwrap();let(start,end,found)=run.unwrap();
-        assert_eq!((start,end,cost),(98,100,6));assert!(found.ptr_eq(value));
-        let (run,_)=table.mapping_next(end+1,65536).unwrap();assert_eq!((run.unwrap().0,run.unwrap().1),(101,101));
-        table.set(102,value).unwrap();table.set(101,NIL).unwrap();
-        let (run,_)=table.mapping_next(101,65536).unwrap();let(start,end,found)=run.unwrap();
-        assert_eq!((start,end),(102,102));assert!(found.ptr_eq(value));
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let table = CharTableInner::new(None).into_obj(&cx.block);
+        let table = table.untag();
+        let value = cx.add(vec![NIL]);
+        let equal_but_distinct = cx.add(vec![NIL]);
+        table.set(100, value).unwrap();
+        table.set(98, value).unwrap();
+        table.set(99, value).unwrap();
+        table.set(101, equal_but_distinct).unwrap();
+        table.set(97, NIL).unwrap();
+        let (run, cost) = table.mapping_next(0, 65536).unwrap();
+        let (start, end, found) = run.unwrap();
+        assert_eq!((start, end, cost), (98, 100, 6));
+        assert!(found.ptr_eq(value));
+        let (run, _) = table.mapping_next(end + 1, 65536).unwrap();
+        assert_eq!((run.unwrap().0, run.unwrap().1), (101, 101));
+        table.set(102, value).unwrap();
+        table.set(101, NIL).unwrap();
+        let (run, _) = table.mapping_next(101, 65536).unwrap();
+        let (start, end, found) = run.unwrap();
+        assert_eq!((start, end), (102, 102));
+        assert!(found.ptr_eq(value));
     }
     #[test]
     fn mapping_rejects_unsupported_inheritance_and_bounds_without_mutation() {
-        let roots=RootSet::default();let cx=&Context::new(&roots);
-        let table=CharTableInner::new(None).into_obj(&cx.block);let table=table.untag();
-        assert!(table.mapping_next(0,0).is_err());
-        assert!(table.mapping_next(0,1).unwrap().0.is_none());
-        table.set(0x3f_ffff,1.into()).unwrap();
-        let (run,cost)=table.mapping_next(0,2).unwrap();assert_eq!(run.unwrap().1,0x3f_ffff);assert_eq!(cost,2);
-        assert_eq!(table.mapping_next(0x40_0000,0).unwrap().1,0);
-        assert!(table.mapping_next(0,1).is_err());
-        table.set(0x40_0000,1.into()).unwrap();assert!(table.mapping_next(0,3).is_err());
-        let parent=CharTableInner::new(None).into_obj(&cx.block);table.set_parent(Some(parent.untag())).unwrap();
-        assert!(table.mapping_next(0,3).is_err());
-        let default=CharTableInner::new(Some(1.into())).into_obj(&cx.block);assert!(default.untag().mapping_next(0,2).is_err());
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let table = CharTableInner::new(None).into_obj(&cx.block);
+        let table = table.untag();
+        assert!(table.mapping_next(0, 0).is_err());
+        assert!(table.mapping_next(0, 1).unwrap().0.is_none());
+        table.set(0x3f_ffff, 1.into()).unwrap();
+        let (run, cost) = table.mapping_next(0, 2).unwrap();
+        assert_eq!(run.unwrap().1, 0x3f_ffff);
+        assert_eq!(cost, 2);
+        assert_eq!(table.mapping_next(0x40_0000, 0).unwrap().1, 0);
+        assert!(table.mapping_next(0, 1).is_err());
+        table.set(0x40_0000, 1.into()).unwrap();
+        assert!(table.mapping_next(0, 3).is_err());
+        let parent = CharTableInner::new(None).into_obj(&cx.block);
+        table.set_parent(Some(parent.untag())).unwrap();
+        assert!(table.mapping_next(0, 3).is_err());
+        let default = CharTableInner::new(Some(1.into())).into_obj(&cx.block);
+        assert!(default.untag().mapping_next(0, 2).is_err());
     }
 }

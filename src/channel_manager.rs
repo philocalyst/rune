@@ -649,7 +649,7 @@ mod char_table_finalization_tests {
             let ObjectType::CharTable(table) = received.bind(cx).untag() else {
                 panic!("table expected")
             };
-            assert_eq!(table.get(42), "transferred native map");
+            assert_eq!(table.get(42).unwrap(), "transferred native map");
             manager.collect_garbage();
             assert_eq!(finalized_char_table_count(), before + 1);
             assert_eq!(manager.gc_state.lock().unwrap().block.tracked_char_table_allocations(), 0);

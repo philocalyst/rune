@@ -1,0 +1,11 @@
+# Native initial standard syntax table
+
+`standard-syntax-table` returns the canonical owner-Context rooted mutable char-table, not an empty placeholder or an Env-specific shadow. Its purpose is `syntax-table`; `syntax-table-p`, `char-table-subtype`, and `char-table-parent` expose real metadata. The initial values follow GNU Emacs 30.1 `syntax.c:init_syntax_once`: whitespace default, explicit ASCII syntax descriptors and matching delimiters, and a compact word-syntax seed for character codes 128 through 0x3fffff. Descriptor values are traced ordinary owner Lisp objects.
+
+This is the native initialization phase, not the later Unicode customization in original `international/characters.el`. It does not claim GNU `-Q` character-category parity, buffer-local syntax-table selection, syntax scanning, syntax-table property interpretation, or extra-slot subtypes. `make-char-table` supports NIL and syntax-table purposes; other purposes are rejected explicitly rather than silently losing subtype semantics. Range/default mutation primitives are not added here.
+
+Lookup uses explicit values, the native seed, a table's non-NIL default, then parent inheritance. NIL entries fall back to that table's default before the parent. Public parent assignment retains GNU cross-purpose parent support and rejects cycles before mutation. Lookup independently rejects cycles/depth beyond 256 with a static error; no locks survive a parent hop. Existing `map-char-table` retains its explicit-only scope and rejects seeded/default/parent inheritance rather than silently omitting inherited values.
+
+Construction uses a shared Context borrow, with no callbacks or moving collection before canonical root publication. The root survives owner moving collections and is retired with that Context. Parent/copy graph edges include purpose and seeded descriptor values. Native table copying still uses the existing intrinsic traversal/rollback contract. These fixed-size native initialization/lookup bounds are not universal memory, wall-clock, filesystem, or full Emacs compatibility guarantees.
+
+The native Env property map seeds `(get 'syntax-table 'char-table-extra-slots)` to zero. Dump serialization rejects any char-table before constructing output or creating/overwriting the destination; the legacy opaque wire placeholder cannot preserve its state.

@@ -91,6 +91,11 @@ impl<'a> Env<'a> {
         let editor_gateway = cx.editor_gateway()?;
         let current_buffer = editor_gateway.scratch(cx)?;
         let startup_data_directory = crate::resources::capture_data_directory()?;
+        // GNU syntax.c:init_syntax_once declares no extra slots for this
+        // purpose. Canonical symbols and immediate zero need no local roots.
+        let props = [(Slot::new(sym::SYNTAX_TABLE), vec![
+            (Slot::new(sym::CHAR_TABLE_EXTRA_SLOTS), Slot::new(Object::from(0)))
+        ])].into_iter().collect();
         Ok(Self {
             vars: Default::default(),
             variable_aliases: Default::default(),
@@ -98,7 +103,7 @@ impl<'a> Env<'a> {
             startup_system_type,
             startup_shell_file_name,
             startup_data_directory,
-            props: Default::default(),
+            props,
             catch_stack: Default::default(),
             binding_stack: Default::default(),
             binding_targets: Default::default(),

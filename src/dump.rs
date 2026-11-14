@@ -78,6 +78,7 @@ struct DumpState {
     unsupported_overlay: bool,
     unsupported_marker: bool,
     unsupported_string_properties: bool,
+    unsupported_char_table: bool,
 }
 
 impl Display for DumpedObject {
@@ -157,6 +158,7 @@ impl DumpState {
             unsupported_overlay: false,
             unsupported_marker: false,
             unsupported_string_properties: false,
+            unsupported_char_table: false,
         }
     }
 
@@ -236,7 +238,12 @@ impl DumpState {
                 DumpedObject::Record(elems)
             }
             ObjectType::Buffer(_) => DumpedObject::Buffer,
-            ObjectType::CharTable(_) => DumpedObject::CharTable,
+            ObjectType::CharTable(_) => {
+                // Existing wire placeholder cannot restore table metadata,
+                // parent/default/seed or entries. Reject before file effects.
+                self.unsupported_char_table = true;
+                DumpedObject::CharTable
+            },
             ObjectType::BigInt(n) => DumpedObject::BigInt(n.to_string()),
             ObjectType::ChannelSender(_) => DumpedObject::ChannelSender,
             ObjectType::ChannelReceiver(_) => DumpedObject::ChannelReceiver,
@@ -306,6 +313,10 @@ impl DumpState {
                 std::io::ErrorKind::Unsupported,
                 "Property-bearing string persistence is unsupported",
             ));
+        }
+        if self.unsupported_char_table {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,
+                "Char-table persistence is unsupported"));
         }
         let mut out = std::string::String::new();
         writeln!(out, ".HEADER").unwrap();
@@ -1297,5 +1308,19 @@ mod marker_persistence_tests {
         let result=dump_to_file(&path,env,cx);let bytes=std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();std::fs::remove_dir(&directory).unwrap();
         assert_eq!(result.unwrap_err().kind(),std::io::ErrorKind::Unsupported);assert_eq!(bytes,b"existing image");
+    }
+}
+
+#[cfg(test)]
+mod syntax_persistence_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    #[test]
+    fn syntax_table_dump_rejects_before_output() {
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let mut state = DumpState::new();
+        state.dump_object(cx.standard_syntax_table().unwrap());
+        assert_eq!(state.into_output().unwrap_err().kind(), std::io::ErrorKind::Unsupported);
     }
 }

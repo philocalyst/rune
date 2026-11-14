@@ -750,6 +750,14 @@ impl<T, I: SliceIndex<[Rt<T>]>> IndexMut<I> for Rt<Vec<T>> {
 // ensure that there cannot exist a &IndexMap to the same location.
 pub(crate) struct ObjectMap<K, V>(UnsafeCell<IndexMap<K, V>>);
 
+// Native construction before publication: entries already carry their traced
+// representation. This performs no callbacks, collection, or lifetime widening.
+impl<K: Eq + Hash, V> FromIterator<(K, V)> for ObjectMap<K, V> {
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(entries: T) -> Self {
+        Self(UnsafeCell::new(entries.into_iter().collect()))
+    }
+}
+
 impl<K, V> Default for ObjectMap<K, V> {
     fn default() -> Self {
         Self(UnsafeCell::new(Default::default()))

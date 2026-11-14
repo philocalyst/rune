@@ -217,9 +217,9 @@ mod tests {
         let cx = &Context::new(&roots);
         let table = CharTableInner::new(None).into_obj(&cx.block);
         assert!(table.untag().clone_children_snapshot(0).is_err());
-        assert_eq!(table.untag().clone_children_snapshot(1).unwrap().len(), 1);
+        assert_eq!(table.untag().clone_children_snapshot(2).unwrap().len(), 2);
         table.untag().set(7, Object::from(3)).unwrap();
-        assert!(table.untag().clone_children_snapshot(1).is_err());
+        assert!(table.untag().clone_children_snapshot(2).is_err());
         table.untag().set_parent(Some(table.untag())).unwrap();
         assert!(validate_function_clone(table.into()).is_err());
         table.untag().set_parent(None).unwrap();
