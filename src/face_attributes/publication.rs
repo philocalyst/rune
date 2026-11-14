@@ -1,5 +1,5 @@
-//! Initial, callback-free selected-frame DEFAULT face color publication.
-//! No text-property, overlay, inheritance, font, or decoration support is implied.
+//! Bounded owner-only buffer face colors and single-line underline publication.
+//! No overlay, full font-lock, font variant or structured decoration parity.
 use super::*;
 use rune_editor::display::{Color, Face};
 
@@ -32,13 +32,27 @@ fn color(value: Object, fallback: Color) -> std::result::Result<Color, &'static 
     };
     rgb.map(|(r,g,b)|Color(r,g,b,255)).ok_or("unsupported or invalid hexadecimal face color")
 }
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum Underline { Off, Foreground, Color(Color) }
+impl Underline {
+    fn resolve(self,foreground:Color)->Option<Color>{match self{Self::Off=>None,Self::Foreground=>Some(foreground),Self::Color(color)=>Some(color)}}
+}
+fn underline(value:Object,fallback:Color)->std::result::Result<Option<Underline>,&'static str>{
+    if value==sym::UNSPECIFIED{return Ok(None);}
+    if value.is_nil(){return Ok(Some(Underline::Off));}
+    if value==TRUE{return Ok(Some(Underline::Foreground));}
+    match value.untag(){
+        ObjectType::String(_)|ObjectType::ByteString(_)=>color(value,fallback).map(|c|Some(Underline::Color(c))),
+        _=>Err("structured or invalid underline publication unsupported"),
+    }
+}
 /// Read only rooted tables; no lazy table creation, Lisp evaluation, or GC.
 /// Recompute every owner turn so mutable vectors/strings cannot evade revision.
-pub(crate) fn default_face(env: &Rt<Env>, cx: &Context) -> std::result::Result<Face, &'static str> {
+fn default_face_data(env: &Rt<Env>, cx: &Context) -> std::result::Result<(Face,Underline), &'static str> {
     let frame = cx.selected_frame().map_err(|_|"no live owner frame for face publication")?;
     frame.validate(cx).map_err(|_|"invalid owner frame for face publication")?;
     let fallback = Face::default();
-    let Some(table) = env.frame_face_tables.get(Object::from(frame)) else { return Ok(fallback); };
+    let Some(table) = env.frame_face_tables.get(Object::from(frame)) else { return Ok((fallback,Underline::Off)); };
     let table: &LispHashTable = table.bind(cx).try_into().map_err(|_|"invalid frame face table")?;
     let mut name = sym::DEFAULT;
     let mut seen = Vec::new();
@@ -51,14 +65,17 @@ pub(crate) fn default_face(env: &Rt<Env>, cx: &Context) -> std::result::Result<F
         name = target;
     }
     if seen.len() == 256 { return Err("default face alias limit exceeded"); }
-    let Some(value) = table.get(name.into()) else { return Ok(fallback); };
+    let Some(value) = table.get(name.into()) else { return Ok((fallback,Underline::Off)); };
     let vector = checked_vector(value).map_err(|_|"invalid default face vector")?;
     let inverse=vector[8].get();
     if !inverse.is_nil() && inverse!=sym::UNSPECIFIED {return Err("inverse-video default face publication unsupported");}
     let inherited=vector[16].get();
     if !inherited.is_nil() && inherited!=sym::UNSPECIFIED {return Err("default face inheritance publication unsupported");}
-    Ok(Face { id: 0, foreground: color(vector[9].get(), fallback.foreground)?, background: color(vector[10].get(), fallback.background)? })
+    let foreground=color(vector[9].get(),fallback.foreground)?;
+    let line=underline(vector[7].get(),fallback.foreground)?.unwrap_or(Underline::Off);
+    Ok((Face { id:0,foreground,background:color(vector[10].get(),fallback.background)?,underline:line.resolve(foreground) },line))
 }
+pub(crate) fn default_face(env:&Rt<Env>,cx:&Context)->std::result::Result<Face,&'static str>{default_face_data(env,cx).map(|(face,_)|face)}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,10 +177,13 @@ mod joined_tests {
 }
 
 #[derive(Clone,Copy,Default)]
-struct Colors { fg:Option<Color>, bg:Option<Color> }
+struct Colors { fg:Option<Color>, bg:Option<Color>, underline:Option<Underline> }
 impl Colors {
-    fn over(self, lower:Self)->Self {Self{fg:self.fg.or(lower.fg),bg:self.bg.or(lower.bg)}}
-    fn face(self, base:Face)->Face {Face{foreground:self.fg.unwrap_or(base.foreground),background:self.bg.unwrap_or(base.background),..base}}
+    fn over(self, lower:Self)->Self {Self{fg:self.fg.or(lower.fg),bg:self.bg.or(lower.bg),underline:self.underline.or(lower.underline)}}
+    fn face(self, base:Face,base_underline:Underline)->Face {
+        let foreground=self.fg.unwrap_or(base.foreground);
+        Face{foreground,background:self.bg.unwrap_or(base.background),underline:self.underline.unwrap_or(base_underline).resolve(foreground),..base}
+    }
 }
 struct Resolve<'a,'env,'roots> { env:&'a Rt<Env<'env>>, cx:&'a Context<'roots>, base:Face, work:usize, name_bytes:usize }
 impl Resolve<'_,'_,'_> {
@@ -205,7 +225,7 @@ impl Resolve<'_,'_,'_> {
                 let vector=checked_vector(table.get(name.into()).ok_or("unknown frame-local face")?).map_err(|_|"invalid named face vector")?;
                 let inverse=vector[8].get();
                 if !inverse.is_nil() && inverse!=sym::UNSPECIFIED {return Err("inverse-video named face publication unsupported");}
-                let own=Colors{fg:self.optional_color(vector[9].get(),self.base.foreground)?,bg:self.optional_color(vector[10].get(),self.base.background)?};
+                let own=Colors{fg:self.optional_color(vector[9].get(),self.base.foreground)?,bg:self.optional_color(vector[10].get(),self.base.background)?,underline:underline(vector[7].get(),self.base.foreground)?};
                 let inherited=self.spec(vector[16].get(),depth+1)?;
                 Ok(own.over(inherited))
             }
@@ -230,8 +250,9 @@ impl Resolve<'_,'_,'_> {
                         ":foreground"=>if result.fg.is_none(){result.fg=self.optional_color(v,self.base.foreground)?;},
                         ":background"=>if result.bg.is_none(){result.bg=self.optional_color(v,self.base.background)?;},
                         ":inherit"=>if inheritance.is_none(){inheritance=Some(v);},
+                        ":underline"=>result.underline=underline(v,self.base.foreground)?,
                         ":inverse-video"=>if !v.is_nil()&&v!=sym::UNSPECIFIED{return Err("inverse-video anonymous face publication unsupported");},
-                        ":family"|":foundry"|":width"|":height"|":weight"|":slant"|":underline"|":overline"|":strike-through"|":box"|":stipple"|":font"|":fontset"|":distant-foreground"|":extend"=>{},
+                        ":family"|":foundry"|":width"|":height"|":weight"|":slant"|":overline"|":strike-through"|":box"|":stipple"|":font"|":fontset"|":distant-foreground"|":extend"=>{},
                         _=>return Err("unsupported face attribute key"),
                     }
                 }
@@ -258,7 +279,7 @@ impl Resolve<'_,'_,'_> {
     }
 }
 pub(crate) fn text_face_runs(doc:&crate::editor_document::RuntimeDocument,visible:std::ops::Range<usize>,env:&Rt<Env>,cx:&Context)->std::result::Result<Vec<rune_editor::display::FaceSpan>,&'static str>{
-    let base=default_face(env,cx)?;
+    let (base,base_underline)=default_face_data(env,cx)?;
     let mut resolver=Resolve{env,cx,base,work:0,name_bytes:0};
     if visible.end.saturating_sub(visible.start)>100_000{return Err("visible style range limit exceeded");}
     let mut out:Vec<rune_editor::display::FaceSpan>=Vec::new();
@@ -270,7 +291,7 @@ pub(crate) fn text_face_runs(doc:&crate::editor_document::RuntimeDocument,visibl
         resolver.charge()?;
         let plist=doc.resolve(id.0,cx).map_err(|_|"retained property owner resolution failed")?;
         let spec=resolver.face_property(plist)?;
-        let face=resolver.spec(spec,0)?.face(base);
+        let face=resolver.spec(spec,0)?.face(base,base_underline);
         let range=range.start.0..range.end.0;
         if let Some(last)=out.last_mut().filter(|last|last.face==face&&last.range.end==range.start){last.range.end=range.end;}
         else{out.push(rune_editor::display::FaceSpan{range,face});}
@@ -422,6 +443,79 @@ mod joined_run_tests {
             assert_eq!(worker.try_step().unwrap().edit.unwrap(),true);let styled=frame(&mut updates);
             let window=&styled.windows[0];assert!(window.rows[0].source.start>1000);assert!(window.scanned_chars<len/4);assert_eq!(window.rows[0].clusters[0].face.foreground,Color(0x12,0x34,0x56,255));
             let revision=worker.bridge().publication_revision().unwrap();assert!(revision.2[0].range.start>1000);assert!(revision.2[0].range.end-revision.2[0].range.start<len/4);
+            Ok(())
+        }).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod underline_tests {
+    use super::*;
+    use crate::editor_document::with_lisp_runtime_owner;
+    use rune_editor::{EditorHost,Document};
+    fn line(host:&crate::editor_document::LispRuntimeHost<'_,'_,'_>)->rune_editor::Result<Face>{
+        let s=host.snapshot()?;let v=s.views.iter().find(|v|v.id==s.selected_window).unwrap();let b=s.buffers.iter().find(|b|b.id==v.view.buffer).unwrap();
+        Ok(host.display_face_runs(v.id,b.id,b.document.len_chars(),0..b.document.len_chars())?.unwrap()[0].face)
+    }
+    #[test]
+    fn underline_inheritance_distinguishes_off_and_resolves_final_foreground(){
+        with_lisp_runtime_owner(80,24,|mut host|{
+            host.evaluate_source("(insert \"aλ🙂\") (internal-make-lisp-face 'default (selected-frame)) (internal-set-lisp-face-attribute 'default :foreground \"green\") (internal-set-lisp-face-attribute 'default :underline t) (internal-make-lisp-face 'rune-link-parent (selected-frame)) (internal-set-lisp-face-attribute 'rune-link-parent :foreground \"red\") (internal-set-lisp-face-attribute 'rune-link-parent :underline t) (internal-make-lisp-face 'rune-link (selected-frame)) (internal-set-lisp-face-attribute 'rune-link :inherit 'rune-link-parent) (internal-set-lisp-face-attribute 'rune-link :foreground \"blue\") (put-text-property 1 4 'face 'rune-link)").map_err(anyhow::Error::msg)?;
+            assert_eq!(line(&host)?.underline,Some(Color(0,0,255,255)));
+            host.evaluate_source("(internal-set-lisp-face-attribute 'rune-link :underline nil)").map_err(anyhow::Error::msg)?;assert_eq!(line(&host)?.underline,None);
+            host.evaluate_source("(put-text-property 1 4 'face '(:foreground \"blue\" :underline \"red\"))").map_err(anyhow::Error::msg)?;assert_eq!(line(&host)?.underline,Some(Color(255,0,0,255)));
+            host.evaluate_source("(put-text-property 1 4 'face '(:foreground \"blue\" :underline nil))").map_err(anyhow::Error::msg)?;assert_eq!(line(&host)?.underline,None);
+            host.evaluate_source("(put-text-property 1 4 'face '(:foreground \"blue\" :underline unspecified))").map_err(anyhow::Error::msg)?;assert_eq!(line(&host)?.underline,Some(Color(0,0,255,255)),"default t resolves after named foreground override");
+            host.evaluate_source("(put-text-property 1 4 'face '(:underline (:style wave)))").map_err(anyhow::Error::msg)?;assert!(line(&host).is_err());
+            Ok(())
+        }).unwrap();
+    }
+    #[test]
+    fn mutable_underline_color_is_recomputed_and_old_dto_survives_gc(){
+        with_lisp_runtime_owner(80,24,|mut host|{
+            host.evaluate_source("(insert \"a\") (setq rune-line-color (copy-sequence \"#123456\")) (setq rune-line-spec (list :underline rune-line-color)) (put-text-property 1 2 'face rune-line-spec)").map_err(anyhow::Error::msg)?;
+            let before=line(&host)?;let sequence=host.snapshot()?.sequence;
+            host.evaluate_source("(clear-string rune-line-color) (garbage-collect)").map_err(anyhow::Error::msg)?;
+            assert_eq!(before.underline,Some(Color(0x12,0x34,0x56,255)));assert_eq!(host.snapshot()?.sequence,sequence);assert!(line(&host).is_err());
+            host.evaluate_source("(setcar (cdr rune-line-spec) t)").map_err(anyhow::Error::msg)?;assert_eq!(line(&host)?.underline,Some(line(&host)?.foreground));
+            Ok(())
+        }).unwrap();
+    }
+}
+#[cfg(all(test,feature="native"))]
+mod joined_underline_tests {
+    use crate::editor_document::with_lisp_runtime_owner;
+    use rune_editor::EditorHost;
+    use rune_gpui::{editor_bridge::EditorBridge,editor_transport::{OwnerEvent,pending_editor_transport}};
+    use rune_display::{Color,FixedMetrics,Rect,host_updates};
+    use std::{future::Future,task::{Context,Poll,Waker}};
+    fn frame(updates:&mut rune_display::HostUpdates)->std::sync::Arc<rune_display::FrameDisplay>{
+        let mut future=std::pin::pin!(updates.next());let mut cx=Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx){Poll::Ready(Some(u))=>u.frame.unwrap(),_=>panic!("missing underline frame")}
+    }
+    #[test]
+    fn org_link_underline_toggles_publish_without_text_geometry_or_ime_changes(){
+        with_lisp_runtime_owner(80,24,|mut host|{
+            host.evaluate_source("(insert \"[link]🙂\") (internal-make-lisp-face 'rune-org-link (selected-frame)) (internal-set-lisp-face-attribute 'rune-org-link :foreground \"blue\") (internal-set-lisp-face-attribute 'rune-org-link :underline t) (put-text-property 1 8 'face 'rune-org-link)").map_err(anyhow::Error::msg)?;
+            let(publisher,mut updates)=host_updates();let(sender,_replies,pending)=pending_editor_transport(4,publisher);
+            let bridge=EditorBridge::new(host,FixedMetrics::default(),Rect{x:0.,y:0.,width:640.,height:480.}).map_err(|e|anyhow::anyhow!("{e:?}"))?;
+            let(platform,reader)=rune_gpui::platform_context::platform_frames();
+            let mut worker=pending.bind_ime_initialized(bridge,platform).map_err(|e|anyhow::anyhow!("{e:?}"))?.with_evaluator(|h,s|h.evaluate_source(s));
+            let first=frame(&mut updates);assert_eq!(first.protocol_version,2);
+            assert_eq!(first.windows[0].rows[0].clusters[0].face.underline,Some(Color(0,0,255,255)));
+            let identity=reader.latest().unwrap().input.as_ref().unwrap().identity();let sequence=worker.bridge().snapshot().unwrap().sequence;
+            let mut svg=rune_display::svg::SvgTarget::default();rune_display::paint_frame(&first,FixedMetrics::default().0,&mut svg);let svg=svg.finish(first.bounds);
+            assert!(svg.contains("height=\"1\" fill=\"#0000ff\""));
+            sender.try_send(OwnerEvent::Evaluate{request_id:981,source:"(internal-set-lisp-face-attribute 'rune-org-link :underline nil)".into()}).unwrap();
+            let step=worker.try_step().unwrap();assert_eq!(step.edit.unwrap(),true);assert!(step.render_error.is_none());
+            let disabled=frame(&mut updates);assert_eq!(disabled.windows[0].rows[0].clusters[0].face.underline,None);
+            for(a,b)in first.windows[0].rows[0].clusters.iter().zip(&disabled.windows[0].rows[0].clusters){assert_eq!(a.bounds,b.bounds);assert_eq!(a.source,b.source);}
+            let before=worker.bridge().publication_revision().unwrap();
+            sender.try_send(OwnerEvent::Evaluate{request_id:982,source:"(aset (internal-lisp-face-p 'rune-org-link (selected-frame)) 7 t)".into()}).unwrap();
+            let step=worker.try_step().unwrap();assert_eq!(step.edit.unwrap(),true);assert!(step.render_error.is_none());
+            let after=worker.bridge().publication_revision().unwrap();assert_eq!(before.0,after.0);assert_eq!(before.1,after.1);assert_ne!(before.2,after.2);
+            assert_eq!(frame(&mut updates).windows[0].rows[0].clusters[0].face.underline,Some(Color(0,0,255,255)));
+            assert_eq!(worker.bridge().snapshot().unwrap().sequence,sequence);assert_eq!(reader.latest().unwrap().input.as_ref().unwrap().identity(),identity);
             Ok(())
         }).unwrap();
     }
