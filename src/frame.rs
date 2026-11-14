@@ -6,6 +6,15 @@ use crate::core::{
 use anyhow::{Result, anyhow};
 use rune_macros::defun;
 
+// GNU Emacs 30.1 frame.c::syms_of_frame, non-HAVE_X_WINDOWS branch.
+// These are per-frame identities excluded from cloning/session persistence,
+// not configurable defaults. This logical Terminal backend has no X window IDs.
+defvar!(FRAME_INTERNAL_PARAMETERS, crate::frame::initial_internal_parameters(cx));
+pub(crate) fn initial_internal_parameters<'a>(cx: &'a Context) -> Object<'a> {
+    let names = ["name", "parent-id", "window-id"].map(|name| Object::from(crate::lread::intern(name, cx)));
+    crate::fns::slice_into_list(&names, None, cx)
+}
+
 pub(crate) fn live_frame<'a>(
     frame: Option<Object<'a>>,
     cx: &'a Context,
@@ -148,5 +157,26 @@ mod tests {
         crate::assert_elprop!(
             "(let ((f (selected-frame))) (list (framep f) (frame-live-p f) (eq f (selected-frame)) (eq f (car (frame-list))) (display-graphic-p f)))"
         );
+    }
+}
+
+#[cfg(test)]
+mod internal_parameter_tests {
+    #[test]
+    fn real_non_x_identity_list_is_mutable_rooted_and_filters_frameset() {
+        crate::editor_document::with_lisp_runtime_owner(80,24,|mut host| {
+            host.evaluate_source(r#"
+(setq frame-test-original frame-internal-parameters)
+(if (equal frame-internal-parameters '(name parent-id window-id)) nil (signal 'error '("wrong identity list")))
+(if (equal (mapcar (function (lambda (p) (cons p :never))) frame-internal-parameters) '((name . :never) (parent-id . :never) (window-id . :never))) nil (signal 'error '("wrong session filter")))
+(let ((frame-internal-parameters '(temporary))) (if (equal frame-internal-parameters '(temporary)) nil (signal 'error '("dynamic binding failed"))))
+(if (eq frame-test-original frame-internal-parameters) nil (signal 'error '("dynamic restore lost identity")))
+(setcar frame-internal-parameters 'changed)
+(garbage-collect)
+(if (eq (car frame-test-original) 'changed) nil (signal 'error '("mutable identity lost across GC")))
+(setcar frame-internal-parameters 'name)
+"#).map_err(anyhow::Error::msg)?;
+            Ok(())
+        }).unwrap();
     }
 }
