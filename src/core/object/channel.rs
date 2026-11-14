@@ -15,7 +15,7 @@ use crate::{
 };
 use std::{
     fmt,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -40,6 +40,51 @@ impl From<RecvError> for Symbol<'static> {
     }
 }
 
+/// Native family leases are shared by wrapper copies. Counts change once per
+/// independently created family, and last active copy closes that family.
+#[derive(Clone, Copy)]
+enum EndpointKind {
+    Sender,
+    Receiver,
+}
+struct EndpointLease {
+    channel_id: ChannelId,
+    manager: Arc<channel_manager::ChannelManager>,
+    kind: EndpointKind,
+}
+impl EndpointLease {
+    fn new(
+        channel_id: ChannelId,
+        manager: Arc<channel_manager::ChannelManager>,
+        kind: EndpointKind,
+    ) -> Arc<Self> {
+        match kind {
+            EndpointKind::Sender => manager.increment_sender(channel_id),
+            EndpointKind::Receiver => manager.increment_receiver(channel_id),
+        }
+        Arc::new(Self { channel_id, manager, kind })
+    }
+}
+impl Drop for EndpointLease {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        self.manager.observe_endpoint_finalizer();
+        match self.kind {
+            EndpointKind::Sender => self.manager.close_sender(self.channel_id),
+            EndpointKind::Receiver => self.manager.close_receiver(self.channel_id),
+        }
+        self.manager.cleanup_channel(self.channel_id);
+    }
+}
+fn copy_lease(state: &Mutex<Option<Arc<EndpointLease>>>) -> Option<Arc<EndpointLease>> {
+    state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+fn close_lease(state: &Mutex<Option<Arc<EndpointLease>>>) {
+    // No manager callback may run while this wrapper mutex is held.
+    let lease = { state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() };
+    drop(lease);
+}
+
 /// The sending half of a channel.
 pub(crate) struct ChannelSender(pub(in crate::core) GcHeap<ChannelSenderInner>);
 
@@ -48,6 +93,7 @@ derive_GcMoveable!(ChannelSender);
 pub(in crate::core) struct ChannelSenderInner {
     pub(in crate::core) channel_id: ChannelId,
     pub(in crate::core) manager: Arc<channel_manager::ChannelManager>,
+    active: Mutex<Option<Arc<EndpointLease>>>,
 }
 
 impl ChannelSender {
@@ -56,13 +102,17 @@ impl ChannelSender {
         manager: Arc<channel_manager::ChannelManager>,
         constant: bool,
     ) -> Self {
-        manager.increment_sender(channel_id);
-        Self(GcHeap::new(ChannelSenderInner { channel_id, manager }, constant))
+        let lease = EndpointLease::new(channel_id, manager.clone(), EndpointKind::Sender);
+        Self(GcHeap::new(
+            ChannelSenderInner { channel_id, manager, active: Mutex::new(Some(lease)) },
+            constant,
+        ))
     }
 
     /// Send an object through the channel, blocking if full.
     /// Returns Err(SendError::Closed) if the receiver has been dropped.
     pub(crate) fn send<'ob>(&self, obj: Object<'ob>) -> Result<(), SendError> {
+        let _operation = copy_lease(&self.0.active).ok_or(SendError::Closed)?;
         self.0.manager.send(self.0.channel_id, obj)
     }
 
@@ -70,6 +120,7 @@ impl ChannelSender {
     /// Returns Err(SendError::Full) if the channel is full.
     /// Returns Err(SendError::Closed) if the receiver has been dropped.
     pub(crate) fn try_send<'ob>(&self, obj: Object<'ob>) -> Result<(), SendError> {
+        let _operation = copy_lease(&self.0.active).ok_or(SendError::Closed)?;
         self.0.manager.try_send(self.0.channel_id, obj)
     }
 
@@ -100,9 +151,10 @@ impl ChannelSender {
 
     /// Explicitly close the sender side of the channel.
     /// This wakes up any receivers waiting on recv() and causes them to return Err(RecvError::Closed).
-    /// This is idempotent - calling close() multiple times has no additional effect.
+    /// This is idempotent. Already-admitted blocking operations retain a lease
+    /// and may keep waiting; close does not cancel them. Future operations fail.
     pub(crate) fn close(&self) {
-        self.0.manager.close_sender(self.0.channel_id);
+        close_lease(&self.0.active);
     }
 }
 
@@ -114,6 +166,7 @@ derive_GcMoveable!(ChannelReceiver);
 pub(in crate::core) struct ChannelReceiverInner {
     pub(in crate::core) channel_id: ChannelId,
     pub(in crate::core) manager: Arc<channel_manager::ChannelManager>,
+    active: Mutex<Option<Arc<EndpointLease>>>,
 }
 
 impl ChannelReceiver {
@@ -122,13 +175,17 @@ impl ChannelReceiver {
         manager: Arc<channel_manager::ChannelManager>,
         constant: bool,
     ) -> Self {
-        manager.increment_receiver(channel_id);
-        Self(GcHeap::new(ChannelReceiverInner { channel_id, manager }, constant))
+        let lease = EndpointLease::new(channel_id, manager.clone(), EndpointKind::Receiver);
+        Self(GcHeap::new(
+            ChannelReceiverInner { channel_id, manager, active: Mutex::new(Some(lease)) },
+            constant,
+        ))
     }
 
     /// Receive an object from the channel, blocking if empty.
     /// Returns Err(RecvError::Closed) if all senders have been dropped.
     pub(crate) fn recv<'ob>(&self, cx: &'ob Context) -> Result<Object<'ob>, RecvError> {
+        let _operation = copy_lease(&self.0.active).ok_or(RecvError::Closed)?;
         self.0.manager.recv(self.0.channel_id, &cx.block)
     }
 
@@ -136,6 +193,7 @@ impl ChannelReceiver {
     /// Returns Err(RecvError::Empty) if the channel is empty.
     /// Returns Err(RecvError::Closed) if all senders have been dropped.
     pub(crate) fn try_recv<'ob>(&self, cx: &'ob Context) -> Result<Object<'ob>, RecvError> {
+        let _operation = copy_lease(&self.0.active).ok_or(RecvError::Closed)?;
         self.0.manager.try_recv(self.0.channel_id, &cx.block)
     }
 
@@ -166,13 +224,27 @@ impl ChannelReceiver {
 
     /// Explicitly close the receiver side of the channel.
     /// This wakes up any senders waiting on send() and causes them to return Err(SendError::Closed).
-    /// This is idempotent - calling close() multiple times has no additional effect.
+    /// This is idempotent. Already-admitted blocking operations retain a lease
+    /// and may keep waiting; close does not cancel them. Future operations fail.
     ///
     /// Useful for "moving" a receiver to another thread:
     /// the original receiver can be closed after being cloned into a new context.
     pub(crate) fn close(&self) {
-        self.0.manager.close_receiver(self.0.channel_id);
+        close_lease(&self.0.active);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn make_channel_pair_for_test(
+    manager: Arc<channel_manager::ChannelManager>,
+    capacity: usize,
+) -> (ChannelId, ChannelSender, ChannelReceiver) {
+    let (sender, receiver) = manager.new_channel_pair(capacity);
+    (
+        sender,
+        ChannelSender::new(sender, manager.clone(), false),
+        ChannelReceiver::new(receiver, manager, false),
+    )
 }
 
 /// Create a new channel pair with the specified capacity.
@@ -185,20 +257,7 @@ pub(crate) fn make_channel_pair(capacity: usize) -> (ChannelSender, ChannelRecei
     (sender, receiver)
 }
 
-// Drop implementations to decrement counters
-impl Drop for ChannelSenderInner {
-    fn drop(&mut self) {
-        self.manager.close_sender(self.channel_id);
-        self.manager.cleanup_channel(self.channel_id);
-    }
-}
-
-impl Drop for ChannelReceiverInner {
-    fn drop(&mut self) {
-        self.manager.close_receiver(self.channel_id);
-        self.manager.cleanup_channel(self.channel_id);
-    }
-}
+// GC must defer owning-wrapper destruction until collector locks are released.
 
 // GC tracing (channels themselves don't hold GC objects, state is in the manager)
 impl Trace for ChannelSenderInner {
@@ -217,13 +276,56 @@ impl Trace for ChannelReceiverInner {
 impl<'new> CloneIn<'new, &'new Self> for ChannelSender {
     fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
         // The endpoint must live in the target arena, not in this stack frame.
-        ChannelSender::new(self.0.channel_id, self.0.manager.clone(), C).into_obj(bk)
+        self.copy_owned(C).into_obj(bk)
     }
 }
 
 impl<'new> CloneIn<'new, &'new Self> for ChannelReceiver {
     fn clone_in<const C: bool>(&self, bk: &'new Block<C>) -> Gc<&'new Self> {
-        ChannelReceiver::new(self.0.channel_id, self.0.manager.clone(), C).into_obj(bk)
+        self.copy_owned(C).into_obj(bk)
+    }
+}
+
+impl ChannelSender {
+    fn copy_owned(&self, constant: bool) -> Self {
+        Self(GcHeap::new(
+            ChannelSenderInner {
+                channel_id: self.0.channel_id,
+                manager: self.0.manager.clone(),
+                active: Mutex::new(copy_lease(&self.0.active)),
+            },
+            constant,
+        ))
+    }
+    pub(in crate::core) fn forwarding_ptr(&self) -> Option<std::ptr::NonNull<u8>> {
+        match self.0.allocation_state() {
+            crate::core::gc::AllocState::Forwarded(pointer) => Some(pointer),
+            crate::core::gc::AllocState::Unmoved => None,
+            crate::core::gc::AllocState::Global => {
+                panic!("global sender in local finalization list")
+            }
+        }
+    }
+}
+impl ChannelReceiver {
+    fn copy_owned(&self, constant: bool) -> Self {
+        Self(GcHeap::new(
+            ChannelReceiverInner {
+                channel_id: self.0.channel_id,
+                manager: self.0.manager.clone(),
+                active: Mutex::new(copy_lease(&self.0.active)),
+            },
+            constant,
+        ))
+    }
+    pub(in crate::core) fn forwarding_ptr(&self) -> Option<std::ptr::NonNull<u8>> {
+        match self.0.allocation_state() {
+            crate::core::gc::AllocState::Forwarded(pointer) => Some(pointer),
+            crate::core::gc::AllocState::Unmoved => None,
+            crate::core::gc::AllocState::Global => {
+                panic!("global receiver in local finalization list")
+            }
+        }
     }
 }
 
@@ -607,8 +709,7 @@ mod endpoint_ownership_tests {
             copied_sender.bind(cx).send(cx.add(value)).unwrap();
             assert_eq!(copied_receiver.bind(cx).recv(cx).unwrap(), value);
         }
-        // Native endpoint finalization is separate work; close explicitly so
-        // this ownership regression does not claim to cover GC channel closing.
+        // This regression covers arena ownership; lifecycle tests cover GC close.
         copied_sender.bind(cx).close();
         copied_receiver.bind(cx).close();
         sender.close();
@@ -655,13 +756,8 @@ mod endpoint_ownership_tests {
             .unwrap();
         sender.bind(cx).close();
         receiver.bind(cx).close();
-        // Until deferred native finalizers exist, explicitly close the manager's
-        // now-unrooted transit copies too. This is test cleanup, not GC behavior.
-        let endpoint = sender.bind(cx).untag();
-        endpoint.0.manager.close_sender(endpoint.0.channel_id);
-        let endpoint = receiver.bind(cx).untag();
-        endpoint.0.manager.close_receiver(endpoint.0.channel_id);
-        endpoint.0.manager.cleanup_channel(endpoint.0.channel_id);
+        // Transit wrappers finalize outside the manager's collector locks.
+        sender.bind(cx).untag().0.manager.collect_for_test();
         carrier_sender.close();
         carrier_receiver.close();
     }
@@ -678,5 +774,213 @@ mod endpoint_ownership_tests {
         assert!(matches!(receiver.untag().0.allocation_state(), AllocState::Global));
         sender.close();
         receiver.close();
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::core::{gc::RootSet, object::ObjectType};
+    use rune_core::macros::root;
+
+    #[test]
+    fn close_drop_and_closed_clone_cannot_close_a_surviving_alias() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let alias = sender.clone_in(&cx.block);
+        root!(alias, cx);
+        assert_eq!(manager.counts_for_test(id), Some((1, 1)));
+        sender.close();
+        sender.close();
+        drop(sender);
+        assert_eq!(manager.counts_for_test(id), Some((1, 1)));
+        alias.bind(cx).send(cx.add(7)).unwrap();
+        assert_eq!(receiver.recv(cx).unwrap(), 7);
+        alias.bind(cx).close();
+        alias.bind(cx).close();
+        assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+        let closed = alias.bind(cx).clone_in(&cx.block);
+        assert_eq!(closed.try_send(cx.add(8)), Err(SendError::Closed));
+        assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+        receiver.close();
+        receiver.close();
+        drop(receiver);
+        assert_eq!(manager.counts_for_test(id), None);
+        cx.garbage_collect(true);
+    }
+    #[test]
+    fn receiver_close_is_idempotent_and_last_alias_releases_family() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let alias = receiver.clone_in(&cx.block);
+        root!(alias, cx);
+        receiver.close();
+        receiver.close();
+        drop(receiver);
+        sender.send(cx.add(9)).unwrap();
+        assert_eq!(alias.bind(cx).recv(cx).unwrap(), 9);
+        alias.bind(cx).close();
+        let closed = alias.bind(cx).clone_in(&cx.block);
+        assert_eq!(closed.try_recv(cx), Err(RecvError::Closed));
+        assert_eq!(manager.counts_for_test(id), Some((1, 0)));
+        sender.close();
+        drop(sender);
+        assert_eq!(manager.counts_for_test(id), None);
+        cx.garbage_collect(true);
+    }
+    #[test]
+    fn self_channel_endpoint_roundtrip_does_not_reenter_data_lock() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let sender = sender.into_obj(&cx.block);
+        root!(sender, cx);
+        sender.bind(cx).send(cx.add(sender.bind(cx))).unwrap();
+        let copy = receiver.recv(cx).unwrap();
+        root!(copy, cx);
+        let ObjectType::ChannelSender(copied) = copy.bind(cx).untag() else {
+            panic!("sender expected")
+        };
+        copied.send(cx.add(11)).unwrap();
+        assert_eq!(receiver.recv(cx).unwrap(), 11);
+        manager.collect_for_test();
+        copied.close();
+        sender.bind(cx).close();
+        receiver.close();
+        cx.garbage_collect(true);
+        manager.collect_for_test();
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+    #[test]
+    fn self_channel_receiver_roundtrip_preserves_a_live_alias() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let receiver = receiver.into_obj(&cx.block);
+        root!(receiver, cx);
+        sender.send(cx.add(receiver.bind(cx))).unwrap();
+        let copy = receiver.bind(cx).recv(cx).unwrap();
+        root!(copy, cx);
+        receiver.bind(cx).close();
+        sender.send(cx.add(13)).unwrap();
+        let copied: Gc<&ChannelReceiver> = copy.bind(cx).try_into().unwrap();
+        assert_eq!(copied.recv(cx).unwrap(), 13);
+        copied.close();
+        sender.close();
+        cx.garbage_collect(true);
+        manager.collect_for_test();
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+    #[test]
+    fn opposite_carrier_transfers_do_not_form_a_data_lock_cycle() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (a, a_sender, a_receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let (b, b_sender, b_receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let left_carrier = a_sender.copy_owned(false);
+        let left_payload = b_sender.copy_owned(false);
+        let right_carrier = b_sender.copy_owned(false);
+        let right_payload = a_sender.copy_owned(false);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (done, completions) = std::sync::mpsc::channel();
+        let start = barrier.clone();
+        let finished = done.clone();
+        let left = std::thread::spawn(move || {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            let payload = left_payload.into_obj(&cx.block);
+            root!(payload, cx);
+            start.wait();
+            left_carrier.send(cx.add(payload.bind(cx))).unwrap();
+            finished.send(()).unwrap();
+        });
+        let start = barrier.clone();
+        let right = std::thread::spawn(move || {
+            let roots = RootSet::default();
+            let cx = &mut Context::new(&roots);
+            let payload = right_payload.into_obj(&cx.block);
+            root!(payload, cx);
+            start.wait();
+            right_carrier.send(cx.add(payload.bind(cx))).unwrap();
+            done.send(()).unwrap();
+        });
+        barrier.wait();
+        for _ in 0..2 {
+            if completions.recv_timeout(Duration::from_secs(3)).is_err() {
+                std::mem::forget(a_receiver);
+                std::mem::forget(b_receiver);
+                panic!("opposite endpoint transfers deadlocked");
+            }
+        }
+        left.join().unwrap();
+        right.join().unwrap();
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let payload = a_receiver.recv(&cx).unwrap();
+        let endpoint: Gc<&ChannelSender> = payload.try_into().unwrap();
+        endpoint.close();
+        let payload = b_receiver.recv(&cx).unwrap();
+        let endpoint: Gc<&ChannelSender> = payload.try_into().unwrap();
+        endpoint.close();
+        a_sender.close();
+        b_sender.close();
+        a_receiver.close();
+        b_receiver.close();
+        manager.collect_for_test();
+        assert_eq!(manager.counts_for_test(a), None);
+        assert_eq!(manager.counts_for_test(b), None);
+    }
+    #[test]
+    fn cloning_racing_close_cannot_resurrect_a_native_family() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let state = &sender.0.active;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..500 {
+                    drop(copy_lease(state));
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..500 {
+                    close_lease(state);
+                }
+            });
+        });
+        assert!(copy_lease(state).is_none());
+        assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        assert_eq!(sender.try_send(cx.add(1)), Err(SendError::Closed));
+        drop(sender);
+        receiver.close();
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+    #[test]
+    fn owner_gc_finalizes_last_unclosed_heap_endpoint_once() {
+        let manager = channel_manager::ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        {
+            let sender = sender.into_obj(&cx.block);
+            root!(sender, cx);
+            for _ in 0..5 {
+                cx.garbage_collect(true);
+                assert_eq!(manager.counts_for_test(id), Some((1, 1)));
+            }
+        }
+        cx.garbage_collect(true);
+        assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+        assert_eq!(receiver.try_recv(cx), Err(RecvError::Closed));
+        cx.garbage_collect(true);
+        assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+        receiver.close();
+        assert_eq!(manager.counts_for_test(id), None);
     }
 }

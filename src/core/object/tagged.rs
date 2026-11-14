@@ -553,6 +553,9 @@ impl IntoObject for ChannelSender {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         let ChannelSender(heap) = self;
         let ptr = block.objects.alloc(ChannelSender(heap.for_block::<C>()));
+        if !C {
+            block.lisp_senders.borrow_mut().push(ptr);
+        }
         unsafe { <&ChannelSender>::tag_ptr(ptr) }
     }
 }
@@ -563,6 +566,9 @@ impl IntoObject for ChannelReceiver {
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
         let ChannelReceiver(heap) = self;
         let ptr = block.objects.alloc(ChannelReceiver(heap.for_block::<C>()));
+        if !C {
+            block.lisp_receivers.borrow_mut().push(ptr);
+        }
         unsafe { <&ChannelReceiver>::tag_ptr(ptr) }
     }
 }

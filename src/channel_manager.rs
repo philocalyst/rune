@@ -7,10 +7,15 @@
 //! collection of in-transit objects.
 
 use crate::core::{
-    gc::{__HeapRoot, Block, Context, Slot, ThreadSafeRootSet, collect_garbage_raw},
+    gc::{
+        __HeapRoot, Block, Context, DeferredEndpointFinalizers, Slot, ThreadSafeRootSet,
+        collect_garbage_raw,
+    },
     object::{CloneIn, Object},
 };
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -50,9 +55,9 @@ struct ChannelData {
     queue: VecDeque<__HeapRoot<Slot<Object<'static>>>>,
     /// Maximum capacity of the channel
     capacity: usize,
-    /// Number of active senders
+    /// Active native sender lease families, not wrapper copies
     sender_count: usize,
-    /// Number of active receivers
+    /// Active native receiver lease families
     receiver_count: usize,
     /// Whether senders have been explicitly closed
     sender_closed: bool,
@@ -117,6 +122,10 @@ pub(crate) struct ChannelManager {
     recv_count: AtomicUsize,
     /// Trigger GC after this many receives
     gc_threshold: usize,
+    #[cfg(test)]
+    probe_finalizer_locks: AtomicBool,
+    #[cfg(test)]
+    finalizer_lock_violation: AtomicBool,
 }
 
 impl ChannelManager {
@@ -134,6 +143,10 @@ impl ChannelManager {
             next_channel_id: AtomicU64::new(1),
             recv_count: AtomicUsize::new(0),
             gc_threshold: 10,
+            #[cfg(test)]
+            probe_finalizer_locks: AtomicBool::new(false),
+            #[cfg(test)]
+            finalizer_lock_violation: AtomicBool::new(false),
         }
     }
 
@@ -145,7 +158,7 @@ impl ChannelManager {
         id
     }
 
-    /// Increment sender count for a channel
+    /// Register one newly created native sender family (not a wrapper clone)
     pub(crate) fn increment_sender(&self, channel_id: ChannelId) {
         let channels = self.channels.read().unwrap();
         if let Some(state) = channels.get(&channel_id) {
@@ -154,7 +167,7 @@ impl ChannelManager {
         }
     }
 
-    /// Increment receiver count for a channel
+    /// Register one newly created native receiver family
     pub(crate) fn increment_receiver(&self, channel_id: ChannelId) {
         let channels = self.channels.read().unwrap();
         if let Some(state) = channels.get(&channel_id) {
@@ -163,182 +176,152 @@ impl ChannelManager {
         }
     }
 
-    /// Try to send an object to a channel (non-blocking)
-    pub(crate) fn try_send<'ob>(
-        &self,
-        channel_id: ChannelId,
-        obj: Object<'ob>,
-    ) -> Result<(), SendError> {
-        let channels = self.channels.read().unwrap();
-        let state = channels.get(&channel_id).ok_or(SendError::Closed)?;
-        let state = Arc::clone(state);
-        drop(channels);
-
-        let mut data = state.data.lock().unwrap();
-
-        if data.receiver_count == 0 || data.receiver_closed {
-            return Err(SendError::Closed);
-        }
-
-        if data.is_full() {
-            return Err(SendError::Full);
-        }
-
-        // Clone the object into the manager's block
-        let _gc_guard = self.gc_access.read().unwrap();
-        let gc_state = self.gc_state.lock().unwrap();
-        let cloned = unsafe {
-            let _clone_session = gc_state.block.clone_session();
-            let obj_static = obj.clone_in(&gc_state.block);
-            std::mem::transmute::<Object<'_>, Object<'static>>(obj_static)
-        };
-        // Wrap in HeapRoot to protect from GC
-        let rooted = __HeapRoot::new(Slot::new(cloned), gc_state.roots_static);
-        drop(gc_state);
-        drop(_gc_guard);
-
-        data.queue.push_back(rooted);
-
-        state.not_empty.notify_one();
-
-        Ok(())
+    fn channel(&self, id: ChannelId) -> Option<Arc<ChannelState>> {
+        self.channels.read().unwrap().get(&id).cloned()
     }
-
-    /// Send an object to a channel (blocking)
-    pub(crate) fn send<'ob>(
-        &self,
-        channel_id: ChannelId,
-        obj: Object<'ob>,
-    ) -> Result<(), SendError> {
-        let channels = self.channels.read().unwrap();
-        let state = channels.get(&channel_id).ok_or(SendError::Closed)?;
-        let state = Arc::clone(state);
-        drop(channels);
-
-        let mut data = state.data.lock().unwrap();
-
-        while data.is_full() {
-            if data.receiver_count == 0 || data.receiver_closed {
+    fn send_closed(data: &ChannelData) -> bool {
+        data.sender_count == 0
+            || data.sender_closed
+            || data.receiver_count == 0
+            || data.receiver_closed
+    }
+    /// Copy without ChannelData locks; a payload may reference its own carrier.
+    fn copy_for_queue(&self, object: Object) -> __HeapRoot<Slot<Object<'static>>> {
+        let _access = self.gc_access.read().unwrap();
+        let state = self.gc_state.lock().unwrap();
+        let _session = state.block.clone_session();
+        let copied = object.clone_in(&state.block);
+        // SAFETY: register the manager-owned graph before releasing gc_access.
+        let copied = unsafe { std::mem::transmute::<Object<'_>, Object<'static>>(copied) };
+        __HeapRoot::new(Slot::new(copied), state.roots_static)
+    }
+    fn reject_prepared(&self, prepared: __HeapRoot<Slot<Object<'static>>>) {
+        drop(prepared);
+        // Rejected copied endpoints must not keep channels alive until unrelated
+        // traffic. Caller has released data locks before this forced collection.
+        self.collect_garbage_with_force(true);
+    }
+    pub(crate) fn try_send(&self, id: ChannelId, object: Object) -> Result<(), SendError> {
+        let state = self.channel(id).ok_or(SendError::Closed)?;
+        {
+            let data = state.data.lock().unwrap();
+            if Self::send_closed(&data) {
                 return Err(SendError::Closed);
             }
-            data = state.not_full.wait(data).unwrap();
+            if data.is_full() {
+                return Err(SendError::Full);
+            }
         }
-
-        if data.receiver_count == 0 || data.receiver_closed {
-            return Err(SendError::Closed);
-        }
-
-        // Clone the object into the manager's block
-        let _gc_guard = self.gc_access.read().unwrap();
-        let gc_state = self.gc_state.lock().unwrap();
-        let cloned = unsafe {
-            let _clone_session = gc_state.block.clone_session();
-            let obj_static = obj.clone_in(&gc_state.block);
-            std::mem::transmute::<Object<'_>, Object<'static>>(obj_static)
+        let prepared = self.copy_for_queue(object);
+        let mut data = state.data.lock().unwrap();
+        let rejected = if Self::send_closed(&data) {
+            Some(SendError::Closed)
+        } else if data.is_full() {
+            Some(SendError::Full)
+        } else {
+            None
         };
-        // Wrap in HeapRoot to protect from GC
-        let rooted = __HeapRoot::new(Slot::new(cloned), gc_state.roots_static);
-        drop(gc_state);
-        drop(_gc_guard);
-
-        data.queue.push_back(rooted);
-
+        if let Some(error) = rejected {
+            drop(data);
+            self.reject_prepared(prepared);
+            return Err(error);
+        }
+        data.queue.push_back(prepared);
+        drop(data);
         state.not_empty.notify_one();
-
         Ok(())
     }
-
-    /// Try to receive an object from a channel (non-blocking)
+    pub(crate) fn send(&self, id: ChannelId, object: Object) -> Result<(), SendError> {
+        let state = self.channel(id).ok_or(SendError::Closed)?;
+        {
+            let mut data = state.data.lock().unwrap();
+            while data.is_full() && !Self::send_closed(&data) {
+                data = state.not_full.wait(data).unwrap();
+            }
+            if Self::send_closed(&data) {
+                return Err(SendError::Closed);
+            }
+        }
+        let prepared = self.copy_for_queue(object);
+        let mut data = state.data.lock().unwrap();
+        // Optimistic preparation: revalidate capacity and retain a HeapRoot,
+        // not a gc_access guard, while blocked. Collection must keep progressing.
+        while data.is_full() && !Self::send_closed(&data) {
+            data = state.not_full.wait(data).unwrap();
+        }
+        if Self::send_closed(&data) {
+            drop(data);
+            self.reject_prepared(prepared);
+            return Err(SendError::Closed);
+        }
+        data.queue.push_back(prepared);
+        drop(data);
+        state.not_empty.notify_one();
+        Ok(())
+    }
+    fn receive_prepared<'ob>(
+        &self,
+        rooted: __HeapRoot<Slot<Object<'static>>>,
+        target: &'ob Block<false>,
+    ) -> Object<'ob> {
+        let result = {
+            let _access = self.gc_access.read().unwrap();
+            // SAFETY: root stays alive and access excludes transit collection
+            // throughout the target graph copy. No data lock is held.
+            let object = unsafe { rooted.get_inner() };
+            let _session = target.clone_session();
+            object.clone_in(target)
+        };
+        drop(rooted);
+        if self.recv_count.fetch_add(1, Ordering::SeqCst) + 1 >= self.gc_threshold {
+            self.recv_count.store(0, Ordering::SeqCst);
+            self.collect_garbage();
+        }
+        result
+    }
     pub(crate) fn try_recv<'ob>(
         &self,
-        channel_id: ChannelId,
-        target_block: &'ob Block<false>,
+        id: ChannelId,
+        target: &'ob Block<false>,
     ) -> Result<Object<'ob>, RecvError> {
-        let channels = self.channels.read().unwrap();
-        let state = channels.get(&channel_id).ok_or(RecvError::Closed)?;
-        let state = Arc::clone(state);
-        drop(channels);
-
+        let state = self.channel(id).ok_or(RecvError::Closed)?;
         let mut data = state.data.lock().unwrap();
-
-        if let Some(rooted) = data.queue.pop_front() {
-            let _gc_guard = self.gc_access.read().unwrap();
-            // SAFETY: gc_access read-lock excludes manager collection and
-            // rooted remains alive until the complete target deep-copy ends.
-            let obj: Object<'static> = unsafe { rooted.get_inner() };
-            let result = {
-                let _clone_session = target_block.clone_session();
-                obj.clone_in(target_block)
-            };
-            drop(_gc_guard);
-
-            // HeapRoot is dropped here, unrooting the object
-            drop(rooted);
-            drop(data);
-
-            state.not_full.notify_one();
-
-            let recv_count = self.recv_count.fetch_add(1, Ordering::SeqCst) + 1;
-            if recv_count >= self.gc_threshold {
-                self.recv_count.store(0, Ordering::SeqCst);
-                self.collect_garbage();
-            }
-
-            Ok(result)
-        } else if (data.sender_count == 0 || data.sender_closed) && data.is_empty() {
-            Err(RecvError::Closed)
-        } else {
-            Err(RecvError::Empty)
+        if data.receiver_closed || data.receiver_count == 0 {
+            return Err(RecvError::Closed);
         }
+        let rooted = match data.queue.pop_front() {
+            Some(rooted) => rooted,
+            None if data.sender_count == 0 || data.sender_closed => return Err(RecvError::Closed),
+            None => return Err(RecvError::Empty),
+        };
+        drop(data);
+        state.not_full.notify_one();
+        Ok(self.receive_prepared(rooted, target))
     }
-
-    /// Receive an object from a channel (blocking)
     pub(crate) fn recv<'ob>(
         &self,
-        channel_id: ChannelId,
-        target_block: &'ob Block<false>,
+        id: ChannelId,
+        target: &'ob Block<false>,
     ) -> Result<Object<'ob>, RecvError> {
-        let channels = self.channels.read().unwrap();
-        let state = channels.get(&channel_id).ok_or(RecvError::Closed)?;
-        let state = Arc::clone(state);
-        drop(channels);
-
+        let state = self.channel(id).ok_or(RecvError::Closed)?;
         let mut data = state.data.lock().unwrap();
-
         while data.is_empty() {
-            if data.sender_count == 0 || data.sender_closed {
+            if data.receiver_closed
+                || data.receiver_count == 0
+                || data.sender_count == 0
+                || data.sender_closed
+            {
                 return Err(RecvError::Closed);
             }
             data = state.not_empty.wait(data).unwrap();
         }
-
-        if let Some(rooted) = data.queue.pop_front() {
-            let _gc_guard = self.gc_access.read().unwrap();
-            // SAFETY: gc_access read-lock excludes manager collection and
-            // rooted remains alive until the complete target deep-copy ends.
-            let obj: Object<'static> = unsafe { rooted.get_inner() };
-            let result = {
-                let _clone_session = target_block.clone_session();
-                obj.clone_in(target_block)
-            };
-            drop(_gc_guard);
-
-            // HeapRoot is dropped here, unrooting the object
-            drop(rooted);
-            drop(data);
-
-            state.not_full.notify_one();
-
-            let recv_count = self.recv_count.fetch_add(1, Ordering::SeqCst) + 1;
-            if recv_count >= self.gc_threshold {
-                self.recv_count.store(0, Ordering::SeqCst);
-                self.collect_garbage();
-            }
-
-            Ok(result)
-        } else {
-            Err(RecvError::Closed)
+        if data.receiver_closed || data.receiver_count == 0 {
+            return Err(RecvError::Closed);
         }
+        let rooted = data.queue.pop_front().expect("nonempty queue");
+        drop(data);
+        state.not_full.notify_one();
+        Ok(self.receive_prepared(rooted, target))
     }
 
     /// Close the sender side of a channel
@@ -367,27 +350,62 @@ impl ChannelManager {
             }
             if data.receiver_count == 0 {
                 data.receiver_closed = true;
-                // Clear the queue (HeapRoots will be dropped and unrooted)
-                let _gc_guard = self.gc_access.read().unwrap();
+                // Only root membership is dropped, never Lisp values. Root
+                // removal synchronizes with trace through roots mutex. No data
+                // -> gc_access read acquisition (writer-preference inversion).
                 data.queue.clear();
-                drop(_gc_guard);
                 drop(data);
                 state.not_full.notify_all();
+                state.not_empty.notify_all();
             }
         }
     }
 
-    /// Trigger garbage collection in the manager's block
     fn collect_garbage(&self) {
-        let _gc_guard = self.gc_access.write().unwrap();
-        let mut gc_state = self.gc_state.lock().unwrap();
-
-        // SAFETY: We have exclusive access via both locks:
-        // - gc_access write lock ensures no concurrent HeapRoot access
-        // - gc_state mutex ensures exclusive access to Block's RefCells
-        unsafe {
-            let GcState { ref mut block, ref mut next_limit, roots_static } = *gc_state;
-            collect_garbage_raw(block, roots_static, false, next_limit);
+        self.collect_garbage_with_force(false);
+    }
+    fn collect_garbage_with_force(&self, force: bool) {
+        // Declare BEFORE guards: callbacks must be outside collector locks on
+        // both normal return and unwind after completed raw collection.
+        let mut deferred = DeferredEndpointFinalizers::default();
+        {
+            let _access = self.gc_access.write().unwrap();
+            let mut state = self.gc_state.lock().unwrap();
+            let GcState { ref mut block, ref mut next_limit, roots_static } = *state;
+            unsafe {
+                collect_garbage_raw(block, roots_static, force, next_limit, &mut deferred);
+            }
+        }
+        drop(deferred);
+    }
+    #[cfg(test)]
+    pub(crate) fn collect_for_test(&self) {
+        self.collect_garbage_with_force(true);
+    }
+    #[cfg(test)]
+    pub(crate) fn isolated_for_test() -> Arc<Self> {
+        let manager = Arc::new(Self::new());
+        // Match the process-lifetime manager/root-set model; do not drop an
+        // unchecked native arena as though it owned the Context singleton.
+        std::mem::forget(manager.clone());
+        manager
+    }
+    #[cfg(test)]
+    pub(crate) fn counts_for_test(&self, id: ChannelId) -> Option<(usize, usize)> {
+        let state = self.channel(id)?;
+        let data = state.data.lock().unwrap();
+        Some((data.sender_count, data.receiver_count))
+    }
+    #[cfg(test)]
+    pub(crate) fn observe_endpoint_finalizer(&self) {
+        if !self.probe_finalizer_locks.load(Ordering::Relaxed) {
+            return;
+        }
+        use std::sync::TryLockError::WouldBlock;
+        let state_free = !matches!(self.gc_state.try_lock(), Err(WouldBlock));
+        let access_free = !matches!(self.gc_access.try_read(), Err(WouldBlock));
+        if !state_free || !access_free {
+            self.finalizer_lock_violation.store(true, Ordering::Relaxed);
         }
     }
 
@@ -459,5 +477,118 @@ impl ChannelManager {
     pub(crate) fn new_channel_pair(&self, capacity: usize) -> (ChannelId, ChannelId) {
         let id = self.create_channel(capacity);
         (id, id)
+    }
+}
+
+#[cfg(test)]
+mod deferred_endpoint_tests {
+    use super::*;
+    use crate::core::object::{IntoObject, make_channel_pair_for_test};
+    fn unreachable_sender(
+        manager: &Arc<ChannelManager>,
+    ) -> (ChannelId, crate::core::object::ChannelReceiver) {
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let _access = manager.gc_access.write().unwrap();
+        let state = manager.gc_state.lock().unwrap();
+        let _sender = sender.into_obj(&state.block);
+        (id, receiver)
+    }
+    #[test]
+    fn raw_gc_defers_native_close_until_batch_and_locks_are_released() {
+        let manager = ChannelManager::isolated_for_test();
+        manager.probe_finalizer_locks.store(true, Ordering::Relaxed);
+        let (id, receiver) = unreachable_sender(&manager);
+        let mut deferred = DeferredEndpointFinalizers::default();
+        {
+            let _access = manager.gc_access.write().unwrap();
+            let mut state = manager.gc_state.lock().unwrap();
+            let GcState { ref mut block, roots_static, ref mut next_limit } = *state;
+            unsafe {
+                collect_garbage_raw(block, roots_static, true, next_limit, &mut deferred);
+            }
+            assert_eq!(manager.counts_for_test(id), Some((1, 1)), "callback under collector locks");
+            assert_eq!(block.tracked_endpoint_allocations(), (0, 0));
+        }
+        assert_eq!(manager.counts_for_test(id), Some((1, 1)));
+        drop(deferred);
+        assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+        assert!(!manager.finalizer_lock_violation.load(Ordering::Relaxed));
+        receiver.close();
+        assert_eq!(manager.counts_for_test(id), None);
+    }
+    #[test]
+    fn unwind_drops_collector_guards_before_deferred_native_callbacks() {
+        let manager = ChannelManager::isolated_for_test();
+        manager.probe_finalizer_locks.store(true, Ordering::Relaxed);
+        let (id, receiver) = unreachable_sender(&manager);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut deferred = DeferredEndpointFinalizers::default();
+            let _access = manager.gc_access.write().unwrap();
+            let mut state = manager.gc_state.lock().unwrap();
+            let GcState { ref mut block, roots_static, ref mut next_limit } = *state;
+            unsafe {
+                collect_garbage_raw(block, roots_static, true, next_limit, &mut deferred);
+            }
+            assert_eq!(manager.counts_for_test(id), Some((1, 1)));
+            panic!("after raw collection, before normal guard release");
+        }));
+        assert!(result.is_err());
+        assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+        assert!(!manager.finalizer_lock_violation.load(Ordering::Relaxed));
+        receiver.close();
+    }
+}
+
+#[cfg(test)]
+mod char_table_finalization_tests {
+    use super::*;
+    use crate::core::{
+        gc::RootSet,
+        object::{CharTableInner, IntoObject, ObjectType, finalized_char_table_count},
+    };
+    use rune_core::macros::root;
+    #[test]
+    fn manager_raw_gc_moves_then_finalizes_transferred_char_table_exactly_once() {
+        let manager = ChannelManager::isolated_for_test();
+        let channel = manager.create_channel(1);
+        manager.increment_sender(channel);
+        manager.increment_receiver(channel);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let before = finalized_char_table_count();
+        {
+            let source = CharTableInner::new(None).into_obj(&cx.block);
+            root!(source, cx);
+            source.bind(cx).untag().set(42, cx.add("transferred native map")).unwrap();
+            manager.try_send(channel, cx.add(source.bind(cx))).unwrap();
+            for _ in 0..5 {
+                manager.collect_garbage();
+                assert_eq!(finalized_char_table_count(), before);
+                assert_eq!(
+                    manager.gc_state.lock().unwrap().block.tracked_char_table_allocations(),
+                    1
+                );
+            }
+            let received = manager.try_recv(channel, &cx.block).unwrap();
+            root!(received, cx);
+            let ObjectType::CharTable(table) = received.bind(cx).untag() else {
+                panic!("table expected")
+            };
+            assert_eq!(table.get(42), "transferred native map");
+            manager.collect_garbage();
+            assert_eq!(finalized_char_table_count(), before + 1);
+            assert_eq!(manager.gc_state.lock().unwrap().block.tracked_char_table_allocations(), 0);
+            cx.garbage_collect(true);
+            assert_eq!(finalized_char_table_count(), before + 1);
+            assert_eq!(cx.block.tracked_char_table_allocations(), 2);
+        }
+        cx.garbage_collect(true);
+        assert_eq!(finalized_char_table_count(), before + 3);
+        assert_eq!(cx.block.tracked_char_table_allocations(), 0);
+        manager.collect_garbage();
+        assert_eq!(finalized_char_table_count(), before + 3);
+        manager.close_sender(channel);
+        manager.close_receiver(channel);
+        manager.cleanup_channel(channel);
     }
 }

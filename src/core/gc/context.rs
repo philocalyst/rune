@@ -2,7 +2,7 @@ use super::GcState;
 use super::Trace;
 use crate::core::object::GcString;
 use crate::core::object::WeakBufferPropertyRoot;
-use crate::core::object::{CharTable, LispHashTable};
+use crate::core::object::{ChannelReceiver, ChannelSender, CharTable, LispHashTable};
 use crate::core::object::{Gc, IntoObject, Object, UninternedSymbolMap, WithLifetime};
 use bumpalo::collections::Vec as GcVec;
 use std::cell::{Cell, RefCell};
@@ -58,10 +58,41 @@ pub(crate) struct Block<const CONST: bool> {
     pub(in crate::core) lisp_hashtables: RefCell<Vec<*const LispHashTable>>,
     // Char-tables also own native map/mutex resources requiring finalization.
     pub(in crate::core) lisp_chartables: RefCell<Vec<*const CharTable>>,
+    pub(in crate::core) lisp_senders: RefCell<Vec<*const ChannelSender>>,
+    pub(in crate::core) lisp_receivers: RefCell<Vec<*const ChannelReceiver>>,
     pub(in crate::core) uninterned_symbol_map: UninternedSymbolMap,
 }
 
 unsafe impl<const C: bool> Send for Block<C> {}
+
+/// Owned wrappers moved out of from-space, not deferred arena pointers. Declare
+/// before collector guards so native callbacks run after their release, including
+/// unwind AFTER completed collection. This does not make mid-GC panic recoverable.
+#[derive(Default)]
+pub(crate) struct DeferredEndpointFinalizers {
+    senders: Vec<ChannelSender>,
+    receivers: Vec<ChannelReceiver>,
+}
+fn collect_endpoint_finalizers(block: &Block<false>, deferred: &mut DeferredEndpointFinalizers) {
+    block.lisp_senders.borrow_mut().retain_mut(|pointer| {
+        if let Some(new) = unsafe { &**pointer }.forwarding_ptr() {
+            *pointer = new.as_ptr().cast();
+            true
+        } else {
+            deferred.senders.push(unsafe { std::ptr::read(*pointer) });
+            false
+        }
+    });
+    block.lisp_receivers.borrow_mut().retain_mut(|pointer| {
+        if let Some(new) = unsafe { &**pointer }.forwarding_ptr() {
+            *pointer = new.as_ptr().cast();
+            true
+        } else {
+            deferred.receivers.push(unsafe { std::ptr::read(*pointer) });
+            false
+        }
+    });
+}
 
 /// Owns all allocations and creates objects. All objects have
 /// a lifetime tied to the borrow of their `Context`. When the
@@ -141,8 +172,19 @@ impl<const CONST: bool> Block<CONST> {
             drop_stack: RefCell::default(),
             lisp_hashtables: RefCell::default(),
             lisp_chartables: RefCell::default(),
+            lisp_senders: RefCell::default(),
+            lisp_receivers: RefCell::default(),
             uninterned_symbol_map: UninternedSymbolMap::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_char_table_allocations(&self) -> usize {
+        self.lisp_chartables.borrow().len()
+    }
+    #[cfg(test)]
+    pub(crate) fn tracked_endpoint_allocations(&self) -> (usize, usize) {
+        (self.lisp_senders.borrow().len(), self.lisp_receivers.borrow().len())
     }
 
     /// Scope the uninterned-symbol alias cache to one complete graph copy.
@@ -232,6 +274,7 @@ impl<'ob, 'rt> Context<'rt> {
             return;
         }
 
+        let mut deferred = DeferredEndpointFinalizers::default();
         self.block.uninterned_symbol_map.clear();
         let mut state = GcState::new();
         for x in self.root_set.roots.borrow().iter() {
@@ -278,6 +321,7 @@ impl<'ob, 'rt> Context<'rt> {
             }
         });
 
+        collect_endpoint_finalizers(&self.block, &mut deferred);
         self.block.objects = state.to_space;
     }
 }
@@ -292,11 +336,13 @@ impl<'ob, 'rt> Context<'rt> {
 /// 2. The root_set accurately represents all live references to objects in the block
 /// 3. The block's drop_stack and native-resource allocation lists are properly maintained
 /// 4. No active Context exists that references this block or root_set
+/// 5. deferred is caller-owned and outlives all collector lock guards
 pub(crate) unsafe fn collect_garbage_raw(
     block: &mut Block<false>,
     root_set: &ThreadSafeRootSet,
     force: bool,
     next_limit: &mut usize,
+    deferred: &mut DeferredEndpointFinalizers,
 ) {
     let bytes = block.objects.allocated_bytes();
     if cfg!(not(test)) && !force && bytes < *next_limit {
@@ -341,6 +387,7 @@ pub(crate) unsafe fn collect_garbage_raw(
         }
     });
 
+    collect_endpoint_finalizers(block, deferred);
     block.objects = state.to_space;
 }
 

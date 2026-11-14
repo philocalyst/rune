@@ -17,6 +17,19 @@ pub struct CharTableInner<'ob> {
     init: Slot<Object<'ob>>,
 }
 
+#[cfg(test)]
+thread_local! { static FINALIZED_CHAR_TABLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+impl Drop for CharTableInner<'_> {
+    fn drop(&mut self) {
+        FINALIZED_CHAR_TABLES.with(|count| count.set(count.get() + 1));
+    }
+}
+#[cfg(test)]
+pub(crate) fn finalized_char_table_count() -> usize {
+    FINALIZED_CHAR_TABLES.with(std::cell::Cell::get)
+}
+
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     value.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -194,6 +207,30 @@ mod ownership_tests {
         }
         cx.garbage_collect(true);
         assert!(cx.block.lisp_chartables.borrow().is_empty());
+    }
+
+    #[test]
+    fn cyclic_local_table_finalizes_exactly_once_after_last_root_drops() {
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let before = finalized_char_table_count();
+        {
+            let table = CharTableInner::new(None).into_obj(&cx.block);
+            root!(table, cx);
+            let current = table.bind(cx);
+            current.untag().set_parent(Some(current.untag())).unwrap();
+            current.untag().set(1, cx.add(current)).unwrap();
+            for _ in 0..5 {
+                cx.garbage_collect(true);
+                assert_eq!(finalized_char_table_count(), before);
+                assert_eq!(cx.block.tracked_char_table_allocations(), 1);
+            }
+        }
+        cx.garbage_collect(true);
+        assert_eq!(finalized_char_table_count(), before + 1);
+        assert_eq!(cx.block.tracked_char_table_allocations(), 0);
+        cx.garbage_collect(true);
+        assert_eq!(finalized_char_table_count(), before + 1);
     }
 
     #[test]
