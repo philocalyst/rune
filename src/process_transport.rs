@@ -78,6 +78,43 @@ impl Drop for ChildOwner {
     }
 }
 
+struct SignalRequest {
+    signal: i32,
+    reply: SyncSender<io::Result<()>>,
+}
+fn signal_owned_child(child: &std::process::Child, signal: i32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if !matches!(signal, 2 | 9 | 15) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported owned-child signal",
+            ));
+        }
+        let pid = libc::pid_t::try_from(child.id()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "child PID is outside pid_t")
+        })?;
+        if pid <= 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid child PID"));
+        }
+        // SAFETY: called only by the supervisor while it exclusively owns
+        // this unreaped Child. Its positive PID cannot yet have been reused.
+        if unsafe { libc::kill(pid, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (child, signal);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "owned-child Unix signals are unsupported on this platform",
+        ))
+    }
+}
+
 /// Arc residence controls direct-child lifetime. No thread captures this Arc,
 /// so dropping the last residence requests cancellation without joining/waiting.
 pub(crate) struct ProcessTransport {
@@ -87,6 +124,7 @@ pub(crate) struct ProcessTransport {
     input: Mutex<Option<SyncSender<Vec<u8>>>>,
     events: Mutex<Receiver<ProcessEvent>>,
     terminal: Arc<Mutex<VecDeque<ProcessEvent>>>,
+    signals: SyncSender<SignalRequest>,
 }
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -235,6 +273,7 @@ impl ProcessTransport {
             child.child.stdin.take().ok_or_else(|| io::Error::other("missing stdin pipe"))?;
         let (event_tx, event_rx) = mpsc::sync_channel(64);
         let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(32);
+        let (signal_tx, signal_rx) = mpsc::sync_channel::<SignalRequest>(16);
         let cancel = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(ProcessStatus::Running));
         let controls = Arc::new(Mutex::new(VecDeque::new()));
@@ -245,6 +284,7 @@ impl ProcessTransport {
             input: Mutex::new(Some(input_tx)),
             events: Mutex::new(event_rx),
             terminal: controls.clone(),
+            signals: signal_tx,
         });
         let supervisor_cancel = cancel.clone();
         let supervisor_controls = controls.clone();
@@ -258,6 +298,20 @@ impl ProcessTransport {
                     if supervisor_cancel.load(Ordering::Acquire) && !killed {
                         let _ = child.child.kill();
                         killed = true;
+                    }
+                    for _ in 0..16 {
+                        let Ok(request) = signal_rx.try_recv() else {
+                            break;
+                        };
+                        let result = if killed {
+                            Err(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "process cancellation is pending",
+                            ))
+                        } else {
+                            signal_owned_child(&child.child, request.signal)
+                        };
+                        let _ = request.reply.try_send(result);
                     }
                     match child.child.try_wait() {
                         Ok(Some(exit)) => {
@@ -364,6 +418,38 @@ impl ProcessTransport {
                 io::Error::new(io::ErrorKind::BrokenPipe, "subprocess stdin is closed")
             }
         })
+    }
+    pub(crate) fn signal(&self, signal: i32) -> io::Result<()> {
+        if !matches!(signal, 2 | 9 | 15) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only SIGINT, SIGKILL and SIGTERM are supported",
+            ));
+        }
+        if self.cancel.load(Ordering::Acquire) || self.status() != ProcessStatus::Running {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "owned child is not running"));
+        }
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.signals
+            .try_send(SignalRequest { signal, reply: reply_tx })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "process signal queue is full")
+                }
+                TrySendError::Disconnected(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "owned child has exited")
+                }
+            })?;
+        reply_rx.recv_timeout(Duration::from_millis(100)).map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => io::Error::new(
+                io::ErrorKind::TimedOut,
+                "owned-child signal delivery acknowledgement timed out",
+            ),
+            mpsc::RecvTimeoutError::Disconnected => io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "owned child exited before signal acknowledgement",
+            ),
+        })?
     }
     pub(crate) fn close_stdin(&self) {
         lock(&self.input).take();
@@ -566,6 +652,30 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         panic!("idle native writer survived natural child exit");
+    }
+    #[test]
+    #[cfg(unix)]
+    fn owned_sigint_reaches_real_handler_not_fake_kill() {
+        let process = python(
+            "import signal,sys,time; signal.signal(signal.SIGINT,lambda *args: sys.exit(42)); print('ready',flush=True); time.sleep(30)",
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(ProcessEvent::Output { stream: OutputStream::Stdout, bytes }) =
+                process.recv(Duration::from_millis(20))
+            {
+                if bytes.windows(5).any(|word| word == b"ready") {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "synthetic signal handler did not become ready");
+        }
+        process.signal(2).unwrap();
+        let (_, _, exit) = collect(&process);
+        assert_eq!(exit.code, Some(42));
+        assert_eq!(exit.signal, None);
+        assert!(process.signal(9).is_err());
+        assert!(process.signal(12345).is_err());
     }
     #[test]
     #[ignore = "requires explicitly configured official mu + synthetic Maildir fixture"]

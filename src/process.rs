@@ -161,6 +161,37 @@ fn process_live_p(process: Object, cx: &Context) -> Result<bool> {
 fn process_buffer<'ob>(process: Object, cx: &'ob Context) -> Result<Object<'ob>> {
     resolve(process, cx)?.callback_snapshot(cx)?.buffer.bind(cx)
 }
+/// Only owner-local, live process records are searched. Snapshot roots keep
+/// process/buffer objects alive without retaining registry guards across work.
+#[defun]
+fn get_buffer_process<'ob>(
+    buffer: Object<'ob>,
+    env: &Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    let handle = if buffer.is_nil() {
+        env.current_buffer_handle()
+    } else {
+        let value = crate::buffer::get_buffer(buffer, cx)?;
+        if value.is_nil() {
+            return Ok(NIL);
+        }
+        let ObjectType::Buffer(buffer) = value.untag() else { unreachable!() };
+        buffer.read(cx)?;
+        buffer.handle()
+    };
+    for snapshot in cx.process_snapshots() {
+        if snapshot.transport.status() != ProcessStatus::Running {
+            continue;
+        }
+        let value = snapshot.buffer.bind(cx)?;
+        if matches!(value.untag(), ObjectType::Buffer(buffer) if buffer.handle() == handle) {
+            return snapshot.process.bind(cx);
+        }
+    }
+    Ok(NIL)
+}
+
 #[defun]
 fn process_filter<'ob>(process: Object, cx: &'ob Context) -> Result<Object<'ob>> {
     let value = resolve(process, cx)?.callback_snapshot(cx)?.filter.bind(cx)?;
@@ -481,6 +512,34 @@ fn call_process<'ob>(
     })
 }
 
+/// Deliberately restricted to this owner Context's actual child processes.
+/// Numeric PIDs are looked up in that registry, never signalled directly.
+#[defun]
+fn signal_process(process: Object, signal: Object, cx: &Context) -> Result<i64> {
+    let number = match signal.untag() {
+        ObjectType::Int(value) => i32::try_from(value)?,
+        ObjectType::Symbol(value) => match value.name() {
+            "SIGINT" | "INT" => 2,
+            "SIGKILL" | "KILL" => 9,
+            "SIGTERM" | "TERM" => 15,
+            other => bail!("Unsupported process signal: {other}"),
+        },
+        _ => bail!("Expected a supported process signal integer or symbol"),
+    };
+    let native = if let ObjectType::Int(pid) = process.untag() {
+        let pid = u32::try_from(pid)?;
+        cx.process_snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.transport.id() == pid)
+            .ok_or_else(|| anyhow::anyhow!("PID is not an owned child process"))?
+            .transport
+    } else {
+        resolve(process, cx)?.transport(cx)?
+    };
+    native.signal(number)?;
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::interpreter::assert_lisp;
@@ -598,5 +657,34 @@ mod tests {
         let state = cx.process_state(&process).unwrap();
         assert_eq!(state.read_coding, ProcessCoding::Utf8);
         assert_eq!(state.stderr_pending_utf8, vec![0xce]);
+    }
+    #[test]
+    fn get_buffer_process_finds_owner_rooted_identity_after_gc() {
+        assert_lisp(
+            r#"(let ((p (start-process "rune-buffer-process" " *rune-buffer-process*" "/usr/bin/python3" "-c" "import time; time.sleep(30)")))
+            (unwind-protect
+                (progn (set-buffer (process-buffer p)) (garbage-collect)
+                    (list (eq p (get-buffer-process nil))
+                        (eq p (get-buffer-process " *rune-buffer-process*"))
+                        (eq p (get-buffer-process (process-buffer p)))
+                        (get-buffer-process "rune-never-created-buffer")
+                        (get-buffer "rune-never-created-buffer")))
+                (delete-process p)))"#,
+            "(t t t nil nil)",
+        );
+    }
+    #[test]
+    fn arbitrary_unregistered_pid_signalling_is_rejected() {
+        use crate::core::{
+            env::sym,
+            gc::{Context, RootSet},
+        };
+        sym::init_symbols();
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let target = cx.add(i64::from(std::process::id()));
+        let signal = crate::core::env::intern("SIGKILL", &cx).into();
+        // Empty owner registry means no OS signal can be dispatched.
+        assert!(super::signal_process(target, signal, &cx).is_err());
     }
 }

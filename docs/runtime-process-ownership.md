@@ -17,8 +17,11 @@ payload provenance validation. Native coding/query/event state has no GC values.
 Context teardown requests termination before retiring roots and collecting the
 heap. It never joins workers or waits for child reaping; the native supervisor
 owns that duty. delete-process must terminate without unregistering callbacks;
-post-exit/output/sentinel delivery performs registry cleanup. Exited process
-handles may still query their native state in the original live Context.
+completed records are excluded from active lookup/polling after sentinel delivery,
+but retain metadata until Context teardown so retained process handles keep their
+filter/sentinel/buffer/plist. This strong-record retention is an explicit resource
+gap, not weak/ephemeron lifecycle completion. Explicit remove_process is an owner
+retirement/testing API, not the ordinary sentinel path.
 
 This requires the cancellation-aware and natural-exit transport supplements.
 No process-group/descendant pipe cleanup, complete Emacs process compatibility,

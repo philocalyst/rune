@@ -11,7 +11,7 @@ use rune_macros::defun;
 
 // Scoped Env/dynamic default. GNU buffer-local case tables/forwarding remain
 // separate; do not claim per-buffer behavior from this variable alone.
-defvar_bool!(CASE_FOLD_SEARCH, true);
+defvar!(CASE_FOLD_SEARCH, true);
 fn case_fold(env: &Rt<Env>, cx: &Context) -> Result<bool> {
     Ok(!crate::data::symbol_value(sym::CASE_FOLD_SEARCH, env, cx)?.is_nil())
 }

@@ -3,6 +3,7 @@
 mod macros;
 mod process_transport;
 mod process;
+mod process_events;
 #[macro_use]
 mod core;
 #[macro_use]

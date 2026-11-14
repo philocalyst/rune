@@ -169,7 +169,12 @@ impl Context<'_> {
         buffer: Object,
     ) -> Result<Object<'_>> {
         ensure!(
-            !self.process_registry.borrow().records.values().any(|p| p.snapshot.name == name),
+            !self
+                .process_registry
+                .borrow()
+                .records
+                .values()
+                .any(|p| !p.state.sentinel_delivered && p.snapshot.name == name),
             "Process name already exists"
         );
         let process = self.add(LispProcess::new(name.clone(), transport.clone(), self));
@@ -211,6 +216,7 @@ impl Context<'_> {
             .borrow()
             .records
             .values()
+            .filter(|p| !p.state.sentinel_delivered)
             .map(|p| p.snapshot.clone())
             .collect()
     }
@@ -219,6 +225,7 @@ impl Context<'_> {
             .borrow()
             .records
             .values()
+            .filter(|p| !p.state.sentinel_delivered)
             .map(|p| p.snapshot.process.clone())
             .collect()
     }
@@ -227,7 +234,7 @@ impl Context<'_> {
             .borrow()
             .records
             .values()
-            .find(|p| p.snapshot.name == name)
+            .find(|p| !p.state.sentinel_delivered && p.snapshot.name == name)
             .map(|p| p.snapshot.process.clone())
     }
     /// Native-only closure: MUST NOT evaluate Lisp, collect, or retain owner borrows.
@@ -452,5 +459,76 @@ mod retired_snapshot_tests {
             assert!(start.elapsed() < std::time::Duration::from_secs(2));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod completed_metadata_tests {
+    use super::*;
+    use crate::{
+        core::gc::RootSet,
+        process_transport::{ProcessStatus, SpawnSpec},
+    };
+    use rune_core::macros::root;
+    #[test]
+    fn completed_process_keeps_metadata_but_leaves_active_lookup_and_allows_name_reuse() {
+        let spawn = || {
+            ProcessTransport::spawn(SpawnSpec {
+                program: "/bin/cat".into(),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+            })
+            .unwrap()
+        };
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let native = spawn();
+        let value = unsafe {
+            cx.register_process(
+                "reusable".into(),
+                native.clone(),
+                cx.add("retained metadata"),
+                NIL,
+                NIL,
+            )
+            .unwrap()
+        };
+        root!(old, value, cx);
+        native.terminate();
+        let start = std::time::Instant::now();
+        while native.status() == ProcessStatus::Running {
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let typed: Gc<&LispProcess> = old.bind(cx).try_into().unwrap();
+        cx.update_process_state(&typed, |state| {
+            state.stdout_eof = true;
+            state.stderr_eof = true;
+            state.sentinel_delivered = true;
+        })
+        .unwrap();
+        assert!(cx.find_process("reusable").is_none());
+        assert!(cx.process_list_roots().is_empty());
+        assert!(cx.process_snapshots().is_empty());
+        let replacement = spawn();
+        let value = unsafe {
+            cx.register_process("reusable".into(), replacement.clone(), NIL, NIL, NIL)
+                .unwrap()
+        };
+        root!(new, value, cx);
+        for _ in 0..3 {
+            cx.garbage_collect(true);
+        }
+        let typed: Gc<&LispProcess> = old.bind(cx).try_into().unwrap();
+        assert_eq!(
+            typed.callback_snapshot(cx).unwrap().filter.bind(cx).unwrap().to_string(),
+            "\"retained metadata\""
+        );
+        let fresh: Gc<&LispProcess> = new.bind(cx).try_into().unwrap();
+        assert_ne!(typed.identity(), fresh.identity());
+        assert_eq!(cx.process_list_roots().len(), 1);
+        cx.remove_process(&typed).unwrap();
+        cx.remove_process(&fresh).unwrap();
     }
 }
