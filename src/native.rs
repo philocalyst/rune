@@ -38,7 +38,7 @@ pub(crate) fn run(sources: Vec<String>, native_file: Option<std::path::PathBuf>,
             Err(error) => {
                 eprintln!("native font calibration failed: {error}");
                 startup_failed.store(true, Ordering::Relaxed);
-                cx.quit();
+                rune_gpui::quit_on_next_foreground_turn(cx);
                 return;
             }
         };
@@ -53,7 +53,7 @@ pub(crate) fn run(sources: Vec<String>, native_file: Option<std::path::PathBuf>,
             {
                 eprintln!("native startup evaluation admission failed: {error:?}");
                 startup_failed.store(true, Ordering::Relaxed);
-                cx.quit();
+                rune_gpui::quit_on_next_foreground_turn(cx);
                 return;
             }
         }

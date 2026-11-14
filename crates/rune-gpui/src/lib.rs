@@ -756,3 +756,10 @@ mod ime_keys;
 pub mod platform_handler;
 #[cfg(feature = "editor")]
 pub mod platform_state;
+
+/// Request shutdown on an official foreground-executor turn. A quit signal sent
+/// synchronously inside the launch callback can precede the Linux event loop
+/// and be lost when that loop begins. No window or Lisp state is captured.
+pub fn quit_on_next_foreground_turn(cx:&App){
+    cx.spawn(async |cx|{let _=cx.update(|app|app.quit());}).detach();
+}

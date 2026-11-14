@@ -92,6 +92,10 @@ opt-level = 3
 [profile.release]
 debug = true
 
+[[example]]
+name = "headless_startup_exit_probe"
+required-features = ["native"]
+
 [features]
 native = ["dep:gpui", "dep:rune-gpui", "dep:rune-display"]
 default = []
