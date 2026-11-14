@@ -10,6 +10,16 @@ use anyhow::{Result, bail};
 use rune_macros::defun;
 use std::ffi::OsString;
 
+// GNU resolves bare program names through owner `exec-path`, not the child
+// PATH. Until that owner variable is supported, reject relative programs
+// instead of allowing Command's platform/ambient search to execute another file.
+fn absolute_program(program: &str) -> Result<OsString> {
+    if program.as_bytes().contains(&0) || !std::path::Path::new(program).is_absolute() {
+        bail!("Subprocess program must be an absolute path; owner exec-path search is not implemented");
+    }
+    Ok(program.into())
+}
+
 fn argument(object: Object) -> Result<OsString> {
     match object.untag() {
         ObjectType::String(value) => Ok(OsString::from(&**value)),
@@ -68,6 +78,7 @@ fn start_process<'ob>(
     buffer: Object<'ob>,
     program: &str,
     args: &[Object],
+    env: &Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Object<'ob>> {
     let buffer = if buffer.is_nil() {
@@ -84,11 +95,11 @@ fn start_process<'ob>(
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("Process name space exhausted"))?;
     }
-    let native = ProcessTransport::spawn(SpawnSpec {
-        program: program.into(),
+    let native = ProcessTransport::spawn_exact_environment(SpawnSpec {
+        program: absolute_program(program)?,
         args,
         cwd: None,
-        env: Vec::new(),
+        env: crate::emacs::process_environment_snapshot(env, cx)?,
     })?;
     // SAFETY: buffer came from the current Context's editor gateway or NIL;
     // callbacks are NIL. No Lisp value crosses into native transport workers.
@@ -455,11 +466,11 @@ fn call_process<'ob>(
         _ => bail!("call-process destination must be nil, t, a buffer or a buffer name"),
     };
     let args = args.iter().copied().map(argument).collect::<Result<Vec<_>>>()?;
-    let native = ProcessTransport::spawn_merged(SpawnSpec {
-        program: program.into(),
+    let native = ProcessTransport::spawn_merged_exact_environment(SpawnSpec {
+        program: absolute_program(program)?,
         args,
         cwd: None,
-        env: Vec::new(),
+        env: crate::emacs::process_environment_snapshot(env, cx)?,
     })?;
     native.close_stdin();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -543,6 +554,60 @@ fn signal_process(process: Object, signal: Object, cx: &Context) -> Result<i64> 
 #[cfg(test)]
 mod tests {
     use crate::interpreter::assert_lisp;
+    #[test]
+    fn child_environment_is_complete_and_first_entry_wins() {
+        assert_lisp(
+            r#"(progn (set-buffer (get-buffer-create "rune-empty-child-env"))
+                (let ((process-environment nil))
+                  (list (call-process "/usr/bin/env" nil t)
+                    (buffer-substring-no-properties (point-min) (point-max)))))"#,
+            r#"(0 "")"#,
+        );
+        assert_lisp(
+            r#"(progn (set-buffer (get-buffer-create "rune-ordered-child-env"))
+                (let ((process-environment '("A=first" "A=second" "B" "B=later" "C=" "PATH=/not/used/for/program/search")))
+                  (list (call-process "/usr/bin/env" nil t)
+                    (buffer-substring-no-properties (point-min) (point-max)))))"#,
+            r#"(0 "A=first\nC=\nPATH=/not/used/for/program/search\n")"#,
+        );
+    }
+    #[test]
+    fn asynchronous_child_uses_same_owner_environment_snapshot() {
+        assert_lisp(
+            r#"(let ((process-environment '("ASYNC_OWNER=first" "ASYNC_OWNER=later"))
+                     (p nil) (attempts 0))
+                (set-buffer (get-buffer-create "rune-async-child-env"))
+                (setq p (start-process "rune-async-child-env" (current-buffer) "/usr/bin/env"))
+                (set-process-sentinel p #'(lambda (process event) nil))
+                (unwind-protect
+                    (progn
+                      (while (and (process-live-p p) (< attempts 200))
+                        (setq attempts (+ attempts 1)) (accept-process-output p 0.01))
+                      (accept-process-output p 0)
+                      (list (process-exit-status p)
+                        (buffer-substring-no-properties (point-min) (point-max))))
+                  (delete-process p)))"#,
+            r#"(0 "ASYNC_OWNER=first\n")"#,
+        );
+    }
+
+    #[test]
+    fn child_environment_rejects_relative_program_and_nul_before_spawn() {
+        assert_lisp(
+            r#"(let ((process-environment '("PATH=/usr/bin")))
+                (list (condition-case nil (call-process "env") (error 'caught))
+                      (condition-case nil (start-process "relative-must-not-spawn" nil "env") (error 'caught))
+                      (null (get-process "relative-must-not-spawn"))))"#,
+            "(caught caught t)",
+        );
+        assert_lisp(
+            r#"(let ((process-environment (list (concat "A=" (string 0)))))
+                (list (condition-case nil (start-process "nul-must-not-spawn" nil "/usr/bin/env") (error 'caught))
+                      (null (get-process "nul-must-not-spawn"))))"#,
+            "(caught t)",
+        );
+    }
+
     #[test]
     fn genuine_process_metadata_roots_survive_collection() {
         assert_lisp(

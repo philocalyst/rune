@@ -954,6 +954,7 @@ pub(crate) fn assert_lisp(compare: &str, expect: &str) {
     let cx = &mut Context::new(roots);
     sym::init_symbols();
     root!(env, init(Env::new(cx).unwrap()), cx);
+    crate::core::env::init_variables(cx, env);
     println!("Test String: {compare}");
     let compare = {
         let obj = crate::reader::read(compare, cx).unwrap().0;

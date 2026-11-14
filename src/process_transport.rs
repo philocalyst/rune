@@ -201,12 +201,20 @@ fn reader(
 }
 impl ProcessTransport {
     pub(crate) fn spawn(spec: SpawnSpec) -> io::Result<Arc<Self>> {
-        Self::spawn_mode(spec, false)
+        Self::spawn_mode(spec, false, false)
     }
     pub(crate) fn spawn_merged(spec: SpawnSpec) -> io::Result<Arc<Self>> {
-        Self::spawn_mode(spec, true)
+        Self::spawn_mode(spec, true, false)
     }
-    fn spawn_mode(spec: SpawnSpec, merge_stderr: bool) -> io::Result<Arc<Self>> {
+    /// Spawn using a complete owner-supplied environment, without changing the
+    /// process-wide environment shared by native worker threads.
+    pub(crate) fn spawn_exact_environment(spec: SpawnSpec) -> io::Result<Arc<Self>> {
+        Self::spawn_mode(spec, false, true)
+    }
+    pub(crate) fn spawn_merged_exact_environment(spec: SpawnSpec) -> io::Result<Arc<Self>> {
+        Self::spawn_mode(spec, true, true)
+    }
+    fn spawn_mode(spec: SpawnSpec, merge_stderr: bool, exact_environment: bool) -> io::Result<Arc<Self>> {
         if spec.program.is_empty() || spec.args.len() > 256 || spec.env.len() > 256 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -229,6 +237,9 @@ impl ProcessTransport {
         let stderr_budget = Budget::acquire(&WORKERS, 64)?;
         let writer_budget = Budget::acquire(&WORKERS, 64)?;
         let mut command = Command::new(spec.program);
+        if exact_environment {
+            command.env_clear();
+        }
         command
             .args(spec.args)
             .envs(spec.env)

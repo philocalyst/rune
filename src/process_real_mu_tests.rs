@@ -49,6 +49,7 @@ fn real_mu_owner_pump_preserves_binary_chunks_gc_and_final_sentinel() {
     let cx = &mut Context::new(roots);
     sym::init_symbols();
     root!(env, init(Env::new(cx).unwrap()), cx);
+    crate::core::env::init_variables(cx, env);
     let object = crate::reader::read(&source, cx).unwrap().0;
     root!(object, cx);
     let (stream, metadata) = {
