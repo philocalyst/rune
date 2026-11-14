@@ -267,6 +267,7 @@ mod tests {
 pub(crate) struct RuntimeEditor {
     session: rune_editor::Session<RuntimeDocument>,
     properties: PropertyRegistry,
+    disk_baselines: std::collections::BTreeMap<rune_editor::BufferId, save::guarded::Baseline>,
 }
 pub(crate) struct PreparedMetadata {
     buffer: rune_editor::BufferId,
@@ -278,7 +279,10 @@ impl RuntimeEditor {
         let properties = PropertyRegistry::new(cx);
         let session =
             rune_editor::Session::new(RuntimeDocument::new("", &properties, cx)?, width, height)?;
-        Ok(Self { session, properties })
+        Ok(Self { session, properties, disk_baselines: Default::default() })
+    }
+    fn prune_disk_baselines(&mut self) {
+        self.disk_baselines.retain(|id,_| self.session.buffer_live(*id));
     }
     pub(crate) fn session(&self) -> &rune_editor::Session<RuntimeDocument> {
         &self.session
@@ -351,14 +355,18 @@ impl rune_editor::EditorHost for RuntimeEditorHost<'_, '_> {
             .properties
             .empty(self.cx)
             .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
-        self.editor.session.execute(c)
+        let result = self.editor.session.execute(c);
+        self.editor.prune_disk_baselines();
+        result
     }
     fn dispatch_key(&mut self, k: rune_editor::Key) -> rune_editor::Result<rune_editor::Dispatch> {
         self.editor
             .properties
             .empty(self.cx)
             .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
-        self.editor.session.dispatch(k)
+        let result = self.editor.session.dispatch(k);
+        self.editor.prune_disk_baselines();
+        result
     }
     fn cancel_prefix(&mut self) -> rune_editor::Result<()> {
         self.editor
@@ -845,7 +853,9 @@ impl GatewayEditorHost<'_, '_> {
             .properties
             .empty(self.cx)
             .map_err(|e| rune_editor::EditorError::Backend(e.to_string()))?;
-        run(&mut owner)
+        let result = run(&mut owner);
+        owner.prune_disk_baselines();
+        result
     }
 }
 impl rune_editor::EditorHost for GatewayEditorHost<'_, '_> {
@@ -1008,6 +1018,7 @@ impl RuntimeEditorGateway {
         let mut owner = self.inner.try_borrow_mut()?;
         let id = owner.validate_handle(handle, cx)?;
         owner.session.execute(rune_editor::Command::KillBuffer { buffer: id, force })?;
+        owner.disk_baselines.remove(&id);
         owner.buffer_handle(owner.session.current_buffer(), cx)
     }
 }

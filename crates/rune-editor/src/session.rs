@@ -459,6 +459,16 @@ impl<D: Document> Session<D> {
         self.state.mru.push(id);
         Ok(id)
     }
+    /// Publish a newly loaded clean document and native association together.
+    /// Does not select a UI window or alter evaluator current-buffer binding.
+    pub fn create_visited_buffer(&mut self, name:&str, document:D, path:std::sync::Arc<std::path::Path>)->Result<BufferId> {
+        let sequence=self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let id=self.create_buffer(name,document)?;
+        let buffer=self.state.buffers.get_mut(&id).expect("just created buffer");
+        buffer.file=crate::FileAssociation{revision:1,path:Some(path)};
+        self.state.sequence=sequence;
+        Ok(id)
+    }
     pub fn set_current_buffer(&mut self, id: BufferId) -> Result<()> {
         self.document(id)?;
         self.state.current = id;

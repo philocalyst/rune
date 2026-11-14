@@ -1,6 +1,10 @@
 //! Bounded UTF-8 snapshot write + atomic owner association/checkpoint.
 //! No coding detection, file handlers, backup policy, external-file conflict
 //! detection or crash-durable directory commit is implied.
+#[path = "disk_witness.rs"]
+mod disk_witness;
+#[path = "guarded_save.rs"]
+pub(super) mod guarded;
 use super::{OwnerBufferHandle, RuntimeDocument, RuntimeEditorGateway};
 use crate::core::gc::Context;
 use anyhow::{Result, ensure};
@@ -33,6 +37,7 @@ pub(crate) struct PendingSave {
 pub(crate) struct WrittenSave {
     pending: PendingSave,
     path: PathBuf,
+    committed_metadata: fs::Metadata,
 }
 #[derive(Debug)]
 pub(crate) struct SaveOutcome {
@@ -127,6 +132,10 @@ impl PendingSave {
         mode: SaveMode,
         remove_temp: impl FnOnce(&Path) -> std::io::Result<()>,
     ) -> Result<WrittenSave> {
+        self.write_with_checks(path, mode, remove_temp, || Ok(()))
+    }
+
+    fn write_with_checks(self, path: &Path, mode: SaveMode, remove_temp: impl FnOnce(&Path)->std::io::Result<()>, before_commit: impl FnOnce()->Result<()>) -> Result<WrittenSave> {
         let absolute = absolute_path(path)?;
         if let Some(expected) = &self.target {
             ensure!(expected == &absolute, "Save target differs from captured association");
@@ -176,10 +185,12 @@ impl PendingSave {
         }
         writer.flush()?;
         writer.get_ref().sync_all()?;
+        let committed_metadata = writer.get_ref().metadata()?;
         drop(writer);
         if let Some(metadata) = target_metadata(path)? {
             ensure!(!metadata.permissions().readonly(), "Save target became read-only");
         }
+        before_commit()?;
         match mode {
             SaveMode::ReplaceExisting => fs::rename(&temp, path)?,
             // Atomic no-clobber final-component creation. No explicit target
@@ -197,7 +208,7 @@ impl PendingSave {
         if matches!(mode, SaveMode::ReplaceExisting) {
             cleanup.0 = None;
         }
-        Ok(WrittenSave { pending: self, path: path.to_owned() })
+        Ok(WrittenSave { pending: self, path: path.to_owned(), committed_metadata })
     }
 }
 #[cfg(test)]
@@ -410,7 +421,9 @@ impl RuntimeEditorGateway {
         self.check(cx)?;
         let mut owner = self.inner.try_borrow_mut()?;
         let id = owner.validate_handle(handle, cx)?;
-        Ok(owner.session.set_file_association(id, expected_revision, path)?)
+        let association = owner.session.set_file_association(id, expected_revision, path)?;
+        owner.disk_baselines.remove(&id);
+        Ok(association)
     }
     pub(crate) fn prepare_visited_save(
         &self,
