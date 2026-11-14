@@ -2601,3 +2601,5 @@ mod marker_buffer_live_tests {
         assert!(other.buffer_is_live(h,&cx).is_err());
     }
 }
+
+mod font_runs;
