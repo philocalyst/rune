@@ -8,7 +8,7 @@ use std::fmt::{Debug, Display};
 /// types to be used in match statements if they derive Eq. Even if you never
 /// actually use that field in a match. So we need a float wrapper that
 /// implements that trait.
-#[derive(PartialEq, Trace)]
+#[derive(Trace)]
 pub(crate) struct LispFloat(GcHeap<f64>);
 
 derive_GcMoveable!(LispFloat);
@@ -29,6 +29,14 @@ impl LispFloat {
 
 impl Trace for f64 {
     fn trace(&self, _: &mut GcState) {}
+}
+
+// Lisp `equal`/`eql` compare float representations, unlike numeric `=`.
+// This also makes Eq reflexive for NaNs and distinguishes both signed zeros.
+impl PartialEq for LispFloat {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_bits() == other.to_bits()
+    }
 }
 
 impl Eq for LispFloat {}
@@ -174,6 +182,52 @@ mod tests {
             (-1.5, "-1.5"),
         ] {
             assert_eq!(LispFloat::new(value, false).to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn structural_float_equality_is_bitwise_and_hash_consistent() {
+        use std::collections::HashSet;
+        let roots = crate::core::gc::RootSet::default();
+        let cx = crate::core::gc::Context::new(&roots);
+        for bits in [
+            0_u64,
+            1_u64 << 63,
+            0x7ff8_0000_0000_0000,
+            0x7ff8_0000_0000_0001,
+            0xfff8_0000_0000_0001,
+        ] {
+            let left = cx.add(f64::from_bits(bits));
+            let right = cx.add(f64::from_bits(bits));
+            assert!(!left.ptr_eq(right));
+            assert_eq!(left, right);
+            let keys = HashSet::from([left]);
+            assert!(keys.contains(&right));
+        }
+        assert_ne!(cx.add(0.0), cx.add(-0.0));
+        assert_ne!(
+            cx.add(f64::from_bits(0x7ff8_0000_0000_0000)),
+            cx.add(f64::from_bits(0x7ff8_0000_0000_0001))
+        );
+    }
+
+    #[test]
+    fn lisp_structural_float_comparison_is_distinct_from_numeric_ieee_comparison() {
+        for (source, expected) in [
+            ("(equal 0.0e+NaN 0.0e+NaN)", "t"),
+            ("(equal 1.0e+NaN 1.0e+NaN)", "t"),
+            ("(equal 0.0e+NaN 1.0e+NaN)", "nil"),
+            ("(equal 1.0e+NaN -1.0e+NaN)", "nil"),
+            ("(equal 0.0 -0.0)", "nil"),
+            ("(equal '(1.0e+NaN) '(1.0e+NaN))", "t"),
+            ("(equal [1.0e+NaN] [1.0e+NaN])", "t"),
+            ("(equal '(0.0) '(-0.0))", "nil"),
+            ("(equal [0.0] [-0.0])", "nil"),
+            ("(= 0.0 -0.0)", "t"),
+            ("(= 1.0e+NaN 1.0e+NaN)", "nil"),
+            ("(< 1.0e+NaN 2.0)", "nil"),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
         }
     }
 

@@ -1783,7 +1783,8 @@ impl<T> Hash for Gc<T> {
             ObjectType::Int(value) => value.hash(state),
             ObjectType::Symbol(value) => value.hash(state),
             ObjectType::Float(value) => {
-                // Structural float equality equates both signed zeros.
+                // Bitwise structural equality distinguishes signed zeros; this
+                // existing normalization is a permitted hash collision.
                 let bits = if **value == 0.0 { 0 } else { value.to_bits() };
                 bits.hash(state);
             }
@@ -1928,8 +1929,9 @@ mod object_hash_contract_tests {
             (cx.add(vec![cx.add(7)]), cx.add(vec![cx.add(7)])),
             (cx.add(large.clone()), cx.add(large)),
             (cx.add(1.5), cx.add(1.5)),
-            (cx.add(0.0), cx.add(-0.0)),
+            (cx.add(0.0), cx.add(0.0)),
         ];
+        assert_ne!(cx.add(0.0), cx.add(-0.0));
         for (left, right) in pairs {
             assert_eq!(left, right);
             assert_eq!(hash(left), hash(right));

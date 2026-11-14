@@ -21,6 +21,19 @@ including 512-bit decimal prefixes, overflow boundaries and fractional syntax.
 Rune tests exercise 8,192 signed quiet-NaN bit-pattern roundtrips and 512 large
 prefix cases, plus Lisp `eql` distinctions between payloads and signs.
 
+## Structural versus numeric comparison
+
+Lisp `equal` and `eql` compare float representation bits. Equal quiet-NaN
+payload/sign pairs compare equal structurally, while different payloads/signs
+and positive versus negative zero are distinct, including inside lists/vectors.
+Numeric `=` and ordered comparisons remain IEEE: NaNs are unordered and never
+numerically equal, while both signed zeros compare numerically equal.
+
+The generic object hash is compatible: equal float bits produce equal hashes.
+Its existing signed-zero normalization may give two unequal zeros the same hash,
+which is a permitted collision, not a violation of the equality/hash contract.
+This does not complete the separate Lisp hash-table `eq`/`eql`/`equal` test modes.
+
 ## Deliberate limits
 
 These literals always construct a **quiet** NaN. They do not encode the signaling
