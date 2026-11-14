@@ -69,12 +69,14 @@ constants in the number module describe that storage honestly. Low-three-bit
 GNU tags and a 62-bit fixnum payload require the common-header/kind migration;
 changing only a constant would corrupt pointers and integer values.
 
-The explicit width check is currently used by shifts and powers; enforcing a dynamically
-bound width at every allocation-producing arithmetic operation requires carrying
-numeric policy through every primitive adapter and the reader. This patch does
-not claim that global policy plumbing, a generational collector, named numeric
-condition hierarchy, raw-byte strings, cross-domain identity, or finalizer-aware
-BigInt accounting has been implemented.
+Arithmetic width policy now also gates final results of ordinary arithmetic,
+bitwise operations, allocating rounding and negative integer `abs`; the precise
+scope and allocation limitations are in [the width policy note](runtime-number-width-policy.md).
+This is not a global integer-allocation restriction: GNU Emacs 30.1 permits
+`string-to-number` and `read-from-string` to construct a 1,000-digit integer even
+under `integer-width` 128. Reader allocation must not be gated indiscriminately.
+This does not claim a generational collector, named numeric condition hierarchy,
+raw-byte strings, cross-domain identity, or finalizer-aware BigInt accounting.
 
 A future R1 change should replace the storage constants/checked `Fixnum` codec,
 make raw constructors private/fallible, migrate remaining direct integer

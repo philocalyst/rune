@@ -790,9 +790,17 @@ fn bind_args<'a>(
 ) -> AnyResult<()> {
     let (required, optional, rest) = parse_arg_list(arg_list)?;
 
-    let num_required_args = required.len() as u16;
-    let num_optional_args = optional.len() as u16;
-    let num_actual_args = args.len() as u16;
+    // Formal lists are Lisp data and need not fit native frame metadata.
+    // Validate before argument unwraps or publishing any lexical bindings.
+    let num_required_args = u16::try_from(required.len())
+        .context("Required formal parameter count exceeds supported range")?;
+    let num_optional_args = u16::try_from(optional.len())
+        .context("Optional formal parameter count exceeds supported range")?;
+    let max_args = num_required_args
+        .checked_add(num_optional_args)
+        .context("Combined formal parameter count exceeds supported range")?;
+    let num_actual_args =
+        u16::try_from(args.len()).context("Actual argument count exceeds supported range")?;
     // Ensure the minimum number of arguments is present
     ensure!(
         num_actual_args >= num_required_args,
@@ -800,7 +808,7 @@ fn bind_args<'a>(
     );
 
     let mut arg_values = args.iter().copied();
-    let rest_offset = args.len().min(required.len() + optional.len());
+    let rest_offset = args.len().min(usize::from(max_args));
 
     for name in required {
         let val = arg_values.next().unwrap();
@@ -819,7 +827,7 @@ fn bind_args<'a>(
         // Ensure too many args were not provided
         ensure!(
             arg_values.next().is_none(),
-            LispError::arg_cnt(name, num_required_args + num_optional_args, num_actual_args, cx)
+            LispError::arg_cnt(name, max_args, num_actual_args, cx)
         );
     }
     Ok(())
@@ -968,6 +976,27 @@ mod test {
         let obj = crate::reader::read(test_str, cx).unwrap().0;
         root!(obj, cx);
         assert!(eval(obj, None, env, cx).is_err());
+    }
+
+    #[test]
+    fn oversized_formal_parameter_lists_error_before_binding_or_argument_unwrap() {
+        for (required, optional) in [(65_536usize, 0usize), (0, 65_536), (32_768, 32_768)] {
+            let roots = &RootSet::default();
+            let cx = &Context::new(roots);
+            let mut names = vec![Object::from(sym::FILL_COLUMN); required];
+            if optional != 0 {
+                names.push(sym::AND_OPTIONAL.into());
+            }
+            names.extend(std::iter::repeat_n(Object::from(sym::FILL_COLUMN), optional));
+            let parameters = crate::fns::slice_into_list(&names, None, cx);
+            root!(parameters, cx);
+            let mut variables = Vec::new();
+            let error =
+                bind_args(parameters.bind(cx).into(), &[], &mut variables, "oversized-formals", cx)
+                    .unwrap_err();
+            assert!(error.to_string().contains("formal parameter count exceeds supported range"));
+            assert!(variables.is_empty());
+        }
     }
 
     #[test]
