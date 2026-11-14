@@ -1,6 +1,6 @@
 # Single-line underline publication
 
-The immutable face DTO (display protocol version2) carries a resolved optional
+The immutable face DTO (display protocol version 3; underline introduced in version 2) carries a resolved optional
 underline color. Owner resolution supports GNU underline nil (explicit off), t
 (final merged foreground), color strings, unspecified inheritance, and the
 existing bounded named/list/anonymous buffer face reference subset. The raw

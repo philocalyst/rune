@@ -15,4 +15,4 @@ Existing alias/list/visible-range/work limits apply unchanged.
 
 This is not full GNU face merging, overlays/font-lock, graphical frame or native
 window verification. Font families/weights/slants, decorations beyond the
-existing single-line underline and full Org-mode styling remain outside scope.
+existing single-line underline/strike-through and full Org-mode styling remain outside scope.

@@ -8,8 +8,9 @@ released. No Lisp values, roots or Context enter GPUI or the frame DTO.
 
 Supported color references: frame-local named Symbol/String faces, bounded
 Symbol/String aliases, ordered face lists, anonymous foreground/background plists
-and named/anonymous `:inherit` color fallbacks. Only raw foreground/background
-colors are published; fonts/decorations/distant-color heuristics are not applied.
+and named/anonymous `:inherit` color fallbacks. Foreground/background and the separately documented single-line underline and
+strike-through slices are published. Font variants, other decorations and
+distant-color heuristics are not applied.
 Nonboolean inverse-video, default-face inheritance, duplicate anonymous attributes,
 unknown faces/colors, and non-nil font-lock-face properties fail explicitly.
 Global new-frame defaults, overlays, mouse faces, full font-lock/Org styling and
