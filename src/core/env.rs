@@ -232,6 +232,31 @@ impl<'a> RootedEnv<'a> {
         }
     }
 
+    pub(crate) fn toplevel_value<'ob>(&self, var: Symbol, cx: &'ob Context) -> Option<Object<'ob>> {
+        if var.is_const() {
+            return Some(var.into());
+        }
+        for (symbol, saved) in self.binding_stack.bind_ref(cx) {
+            if **symbol == var {
+                return saved.as_ref().map(|value| cx.bind(**value));
+            }
+        }
+        self.vars.get(var).map(|value| value.bind(cx))
+    }
+    pub(crate) fn set_toplevel_value(&mut self, var: Symbol, value: Object) -> Result<()> {
+        Self::validate_variable_value(var, value)?;
+        if var.is_const() {
+            return Err(anyhow!("Attempt to set a constant symbol"));
+        }
+        for binding in &mut *self.binding_stack {
+            if binding.0 == var {
+                binding.1.set(Some(value));
+                return Ok(());
+            }
+        }
+        self.set_var(var, value)
+    }
+
     pub(crate) fn defvar(&mut self, var: Symbol, value: Object) -> Result<()> {
         // TOOD: Handle `eval-sexp` on defvar, which should always update the
         // value

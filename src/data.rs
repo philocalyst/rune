@@ -78,6 +78,22 @@ pub(crate) fn local_variable_if_set_p(_sym: Symbol) -> bool {
 }
 
 #[defun]
+fn default_toplevel_value<'ob>(
+    symbol: Symbol,
+    env: &Rt<Env>,
+    cx: &'ob Context,
+) -> Result<Object<'ob>> {
+    env.toplevel_value(symbol, cx).ok_or_else(|| {
+        crate::eval::EvalError::signal(sym::VOID_VARIABLE.into(), Cons::new1(symbol, cx).into(), cx)
+            .into()
+    })
+}
+#[defun]
+fn set_default_toplevel_value(symbol: Symbol, value: Object, env: &mut Rt<Env>) -> Result<()> {
+    env.set_toplevel_value(symbol, value)
+}
+
+#[defun]
 pub(crate) fn default_value<'ob>(
     symbol: Symbol,
     env: &Rt<Env>,
@@ -1310,5 +1326,32 @@ mod error_ownership_tests {
         })
         .join()
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod toplevel_default_tests {
+    #[test]
+    fn top_level_defaults_ignore_dynamic_binding_and_restore_updated_saved_value() {
+        for (source, expected) in [
+            (
+                "(progn (defvar vm-top-a 1) (list (let ((vm-top-a 2)) (list (default-toplevel-value 'vm-top-a) (set-default-toplevel-value 'vm-top-a 3) vm-top-a)) vm-top-a))",
+                "((1 nil 2) 3)",
+            ),
+            (
+                "(progn (defvar vm-top-b nil) (makunbound 'vm-top-b) (list (let ((vm-top-b 1)) (list (condition-case nil (default-toplevel-value 'vm-top-b) (void-variable 'unbound)) (set-default-toplevel-value 'vm-top-b 2) vm-top-b)) vm-top-b))",
+                "((unbound nil 1) 2)",
+            ),
+            (
+                "(list (default-toplevel-value nil) (default-toplevel-value t) (default-toplevel-value :vm-top-key))",
+                "(nil t :vm-top-key)",
+            ),
+            (
+                "(progn (defvar vm-top-gc '(\"kept\")) (let ((vm-top-gc nil)) (set-default-toplevel-value 'vm-top-gc '(\"moved\")) (garbage-collect) (default-toplevel-value 'vm-top-gc)))",
+                "(\"moved\")",
+            ),
+        ] {
+            crate::interpreter::assert_lisp(source, expected);
+        }
     }
 }
