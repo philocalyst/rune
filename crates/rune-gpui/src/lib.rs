@@ -19,6 +19,10 @@ use std::{
 };
 
 mod font_geometry;
+mod font_bank_identity;
+mod font_variants;
+pub use font_variants::NativeFontVariantBank;
+pub use rune_display::{MeasuredFontCapabilities as NativeFontCapabilities, MeasuredFontVariant as NativeFontVariant};
 mod input_policy;
 #[cfg(feature = "editor")]
 mod wheel;
@@ -81,6 +85,7 @@ pub struct NativeFont {
     font: gpui::Font,
     size: Pixels,
     metrics: FontMetrics,
+    measured_advances: [f32; 3],
 }
 impl NativeFont {
     /// Measures on the UI thread before creating a layout worker. GPUI resolves
@@ -112,6 +117,7 @@ impl NativeFont {
             font,
             size: px(size),
             metrics: FontMetrics { advance: advances[0], ascent, descent, line_gap },
+            measured_advances: advances,
         })
     }
     pub fn metrics(&self) -> FontMetrics {
