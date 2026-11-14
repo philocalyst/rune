@@ -10,7 +10,7 @@ use gpui::{
 use rune_display::{Color, Face, FontMetrics, FrameDisplay, PaintTarget, Rect};
 use rune_display::{InputBacklog, InputEvent, ResizeTracker};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::Rc,
     sync::{
         Arc,
@@ -390,6 +390,10 @@ impl Render for FrameView {
         }
         let frame = self.frame.clone();
         let pointer_frame = frame.clone();
+        // Pointer events are window-relative; prepared frame coordinates are
+        // canvas-local, just like the paint target and platform text geometry.
+        let painted_bounds = Rc::new(Cell::new(None::<Bounds<Pixels>>));
+        let pointer_bounds = painted_bounds.clone();
         let pointer_focus = self.focus.clone();
         let pointer_input = self.input.clone();
         let wheel_input = self.input.clone();
@@ -431,8 +435,13 @@ impl Render for FrameView {
                 cx.stop_propagation();
             })
             .on_any_mouse_down(move |event: &MouseDownEvent, window, cx| {
-                let position =
-                    rune_display::Point { x: event.position.x.into(), y: event.position.y.into() };
+                let Some(bounds) = pointer_bounds.get() else {
+                    return;
+                };
+                let position = rune_display::Point {
+                    x: (event.position.x - bounds.origin.x).into(),
+                    y: (event.position.y - bounds.origin.y).into(),
+                };
                 if let Some(hit) = pointer_frame.hit_test(position) {
                     let button = match event.button {
                         MouseButton::Left => 1,
@@ -465,6 +474,7 @@ impl Render for FrameView {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, cx| {
+                        painted_bounds.set(Some(bounds));
                         #[cfg(feature = "editor")]
                         let overlay = ime_for_paint.as_ref().and_then(|ime| {
                             ime.bounds.set(Some(bounds));
