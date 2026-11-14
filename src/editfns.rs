@@ -200,6 +200,23 @@ fn char_before(position: Option<i64>, env: &Rt<Env>, cx: &Context) -> Result<Opt
     character_at_point(position, true, env, cx)
 }
 #[defun]
+fn following_char(env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    Ok(character_at_point(None, false, env, cx)?.unwrap_or(0))
+}
+#[defun]
+fn preceding_char(env: &Rt<Env>, cx: &Context) -> Result<usize> {
+    Ok(character_at_point(None, true, env, cx)?.unwrap_or(0))
+}
+#[defun]
+fn bobp(env: &Rt<Env>, cx: &Context) -> Result<bool> {
+    Ok(env.buffer_read(cx)?.point == 0)
+}
+#[defun]
+fn eobp(env: &Rt<Env>, cx: &Context) -> Result<bool> {
+    let read = env.buffer_read(cx)?;
+    Ok(read.point == read.document.text().len_chars())
+}
+#[defun]
 fn eolp(env: &Rt<Env>, cx: &Context) -> Result<bool> {
     let read = env.buffer_read(cx)?;
     Ok(matches!(read.document.text().char_at(rune_text::CharPos(read.point)), None | Some('\n')))
@@ -400,6 +417,16 @@ mod owner_buffer_primitives_tests {
         assert!(!native.snapshot()?.buffers[0].modified);
         assert!(matches!(native.execute(Command::Undo), Err(rune_editor::EditorError::NoUndo)));
         Ok(())
+    }
+    #[test]
+    fn lisp_empty_and_unicode_boundary_queries_match_gnu_without_moving_point() {
+        crate::assert_elprop!(r#"(progn (erase-buffer)
+          (let ((empty (list (bobp) (eobp) (bolp) (eolp) (following-char) (preceding-char))))
+            (insert "é🙂\n") (goto-char 1)
+            (list empty
+                  (list (bobp) (eobp) (following-char) (preceding-char) (point))
+                  (progn (goto-char 2) (list (following-char) (preceding-char) (point)))
+                  (progn (goto-char 4) (list (bobp) (eobp) (bolp) (eolp) (following-char) (preceding-char) (point))))))"#);
     }
     #[test]
     fn lisp_character_queries_match_gnu_unicode_and_boundaries() {
