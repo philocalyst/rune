@@ -63,6 +63,12 @@ impl Document for RopeDocument {
         )?;
         Ok(Self { snapshot, insertion_properties: self.insertion_properties })
     }
+    fn insert_before_markers(&self, at: usize, text: &str) -> Result<Self, Self::Error> {
+        let inserted = Snapshot::new(rune_text::Rope::from(text))
+            .set_properties(CharPos(0)..CharPos(text.chars().count()), self.insertion_properties)?;
+        let (snapshot, _) = self.snapshot.insert_before_markers(CharPos(at), &inserted)?;
+        Ok(Self { snapshot, insertion_properties: self.insertion_properties })
+    }
     fn replace_preserving_properties(
         &self,
         range: Range<usize>,

@@ -140,6 +140,15 @@ impl Document for RuntimeDocument {
             .transpose()?;
         Ok(Self { snapshot, lineage: Arc::new(()), binding })
     }
+    fn insert_before_markers(&self, at:usize, text:&str)->anyhow::Result<Self> {
+        let id=self.binding.as_ref().map_or(0,|b|b.insertion.id());
+        let inserted=Snapshot::new(rune_text::Rope::from(text)).set_properties(CharPos(0)..CharPos(text.chars().count()),PropSetId(id))?;
+        let (snapshot,_)=self.snapshot.insert_before_markers(CharPos(at),&inserted)?;
+        let binding=self.binding.as_ref().map(|b| Ok::<_,anyhow::Error>(Binding{
+            lease:b.lease.retain_for_snapshot(snapshot.properties().runs().map(|(_,id)|id.0),&b.insertion)?,insertion:b.insertion.clone()
+        })).transpose()?;
+        Ok(Self{snapshot,lineage:Arc::new(()),binding})
+    }
     fn replace_preserving_properties(
         &self,
         range: Range<usize>,
@@ -1843,3 +1852,33 @@ mod persistent_lisp_quit_adapter_tests {
 
 mod save;
 pub(crate) use save::{PendingSave, SaveKind, SaveMode, SaveOutcome, WrittenSave};
+
+impl RuntimeEditorGateway {
+    pub(crate) fn insert_before_markers(&self,handle:OwnerBufferHandle,epoch:u64,at:usize,text:&str,cx:&Context)->anyhow::Result<()> {
+        self.check(cx)?;let mut owner=self.inner.try_borrow_mut()?;let id=owner.validate_handle(handle,cx)?;
+        owner.session.insert_buffer_before_markers(id,epoch,at,text)?;Ok(())
+    }
+}
+
+#[cfg(test)]
+mod insert_before_marker_owner_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_editor::{Command,EditorHost};
+    #[test]
+    fn atomic_owner_insertion_preserves_properties_and_dynamic_live_marker_history() {
+        let roots=RootSet::default();let cx=Context::new(&roots);let g=cx.editor_gateway().unwrap();let h=g.create("forced-markers","ab",&cx).unwrap();
+        let read=g.read(h,&cx).unwrap();
+        // SAFETY: fresh value belongs to this owner Context.
+        let style=unsafe{g.intern_property(cx.add("face"),&cx)}.unwrap();
+        let properties=g.prepare_properties(&read,CharPos(1)..CharPos(2),&style,&cx).unwrap();g.publish_properties(properties,&cx).unwrap();
+        let left=g.register_marker(h,1,Bias::Left,&cx).unwrap();let right=g.register_marker(h,1,Bias::Right,&cx).unwrap();let removed=g.register_marker(h,1,Bias::Left,&cx).unwrap();let read=g.read(h,&cx).unwrap();
+        g.insert_before_markers(h,read.epoch,1,"λ🙂",&cx).unwrap();
+        assert_eq!(g.read(h,&cx).unwrap().document.to_text(),"aλ🙂b");assert_eq!(g.marker_position(h,left,&cx).unwrap(),Some(3));assert_eq!(g.marker_position(h,right,&cx).unwrap(),Some(3));assert_eq!(g.read(h,&cx).unwrap().document.properties().at(CharPos(3)),Some(PropSetId(style.id())));
+        assert!(g.insert_before_markers(h,read.epoch,1,"stale",&cx).is_err());g.remove_marker(h,removed,&cx).unwrap();
+        let mut host=g.host(&cx).unwrap();host.execute(Command::SwitchBuffer(h.buffer)).unwrap();host.execute(Command::Undo).unwrap();assert_eq!(g.marker_position(h,left,&cx).unwrap(),Some(1));
+        let fresh=g.register_marker(h,1,Bias::Left,&cx).unwrap();
+        host.execute(Command::Redo).unwrap();assert_eq!(g.marker_position(h,left,&cx).unwrap(),Some(3));assert_eq!(g.marker_position(h,right,&cx).unwrap(),Some(3));assert_eq!(g.marker_position(h,fresh,&cx).unwrap(),Some(1));assert_eq!(g.marker_position(h,removed,&cx).unwrap(),None);
+        assert_eq!(g.read(h,&cx).unwrap().document.properties().at(CharPos(3)),Some(PropSetId(style.id())));
+    }
+}

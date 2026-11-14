@@ -17,6 +17,10 @@ pub trait Document: Clone {
     fn empty() -> Self;
     fn len_chars(&self) -> usize;
     fn replace(&self, range: Range<usize>, text: &str) -> Result<Self, Self::Error>;
+    /// Insert advancing every preexisting marker at the insertion boundary.
+    fn insert_before_markers(&self, at: usize, text: &str) -> Result<Self, Self::Error> {
+        self.replace(at..at, text)
+    }
     /// Case conversion policy: preserve properties for same-width substitution.
     /// Marker/history transformation is still an ordinary text splice.
     fn replace_preserving_properties(

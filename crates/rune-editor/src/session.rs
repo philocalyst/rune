@@ -132,6 +132,18 @@ pub enum Dispatch {
     Executed(CommandOutcome),
 }
 
+#[derive(Clone, Copy)]
+enum ViewField {
+    Point,
+    Start,
+}
+#[derive(Clone)]
+struct ViewAdjustment {
+    window: WindowId,
+    buffer: BufferId,
+    field: ViewField,
+    offset: usize,
+}
 #[derive(Clone)]
 struct HistoryEntry<D: Document> {
     before: D,
@@ -141,6 +153,8 @@ struct HistoryEntry<D: Document> {
     coordinate_stable: bool,
     before_markers: Option<D::MarkerUndo>,
     after_markers: Option<D::MarkerUndo>,
+    before_views: Option<Vec<ViewAdjustment>>,
+    after_views: Option<Vec<ViewAdjustment>>,
     before_version: u64,
     after_version: u64,
     before_dirty: bool,
@@ -461,12 +475,17 @@ impl<D: Document> Session<D> {
     }
     /// Publish a newly loaded clean document and native association together.
     /// Does not select a UI window or alter evaluator current-buffer binding.
-    pub fn create_visited_buffer(&mut self, name:&str, document:D, path:std::sync::Arc<std::path::Path>)->Result<BufferId> {
-        let sequence=self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
-        let id=self.create_buffer(name,document)?;
-        let buffer=self.state.buffers.get_mut(&id).expect("just created buffer");
-        buffer.file=crate::FileAssociation{revision:1,path:Some(path)};
-        self.state.sequence=sequence;
+    pub fn create_visited_buffer(
+        &mut self,
+        name: &str,
+        document: D,
+        path: std::sync::Arc<std::path::Path>,
+    ) -> Result<BufferId> {
+        let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
+        let id = self.create_buffer(name, document)?;
+        let buffer = self.state.buffers.get_mut(&id).expect("just created buffer");
+        buffer.file = crate::FileAssociation { revision: 1, path: Some(path) };
+        self.state.sequence = sequence;
         Ok(id)
     }
     pub fn set_current_buffer(&mut self, id: BufferId) -> Result<()> {
@@ -634,18 +653,102 @@ impl<D: Document> Session<D> {
         Ok(())
     }
     fn map_views(&mut self, buffer: BufferId, splice: Splice, length: usize) -> Result<()> {
+        self.map_views_bias(buffer, splice, length, Bias::Left)
+    }
+    fn map_views_bias(
+        &mut self,
+        buffer: BufferId,
+        splice: Splice,
+        length: usize,
+        bias: Bias,
+    ) -> Result<()> {
         for id in self.state.windows.leaves() {
             let view = self.state.windows.view_mut(id)?;
             if view.buffer == buffer {
-                view.point = splice.map(view.point, Bias::Left)?.min(length);
-                view.start = splice.map(view.start, Bias::Left)?.min(length);
+                view.point = splice.map(view.point, bias)?.min(length);
+                view.start = splice.map(view.start, bias)?.min(length);
+            }
+        }
+        Ok(())
+    }
+    fn capture_view_undo(
+        &self,
+        buffer: BufferId,
+        range: Range<usize>,
+    ) -> Result<Vec<ViewAdjustment>> {
+        let mut records = Vec::new();
+        for window in self.state.windows.leaves() {
+            let view = self.state.windows.view(window)?;
+            if view.buffer != buffer {
+                continue;
+            }
+            for (field, position) in
+                [(ViewField::Point, view.point), (ViewField::Start, view.start)]
+            {
+                if position > range.start && position <= range.end {
+                    records.push(ViewAdjustment {
+                        window,
+                        buffer,
+                        field,
+                        offset: position - range.start,
+                    });
+                }
+            }
+        }
+        Ok(records)
+    }
+    fn restore_views(
+        &mut self,
+        buffer: BufferId,
+        splice: Splice,
+        length: usize,
+        records: Option<&[ViewAdjustment]>,
+    ) -> Result<()> {
+        let Some(records) = records else { return self.map_views(buffer, splice, length) };
+        // Separate phases matter even when the sparse record list is empty.
+        let deleted = Splice { start: splice.start, end: splice.end, inserted: 0 };
+        self.map_views(
+            buffer,
+            deleted,
+            length.checked_sub(splice.inserted).ok_or(EditorError::InvalidRange)?,
+        )?;
+        let mut eligible = Vec::new();
+        for record in records {
+            if record.buffer != buffer || record.offset > splice.inserted {
+                continue;
+            }
+            if let Ok(view) = self.state.windows.view(record.window) {
+                let position = match record.field {
+                    ViewField::Point => view.point,
+                    ViewField::Start => view.start,
+                };
+                if view.buffer == buffer && position == splice.start {
+                    eligible.push(record.clone());
+                }
+            }
+        }
+        self.map_views(
+            buffer,
+            Splice { start: splice.start, end: splice.start, inserted: splice.inserted },
+            length,
+        )?;
+        for record in eligible {
+            let position = splice
+                .start
+                .checked_add(record.offset)
+                .ok_or(EditorError::InvalidPosition)?
+                .min(length);
+            let view = self.state.windows.view_mut(record.window)?;
+            match record.field {
+                ViewField::Point => view.point = position,
+                ViewField::Start => view.start = position,
             }
         }
         Ok(())
     }
     fn edit(&mut self, range: Range<usize>, text: &str) -> Result<BufferId> {
         let id = self.state.windows.view(self.selected_window())?.buffer;
-        self.edit_buffer(id, range, text, false)
+        self.edit_buffer(id, range, text, false, false)
     }
     fn edit_buffer(
         &mut self,
@@ -653,6 +756,7 @@ impl<D: Document> Session<D> {
         range: Range<usize>,
         text: &str,
         preserve: bool,
+        before_markers: bool,
     ) -> Result<BufferId> {
         let buffer = self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?;
         if buffer.read_only {
@@ -676,7 +780,14 @@ impl<D: Document> Session<D> {
         } else {
             None
         };
-        let document = if preserve {
+        let before_views = if !coordinate_stable && range.start < range.end {
+            Some(self.capture_view_undo(id, range.clone())?)
+        } else {
+            None
+        };
+        let document = if before_markers {
+            buffer.document.insert_before_markers(range.start, text)
+        } else if preserve {
             buffer.document.replace_preserving_properties(range, text)
         } else {
             buffer.document.replace(range, text)
@@ -693,6 +804,8 @@ impl<D: Document> Session<D> {
             coordinate_stable,
             before_markers: records,
             after_markers: None,
+            before_views,
+            after_views: None,
             before_version: buffer.version,
             after_version: version,
             before_dirty: buffer.forced_dirty || buffer.version != buffer.saved_version,
@@ -701,7 +814,12 @@ impl<D: Document> Session<D> {
             after_dirty_generation: buffer.save_generation,
         };
         if !coordinate_stable {
-            self.map_views(id, splice, length)?;
+            self.map_views_bias(
+                id,
+                splice,
+                length,
+                if before_markers { Bias::Right } else { Bias::Left },
+            )?;
         }
         let buffer = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
         if !buffer.name.starts_with(' ') {
@@ -768,6 +886,22 @@ impl<D: Document> Session<D> {
         };
         let reinserted =
             if redo { entry.after_markers.clone() } else { entry.before_markers.clone() };
+        let reinserted_views =
+            if redo { entry.after_views.clone() } else { entry.before_views.clone() };
+        let removed_views =
+            if !entry.metadata && !entry.coordinate_stable && splice.start < splice.end {
+                Some(self.capture_view_undo(id, splice.start..splice.end)?)
+            } else {
+                None
+            };
+        if !entry.metadata && !entry.coordinate_stable {
+            if redo {
+                entry.before_views = removed_views;
+            } else {
+                entry.after_views = removed_views;
+            }
+        }
+
         let removed = if !entry.metadata && !entry.coordinate_stable && splice.start < splice.end {
             Some(
                 buffer
@@ -795,7 +929,7 @@ impl<D: Document> Session<D> {
             .map_err(|e| EditorError::Backend(e.to_string()))?;
         let length = document.len_chars();
         if !entry.metadata && !entry.coordinate_stable {
-            self.map_views(id, splice, length)?;
+            self.restore_views(id, splice, length, reinserted_views.as_deref())?;
         }
         let metadata = entry.metadata;
         let buffer = self.state.buffers.get_mut(&id).ok_or(EditorError::InvalidBuffer)?;
@@ -1133,6 +1267,8 @@ impl<D: Document> Session<D> {
                 coordinate_stable: true,
                 before_markers: None,
                 after_markers: None,
+                before_views: None,
+                after_views: None,
                 before_version: b.version,
                 after_version: version,
                 before_dirty: b.forced_dirty || b.version != b.saved_version,
@@ -1191,7 +1327,7 @@ impl<D: Document> Session<D> {
         range: Range<usize>,
         text: &str,
     ) -> Result<CommandOutcome> {
-        self.replace_buffer_policy(id, expected_epoch, range, text, false)
+        self.replace_buffer_policy(id, expected_epoch, range, text, false, false)
     }
     pub fn replace_buffer_preserving_properties(
         &mut self,
@@ -1200,7 +1336,16 @@ impl<D: Document> Session<D> {
         range: Range<usize>,
         text: &str,
     ) -> Result<CommandOutcome> {
-        self.replace_buffer_policy(id, expected_epoch, range, text, true)
+        self.replace_buffer_policy(id, expected_epoch, range, text, true, false)
+    }
+    pub fn insert_buffer_before_markers(
+        &mut self,
+        id: BufferId,
+        expected_epoch: u64,
+        at: usize,
+        text: &str,
+    ) -> Result<CommandOutcome> {
+        self.replace_buffer_policy(id, expected_epoch, at..at, text, false, true)
     }
     fn replace_buffer_policy(
         &mut self,
@@ -1209,6 +1354,7 @@ impl<D: Document> Session<D> {
         range: Range<usize>,
         text: &str,
         preserve: bool,
+        before_markers: bool,
     ) -> Result<CommandOutcome> {
         if self.state.buffers.get(&id).ok_or(EditorError::InvalidBuffer)?.publication_epoch
             != expected_epoch
@@ -1217,7 +1363,9 @@ impl<D: Document> Session<D> {
         }
         let sequence = self.state.sequence.checked_add(1).ok_or(EditorError::IdExhausted)?;
         let backup = self.state.clone();
-        let result = catch_unwind(AssertUnwindSafe(|| self.edit_buffer(id, range, text, preserve)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.edit_buffer(id, range, text, preserve, before_markers)
+        }));
         match result {
             Ok(Ok(id)) => {
                 self.state.sequence = sequence;
@@ -1572,18 +1720,31 @@ mod file_association_tests {
     }
     #[test]
     fn trusted_open_sequence_exhaustion_or_name_collision_publishes_nothing() {
-        let mut s=Session::new(StringDocument::empty(),80,24).unwrap();
-        let before=s.snapshot();
-        s.state.sequence=u64::MAX;
-        assert_eq!(s.create_visited_buffer("new",StringDocument::from("disk"),Arc::from(Path::new("/native/new"))),Err(EditorError::IdExhausted));
+        let mut s = Session::new(StringDocument::empty(), 80, 24).unwrap();
+        let before = s.snapshot();
+        s.state.sequence = u64::MAX;
+        assert_eq!(
+            s.create_visited_buffer(
+                "new",
+                StringDocument::from("disk"),
+                Arc::from(Path::new("/native/new"))
+            ),
+            Err(EditorError::IdExhausted)
+        );
         assert!(s.get_buffer("new").is_none());
-        assert_eq!(s.snapshot().buffers.len(),before.buffers.len());
-        s.state.sequence=before.sequence;
-        let old=s.current_buffer();
-        let name=s.snapshot().buffers.iter().find(|b|b.id==old).unwrap().name.clone();
-        assert_eq!(s.create_visited_buffer(&name,StringDocument::from("disk"),Arc::from(Path::new("/native/new"))),Err(EditorError::NameInUse));
-        assert_eq!(s.snapshot().sequence,before.sequence);
+        assert_eq!(s.snapshot().buffers.len(), before.buffers.len());
+        s.state.sequence = before.sequence;
+        let old = s.current_buffer();
+        let name = s.snapshot().buffers.iter().find(|b| b.id == old).unwrap().name.clone();
+        assert_eq!(
+            s.create_visited_buffer(
+                &name,
+                StringDocument::from("disk"),
+                Arc::from(Path::new("/native/new"))
+            ),
+            Err(EditorError::NameInUse)
+        );
+        assert_eq!(s.snapshot().sequence, before.sequence);
         assert!(s.file_name(old).unwrap().is_none());
     }
-
 }

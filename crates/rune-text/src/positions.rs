@@ -123,6 +123,14 @@ impl PositionTree {
         Self { tree: left.append(&right), text_len: self.text_len }
     }
     pub fn edit(&self, delta: &EditDelta) -> TextResult<Self> {
+        self.edit_impl(delta, false)
+    }
+    /// Insert before every marker at `at`, independent of its insertion bias.
+    /// Biases themselves are preserved; later ordinary edits still respect them.
+    pub fn insert_before_markers(&self, at: CharPos, inserted_chars: usize) -> TextResult<Self> {
+        self.edit_impl(&EditDelta::new(at..at, inserted_chars)?, true)
+    }
+    fn edit_impl(&self, delta: &EditDelta, advance_boundary: bool) -> TextResult<Self> {
         if delta.old.start > delta.old.end {
             return Err(TextError::ReversedRange);
         }
@@ -152,7 +160,10 @@ impl PositionTree {
                 break;
             }
             affected += 1;
-            let target = delta.map(CharPos(old_position), marker.bias)?.0;
+            let bias = if advance_boundary && old_position == delta.old.start.0 {
+                Bias::Right
+            } else { marker.bias };
+            let target = delta.map(CharPos(old_position), bias)?.0;
             if target == delta.old.start.0 {
                 left_markers.push((*marker, target));
             } else {
@@ -230,5 +241,30 @@ mod tests {
             let positions = tree.markers().map(|(_, p, _)| p).collect::<Vec<_>>();
             assert!(positions.windows(2).all(|w| w[0] <= w[1]));
         }
+    }
+}
+
+#[cfg(test)]
+mod insert_before_marker_tests {
+    use super::*;
+    #[test]
+    fn both_biases_advance_at_boundary_without_changing_bias_or_old_root() {
+        let old = PositionTree::new(4)
+            .insert(MarkerId(1), CharPos(2), Bias::Left).unwrap()
+            .insert(MarkerId(2), CharPos(2), Bias::Right).unwrap()
+            .insert(MarkerId(3), CharPos(0), Bias::Left).unwrap()
+            .insert(MarkerId(4), CharPos(4), Bias::Left).unwrap();
+        let next = old.insert_before_markers(CharPos(2), 2).unwrap();
+        assert_eq!(next.get(MarkerId(1)), Some((CharPos(4), Bias::Left)));
+        assert_eq!(next.get(MarkerId(2)), Some((CharPos(4), Bias::Right)));
+        assert_eq!(next.get(MarkerId(3)), Some((CharPos(0), Bias::Left)));
+        assert_eq!(next.get(MarkerId(4)), Some((CharPos(6), Bias::Left)));
+        assert_eq!(old.get(MarkerId(1)), Some((CharPos(2), Bias::Left)));
+        let ordinary = next.edit(&EditDelta::new(CharPos(4)..CharPos(4), 1).unwrap()).unwrap();
+        assert_eq!(ordinary.get(MarkerId(1)).unwrap().0, CharPos(4));
+        assert_eq!(ordinary.get(MarkerId(2)).unwrap().0, CharPos(5));
+        assert!(old.insert_before_markers(CharPos(5), 1).is_err());
+        let huge = PositionTree::new(usize::MAX);
+        assert!(huge.insert_before_markers(CharPos(0), 1).is_err());
     }
 }

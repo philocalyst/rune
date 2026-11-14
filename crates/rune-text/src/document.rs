@@ -163,6 +163,15 @@ impl Snapshot {
         range: Range<CharPos>,
         inserted: &Snapshot,
     ) -> TextResult<(Self, EditRecord)> {
+        self.splice_impl(range, inserted, false)
+    }
+    /// Persistent insertion that advances all existing markers at the boundary.
+    /// Inserted snapshots contribute text/properties, never marker ownership.
+    /// Runtime callers must validate the common property-ID owner domain.
+    pub fn insert_before_markers(&self, at: CharPos, inserted: &Snapshot) -> TextResult<(Self, EditRecord)> {
+        self.splice_impl(at..at, inserted, true)
+    }
+    fn splice_impl(&self, range: Range<CharPos>, inserted: &Snapshot, advance_boundary: bool) -> TextResult<(Self, EditRecord)> {
         let old_bytes = self.text.char_to_byte(range.start)?..self.text.char_to_byte(range.end)?;
         let old_lines =
             self.text.char_to_line(range.start)?..LinePos(self.text.char_to_line(range.end)?.0 + 1);
@@ -175,7 +184,9 @@ impl Snapshot {
             .slice(CharPos(0)..range.start)?
             .checked_append(&inserted.props)?
             .checked_append(&self.props.slice(range.end..CharPos(self.len_chars()))?)?;
-        let next_positions = self.positions.edit(&delta)?;
+        let next_positions = if advance_boundary {
+            self.positions.insert_before_markers(range.start, inserted.len_chars())?
+        } else { self.positions.edit(&delta)? };
         let version = Version(self.version.0.checked_add(1).ok_or(TextError::VersionOverflow)?);
         let new_end = CharPos(delta.old.start.0 + delta.inserted_chars);
         let record = EditRecord {
@@ -415,5 +426,43 @@ mod recovered_history_tests {
             )
             .unwrap();
         assert_eq!(restored.positions().get(MarkerId(3)).unwrap().0, CharPos(0));
+    }
+}
+
+#[cfg(test)]
+mod insert_before_marker_snapshot_tests {
+    use super::*;
+    use crate::{DeletionMarkers, MarkerId};
+    #[test]
+    fn unicode_properties_and_dynamic_marker_undo_preserve_live_ids() {
+        let old = Snapshot::new(Rope::from("ab"))
+            .set_properties(CharPos(0)..CharPos(2), PropSetId(3)).unwrap()
+            .with_marker(MarkerId(1), CharPos(1), Bias::Left).unwrap()
+            .with_marker(MarkerId(2), CharPos(1), Bias::Right).unwrap();
+        let inserted = Snapshot::new(Rope::from("λ🙂"))
+            .set_properties(CharPos(0)..CharPos(2), PropSetId(7)).unwrap()
+            .with_marker(MarkerId(99), CharPos(0), Bias::Left).unwrap();
+        let (next, record) = old.insert_before_markers(CharPos(1), &inserted).unwrap();
+        assert_eq!(next.text().to_string(), "aλ🙂b");
+        assert_eq!(next.positions().get(MarkerId(1)), Some((CharPos(3), Bias::Left)));
+        assert_eq!(next.positions().get(MarkerId(2)), Some((CharPos(3), Bias::Right)));
+        assert_eq!(next.positions().get(MarkerId(99)), None);
+        assert_eq!(next.properties().at(CharPos(0)), Some(PropSetId(3)));
+        assert_eq!(next.properties().at(CharPos(1)), Some(PropSetId(7)));
+        assert_eq!(next.properties().at(CharPos(2)), Some(PropSetId(7)));
+        assert_eq!(next.properties().at(CharPos(3)), Some(PropSetId(3)));
+        assert_eq!(record.delta.inserted_chars, 2);
+        assert_eq!(old.positions().get(MarkerId(1)).unwrap().0, CharPos(1));
+        let markers = DeletionMarkers::capture(next.positions(), CharPos(1)..CharPos(3)).unwrap();
+        let inverse = EditDelta::new(CharPos(1)..CharPos(3), 0).unwrap();
+        let undone = next.restore_content(&old, Some(&inverse)).unwrap()
+            .with_marker(MarkerId(5), CharPos(1), Bias::Left).unwrap();
+        let redo = undone.restore_content_with_marker_undo(&next, &record.delta, &markers).unwrap();
+        assert_eq!(redo.positions().get(MarkerId(1)).unwrap().0, CharPos(3));
+        assert_eq!(redo.positions().get(MarkerId(2)).unwrap().0, CharPos(3));
+        assert_eq!(redo.positions().get(MarkerId(5)).unwrap().0, CharPos(1));
+        let removed = undone.without_marker(MarkerId(1))
+            .restore_content_with_marker_undo(&next, &record.delta, &markers).unwrap();
+        assert_eq!(removed.positions().get(MarkerId(1)), None);
     }
 }
