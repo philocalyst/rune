@@ -1,8 +1,9 @@
 # Opt-in per-face font admission seam
 
 This prerequisite adds an explicit API, not automatic GNU face-weight publication.
-Existing constructors and ordinary `present` stay normal-only. No startup or
-command path calls the new method. No default style or display protocol field
+Existing constructors and ordinary `present` stay normal-only. No normal startup or
+command path calls the new method. A separate experimental paired stream can
+consume owner requests explicitly; see paired-owner-font-stream.md. No default style or display protocol field
 changes. `FrameDisplay` remains protocol 3; the optional typed sidecar is separate.
 
 A plain `FrameFontPlan` pins one exact immutable `Arc<FrameDisplay>` and maps

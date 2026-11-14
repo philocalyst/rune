@@ -29,10 +29,11 @@ by this weight/slant-only API, and this does not change their existing resolver.
 
 The request must be supported by the provided plain measured capabilities. That
 record is not security or input authority; actual native plan admission must
-still validate the live bank, identity and exact baseline. Current code does not
+still validate the live bank, identity and exact baseline. This query alone does not
 convert these runs to per-Face.id plans, stamp a new display protocol, send them
 to a worker, compare them automatically after commands, or activate FrameView.
-All existing rendering paths and protocol 3 remain unchanged.
+Normal rendering and protocol 3 remain unchanged. A separate experimental
+paired owner-font stream can consume the query; see paired-owner-font-stream.md.
 
 Limits: 100000 visible scalars, 4096 property runs, 32768 resolver work units,
 32 inheritance depth, 256 alias/list/property steps, 64KiB per string name and

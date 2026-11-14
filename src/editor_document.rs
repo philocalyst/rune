@@ -2603,3 +2603,6 @@ mod marker_buffer_live_tests {
 }
 
 mod font_runs;
+
+#[cfg(feature="native")]
+pub(crate) use font_runs::transport_projection as native_font_projection;

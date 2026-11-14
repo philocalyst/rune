@@ -26,6 +26,9 @@ impl NativeFrameFontPlan {
         }
         Ok(Self { plan, bank })
     }
+    pub fn bank_id(&self) -> u64 {
+        self.plan.bank_id()
+    }
     pub fn frame(&self) -> &Arc<FrameDisplay> {
         self.plan.frame()
     }

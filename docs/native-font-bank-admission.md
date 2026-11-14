@@ -1,7 +1,8 @@
 # Measured native font-bank admission prerequisite
 
-This is an opt-in diagnostic/API prerequisite. Native startup and FrameView do
-not construct or use the bank. No bold/italic rendering is enabled.
+This is an opt-in diagnostic/API prerequisite. Normal native startup does not construct or use the bank. Experimental opt-in
+FrameView/paired-stream APIs can use it separately; see paired-owner-font-stream.md.
+No default bold/italic rendering is enabled.
 
 The UI-owned bank retains at most four normal/bold/italic/combined measured
 faces. Native Font/FontId values never cross into the editor or layout worker.

@@ -41,11 +41,14 @@ pub struct VisibleFaceRevision {
     pub faces: Result<Option<Vec<rune_display::FaceSpan>>,String>,
 }
 pub type PublicationRevision = (u64, rune_editor::DisplayStyleRevision, Vec<VisibleFaceRevision>);
+pub(crate) type OwnerPublicationRevision = (u64, rune_editor::DisplayStyleRevision, Vec<VisibleFaceRevision>, Vec<Result<crate::font_transport::FontRunProjection,String>>);
 pub struct EditorBridge<H: EditorHost>
 where
     H::Doc: DisplayDocument,
 {
     host: H,
+    fonts: Option<crate::font_transport::Configuration<H>>,
+    font_plan: Option<Arc<rune_display::FrameFontPlan>>,
     metrics: FixedMetrics,
     bounds: Rect,
     scale: f32,
@@ -97,6 +100,8 @@ where
         host.execute(Command::Resize { width, height })?;
         Ok(Self {
             host,
+            fonts: None,
+            font_plan: None,
             metrics,
             bounds,
             scale: 1.,
@@ -107,6 +112,12 @@ where
             visible_ranges: BTreeMap::new(),
         })
     }
+    pub(crate) fn with_font_projector(mut self,capabilities:rune_display::MeasuredFontCapabilities,project:crate::font_transport::FontProjector<H>)->Result<Self,BridgeError>{
+        if !capabilities.matches_geometry(capabilities.bank_id,self.metrics.0){return Err(BridgeError::Publish("font capability baseline mismatch"))}
+        self.fonts=Some(crate::font_transport::Configuration{capabilities,project});Ok(self)
+    }
+    pub(crate) fn has_font_projection(&self)->bool{self.fonts.is_some()}
+    pub fn prepared_font_plan(&self)->Option<Arc<rune_display::FrameFontPlan>>{self.font_plan.clone()}
     pub fn snapshot(&self) -> Result<rune_editor::SessionSnapshot<H::Doc>, BridgeError> {
         self.host.snapshot().map_err(Into::into)
     }
@@ -115,6 +126,11 @@ where
             VisibleFaceRevision {window_id:*id,buffer_id:buffer.as_u64(),len:*len,range:range.clone(),faces:self.host.display_face_runs(*window,*buffer,*len,range.clone()).map_err(|e|e.to_string())}
         }).collect();
         Ok((self.host.snapshot()?.sequence, self.host.display_style_revision()?,runs))
+    }
+    pub(crate) fn owner_publication_revision(&self)->Result<OwnerPublicationRevision,BridgeError>{
+        let (sequence,style,runs)=self.publication_revision()?;
+        let fonts=self.fonts.as_ref().map(|c|crate::font_transport::revision(&self.host,c,&self.visible_ranges,sequence,style.frame_id)).unwrap_or_default();
+        Ok((sequence,style,runs,fonts))
     }
     pub fn with_text_source(mut self, source: TextSource) -> Result<Self, BridgeError> {
         self.host.cancel_prefix()?;
@@ -308,6 +324,7 @@ where
     pub fn prepare_frame(&mut self) -> Result<Arc<FrameDisplay>, BridgeError> {
         let generation = self.generation.checked_add(1).ok_or(BridgeError::GenerationExhausted)?;
         let s = self.host.snapshot()?;
+        if self.fonts.is_some() && s.views.len()>256{return Err(BridgeError::Publish("font window budget exceeded"))}
         let mut windows = Vec::with_capacity(s.views.len());
         let mut anchors = BTreeMap::new();
         let mut visible_ranges = BTreeMap::new();
@@ -367,6 +384,10 @@ where
             background: Color(24, 28, 36, 255),
             windows,
         });
+        let frame=if let Some(c)=&self.fonts {
+            let plan=crate::font_transport::prepare(&self.host,c,frame,&visible_ranges,s.sequence,self.host.display_style_revision()?.frame_id)?;
+            let frame=plan.frame().clone();self.font_plan=Some(plan);frame
+        }else{self.font_plan=None;frame};
         self.generation = generation;
         self.anchors = anchors;
         self.visible_ranges = visible_ranges;

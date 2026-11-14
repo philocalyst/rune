@@ -145,6 +145,7 @@ impl FrameInput {
     }
 }
 pub struct FrameView {
+    font_stream_bank: Option<u64>,
     font_plan: Option<Rc<NativeFrameFontPlan>>,
     frame: Arc<FrameDisplay>,
     font: NativeFont,
@@ -170,6 +171,7 @@ impl FrameView {
         // No strong entity is captured and no subscription cycle is introduced.
         cx.on_release(|view, _| view.shutdown_input()).detach();
         Self {
+            font_stream_bank: None,
             font_plan: None,
             frame,
             font,
@@ -203,6 +205,7 @@ impl FrameView {
     ) -> Self {
         cx.on_release(|view, _| view.shutdown_input()).detach();
         Self {
+            font_stream_bank: None,
             font_plan: None,
             frame,
             font,
@@ -217,6 +220,15 @@ impl FrameView {
             ime: None,
         }
     }
+    /// Dedicated non-IME paired stream. The initial plan is admitted before the
+    /// entity starts; ordinary present cannot silently discard its font mode.
+    #[cfg(feature="editor")]
+    pub fn new_font_editor(plan:Arc<rune_display::FrameFontPlan>,bank:Rc<NativeFontVariantBank>,font:NativeFont,sender:editor_transport::NativeEditorSender,replies:editor_transport::NativeEditorReplies,quit:Arc<AtomicBool>,rejected:owner_input::RejectedOwnerInput,outcome:owner_input::CompositionOutcome,cx:&mut Context<Self>)->Result<Self,&'static str>{
+        let native=NativeFrameFontPlan::new((*plan).clone(),&font,bank,cx)?;
+        let mut view=Self::new_editor(plan.frame().clone(),font,sender,replies,quit,rejected,outcome,cx);
+        view.font_stream_bank=Some(plan.bank_id());view.font_plan=Some(Rc::new(native));Ok(view)
+    }
+
     /// Connect UI C-g to the same request-scoped channel configured on its
     /// owner worker. Legacy quit observability remains independent.
     #[cfg(feature = "editor")]
@@ -385,6 +397,7 @@ impl FrameView {
         frame: Arc<FrameDisplay>,
         cx: &mut Context<Self>,
     ) -> Result<bool, &'static str> {
+        if self.font_stream_bank.is_some(){return Err("paired font stream requires its font plan")}
         if frame.protocol_version != rune_display::DISPLAY_PROTOCOL_VERSION {
             return Err("incompatible display protocol");
         }
@@ -403,6 +416,7 @@ impl FrameView {
     pub fn present_font_plan(&mut self,plan:Rc<NativeFrameFontPlan>,cx:&mut Context<Self>)->Result<bool,&'static str>{
         #[cfg(feature="editor")]
         if self.ime.is_some(){return Err("font plans are not enabled for platform IME views")}
+        if self.font_stream_bank.is_some_and(|id|id!=plan.bank_id()){return Err("font stream bank replacement unsupported")}
         if plan.frame().protocol_version!=rune_display::DISPLAY_PROTOCOL_VERSION{return Err("incompatible display protocol")}
         if plan.frame().generation<=self.frame.generation{return Ok(false)}
         plan.validate_for_base(&self.font,cx)?;
@@ -410,6 +424,17 @@ impl FrameView {
         self.font_plan=Some(plan);
         cx.notify();
         Ok(true)
+    }
+
+    /// Explicit opt-in paired publication. Does not read the normal frame
+    /// mailbox or permit platform IME/font transitions.
+    pub fn present_measured_font_plan(&mut self,plan:Arc<rune_display::FrameFontPlan>,bank:Rc<NativeFontVariantBank>,cx:&mut Context<Self>)->Result<bool,&'static str>{
+        #[cfg(feature="editor")]
+        if self.ime.is_some(){return Err("font plans are not enabled for platform IME views")}
+        if self.font_stream_bank.is_some_and(|id|id!=plan.bank_id()){return Err("font stream bank replacement unsupported")}
+        if plan.frame().generation<=self.frame.generation{return Ok(false)}
+        let native=NativeFrameFontPlan::new((*plan).clone(),&self.font,bank,cx)?;
+        self.present_font_plan(Rc::new(native),cx)
     }
 
     /// UI-thread entry point for hosts using the latest-only display mailbox.
@@ -460,6 +485,26 @@ impl FrameView {
                 view.shutdown_input();
                 cx.notify();
             });
+        })
+    }
+
+    /// Font mode consumes only the exact paired envelope; HostUpdates supplies
+    /// wakes/capacity, never a separately paired frame. No idle timer or UI Lisp.
+    #[cfg(feature="editor")]
+    pub fn watch_font_updates(mut updates:rune_display::HostUpdates,fonts:font_transport::FontPlanReceiver,bank:Rc<NativeFontVariantBank>,cx:&mut Context<Self>)->gpui::Task<()>{
+        cx.spawn(async move|view,cx|{
+            while let Some(update)=updates.next().await{
+                let plan=fonts.latest();
+                let keep=view.update(cx,|view,cx|{
+                    if view.font_stream_bank.is_none(){eprintln!("Rune font stream requires its dedicated constructor");view.shutdown_input();cx.notify();return false;}
+                    if update.input_capacity{let _=view.retry_input();}
+                    let result=match plan {Ok(Some(plan))=>view.present_measured_font_plan(plan,bank.clone(),cx).map(|_|()),Ok(None)=>Err("missing paired font frame"),Err(error)=>Err(error)};
+                    if let Err(error)=result{eprintln!("Rune paired font frame rejected: {error}");view.shutdown_input();cx.notify();return false;}
+                    true
+                }).unwrap_or(false);
+                if !keep{break;}
+            }
+            let _=view.update(cx,|view,cx|{view.shutdown_input();cx.notify();});
         })
     }
 
@@ -804,3 +849,6 @@ pub mod platform_state;
 pub fn quit_on_next_foreground_turn(cx:&App){
     cx.spawn(async |cx|{let _=cx.update(|app|app.quit());}).detach();
 }
+
+#[cfg(feature="editor")]
+pub mod font_transport;

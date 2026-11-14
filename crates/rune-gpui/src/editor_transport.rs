@@ -117,6 +117,7 @@ where
     key_dispatcher: Option<(NativeKeyDispatcher<H>, crate::evaluation_quit::EvaluationQuit)>,
     evaluator: Option<fn(&mut H, &str) -> Result<(), String>>,
     interruptible: Option<(InterruptibleEvaluator<H>, crate::evaluation_quit::EvaluationQuit)>,
+    fonts: Option<crate::font_transport::FontPlanPublisher>,
     platform: Option<crate::platform_context::PlatformPublisher>,
     prepare_input: Option<
         fn(
@@ -186,6 +187,7 @@ impl NativeEditorOwner {
             key_dispatcher: None,
             evaluator: None,
             interruptible: None,
+            fonts: None,
             platform: None,
             prepare_input: None,
         }
@@ -198,6 +200,7 @@ impl NativeEditorOwner {
     where
         H::Doc: rune_editor::PlatformTextDocument,
     {
+        if bridge.has_font_projection(){return Err(InitializationFailure{error:InitializationError::Prepare(BridgeError::Publish("font mode is not enabled for platform IME")),undelivered:self.reject_unbound()})}
         let bridge = match bridge.with_text_source(crate::editor_bridge::TextSource::CommittedText)
         {
             Ok(bridge) => bridge,
@@ -212,6 +215,13 @@ impl NativeEditorOwner {
         worker.platform = Some(platform);
         worker.prepare_input = Some(crate::platform_context::prepare::<H>);
         worker.initialize()
+    }
+    /// Explicit non-IME font mode. Configure before first publication so startup
+    /// failures retain the same definitely-undelivered event accounting.
+    pub fn bind_font_initialized<H:EditorHost>(self,bridge:EditorBridge<H>,capabilities:rune_display::MeasuredFontCapabilities,project:crate::font_transport::FontProjector<H>,publisher:crate::font_transport::FontPlanPublisher)->Result<NativeEditorWorker<H>,InitializationFailure>
+    where H::Doc:DisplayDocument {
+        let bridge=match bridge.with_font_projector(capabilities,project){Ok(b)=>b,Err(error)=>return Err(InitializationFailure{error:InitializationError::Prepare(error),undelivered:self.reject_unbound()})};
+        let mut worker=self.bind(bridge);worker.fonts=Some(publisher);worker.initialize()
     }
     pub fn bind_initialized<H: EditorHost>(
         self,
@@ -377,6 +387,11 @@ where
             let input = prepare(&self.bridge, &frame)?;
             platform.publish(frame.clone(), input)?;
         }
+        if let Some(fonts)=&self.fonts {
+            let plan=self.bridge.prepared_font_plan().ok_or(BridgeError::Publish("missing prepared font plan"))?;
+            if !plan.matches_frame(&frame){return Err(BridgeError::Publish("font plan/frame identity mismatch"))}
+            fonts.publish(plan).map_err(BridgeError::Publish)?;
+        }
         self.publisher.publish(frame).map_err(BridgeError::Publish)
     }
     fn process(&mut self, event: OwnerEvent) -> OwnerStep {
@@ -387,7 +402,7 @@ where
         let mut preserve_context = false;
         let edit = match event {
             OwnerEvent::SaveVisited { request_id, max_bytes } => {
-                match self.bridge.publication_revision() {
+                match self.bridge.owner_publication_revision() {
                     Err(error) => {
                         save = Some(SaveReply {
                             request_id,
@@ -403,7 +418,7 @@ where
                         };
                         let success = outcome.is_ok();
                         save = Some(SaveReply { request_id, outcome });
-                        match self.bridge.publication_revision() {
+                        match self.bridge.owner_publication_revision() {
                             Ok(after) => {
                                 let changed = before != after;
                                 preserve_context = before.0 == after.0;
@@ -420,7 +435,7 @@ where
                 }
             }
             OwnerEvent::Evaluate { request_id, source } => {
-                let before = self.bridge.publication_revision();
+                let before = self.bridge.owner_publication_revision();
                 match before {
                     Err(error) => {
                         evaluation = Some(EvaluationOutcome {
@@ -449,7 +464,7 @@ where
                         evaluation = Some(EvaluationOutcome { request_id, outcome });
                         // Evaluation may edit and then signal. Never replay it;
                         // publication follows owner sequence, not its Result.
-                        match self.bridge.publication_revision() {
+                        match self.bridge.owner_publication_revision() {
                             Ok(after) => { preserve_context = before.0 == after.0; Ok(after != before) },
                             Err(error) => {
                                 if let Some(platform) = &self.platform {
@@ -466,7 +481,7 @@ where
                 if let Some((dispatch, channel)) = &self.key_dispatcher {
                     let dispatch = *dispatch;
                     let channel = channel.clone();
-                    let before = if request.key.len()>128 {Err(BridgeError::UnsupportedInput)} else {self.bridge.publication_revision()};
+                    let before = if request.key.len()>128 {Err(BridgeError::UnsupportedInput)} else {self.bridge.owner_publication_revision()};
                     match before {
                         Err(error) => Err(error),
                         Ok(before) => {
@@ -489,7 +504,7 @@ where
                                     Err(BridgeError::UnsupportedInput)
                                 }
                             } else {
-                                self.bridge.publication_revision().map(|s| { preserve_context = s.0 == before.0; s != before })
+                                self.bridge.owner_publication_revision().map(|s| { preserve_context = s.0 == before.0; s != before })
                             }
                         }
                     }
@@ -504,7 +519,7 @@ where
                 if let Some((dispatch, channel)) = &self.key_dispatcher {
                     let dispatch = *dispatch;
                     let channel = channel.clone();
-                    let before = self.bridge.publication_revision();
+                    let before = self.bridge.owner_publication_revision();
                     match before {
                         Err(error) => Err(error),
                         Ok(before) => {
@@ -533,7 +548,7 @@ where
                             if !handled {
                                 self.bridge.commit_text(window_id, buffer_id, text)
                             } else {
-                                self.bridge.publication_revision().map(|s| { preserve_context = s.0 == before.0; s != before })
+                                self.bridge.owner_publication_revision().map(|s| { preserve_context = s.0 == before.0; s != before })
                             }
                         }
                     }

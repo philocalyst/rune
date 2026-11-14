@@ -1,4 +1,4 @@
-//! Opt-in exact owner font requests; no worker transport or frame protocol wiring.
+//! Opt-in owner font requests and plain native adapter; no Lisp crosses threads.
 use super::*;
 use rune_editor::display::MeasuredFontCapabilities;
 use rune_editor::{Document, EditorHost};
@@ -162,4 +162,11 @@ mod tests {
             Ok(())
         }).unwrap();
     }
+}
+
+/// Native transport adapter: only plain scoped DTOs cross this function boundary.
+#[cfg(feature="native")]
+pub(crate) fn transport_projection(host:&LispRuntimeHost<'_,'_,'_>,window:rune_editor::WindowId,buffer:rune_editor::BufferId,len:usize,visible:Range<usize>,capabilities:MeasuredFontCapabilities)->Result<rune_gpui::font_transport::FontRunProjection,String>{
+    let p=host.font_variant_runs(window,buffer,len,visible,capabilities).map_err(|e|e.to_string())?;
+    Ok(rune_gpui::font_transport::FontRunProjection{window_id:p.window.as_u64(),buffer_id:p.buffer.as_u64(),publication_epoch:p.publication_epoch,owner_sequence:p.owner_sequence,frame_id:p.frame_id,visible:p.visible,capabilities:p.capabilities,runs:p.runs.into_iter().map(|r|rune_gpui::font_transport::ProjectedFontRun{range:r.range,variant:r.variant}).collect()})
 }

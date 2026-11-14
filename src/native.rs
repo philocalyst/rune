@@ -751,3 +751,6 @@ mod joined_owner_tests {
         }).unwrap();
     }
 }
+
+#[cfg(test)]
+mod font_pipeline_tests;
