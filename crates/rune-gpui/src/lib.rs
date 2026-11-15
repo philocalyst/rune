@@ -852,3 +852,7 @@ pub fn quit_on_next_foreground_turn(cx:&App){
 
 #[cfg(feature="editor")]
 pub mod font_transport;
+
+/// Experimental retained whole-row staging, not activated by FrameView.
+#[cfg(feature = "editor")]
+pub mod retained_row_stage;

@@ -5,6 +5,11 @@ mod protocol;
 mod snapshot;
 pub mod svg;
 mod transport;
+mod row_activity;
+/// Dormant bounded nonblocking row preparation handoff.
+pub mod retained_row_handoff;
+/// Dormant bounded correlation only; no producer or native renderer activation.
+pub mod retained_row_transaction;
 pub use layout::*;
 pub use protocol::*;
 pub use snapshot::*;

@@ -1,0 +1,179 @@
+//! Opt-in UI staging only. No paint API or owner-layout admission is provided.
+use crate::{NativeFont, NativeFontVariantBank};
+use gpui::{AnyWindowHandle, App, Hsla, ShapedLine, TextRun, TextSystem, Window};
+use rune_display::{
+    MeasuredFontVariant,
+    retained_row_handoff::RetainedRowReply,
+    retained_row_transaction::{AcceptedRowToken, RetainedRowRequest},
+};
+use std::{rc::Rc, sync::{Arc, Weak, atomic::{AtomicU64, Ordering}}};
+
+const MAX_STAGED_GLYPHS: usize = 256;
+pub const NORMAL_SINGLE_RUN_POLICY: u64 = 1;
+static NEXT_STAGE: AtomicU64 = AtomicU64::new(1);
+
+/// Diagnostics only. Unknown must never become VerifiedAvailable implicitly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StagedCoverage { Unknown }
+
+#[derive(Clone, Debug)]
+pub struct NativeRowObservation {
+    pub reply: RetainedRowReply,
+    pub width: f32,
+    pub ascent: f32,
+    pub descent: f32,
+    pub glyph_count: usize,
+    pub coverage: StagedCoverage,
+}
+
+/// This preflight can run headlessly. It does not invoke Window shaping.
+pub fn preflight_retained_row(
+    request: &RetainedRowRequest,
+    baseline: &NativeFont,
+    bank: &NativeFontVariantBank,
+    app: &App,
+) -> Result<(), &'static str> {
+    bank.validate_baseline(baseline, app)?;
+    if !request.is_live() {
+        return Err("retained request canceled");
+    }
+    let capabilities = bank.capabilities(app)?;
+    if request.scope().font_bank_generation != capabilities.bank_id {
+        return Err("retained request belongs to another font bank");
+    }
+    if request.scope().shaping_policy_revision != NORMAL_SINGLE_RUN_POLICY
+        || request.scope().source_start_scalar != 0
+        || request.scope().window == 0 || request.scope().buffer == 0
+    {
+        return Err("unsupported retained row policy or source range");
+    }
+    // Request construction already bounds bytes/scalars and rejects controls.
+    bank.get_compatible_font(capabilities.bank_id, capabilities.metrics,
+        MeasuredFontVariant::Normal, app)?;
+    Ok(())
+}
+
+/// Actual native line remains private and UI-owned; nothing here paints it.
+pub struct StagedNativeRow {
+    line: ShapedLine,
+    request: RetainedRowRequest,
+    bank: Rc<NativeFontVariantBank>,
+    system: Weak<TextSystem>,
+    window: AnyWindowHandle,
+    observation: NativeRowObservation,
+}
+
+impl StagedNativeRow {
+    /// Public SDK route only. This method has NOT executed without a real Window.
+    pub fn shape(
+        request: RetainedRowRequest,
+        baseline: &NativeFont,
+        bank: Rc<NativeFontVariantBank>,
+        foreground: Hsla,
+        window: &Window,
+        app: &App,
+    ) -> Result<Self, &'static str> {
+        preflight_retained_row(&request, baseline, &bank, app)?;
+        if !Arc::ptr_eq(app.text_system(), window.text_system()) {
+            return Err("window belongs to another text system");
+        }
+        if ![foreground.h, foreground.s, foreground.l, foreground.a].iter()
+            .all(|component| component.is_finite() && (0.0..=1.0).contains(component))
+        {
+            return Err("invalid retained foreground color");
+        }
+        let capabilities = bank.capabilities(app)?;
+        let descriptor = bank.get_compatible_font(capabilities.bank_id,
+            capabilities.metrics, MeasuredFontVariant::Normal, app)?.clone();
+        let runs = [TextRun {
+            len: request.text().len(), font: descriptor, color: foreground,
+            background_color: None, underline: None, strikethrough: None,
+        }];
+        let line = window.text_system().shape_line(
+            request.text().to_owned().into(), baseline.size, &runs, None,
+        );
+        if line.runs.len() > MAX_STAGED_GLYPHS {
+            return Err("retained shape run budget exceeded");
+        }
+        let glyph_count = line.runs.iter().try_fold(0usize, |count, run| {
+            count.checked_add(run.glyphs.len())
+                .filter(|count| *count <= MAX_STAGED_GLYPHS)
+        }).ok_or("retained shape glyph budget exceeded")?;
+        if line.runs.iter().flat_map(|run| &run.glyphs).any(|glyph| {
+            let x: f32 = glyph.position.x.into();
+            let y: f32 = glyph.position.y.into();
+            !x.is_finite() || !y.is_finite()
+        }) {
+            return Err("nonfinite retained glyph position");
+        }
+        let width: f32 = line.width.into();
+        let ascent: f32 = line.ascent.into();
+        let descent: f32 = line.descent.into();
+        if line.text.as_ref() != request.text() || line.len() != request.text().len()
+            || glyph_count > MAX_STAGED_GLYPHS
+            || ![width, ascent, descent].iter().all(|value| value.is_finite())
+            || width < 0.0
+        {
+            return Err("unsupported retained shape observation");
+        }
+        let ui_token = NEXT_STAGE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |next| next.checked_add(1)).map_err(|_| "retained stage IDs exhausted")?;
+        let observation = NativeRowObservation {
+            reply: RetainedRowReply { key: request.key(), ui_token },
+            width, ascent, descent, glyph_count, coverage: StagedCoverage::Unknown,
+        };
+        Ok(Self { line, request, bank, system: Arc::downgrade(app.text_system()),
+            window: window.window_handle(), observation })
+    }
+
+    pub fn observation(&self) -> NativeRowObservation {
+        self.observation.clone()
+    }
+
+    /// Correlation only: even true grants NO paint or owner geometry authority.
+    pub fn matches_receipt(&self, receipt: &AcceptedRowToken, window: &Window, app: &App) -> bool {
+        receipt.is_live() && receipt.key() == self.request.key()
+            && receipt.ui_token() == self.observation.reply.ui_token
+            && self.window == window.window_handle()
+            && self.system.upgrade().is_some_and(|system| {
+                Arc::ptr_eq(&system, app.text_system())
+                    && Arc::ptr_eq(&system, window.text_system())
+            })
+            && self.bank.capabilities(app).is_ok_and(|capabilities| {
+                capabilities.bank_id == self.request.scope().font_bank_generation
+            })
+            && self.line.text.as_ref() == self.request.text()
+    }
+}
+
+
+/// Capacity-one UI retention. Cleanup runs when explicitly observed, not on a timer.
+#[derive(Default)]
+pub struct StagedNativeRowSlot {
+    row: Option<StagedNativeRow>,
+}
+
+impl StagedNativeRowSlot {
+    pub fn replace(&mut self, row: StagedNativeRow, app: &App) -> Result<(), &'static str> {
+        if !row.request.is_live() || row.bank.capabilities(app).is_err() {
+            return Err("staged row is canceled or belongs to an expired context");
+        }
+        self.row = Some(row);
+        Ok(())
+    }
+
+    /// Drops the retained native line/bank when cancellation or App mismatch is observed.
+    pub fn prune(&mut self, app: &App) -> bool {
+        let stale = self.row.as_ref().is_some_and(|row| {
+            !row.request.is_live() || row.bank.capabilities(app).is_err()
+        });
+        if stale {
+            self.row = None;
+        }
+        stale
+    }
+
+    pub fn clear(&mut self) {
+        self.row = None;
+    }
+}

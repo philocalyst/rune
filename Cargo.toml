@@ -149,3 +149,19 @@ must_use_candidate = "allow"
 [[example]]
 name = "headless_font_bank_gate"
 required-features = ["native"]
+
+[[example]]
+name = "headless_row_stage_preflight"
+required-features = ["native"]
+
+[[example]]
+name = "headless_row_disconnect"
+required-features = ["native"]
+
+[[example]]
+name = "headless_row_activity"
+required-features = ["native"]
+
+[[example]]
+name = "headless_row_entity_watcher"
+required-features = ["native"]
