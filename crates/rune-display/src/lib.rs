@@ -25,3 +25,6 @@ pub use font_capabilities::{MeasuredFontCapabilities, MeasuredFontVariant};
 
 mod frame_font_plan;
 pub use frame_font_plan::{FrameFontAssignment, FrameFontPlan};
+
+mod grapheme_font_guard;
+pub use grapheme_font_guard::{GraphemeFontRun, validate_grapheme_font_runs};
