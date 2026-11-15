@@ -28,3 +28,6 @@ pub use frame_font_plan::{FrameFontAssignment, FrameFontPlan};
 
 mod grapheme_font_guard;
 pub use grapheme_font_guard::{GraphemeFontRun, validate_grapheme_font_runs};
+
+mod measured_grapheme_layout;
+pub use measured_grapheme_layout::{MeasuredLayoutScope, WidthProvenance, ContextualClusterWidth, MeasuredGraphemeLayoutPlan, layout_measured_graphemes};
