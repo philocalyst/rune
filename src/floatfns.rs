@@ -282,9 +282,30 @@ fn acos(arg: Number) -> f64 {
     coerce(arg).acos()
 }
 
+// Validate native number tags before conversion: generic TypeError formatting
+// can recurse through an arbitrary cyclic non-number supplied by Lisp.
+fn atan_number<'a>(value: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Number<'a>> {
+    if matches!(value.untag(), crate::core::object::ObjectType::Int(_)
+        | crate::core::object::ObjectType::Float(_)
+        | crate::core::object::ObjectType::BigInt(_)) {
+        return Ok(Number::try_from(value)?);
+    }
+    // Arguments remain rooted by the defun frame, and shared Context excludes
+    // moving GC/callbacks while the fresh structured condition is constructed.
+    env.initialize_condition_metadata(cx);
+    let tail = Cons::new(value, crate::sym::NIL, cx);
+    let data = Cons::new(crate::sym::NUMBERP, tail, cx).into();
+    Err(crate::eval::EvalError::signal(crate::sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into())
+}
+
 #[defun]
-fn atan(arg: Number, x: Option<f64>) -> f64 {
-    if let Some(x) = x { coerce(arg).atan2(x) } else { coerce(arg).atan() }
+fn atan(arg: Object, x: Option<Object>, env: &mut Rt<Env>, cx: &Context) -> Result<f64> {
+    // GNU validates the first number before the optional second number.
+    let arg = coerce(atan_number(arg, env, cx)?);
+    match x.filter(|x| !x.is_nil()) {
+        Some(x) => Ok(arg.atan2(coerce(atan_number(x, env, cx)?))),
+        None => Ok(arg.atan()),
+    }
 }
 
 #[defun]
@@ -792,5 +813,23 @@ mod m0_logb_regressions {
         assert_lisp("(logb 0)", "-1.0e+INF");
         assert_lisp("(logb -1.0e+INF)", "1.0e+INF");
         assert_lisp("(logb 18446744073709551615)", "63");
+    }
+}
+
+#[cfg(test)]
+mod atan_boundary_tests {
+    use crate::interpreter::assert_lisp;
+
+    #[test]
+    fn atan_cyclic_operands_signal_numberp_in_gnu_order() {
+        assert_lisp(
+            "(let ((a (vector nil)) (b (vector nil))) (aset a 0 a) (aset b 0 b) (list (condition-case e (atan a b) (wrong-type-argument (list (eq (car e) 'wrong-type-argument) (eq (car (cdr e)) 'numberp) (eq (car (cdr (cdr e))) a)))) (condition-case e (atan 1 b) (wrong-type-argument (eq (car (cdr (cdr e))) b))) (condition-case e (atan a nil) (wrong-type-argument (eq (car (cdr (cdr e))) a)))))",
+            "((t t t) t t)",
+        );
+    }
+
+    #[test]
+    fn atan_numeric_optional_and_signed_zero_controls() {
+        assert_lisp("(list (= (atan 0) 0.0) (= (atan 0 nil) 0.0) (= (atan 1 0) (/ (acos -1) 2)) (= (atan 0 -1) (acos -1)) (= (atan -0.0 -1.0) (- (acos -1))))", "(t t t t t)");
     }
 }
