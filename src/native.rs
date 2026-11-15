@@ -754,3 +754,68 @@ mod joined_owner_tests {
 
 #[cfg(test)]
 mod font_pipeline_tests;
+
+#[cfg(test)]
+mod row_fifo_runtime_tests {
+    use super::*;
+    use rune_display::{TextSnapshot, retained_row_handoff::RowPreparationOwner};
+    use rune_gpui::editor_transport::RowOwnerExitReason;
+
+    fn readonly_snapshot_error(
+        bridge: &EditorBridge<LispRuntimeHost<'_, '_, '_>>,
+        _: &mut RowPreparationOwner,
+    ) -> Result<(), String> {
+        let snapshot = bridge.snapshot().map_err(|_| "snapshot failed")?;
+        let view = snapshot.views.iter().find(|view| view.id == snapshot.selected_window)
+            .ok_or("selected view missing")?;
+        let buffer = snapshot.buffers.iter().find(|buffer| buffer.id == view.view.buffer)
+            .ok_or("selected buffer missing")?;
+        Err(buffer.display_snapshot().chars_from(0).collect())
+    }
+
+    #[test]
+    fn row_fifo_same_persistent_env_gc_partial_error_is_not_replayed() {
+        with_lisp_runtime_owner(80, 24, |host| {
+            let (publisher, _updates) = host_updates();
+            let (sender, _replies, pending) = pending_editor_transport(4, publisher);
+            let controller = sender.row_lifecycle_controller();
+            sender.try_send(OwnerEvent::Evaluate {
+                request_id: 1, source: "(setq row-fifo-persistent (list \"λ🙂\"))".into(),
+            }).unwrap();
+            sender.try_send(OwnerEvent::Evaluate {
+                request_id: 2,
+                source: "(progn (garbage-collect) (insert (car row-fifo-persistent)) (insert \"!\") (error \"expected\"))".into(),
+            }).unwrap();
+            let bridge = EditorBridge::new(host, FixedMetrics::default(),
+                Rect { x: 0., y: 0., width: 640., height: 480. })
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let worker = pending.bind(bridge).with_evaluator(evaluate_source);
+            let (rows, _ui) = rune_display::retained_row_handoff::row_preparation_handoff()
+                .map_err(|_| anyhow::anyhow!("row construction"))?;
+            let mut evaluations = Vec::new();
+            let mut observed_partial = 0;
+            let completed = std::cell::Cell::new(0usize);
+            let exit = worker.run_with_row_activity(rows, &controller, readonly_snapshot_error,
+                |step| {
+                    if let Some(evaluation) = step.evaluation {
+                        evaluations.push((evaluation.request_id, evaluation.outcome.is_ok()));
+                        completed.set(completed.get() + 1);
+                    }
+                },
+                |outcome| {
+                    if completed.get() >= 2 {
+                        if matches!(outcome, Err(ref text) if text == "λ🙂!") {
+                            observed_partial += 1;
+                        }
+                        // Also stop on a regression, then fail the assertion below.
+                        controller.request_stop();
+                    }
+                }).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            assert_eq!(evaluations, [(1, true), (2, false)]);
+            assert_eq!(observed_partial, 1);
+            assert_eq!(exit.reason, RowOwnerExitReason::StopRequested);
+            assert!(exit.undelivered.is_empty());
+            Ok(())
+        }).unwrap();
+    }
+}
