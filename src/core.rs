@@ -8,3 +8,6 @@ pub(crate) mod error;
 pub(crate) mod object;
 #[macro_use]
 pub(crate) mod gc;
+
+// Dormant rooted owner-job foundation; no runtime activation.
+mod owner_jobs;
