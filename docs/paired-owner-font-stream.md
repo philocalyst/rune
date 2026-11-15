@@ -84,3 +84,25 @@ Window. This change does not execute FrameView's entity constructor, watcher,
 generation branch, TextRun painter, OS input, glyph rasterization or shaping.
 The previous source/probe evidence is separate. No rendered weight/slant,
 Unicode/grapheme/bidi, GUI workflow or GNU redisplay parity is claimed.
+
+## Bounded grapheme font-transition preflight
+
+The opt-in font projection now rejects a change of measured font variant inside
+an extended grapheme, using Unicode segmentation 1.12 over the complete owner
+buffer snapshot. Arbitrary visible substrings are insufficient context (notably
+for regional-indicator parity). Each projected window is limited to a complete
+buffer of 100,000 Unicode scalars and 1 MiB of UTF-8, in addition to existing
+visible-range/run/window caps. Exceeding these limits is a visible projection
+failure, not permission to skip validation. Work is bounded per window, not
+cached or promised to be independent of total buffer length.
+
+The exact snapshot sequence, buffer identity, publication epoch and scalar length
+must match. Temporary endpoint variant extension supplies complete validation
+coverage only; it never publishes styles outside the visible range. Equal-variant
+administrative run splits are allowed. The guard rejects conflicting font changes
+rather than moving scalar/UTF-16 offsets, caret positions or IME ranges.
+
+This does not merge scalar display clusters, validate viewport clipping as a
+grapheme boundary, shape text, establish Unicode cell widths or enable IME/font
+mode. Current layout and native paint remain separate authorities. Tests of the
+owner preflight are not evidence of a Window or text painter executing.

@@ -3,7 +3,7 @@ use crate::editor_bridge::BridgeError;
 use rune_display::{
     FrameDisplay, FrameFontAssignment, FrameFontPlan, MeasuredFontCapabilities, MeasuredFontVariant,
 };
-use rune_editor::{BufferId, EditorHost, WindowId};
+use rune_editor::{BufferId, Document, EditorHost, WindowId};
 use std::{
     collections::BTreeMap,
     ops::Range,
@@ -106,7 +106,40 @@ fn project<H: EditorHost>(
     if end != visible.end {
         return Err("incomplete projected font coverage".into());
     }
+    validate_grapheme_projection(host, &p, *len)?;
     Ok(p)
+}
+
+// Whole snapshot context is bounded before materialization. Visible substrings
+// alone cannot determine RI parity or arbitrary preceding grapheme context.
+fn validate_grapheme_projection<H: EditorHost>(host: &H, p: &FontRunProjection, len: usize) -> Result<(), String> {
+    if len > 100_000 { return Err("font grapheme snapshot scalar budget exceeded".into()); }
+    let snapshot = host.snapshot().map_err(|_| "font grapheme snapshot unavailable")?;
+    if snapshot.sequence != p.owner_sequence { return Err("font grapheme sequence mismatch".into()); }
+    let buffer = snapshot.buffers.iter().find(|b| b.id.as_u64() == p.buffer_id)
+        .ok_or("font grapheme buffer missing")?;
+    if buffer.version != p.publication_epoch || buffer.document.len_chars() != len {
+        return Err("font grapheme document mismatch".into());
+    }
+    let mut text = String::new();
+    let mut count = 0usize;
+    let mut invalid = false;
+    buffer.document.visit_chars(0, len, &mut |position, ch| {
+        if position != count || count >= len || text.len() + ch.len_utf8() > 1024 * 1024 {
+            invalid = true; return false;
+        }
+        text.push(ch); count += 1; true
+    });
+    if invalid || count != len { return Err("font grapheme snapshot incomplete or oversized".into()); }
+    // Extend endpoint variants only for boundary validation, never for painting.
+    // This does not invent projected styles outside the requested visible range.
+    let mut runs: Vec<rune_display::GraphemeFontRun> = p.runs.iter().map(|r|
+        rune_display::GraphemeFontRun { source: r.range.clone(), variant: r.variant }).collect();
+    if let Some(first) = runs.first_mut() { first.source.start = 0; }
+    if let Some(last) = runs.last_mut() { last.source.end = len; }
+    // Empty visible ranges contain no font transitions to validate.
+    if runs.is_empty() { return Ok(()); }
+    rune_display::validate_grapheme_font_runs(&text, &runs).map_err(str::to_owned)
 }
 pub(crate) fn revision<H: EditorHost>(
     host: &H,
@@ -259,4 +292,63 @@ impl Drop for FontPlanReceiver {
             s.latest = None;
         }
     }
+}
+
+#[cfg(test)]
+mod grapheme_projection_tests {
+    use super::*;
+    use rune_editor::{Session, StringDocument};
+    fn fixture(text: &str, visible: Range<usize>, cuts: &[(Range<usize>, MeasuredFontVariant)]) -> (Session<StringDocument>, FontRunProjection) {
+        let host = Session::new(StringDocument::from(text), 80, 24).unwrap();
+        let s = host.snapshot();
+        let b = &s.buffers[0];
+        let p = FontRunProjection {
+            window_id: s.selected_window.as_u64(), buffer_id: b.id.as_u64(),
+            publication_epoch: b.version, owner_sequence: s.sequence, frame_id: 1,
+            visible, capabilities: MeasuredFontCapabilities { bank_id:1, metrics:rune_display::FontMetrics {advance:8.0,ascent:13.0,descent:4.0,line_gap:3.0}, normal:true,bold:true,italic:true,bold_italic:true },
+            runs: cuts.iter().map(|(range,variant)|ProjectedFontRun {range:range.clone(),variant:*variant}).collect(),
+        };
+        (host,p)
+    }
+    #[test]
+    fn full_document_context_rejects_visible_ri_split_without_rewriting_projection() {
+        let (host,p)=fixture("🇦🇧🇨🇩",1..4,&[(1..3,MeasuredFontVariant::Normal),(3..4,MeasuredFontVariant::Bold)]);
+        let before=p.clone();
+        assert!(validate_grapheme_projection(&host,&p,4).is_err());
+        assert_eq!(p,before);
+        let (host,p)=fixture("🇦🇧🇨🇩",1..4,&[(1..2,MeasuredFontVariant::Normal),(2..4,MeasuredFontVariant::Bold)]);
+        assert!(validate_grapheme_projection(&host,&p,4).is_ok());
+    }
+    #[test]
+    fn stale_document_and_sequence_and_budget_reject() {
+        let (host,mut p)=fixture("ab",0..2,&[(0..2,MeasuredFontVariant::Normal)]);
+        p.owner_sequence+=1;
+        assert!(validate_grapheme_projection(&host,&p,2).is_err());
+        p.owner_sequence-=1;p.publication_epoch+=1;
+        assert!(validate_grapheme_projection(&host,&p,2).is_err());
+        p.publication_epoch-=1;
+        assert!(validate_grapheme_projection(&host,&p,3).is_err());
+        assert!(validate_grapheme_projection(&host,&p,100_001).is_err());
+    }
+    #[test]
+    fn actual_project_path_rejects_then_repairs_without_offset_changes() {
+        fn projector(host: &Session<StringDocument>, window: WindowId, buffer: BufferId, _: usize, visible: Range<usize>, capabilities: MeasuredFontCapabilities) -> Result<FontRunProjection,String> {
+            let s=host.snapshot();
+            Ok(FontRunProjection { window_id:window.as_u64(),buffer_id:buffer.as_u64(),publication_epoch:s.buffers[0].version,owner_sequence:s.sequence,frame_id:1,visible,capabilities,
+                runs:vec![ProjectedFontRun {range:1..3,variant:MeasuredFontVariant::Normal},ProjectedFontRun {range:3..4,variant:MeasuredFontVariant::Bold}] })
+        }
+        fn repaired(host: &Session<StringDocument>, window: WindowId, buffer: BufferId, len: usize, visible: Range<usize>, capabilities: MeasuredFontCapabilities) -> Result<FontRunProjection,String> {
+            let mut p=projector(host,window,buffer,len,visible,capabilities)?;
+            p.runs[0].range.end=2;p.runs[1].range.start=2;Ok(p)
+        }
+        let (host,p)=fixture("🇦🇧🇨🇩",1..4,&[]);
+        let s=host.snapshot();let scope=(s.selected_window,s.buffers[0].id,4,1..4);
+        let config=Configuration {capabilities:p.capabilities,project:projector};
+        assert!(project(&host,&config,&scope,s.sequence,1).is_err());
+        let config=Configuration {capabilities:p.capabilities,project:repaired};
+        let result=project(&host,&config,&scope,s.sequence,1).unwrap();
+        assert_eq!(result.visible,1..4);assert_eq!(result.runs[0].range,1..2);
+        assert_eq!(host.snapshot().sequence,s.sequence);
+    }
+
 }
