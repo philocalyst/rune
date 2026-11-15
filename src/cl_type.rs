@@ -21,6 +21,7 @@ fn cl_type_of(object: Object<'_>) -> Result<Object<'_>> {
         ObjectType::Float(_) => sym::FLOAT.into(),
         ObjectType::String(_) | ObjectType::ByteString(_) => sym::STRING.into(),
         ObjectType::Vec(_) => sym::VECTOR.into(),
+        ObjectType::InterpretedFn(_) => sym::INTERPRETED_FUNCTION.into(),
         ObjectType::ByteFn(_) => sym::BYTE_CODE_FUNCTION.into(),
         ObjectType::SubrFn(_) => sym::PRIMITIVE_FUNCTION.into(),
         ObjectType::Record(record) => {

@@ -922,6 +922,7 @@ pub(crate) fn length(sequence: Object) -> Result<usize> {
         ObjectType::String(x) => x.len(),
         ObjectType::ByteString(x) => x.len(),
         ObjectType::ByteFn(x) => x.len(),
+        ObjectType::InterpretedFn(x) => x.len(),
         ObjectType::NIL => 0,
         obj => bail!(TypeError::new(Type::Sequence, obj)),
     };

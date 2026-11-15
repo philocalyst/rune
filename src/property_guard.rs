@@ -36,6 +36,7 @@ pub(crate) fn reject_property_strings(object: Object<'_>) -> Result<()> {
                 children.try_reserve_exact(record.len())?;
                 children.extend(record.iter().map(|cell| cell.get()));
             }
+            ObjectType::InterpretedFn(_) => anyhow::bail!("Interpreted function serialization is unsupported"),
             ObjectType::ByteFn(function) => {
                 ensure!(function.consts().len() <= 100_000 - work, "Property-aware serialization edge limit exceeded");
                 children.try_reserve_exact(function.consts().len())?;

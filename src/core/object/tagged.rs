@@ -5,7 +5,7 @@ use super::{
         gc::Block,
     },
     ByteFnPrototype, ByteString, ChannelReceiver, ChannelSender, CharTableInner, GcString,
-    LispBigInt, LispBuffer, LispFrame, LispOverlay, LispMarker, LispObarray, LispProcess,
+    InterpretedFn, LispBigInt, LispBuffer, LispFrame, LispOverlay, LispMarker, LispObarray, LispProcess,
 };
 use super::{
     ByteFn, CharTable, HashTable, LispFloat, LispHashTable, LispString, LispVec, Record,
@@ -314,6 +314,7 @@ object_trait_impls!(LispFrame);
 object_trait_impls!(LispOverlay);
 object_trait_impls!(LispMarker);
 object_trait_impls!(LispObarray);
+object_trait_impls!(InterpretedFn);
 
 /// Trait for types that can be managed by the GC. This trait is implemented for
 /// as many types as possible, even for types that are already Gc managed, Like
@@ -654,6 +655,14 @@ impl IntoObject for LispMarker {
         unsafe { <&LispMarker>::tag_ptr(ptr) }
     }
 }
+impl IntoObject for InterpretedFn {
+    type Out<'ob> = &'ob InterpretedFn;
+    fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
+        let ptr = block.objects.alloc(self);
+        unsafe { <&InterpretedFn>::tag_ptr(ptr) }
+    }
+}
+
 impl IntoObject for LispObarray {
     type Out<'ob> = &'ob LispObarray;
     fn into_obj<const C: bool>(self, block: &Block<C>) -> Gc<Self::Out<'_>> {
@@ -696,6 +705,7 @@ mod private {
         Overlay,
         Marker,
         Obarray,
+        InterpretedFn,
     }
 
     /// Trait for tagged pointers. Anything that can be stored and passed around
@@ -815,6 +825,7 @@ impl<'a> TaggedPtr for ObjectType<'a> {
                 Tag::Overlay => ObjectType::Overlay(<&LispOverlay>::from_obj_ptr(ptr)),
                 Tag::Marker => ObjectType::Marker(<&LispMarker>::from_obj_ptr(ptr)),
                 Tag::Obarray => ObjectType::Obarray(<&LispObarray>::from_obj_ptr(ptr)),
+                Tag::InterpretedFn => ObjectType::InterpretedFn(<&InterpretedFn>::from_obj_ptr(ptr)),
             }
         }
     }
@@ -842,6 +853,7 @@ impl<'a> TaggedPtr for ObjectType<'a> {
             ObjectType::Overlay(x) => TaggedPtr::tag(x).into(),
             ObjectType::Marker(x) => TaggedPtr::tag(x).into(),
             ObjectType::Obarray(x) => TaggedPtr::tag(x).into(),
+            ObjectType::InterpretedFn(x) => TaggedPtr::tag(x).into(),
         }
     }
 }
@@ -1197,6 +1209,16 @@ impl TaggedPtr for &LispObarray {
         self as *const Self::Ptr
     }
 }
+impl TaggedPtr for &InterpretedFn {
+    type Ptr = InterpretedFn;
+    const TAG: Tag = Tag::InterpretedFn;
+    unsafe fn from_obj_ptr(ptr: *const u8) -> Self {
+        &*ptr.cast::<Self::Ptr>()
+    }
+    fn get_ptr(self) -> *const Self::Ptr {
+        self as *const Self::Ptr
+    }
+}
 
 impl<T> TracePtr for Gc<T> {
     fn trace_ptr(&self, state: &mut GcState) {
@@ -1221,6 +1243,7 @@ impl<T> TracePtr for Gc<T> {
             ObjectType::Overlay(x) => x.0.trace(state),
             ObjectType::Marker(x) => x.0.trace(state),
             ObjectType::Obarray(x) => x.0.trace(state),
+            ObjectType::InterpretedFn(x) => x.trace(state),
         }
     }
 }
@@ -1351,6 +1374,7 @@ pub(crate) enum ObjectType<'ob> {
     Overlay(&'ob LispOverlay) = Tag::Overlay as u8,
     Marker(&'ob LispMarker) = Tag::Marker as u8,
     Obarray(&'ob LispObarray) = Tag::Obarray as u8,
+    InterpretedFn(&'ob InterpretedFn) = Tag::InterpretedFn as u8,
 }
 
 /// The Object defintion that contains all other possible lisp objects. This
@@ -1380,7 +1404,8 @@ cast_gc!(ObjectType<'ob> => NumberType<'ob>,
          &'ob LispFrame,
          &'ob LispOverlay,
          &'ob LispMarker,
-         &'ob LispObarray
+         &'ob LispObarray,
+         &'ob InterpretedFn
 );
 
 impl ObjectType<'_> {
@@ -1409,6 +1434,7 @@ impl ObjectType<'_> {
             ObjectType::Overlay(_) => Type::Overlay,
             ObjectType::Marker(_) => Type::Marker,
             ObjectType::Obarray(_) => Type::Obarray,
+            ObjectType::InterpretedFn(_) => Type::Func,
         }
     }
 }
@@ -1835,6 +1861,7 @@ where
             ObjectType::Overlay(x) => x.clone_in(bk)?.into(),
             ObjectType::Marker(x) => x.clone_in(bk)?.into(),
             ObjectType::Obarray(x) => x.clone_in(bk)?.into(),
+            ObjectType::InterpretedFn(_) => anyhow::bail!("Interpreted function copy is unsupported"),
         };
         let Ok(x) = Gc::<U>::try_from(obj) else { unreachable!() };
         Ok(x)
@@ -1883,6 +1910,7 @@ impl GcMoveable for Object<'_> {
             ObjectType::Overlay(x) => cast_pair(x.move_value(to_space)?),
             ObjectType::Marker(x) => cast_pair(x.move_value(to_space)?),
             ObjectType::Obarray(x) => cast_pair(x.move_value(to_space)?),
+            ObjectType::InterpretedFn(x) => cast_pair(x.move_value(to_space)?),
         };
 
         let tag = self.get_tag();
@@ -2108,6 +2136,7 @@ impl ObjectType<'_> {
             ObjectType::Overlay(x) => D::fmt(x, f),
             ObjectType::Marker(x) => D::fmt(x, f),
             ObjectType::Obarray(x) => D::fmt(x, f),
+            ObjectType::InterpretedFn(x) => D::fmt(x, f),
         }
     }
 }

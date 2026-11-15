@@ -641,6 +641,7 @@ pub(crate) fn aref<'ob>(array: Object<'ob>, idx: usize, cx: &'ob Context) -> Res
                 Err(anyhow!("index {idx} is out of bounds. Length was {len}"))
             }
         },
+        ObjectType::InterpretedFn(fun) => fun.field(idx).ok_or_else(|| anyhow!("interpreted field index out of bounds")),
         ObjectType::ByteFn(fun) => match fun.index(idx, cx) {
             Some(x) => Ok(x),
             None => Err(anyhow!("index {idx} is out of bounds")),
@@ -659,6 +660,7 @@ fn type_of(object: Object) -> Object {
         ObjectType::Cons(_) => sym::CONS.into(),
         ObjectType::Vec(_) => sym::VECTOR.into(),
         ObjectType::Record(x) => x.first().expect("record was missing type").get(),
+        ObjectType::InterpretedFn(_) => sym::INTERPRETED_FUNCTION.into(),
         ObjectType::ByteFn(_) => sym::COMPILED_FUNCTION.into(),
         ObjectType::HashTable(_) => sym::HASH_TABLE.into(),
         ObjectType::String(_) | ObjectType::ByteString(_) => sym::STRING.into(),
@@ -1407,6 +1409,7 @@ defsym!(MANY);
 defsym!(INTEGER);
 defsym!(SYMBOL);
 defsym!(COMPILED_FUNCTION);
+defsym!(INTERPRETED_FUNCTION);
 defsym!(HASH_TABLE);
 defsym!(BUFFER);
 defsym!(PROCESS);

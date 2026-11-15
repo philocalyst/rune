@@ -24,6 +24,11 @@ pub(crate) fn equal(left: Object<'_>, right: Object<'_>, cx: &Context) -> Result
         if left.ptr_eq(right) { continue; }
         let mut children = Vec::new();
         match (left.untag(), right.untag()) {
+            (ObjectType::InterpretedFn(a), ObjectType::InterpretedFn(b)) => {
+                if a.len() != b.len() { return Ok(false); }
+                children.extend(a.fields_snapshot(6)?.into_iter().zip(b.fields_snapshot(6)?));
+            },
+            (ObjectType::InterpretedFn(_), _) | (_, ObjectType::InterpretedFn(_)) => return Ok(false),
             (ObjectType::Cons(a), ObjectType::Cons(b)) => children.extend([(a.car(), b.car()), (a.cdr(), b.cdr())]),
             (ObjectType::Vec(a), ObjectType::Vec(b)) => {
                 if a.len() != b.len() { return Ok(false); }
@@ -89,6 +94,7 @@ pub(crate) fn reject_marker_hash_key(root: Object<'_>) -> Result<()> {
                 children.try_reserve_exact(record.len())?;
                 children.extend(record.iter().map(|cell| cell.get()));
             },
+            ObjectType::InterpretedFn(_) => anyhow::bail!("Structural interpreted function keys are unsupported"),
             ObjectType::ByteFn(function) => {
                 ensure!(function.consts().len() <= 100_000-work, "Hash key edge limit exceeded");
                 children.try_reserve_exact(function.consts().len())?;
