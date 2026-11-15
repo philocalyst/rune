@@ -31,3 +31,6 @@ pub use grapheme_font_guard::{GraphemeFontRun, validate_grapheme_font_runs};
 
 mod measured_grapheme_layout;
 pub use measured_grapheme_layout::{MeasuredLayoutScope, WidthProvenance, ContextualClusterWidth, MeasuredGraphemeLayoutPlan, layout_measured_graphemes};
+
+/// Experimental structural admission; no actual GPUI coverage authority.
+pub mod row_shape_admission;
