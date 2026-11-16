@@ -64,6 +64,26 @@ fn display_color_cells(frame: Option<Object>, cx: &Context) -> Result<i64> {
         crate::core::object::FrameBackend::Terminal => Ok(0),
     }
 }
+/// A terminal's canonical character cell has unit width/height. This is
+/// terminal coordinate semantics, not measured font pixels or native rendering.
+/// Owner validation intentionally rejects foreign/deleted/unavailable frames;
+/// GNU's no-window-system build skips argument checks, so those rejection cases
+/// are a local fail-closed contract, not cross-build error parity.
+fn terminal_character_cell(frame: Option<Object>, cx: &Context) -> Result<i64> {
+    let frame = live_frame(frame, cx)?;
+    match frame.backend() {
+        crate::core::object::FrameBackend::Terminal => Ok(1),
+    }
+}
+#[defun]
+fn frame_char_width(frame: Option<Object>, cx: &Context) -> Result<i64> {
+    terminal_character_cell(frame, cx)
+}
+#[defun]
+fn frame_char_height(frame: Option<Object>, cx: &Context) -> Result<i64> {
+    terminal_character_cell(frame, cx)
+}
+
 /// Return the window-system symbol for a validated owner frame. The current
 /// logical terminal has no window-system connection, so its genuine value is nil.
 #[defun]
@@ -114,6 +134,36 @@ fn frame_parameter<'a>(
         _ => NIL,
     })
 }
+/// Snapshot the parameters implemented by the owner-local Terminal backend.
+/// Geometry is read once from the authoritative Session tree. Returned cons
+/// cells are fresh; mutating the alist does not mutate frame parameters.
+/// This backend currently has no arbitrary parameter storage or GUI parameters.
+#[defun]
+fn frame_parameters<'a>(
+    frame: Option<Object<'a>>,
+    env: &crate::core::gc::Rt<crate::core::env::Env>,
+    cx: &'a Context,
+) -> Result<Object<'a>> {
+    let frame = live_frame(frame, cx)?;
+    let (width, height) = env.editor_gateway().frame_geometry(cx)?;
+    let entries: [(&str, Object<'a>); 10] = [
+        ("window-system", NIL),
+        ("reverse", NIL),
+        ("display-type", crate::lread::intern("mono", cx).into()),
+        ("background-mode", crate::lread::intern("dark", cx).into()),
+        ("font", cx.add("tty")),
+        ("foreground-color", cx.add("unspecified-fg")),
+        ("background-color", cx.add("unspecified-bg")),
+        ("name", cx.add(format!("rune-terminal-{}", frame.id()))),
+        ("width", i64::from(width).into()),
+        ("height", i64::from(height).into()),
+    ];
+    let pairs: Vec<Object<'a>> = entries.into_iter().map(|(name, value)| {
+        crate::core::cons::Cons::new(crate::lread::intern(name, cx), value, cx).into()
+    }).collect();
+    Ok(crate::fns::slice_into_list(&pairs, None, cx))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -178,5 +228,67 @@ mod internal_parameter_tests {
 "#).map_err(anyhow::Error::msg)?;
             Ok(())
         }).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod terminal_cell_metric_tests {
+    #[test]
+    fn terminal_character_cells_match_gnu_valid_frame_calls() {
+        crate::assert_elprop!(
+            "(list (frame-char-width) (frame-char-width nil) (frame-char-width (selected-frame)) (frame-char-height) (frame-char-height nil) (frame-char-height (selected-frame)))"
+        );
+    }
+
+    #[test]
+    fn terminal_character_cells_validate_owner_frame_and_keep_identity() {
+        use crate::core::{gc::{Context, RootSet}, object::NIL};
+        let roots = RootSet::default();
+        let cx = &Context::new(&roots);
+        let frame = cx.selected_frame().unwrap();
+        let identity = frame.id();
+        assert_eq!(super::frame_char_width(Some(frame.into()), cx).unwrap(), 1);
+        assert_eq!(super::frame_char_height(Some(frame.into()), cx).unwrap(), 1);
+        assert_eq!(super::frame_char_width(Some(NIL), cx).unwrap(), 1);
+        assert_eq!(super::frame_char_height(None, cx).unwrap(), 1);
+        assert_eq!(cx.selected_frame().unwrap().id(), identity);
+        assert!(super::frame_char_width(Some(42_i64.into()), cx).is_err());
+        assert!(super::frame_char_height(Some(cx.add("named-display")), cx).is_err());
+        frame.delete(cx).unwrap();
+        assert!(super::frame_char_width(Some(frame.into()), cx).is_err());
+        assert!(super::frame_char_height(Some(frame.into()), cx).is_err());
+        assert!(super::frame_char_width(None, cx).is_err());
+        assert!(super::frame_char_height(None, cx).is_err());
+    }
+}
+
+#[cfg(test)]
+mod frame_parameter_snapshot_tests {
+    #[test]
+    fn terminal_snapshot_uses_real_owner_dimensions_and_fresh_pairs() {
+        for (width, height) in [(80,24), (125,37)] {
+            crate::editor_document::with_lisp_runtime_owner(width,height,|mut host| {
+                host.evaluate_source(&format!(r#"
+(let* ((f (selected-frame)) (p (frame-parameters f)) (q (frame-parameters nil)))
+  (if (equal (cdr (assq 'width p)) {width}) nil (signal 'error '("wrong width")))
+  (if (equal (cdr (assq 'height p)) {height}) nil (signal 'error '("wrong height")))
+  (if (equal (cdr (assq 'width p)) (frame-parameter f 'width)) nil (signal 'error '("width mismatch")))
+  (if (equal (cdr (assq 'height p)) (frame-parameter f 'height)) nil (signal 'error '("height mismatch")))
+  (setcdr (assq 'width p) 999)
+  (if (equal (cdr (assq 'width q)) {width}) nil (signal 'error '("shared snapshot pair")))
+  (if (equal (frame-parameter f 'width) {width}) nil (signal 'error '("snapshot mutated owner")))
+  (if (eq f (selected-frame)) nil (signal 'error '("frame identity changed"))))
+"#)).map_err(anyhow::Error::msg)?;
+                assert!(host.evaluate_source("(frame-parameters 42)").is_err());
+                assert!(host.evaluate_source("(frame-parameters \"named-display\")").is_err());
+                Ok(())
+            }).unwrap();
+        }
+    }
+    #[test]
+    fn terminal_snapshot_dimension_relationship_matches_gnu() {
+        crate::assert_elprop!(
+            "(let* ((f (selected-frame)) (p (frame-parameters f))) (list (equal (cdr (assq 'width p)) (frame-parameter f 'width)) (equal (cdr (assq 'height p)) (frame-parameter f 'height))))"
+        );
     }
 }
