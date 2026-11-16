@@ -163,7 +163,12 @@ impl<T> Drop for __StackRoot<'_, T> {
 /// collections like channels, where stack-based rooting is not possible.
 #[doc(hidden)]
 pub(crate) struct __HeapRoot<T: Trace> {
+    // Rust drops fields in declaration order. Unregister BEFORE boxed T teardown.
+    registration: HeapRootRegistration,
     data: Box<Rt<T>>,
+}
+
+struct HeapRootRegistration {
     root_ptr: *const dyn Trace,
     root_set: &'static ThreadSafeRootSet,
 }
@@ -178,7 +183,7 @@ impl<T: Trace> __HeapRoot<T> {
 
         root_set.roots.lock().unwrap().push(dyn_ptr);
 
-        Self { data: boxed, root_ptr: dyn_ptr, root_set }
+        Self { registration: HeapRootRegistration { root_ptr: dyn_ptr, root_set }, data: boxed }
     }
 }
 
@@ -196,13 +201,36 @@ impl<T: Trace> DerefMut for __HeapRoot<T> {
     }
 }
 
-impl<T: Trace> Drop for __HeapRoot<T> {
+impl Drop for HeapRootRegistration {
     fn drop(&mut self) {
         // Search and remove our root_ptr from the roots vector
         let mut roots = self.root_set.roots.lock().unwrap();
         if let Some(pos) = roots.iter().position(|&ptr| std::ptr::addr_eq(ptr, self.root_ptr)) {
             roots.swap_remove(pos);
         }
+    }
+}
+
+/// Opaque non-rooted storage only. It must NEVER expose, format or trace its
+/// now potentially stale Object. Object/Slot have no owning Lisp destructors.
+/// The Rc marker deliberately prevents moving retired storage to another thread.
+#[must_use = "retain storage until after collector/data guards, then drop it"]
+#[allow(dead_code, reason = "prerequisite only; conditional root collection is not enabled")]
+pub(crate) struct RetiredObjectRoot {
+    _data: Box<Rt<Slot<Object<'static>>>>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl __HeapRoot<Slot<Object<'static>>> {
+    /// Synchronously remove GC registration, preserving ONLY opaque Box storage.
+    /// Like dropping a root, this gives up its liveness protection. It does not
+    /// revoke other roots or make previously copied raw aliases safe across GC.
+    /// Not generic over T: an arbitrary Trace payload's Drop might read old space.
+    #[allow(dead_code, reason = "prerequisite only; conditional root collection is not enabled")]
+    pub(crate) fn retire(self) -> RetiredObjectRoot {
+        let Self { registration, data } = self;
+        drop(registration); // Data is still allocated while registration is removed.
+        RetiredObjectRoot { _data: data, _not_send: std::marker::PhantomData }
     }
 }
 
@@ -877,5 +905,48 @@ mod test {
         cx.garbage_collect(true);
         let val = map.get(key.bind(cx)).unwrap().bind(cx);
         assert_eq!(val, "val");
+    }
+}
+
+#[cfg(test)]
+mod retirement_order_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    struct ObserveDrop {
+        roots: &'static ThreadSafeRootSet,
+        observed: Arc<AtomicBool>,
+    }
+    impl Trace for ObserveDrop { fn trace(&self, _: &mut GcState) {} }
+    impl Drop for ObserveDrop {
+        fn drop(&mut self) {
+            let roots = self.roots.roots.try_lock().expect("root mutex held over payload Drop");
+            assert!(roots.is_empty(), "payload dropped before registration removal");
+            self.observed.store(true, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn normal_heap_root_drop_unregisters_before_generic_payload_destructor() {
+        let roots = Box::leak(Box::new(ThreadSafeRootSet::default()));
+        let observed = Arc::new(AtomicBool::new(false));
+        let root = __HeapRoot::new(ObserveDrop { roots, observed: observed.clone() }, roots);
+        drop(root);
+        assert!(observed.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn outer_unwind_preserves_registration_before_payload_drop_order() {
+        let roots = Box::leak(Box::new(ThreadSafeRootSet::default()));
+        let observed = Arc::new(AtomicBool::new(false));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _root = __HeapRoot::new(ObserveDrop { roots, observed: observed.clone() }, roots);
+            panic!("outer native scope, not a mid-collector panic");
+        }));
+        assert!(result.is_err());
+        assert!(observed.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn erased_object_slot_storage_has_no_payload_destructor() {
+        assert!(!std::mem::needs_drop::<Object<'static>>());
+        assert!(!std::mem::needs_drop::<Slot<Object<'static>>>());
+        assert!(!std::mem::needs_drop::<Rt<Slot<Object<'static>>>>());
     }
 }

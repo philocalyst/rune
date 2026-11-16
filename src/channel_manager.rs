@@ -762,3 +762,80 @@ mod queued_root_classification_tests {
         assert!(manager.snapshot_endpoint_residences().is_empty());
     }
 }
+
+#[cfg(test)]
+mod root_retirement_tests {
+    use super::*;
+    use crate::core::{gc::RootSet, object::{Gc, IntoObject, ChannelReceiver, make_channel_pair_for_test}};
+    use rune_core::macros::root;
+
+    #[test]
+    fn retired_box_outlives_raw_gc_without_root_or_guarded_endpoint_callback() {
+        let manager = ChannelManager::isolated_for_test();
+        manager.probe_finalizer_locks.store(true, Ordering::Relaxed);
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let receiver = receiver.into_obj(&cx.block);
+        root!(receiver, cx);
+        let flight = manager.copy_for_queue(cx.add(receiver.bind(cx))).unwrap();
+        sender.close();
+        receiver.bind(cx).close();
+        assert!(manager.snapshot_endpoint_residences().is_empty());
+        let mut deferred = DeferredEndpointFinalizers::default();
+        let retired;
+        {
+            let _access = manager.gc_access.write().unwrap();
+            let mut state = manager.gc_state.lock().unwrap();
+            let channel = manager.channel(id).unwrap();
+            let data = channel.data.lock().unwrap();
+            retired = flight.retire();
+            let GcState { ref mut block, roots_static, ref mut next_limit } = *state;
+            unsafe { collect_garbage_raw(block, roots_static, true, next_limit, &mut deferred); }
+            assert_eq!(block.tracked_endpoint_allocations(), (0, 0));
+            assert_eq!((data.sender_count, data.receiver_count), (0, 1));
+            assert!(data.queue.is_empty());
+        }
+        drop(deferred); // Last family callbacks run outside access/gc_state guards.
+        assert_eq!(manager.counts_for_test(id), None);
+        // Old-space storage is already gone, but retirement exposes no stale value.
+        manager.collect_for_test();
+        drop(retired);
+        manager.collect_for_test();
+        assert!(!manager.finalizer_lock_violation.load(Ordering::Relaxed));
+        assert!(manager.snapshot_endpoint_residences().is_empty());
+    }
+
+    #[test]
+    fn retiring_one_alias_does_not_remove_an_independent_registered_alias() {
+        let manager = ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let receiver = receiver.into_obj(&cx.block);
+        root!(receiver, cx);
+        let first = manager.copy_for_queue(cx.add(receiver.bind(cx))).unwrap();
+        let second = {
+            let _access = manager.gc_access.read().unwrap();
+            let state = manager.gc_state.lock().unwrap();
+            // SAFETY: first is rooted; access excludes movement until alias registration.
+            let object = unsafe { first.get_inner() };
+            __HeapRoot::new(Slot::new(object), state.roots_static)
+        };
+        let retired_first = first.retire();
+        sender.close();
+        receiver.bind(cx).close();
+        for _ in 0..3 {
+            manager.collect_for_test();
+            assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+        }
+        let received = manager.receive_prepared(second, &cx.block).unwrap();
+        root!(received, cx);
+        let received: Gc<&ChannelReceiver> = received.bind(cx).try_into().unwrap();
+        received.close();
+        manager.collect_for_test();
+        assert_eq!(manager.counts_for_test(id), None);
+        drop(retired_first); // Its old pointer was never forwarded, read or traced.
+        assert!(manager.snapshot_endpoint_residences().is_empty());
+    }
+}
