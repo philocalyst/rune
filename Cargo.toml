@@ -165,3 +165,7 @@ required-features = ["native"]
 [[example]]
 name = "headless_row_entity_watcher"
 required-features = ["native"]
+
+[[example]]
+name = "diagnostic_retained_row_window"
+required-features = ["native"]
