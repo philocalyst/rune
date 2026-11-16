@@ -85,6 +85,9 @@ impl StagedNativeRow {
         let capabilities = bank.capabilities(app)?;
         let descriptor = bank.get_compatible_font(capabilities.bank_id,
             capabilities.metrics, MeasuredFontVariant::Normal, app)?.clone();
+        // This is an identity in the current TextSystem, not a coverage proof.
+        // The SDK may already have resolved the descriptor through its fallback stack.
+        let requested_font_id = window.text_system().resolve_font(&descriptor);
         let runs = [TextRun {
             len: request.text().len(), font: descriptor, color: foreground,
             background_color: None, underline: None, strikethrough: None,
@@ -94,6 +97,9 @@ impl StagedNativeRow {
         );
         if line.runs.len() > MAX_STAGED_GLYPHS {
             return Err("retained shape run budget exceeded");
+        }
+        if !run_fonts_match(&requested_font_id, line.runs.iter().map(|run| &run.font_id)) {
+            return Err("retained shape used a different run font");
         }
         let glyph_count = line.runs.iter().try_fold(0usize, |count, run| {
             count.checked_add(run.glyphs.len())
@@ -213,5 +219,32 @@ mod source_index_tests {
         assert!(!is_source_glyph_index("", 0));
         assert!(!is_source_glyph_index("x", 1));
         assert!(is_source_glyph_index("x", 0));
+    }
+}
+
+/// Relative identity only: equal IDs may still contain a missing-glyph result.
+/// Repeated runs are valid; an empty iterator does not establish coverage.
+fn run_fonts_match<'a, F: Eq + 'a>(
+    requested: &F,
+    run_fonts: impl IntoIterator<Item = &'a F>,
+) -> bool {
+    run_fonts.into_iter().all(|font| font == requested)
+}
+
+#[cfg(test)]
+mod run_font_tests {
+    use super::run_fonts_match;
+
+    #[test]
+    fn admits_repeated_requested_identity_and_no_runs() {
+        assert!(run_fonts_match(&7, [&7, &7, &7]));
+        assert!(run_fonts_match(&7, std::iter::empty()));
+    }
+
+    #[test]
+    fn rejects_a_foreign_run_at_each_position() {
+        for fonts in [[8, 7, 7], [7, 8, 7], [7, 7, 8]] {
+            assert!(!run_fonts_match(&7, fonts.iter()));
+        }
     }
 }
