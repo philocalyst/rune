@@ -1,8 +1,12 @@
-# Reconstructed hash core: SOURCE ONLY, NOT RUN
+# Reconstructed hash core: focused qualification
 
-Restored on published 3699a33 after cloud workspace loss. No recovered source
-has been compiled or executed in this cloud. Earlier qualification is historical
-and does not substitute for new check/tests and independent review.
+The combined hash/charset slice published in `6833751949196f01b0ce3dff572e2e07e4f7c111`
+was reconstructed atop `8c0eea1cac125dd23aa8950f10df5a65c2793b5d` after workspace loss.
+On 2026-11-16, a fresh locked, offline build completed successfully in 268.94s.
+All 22 selected tests passed twice on that build, including an independent rerun;
+source, dependency, toolchain, and artifact checks remained unchanged.
+This supersedes the earlier source-only status, not the limitations below.
+Full-suite conformance and actual Doom startup remain unqualified.
 
 Core stores actual SemanticKey(ObjCell,test)/ObjCell values, not a layout cast of
 IndexMap<Object,Object>. Eq uses header identity; Eql adds bigint numeric equality
@@ -43,7 +47,9 @@ workspace loss: fset globalized cl-generic-generalizers' empty Eql method cache,
 then insertion of a local Unmoved Cons key failed. The guard must stay intact;
 canonical owner runtime/function authority is a separate required architecture.
 
-Five native strong-strategy and nine weak collector regression sources are
-reconstructed, NOT RUN. Constructor/reader and four native consumer adaptations
-are separate patches owned by VM/Text. Core source alone does not form a compiling
-complete chain; no behavior or whole-source completion is claimed.
+The 22 passing focused tests cover five strong-strategy cases, nine weak
+collector cases, four Lisp hash/reader/iteration cases, three charset cases,
+and charset-registry rooting across weak-key collection and callback GC.
+Constructor/reader and native-consumer adaptations are included in this combined
+slice. These scoped results do not establish whole-source completion, resolve
+the normal-bootstrap ownership failure, or recover earlier lost qualification.
