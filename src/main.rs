@@ -20,6 +20,7 @@ mod casefiddle;
 mod channel_manager;
 mod channels;
 mod character;
+mod charset;
 mod chartab;
 mod obarray;
 mod syntax;

@@ -31,6 +31,9 @@ static INTERNED_FEATURES: LazyLock<Mutex<InternedFeatures>> = LazyLock::new(Mute
 type PropertyMap<'a> = ObjectMap<Slot<Symbol<'a>>, Vec<(Slot<Symbol<'a>>, Slot<Object<'a>>)>>;
 #[derive(Debug, Trace)]
 pub(crate) struct Env<'a> {
+    #[no_trace]
+    pub(crate) charset_seeded: bool,
+    pub(crate) charset_registry: ObjectMap<Slot<Symbol<'a>>, Slot<Object<'a>>>,
     pub(crate) vars: ObjectMap<Slot<Symbol<'a>>, Slot<Object<'a>>>,
     variable_aliases: ObjectMap<Slot<Symbol<'a>>, Slot<Symbol<'a>>>,
     // Immutable native initialization input, not a second mutable variable store.
@@ -97,6 +100,8 @@ impl<'a> Env<'a> {
             (Slot::new(sym::CHAR_TABLE_EXTRA_SLOTS), Slot::new(Object::from(0)))
         ])].into_iter().collect();
         Ok(Self {
+            charset_seeded: false,
+            charset_registry: Default::default(),
             vars: Default::default(),
             variable_aliases: Default::default(),
             startup_default_directory,
@@ -144,6 +149,7 @@ impl<'a> Env<'a> {
 // RootedEnv created by #[derive(Trace)]
 impl<'a> RootedEnv<'a> {
     pub(crate) fn initialize_condition_metadata(&mut self, cx: &Context) {
+        self.initialize_charset_registry(cx);
         use super::cons::Cons;
         use super::object::NIL;
         let simple = [
