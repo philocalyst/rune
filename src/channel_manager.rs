@@ -689,3 +689,76 @@ mod residence_registry_tests {
         assert!(owner.snapshot_endpoint_residences().is_empty());
     }
 }
+
+#[cfg(test)]
+mod queued_root_classification_tests {
+    use super::*;
+    use crate::core::{
+        gc::RootSet,
+        object::{Gc, IntoObject, ObjectType, make_channel_pair_for_test},
+    };
+    use rune_core::macros::root;
+
+    #[test]
+    fn orphan_queued_receiver_cycle_survives_without_external_residences_today() {
+        let manager = ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let receiver = receiver.into_obj(&cx.block);
+        root!(receiver, cx);
+        sender.send(cx.add(receiver.bind(cx))).unwrap();
+        sender.close();
+        receiver.bind(cx).close();
+        cx.garbage_collect(true);
+        assert!(manager.snapshot_endpoint_residences().is_empty());
+        for _ in 0..3 {
+            manager.collect_for_test();
+            assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+            assert_eq!(manager.channel(id).unwrap().data.lock().unwrap().queue.len(), 1);
+            assert!(manager.snapshot_endpoint_residences().is_empty());
+        }
+        // Test-only administrative dequeue breaks this ONE bounded cycle for cleanup.
+        // There is no externally reachable receiver capability at this point.
+        let recovered = manager.try_recv(id, &cx.block).unwrap();
+        root!(recovered, cx);
+        assert!(matches!(recovered.bind(cx).untag(), ObjectType::ChannelReceiver(_)));
+        let recovered: Gc<&crate::core::object::ChannelReceiver> = recovered.bind(cx).try_into().unwrap();
+        recovered.close();
+        manager.collect_for_test();
+        assert_eq!(manager.counts_for_test(id), None);
+        assert!(manager.snapshot_endpoint_residences().is_empty());
+    }
+
+    #[test]
+    fn unqueued_prepared_transfer_is_live_with_the_same_zero_external_witnesses() {
+        let manager = ChannelManager::isolated_for_test();
+        let (id, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        let receiver = receiver.into_obj(&cx.block);
+        root!(receiver, cx);
+        // Actual production send preparation creates an unconditional HeapRoot.
+        // This native owner represents a not-yet-published or dequeued transfer.
+        let flight = manager.copy_for_queue(cx.add(receiver.bind(cx))).unwrap();
+        sender.close();
+        receiver.bind(cx).close();
+        cx.garbage_collect(true);
+        assert!(manager.snapshot_endpoint_residences().is_empty());
+        for _ in 0..3 {
+            manager.collect_for_test();
+            assert_eq!(manager.counts_for_test(id), Some((0, 1)));
+            assert!(manager.channel(id).unwrap().data.lock().unwrap().queue.is_empty());
+            assert!(manager.snapshot_endpoint_residences().is_empty());
+        }
+        // Moving GC updated the real prepared root; normal receive-copy can use it.
+        let received = manager.receive_prepared(flight, &cx.block).unwrap();
+        root!(received, cx);
+        let received: Gc<&crate::core::object::ChannelReceiver> = received.bind(cx).try_into().unwrap();
+        assert_eq!(manager.snapshot_endpoint_residences().len(), 1);
+        received.close();
+        manager.collect_for_test();
+        assert_eq!(manager.counts_for_test(id), None);
+        assert!(manager.snapshot_endpoint_residences().is_empty());
+    }
+}
