@@ -100,6 +100,11 @@ impl StagedNativeRow {
                 .filter(|count| *count <= MAX_STAGED_GLYPHS)
         }).ok_or("retained shape glyph budget exceeded")?;
         if line.runs.iter().flat_map(|run| &run.glyphs).any(|glyph| {
+            !is_source_glyph_index(request.text(), glyph.index)
+        }) {
+            return Err("retained glyph index is not a source character boundary");
+        }
+        if line.runs.iter().flat_map(|run| &run.glyphs).any(|glyph| {
             let x: f32 = glyph.position.x.into();
             let y: f32 = glyph.position.y.into();
             !x.is_finite() || !y.is_finite()
@@ -175,5 +180,38 @@ impl StagedNativeRowSlot {
 
     pub fn clear(&mut self) {
         self.row = None;
+    }
+}
+
+/// A glyph must refer to an actual source character, not the end sentinel.
+/// Multiple glyphs may share an index; ligatures need not cover every character.
+/// This is a UTF-8 source check, not a grapheme or shaping correctness proof.
+fn is_source_glyph_index(source: &str, index: usize) -> bool {
+    index < source.len() && source.is_char_boundary(index)
+}
+
+#[cfg(test)]
+mod source_index_tests {
+    use super::is_source_glyph_index;
+
+    #[test]
+    fn admits_each_source_character_start_without_requiring_grapheme_starts() {
+        let source = "aé\u{301}🙂";
+        for (index, _) in source.char_indices() {
+            assert!(is_source_glyph_index(source, index));
+        }
+        // The combining mark is a character start inside a grapheme.
+        assert!(is_source_glyph_index(source, 3));
+    }
+
+    #[test]
+    fn rejects_utf8_interiors_end_sentinels_and_unbounded_indices() {
+        let source = "aé\u{301}🙂";
+        for index in [2, 4, 6, 7, 8, source.len(), usize::MAX] {
+            assert!(!is_source_glyph_index(source, index));
+        }
+        assert!(!is_source_glyph_index("", 0));
+        assert!(!is_source_glyph_index("x", 1));
+        assert!(is_source_glyph_index("x", 0));
     }
 }
