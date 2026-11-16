@@ -146,6 +146,7 @@ impl TracePtr for Symbol<'_> {
 
 impl<'a> GcMoveable for Symbol<'a> {
     type Value = Symbol<'a>;
+    fn weak_state(&self) -> crate::core::gc::AllocState { self.get().0.allocation_state() }
 
     fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         let val = self.get().0.move_value(to_space);

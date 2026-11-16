@@ -109,7 +109,7 @@ impl Resolve<'_, '_, '_> {
         let ObjectType::HashTable(table) = table.bind(self.cx).untag() else {
             return Err("invalid frame face table");
         };
-        let Some(value) = table.get(name.into()) else {
+        let Some(value) = table.get(name.into()).map_err(|_| "invalid frame-local face table key")? else {
             return if missing_default && name == sym::DEFAULT && seen.len() == 1 {
                 Ok(Emphasis::default())
             } else {

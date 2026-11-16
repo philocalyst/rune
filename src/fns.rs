@@ -1258,75 +1258,98 @@ pub(crate) fn clear_string<'ob>(
 
 defsym!(KW_TEST);
 defsym!(KW_DOCUMENTATION);
+defsym!(KW_SIZE);
+defsym!(KW_WEAKNESS);
+defsym!(KW_REHASH_SIZE);
+defsym!(KW_REHASH_THRESHOLD);
+defsym!(KW_PURECOPY);
+defsym!(KEY);
+defsym!(VALUE);
 
-#[defun]
-pub(crate) fn make_hash_table<'ob>(
-    keyword_args: &[Object<'ob>],
-    cx: &'ob Context,
-) -> Result<Object<'ob>> {
-    let kw_test_pos = keyword_args.iter().step_by(2).position(|&x| x == sym::KW_TEST);
-    if let Some(i) = kw_test_pos {
-        let Some(val) = keyword_args.get((i * 2) + 1) else {
-            bail!("Missing keyword value for :test")
-        };
-        if *val != sym::EQ && *val != sym::EQUAL && *val != sym::EQL {
-            // TODO: we are currently only using `equal', but eq should be okay
-            bail!("only `eq' and `equal' keywords support for make-hash-table :test. Found {val}");
-        }
+pub(crate) fn hash_test_argument(value: Object) -> Result<crate::core::object::HashTableTest> {
+    use crate::core::object::HashTableTest;
+    if value == sym::EQ { Ok(HashTableTest::Eq) }
+    else if value == sym::EQL { Ok(HashTableTest::Eql) }
+    else if value == sym::EQUAL { Ok(HashTableTest::Equal) }
+    else { bail!("Unsupported hash-table test") }
+}
+pub(crate) fn hash_weakness_argument(value: Object) -> Result<crate::core::object::HashTableWeakness> {
+    use crate::core::object::HashTableWeakness;
+    if value.is_nil() { Ok(HashTableWeakness::Strong) }
+    else if value == sym::KEY { Ok(HashTableWeakness::Key) }
+    else if value == sym::VALUE { Ok(HashTableWeakness::Value) }
+    else { bail!("Unsupported weak hash-table policy") }
+}
+fn hash_wrong_type<'a>(predicate: Symbol, value: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> anyhow::Error {
+    env.initialize_condition_metadata(cx);
+    let data = list!(predicate, value; cx);
+    crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into()
+}
+fn checked_hash_table<'a>(value: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<&'a LispHashTable> {
+    match value.untag() {
+        ObjectType::HashTable(table) => Ok(table),
+        _ => Err(hash_wrong_type(sym::HASH_TABLE_P, value, env, cx)),
     }
-    // TODO, the rest of the keywords need to be supported here
-    let map = HashTable::with_hasher(std::hash::BuildHasherDefault::default());
-    Ok(cx.add(map))
 }
-
 #[defun]
-pub(crate) fn hash_table_p(obj: Object) -> bool {
-    matches!(obj.untag(), ObjectType::HashTable(_))
+pub(crate) fn make_hash_table<'a>(args: crate::core::env::ArgSlice, env: &mut Rt<Env>, cx: &'a Context) -> Result<Object<'a>> {
+    ensure!(args.len() <= 128 && args.len() % 2 == 0, "Invalid hash-table argument list");
+    let args = Rt::bind_slice(env.stack.arg_slice(args), cx).to_vec();
+    use crate::core::object::{HashTableTest, HashTableWeakness};
+    let mut test = HashTableTest::Eql;
+    let mut weakness = HashTableWeakness::Strong;
+    let mut seen = Vec::new();
+    for pair in args.chunks_exact(2) {
+        let key = pair[0]; let value = pair[1];
+        ensure!([sym::KW_TEST, sym::KW_WEAKNESS, sym::KW_SIZE, sym::KW_REHASH_SIZE,
+            sym::KW_REHASH_THRESHOLD, sym::KW_PURECOPY].iter().any(|symbol| key.ptr_eq(Object::from(*symbol))),
+            "Invalid hash-table argument");
+        ensure!(!seen.contains(&key), "Duplicate hash-table argument");
+        seen.push(key);
+        if key == sym::KW_TEST {
+            if !matches!(value.untag(), ObjectType::Symbol(_)) { return Err(hash_wrong_type(sym::SYMBOLP, value, env, cx)); }
+            test = hash_test_argument(value)?;
+        } else if key == sym::KW_WEAKNESS { weakness = hash_weakness_argument(value)?; }
+        else if key == sym::KW_SIZE { ensure!(matches!(value.untag(), ObjectType::Int(n) if n >= 0), "Invalid hash-table size"); }
+        else if key == sym::KW_REHASH_SIZE || key == sym::KW_REHASH_THRESHOLD { /* obsolete GNU30 hints */ }
+        else if key == sym::KW_PURECOPY { ensure!(value.is_nil(), "Pure-copy hash tables unsupported"); }
+        else { bail!("Invalid hash-table argument"); }
+    }
+    Ok(cx.add(HashTable::with_test_and_weakness(test, weakness)))
 }
-
+#[defun]
+pub(crate) fn hash_table_p(obj: Object) -> bool { matches!(obj.untag(), ObjectType::HashTable(_)) }
+#[defun]
+fn hash_table_test<'a>(table: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Symbol<'a>> {
+    use crate::core::object::HashTableTest;
+    Ok(match checked_hash_table(table,env,cx)?.test() { HashTableTest::Eq=>sym::EQ, HashTableTest::Eql=>sym::EQL, HashTableTest::Equal=>sym::EQUAL })
+}
+#[defun]
+fn hash_table_count<'a>(table: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<usize> { Ok(checked_hash_table(table,env,cx)?.len()) }
+#[defun]
+fn hash_table_weakness<'a>(table: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Object<'a>> {
+    use crate::core::object::HashTableWeakness;
+    Ok(match checked_hash_table(table,env,cx)?.weakness() { HashTableWeakness::Strong=>NIL, HashTableWeakness::Key=>sym::KEY.into(), HashTableWeakness::Value=>sym::VALUE.into() })
+}
 #[defun(name = "gethash")]
-fn gethash_lisp<'a>(key: Object<'a>, table: &'a LispHashTable, dflt: Option<Object<'a>>) -> Result<Option<Object<'a>>> {
-    crate::contextual_equal::reject_marker_hash_key(key)?;
-    Ok(gethash(key,table,dflt))
-}
-pub(crate) fn gethash<'ob>(
-    key: Object<'ob>,
-    table: &'ob LispHashTable,
-    dflt: Option<Object<'ob>>,
-) -> Option<Object<'ob>> {
-    match table.get(key) {
-        Some(x) => Some(x),
-        None => dflt,
-    }
-}
-
+fn gethash_lisp<'a>(key: Object<'a>, table: Object<'a>, dflt: Option<Object<'a>>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Option<Object<'a>>> { gethash(key, checked_hash_table(table,env,cx)?, dflt) }
+pub(crate) fn gethash<'a>(key: Object<'a>, table: &'a LispHashTable, dflt: Option<Object<'a>>) -> Result<Option<Object<'a>>> { Ok(table.get(key)?.or(dflt)) }
 #[defun(name = "puthash")]
-fn puthash_lisp<'a>(key: Object<'a>, value: Object<'a>, table: &'a LispHashTable) -> Result<Object<'a>> {
-    crate::contextual_equal::reject_marker_hash_key(key)?;
-    puthash(key,value,table)
-}
-pub(crate) fn puthash<'ob>(
-    key: Object<'ob>,
-    value: Object<'ob>,
-    table: &'ob LispHashTable,
-) -> Result<Object<'ob>> {
-    table.insert(key, value)?;
-    Ok(value)
-}
-
+fn puthash_lisp<'a>(key: Object<'a>, value: Object<'a>, table: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Object<'a>> { puthash(key,value,checked_hash_table(table,env,cx)?) }
+pub(crate) fn puthash<'a>(key: Object<'a>, value: Object<'a>, table: &'a LispHashTable) -> Result<Object<'a>> { table.insert(key,value)?; Ok(value) }
 #[defun]
-fn remhash(key: Object, table: &LispHashTable) -> Result<()> {
-    crate::contextual_equal::reject_marker_hash_key(key)?;
-    let Some(idx) = table.get_index_of(key) else { return Ok(()) };
-    // If the removed element is before our iterator, then we need to shift the
-    // iterator back one because the whole map get's shifted when something is
-    // removed.
-    let iter_idx = table.get_iter_index();
-    if idx < iter_idx {
-        table.set_iter_index(iter_idx - 1);
+fn remhash<'a>(key: Object<'a>, table: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<()> {
+    let table = checked_hash_table(table,env,cx)?;
+    let Some(index) = table.get_index_of(key)? else { return Ok(()); };
+    remhash_after_index(key, table, index)
+}
+// Keep cursor bookkeeping after the fallible second validation/removal. No
+// callbacks or GC intervene; if validation/allocation fails, nothing commits.
+fn remhash_after_index(key: Object, table: &LispHashTable, index: usize) -> Result<()> {
+    if table.shift_remove(key)?.is_some() {
+        let cursor = table.get_iter_index();
+        if index < cursor { table.set_iter_index(cursor - 1); }
     }
-    // TODO: can we use swap_remove?
-    table.shift_remove(key);
     Ok(())
 }
 
@@ -1523,6 +1546,150 @@ fn base64_encode(string: &str, _line_break: bool, pad: bool, base64url: bool) ->
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn remhash_failed_second_validation_keeps_cursor_and_entries() {
+        use crate::core::{cons::Cons, gc::{Context, RootSet}, object::{HashTable, HashTableTest, Object, ObjectType, NIL}};
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let key = Cons::new1(cx.add(1), &cx);
+        let key_object: Object = key.into();
+        let mut builder = HashTable::with_test(HashTableTest::Equal);
+        builder.insert(key_object, cx.add(7)).unwrap();
+        let table = cx.add(builder);
+        let ObjectType::HashTable(table) = table.untag() else { unreachable!() };
+        let index = table.get_index_of(key_object).unwrap().unwrap();
+        table.set_iter_index(2);
+        // Exercise the removal-stage Result seam directly: the first lookup
+        // already succeeded, but the second validation now deterministically
+        // fails. This models a fallible second stage without allocator hooks.
+        key.set_cdr(key_object).unwrap();
+        assert!(super::remhash_after_index(key_object, table, index).is_err());
+        assert_eq!(table.get_iter_index(), 2);
+        assert_eq!(table.len(), 1);
+        key.set_cdr(NIL).unwrap();
+        super::remhash_after_index(key_object, table, index).unwrap();
+        assert_eq!(table.get_iter_index(), 1);
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn recovered_hash_strategy_and_reader_boundaries() {
+        for (source, expected) in [
+            ("(hash-table-test (make-hash-table))", "eql"),
+            ("(let ((h (make-hash-table :test 'eq))) (puthash (list 1) 7 h) (gethash (list 1) h))", "nil"),
+            ("(let ((h (make-hash-table :test 'equal))) (puthash (list 1) 7 h) (gethash (list 1) h))", "7"),
+            ("(list (hash-table-weakness (make-hash-table :weakness 'key)) (hash-table-weakness (make-hash-table :weakness 'value)))", "(key value)"),
+            (r##"(let ((h (car (read-from-string "#s(hash-table test equal data (a 7 a 9))")))) (list (hash-table-test h) (hash-table-count h) (gethash 'a h)))"##, "(equal 1 9)"),
+            (r##"(let ((h (car (read-from-string (prin1-to-string (make-hash-table)))))) (hash-table-test h))"##, "eql"),
+        ] { crate::interpreter::assert_lisp(source, expected); }
+        let roots = crate::core::gc::RootSet::default();
+        let cx = crate::core::gc::Context::new(&roots);
+        for source in ["#s(hash-table #:test eq)", "#s(hash-table #:data (a 7))", "#s(hash-table test bogus)", "#s(hash-table data (a))", "#s(hash-table weakness key-and-value)"] {
+            assert!(crate::reader::read(source, &cx).is_err());
+        }
+    }
+
+    #[test]
+    fn recovered_weak_maphash_callback_gc_does_not_skip_survivor() {
+        use crate::core::{env::{Env, sym}, gc::{Context, RootSet}};
+        use rune_core::macros::{root, rebind};
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        fn turn(source: &str, env: &mut crate::core::gc::Rt<Env>, cx: &mut Context) {
+            let source = crate::reader::read(source, cx).unwrap().0;
+            root!(source, cx);
+            crate::interpreter::eval(source, None, env, cx).unwrap();
+        }
+        // A distinct evaluator turn releases setup argument/AST roots. The seen
+        // list stores only value symbols, never keys that would fake liveness.
+        turn("(progn (setq rune-weak-map (make-hash-table :test 'eq :weakness 'key) rune-weak-first (list 1) rune-weak-second (list 2) rune-weak-third (list 3) rune-weak-seen nil) (puthash rune-weak-first 'first rune-weak-map) (puthash rune-weak-second 'second rune-weak-map) (puthash rune-weak-third 'third rune-weak-map))", env, cx);
+        turn("(maphash #'(lambda (key value) (setq rune-weak-seen (cons value rune-weak-seen)) (cond ((eq value 'first) (setq rune-weak-first nil)) ((eq value 'second) (garbage-collect)))) rune-weak-map)", env, cx);
+        let source = crate::reader::read("(list (reverse rune-weak-seen) (hash-table-count rune-weak-map))", cx).unwrap().0;
+        root!(source, cx);
+        let result = rebind!(crate::interpreter::eval(source, None, env, cx).unwrap(), cx);
+        let expected = crate::reader::read("((first second third) 2)", cx).unwrap().0;
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn reconstructed_value_weak_maphash_gc_cursor() {
+        use crate::core::{env::{Env, sym}, gc::{Context, RootSet}};
+        use rune_core::macros::root;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        fn turn(source: &str, env: &mut crate::core::gc::Rt<Env>, cx: &mut Context) {
+            let source = crate::reader::read(source, cx).unwrap().0;
+            root!(source, cx);
+            crate::interpreter::eval(source, None, env, cx).unwrap();
+        }
+        // Distinct turns release setup AST/argument roots. Seen contains only
+        // interned keys, never weak values that would conceal collection.
+        turn("(progn (setq rune-wv-map (make-hash-table :test 'eq :weakness 'value) rune-wv-first (list 1) rune-wv-second (list 2) rune-wv-third (list 3) rune-wv-seen nil) (puthash 'first rune-wv-first rune-wv-map) (puthash 'second rune-wv-second rune-wv-map) (puthash 'third rune-wv-third rune-wv-map))", env, cx);
+        turn("(maphash #'(lambda (key value) (setq rune-wv-seen (cons key rune-wv-seen)) (cond ((eq key 'first) (setq rune-wv-first nil)) ((eq key 'second) (garbage-collect)))) rune-wv-map)", env, cx);
+        turn("(if (equal (list (reverse rune-wv-seen) (hash-table-count rune-wv-map)) '((first second third) 2)) nil (error \"value weak cursor mismatch\"))", env, cx);
+        turn("(setq rune-wv-second nil rune-wv-third nil)", env, cx);
+        for _ in 0..4 { cx.garbage_collect(true); }
+        turn("(if (eq (hash-table-count rune-wv-map) 0) nil (error \"weak values unexpectedly retained\"))", env, cx);
+    }
+
+    #[test]
+    fn reconstructed_maphash_error_unwind_resets_cursor_and_releases_key() {
+        use crate::core::{env::{Env, sym}, gc::{Context, RootSet}};
+        use rune_core::macros::root;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        fn turn(source: &str, env: &mut crate::core::gc::Rt<Env>, cx: &mut Context) {
+            let source = crate::reader::read(source, cx).unwrap().0;
+            root!(source, cx);
+            crate::interpreter::eval(source, None, env, cx).unwrap();
+        }
+        turn("(progn (setq rune-we-map (make-hash-table :test 'eq :weakness 'key) rune-we-first (list 1) rune-we-second (list 2) rune-we-seen nil rune-we-caught nil) (puthash rune-we-first 'first rune-we-map) (puthash rune-we-second 'second rune-we-map))", env, cx);
+        turn("(condition-case nil (maphash #'(lambda (key value) (setq rune-we-first nil) (error \"expected callback stop\")) rune-we-map) (error (setq rune-we-caught t)))", env, cx);
+        // Collection happens after the failing call and its condition handler
+        // return, so the current callback key must no longer keep entry 1 alive.
+        for _ in 0..4 { cx.garbage_collect(true); }
+        turn("(maphash #'(lambda (key value) (setq rune-we-seen (cons value rune-we-seen)) (garbage-collect)) rune-we-map)", env, cx);
+        turn("(if (equal (list rune-we-caught rune-we-seen (hash-table-count rune-we-map)) '(t (second) 1)) nil (error \"maphash error unwind mismatch\"))", env, cx);
+        turn("(setq rune-we-seen nil)", env, cx);
+        turn("(maphash #'(lambda (key value) (setq rune-we-seen (cons value rune-we-seen))) rune-we-map)", env, cx);
+        turn("(if (equal rune-we-seen '(second)) nil (error \"repeat maphash cursor mismatch\"))", env, cx);
+    }
+
+    #[test]
+    fn reconstructed_charset_registry_root_drives_weak_key_liveness() {
+        use crate::core::{env::{Env, sym}, gc::{Context, RootSet}};
+        use rune_core::macros::root;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        fn turn(source: &str, env: &mut crate::core::gc::Rt<Env>, cx: &mut Context) {
+            let source = crate::reader::read(source, cx).unwrap().0;
+            root!(source, cx);
+            crate::interpreter::eval(source, None, env, cx).unwrap();
+        }
+        // Only the charset registry retains the dynamic key after setup returns.
+        // Public charset-list is deliberately cleared, and no key enters seen.
+        turn("(progn (setq rune-wc-map (make-hash-table :test 'eq :weakness 'key) rune-wc-seen nil) (let ((key (list 42))) (set-charset-plist 'ascii key) (puthash key 'retained rune-wc-map)) (setq charset-list nil))", env, cx);
+        for _ in 0..4 { cx.garbage_collect(true); }
+        turn("(if (and (eq (gethash (charset-plist 'ascii) rune-wc-map) 'retained) (eq (hash-table-count rune-wc-map) 1)) nil (error \"registry failed to retain weak key\"))", env, cx);
+        turn("(maphash #'(lambda (key value) (garbage-collect) (setq rune-wc-seen (cons value rune-wc-seen))) rune-wc-map)", env, cx);
+        turn("(if (equal rune-wc-seen '(retained)) nil (error \"registry callback identity lost\"))", env, cx);
+        turn("(set-charset-plist 'ascii nil)", env, cx);
+        for _ in 0..4 { cx.garbage_collect(true); }
+        turn("(if (and (eq (hash-table-count rune-wc-map) 0) (eq (charset-id-internal 'ascii) 0) (eq (charset-plist 'ascii) nil)) nil (error \"released charset plist still retained weak key\"))", env, cx);
+    }
+
     #[test]
     fn variable_alias_unibyte_documentation_stays_unibyte() {
         crate::interpreter::assert_lisp(

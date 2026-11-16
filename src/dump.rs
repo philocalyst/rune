@@ -81,6 +81,7 @@ struct DumpState {
     unsupported_interpreted: bool,
     unsupported_string_properties: bool,
     unsupported_char_table: bool,
+    unsupported_hash_table: bool,
 }
 
 impl Display for DumpedObject {
@@ -163,6 +164,7 @@ impl DumpState {
             unsupported_interpreted: false,
             unsupported_string_properties: false,
             unsupported_char_table: false,
+            unsupported_hash_table: false,
         }
     }
 
@@ -230,12 +232,11 @@ impl DumpState {
                 }
             }
             ObjectType::SubrFn(subr) => DumpedObject::Subr(subr.name.to_owned()),
-            ObjectType::HashTable(ht) => {
-                let entries: Vec<(ObjId, ObjId)> = (0..ht.len())
-                    .filter_map(|i| ht.get_index(i))
-                    .map(|(k, v)| (self.dump_object(k), self.dump_object(v)))
-                    .collect();
-                DumpedObject::HashTable(entries)
+            ObjectType::HashTable(_) => {
+                // Legacy wire cannot preserve real strategy/weak reachability.
+                // Do not traverse the rejected graph or emit partial file output.
+                self.unsupported_hash_table=true;
+                DumpedObject::HashTable(Vec::new())
             }
             ObjectType::Record(rec) => {
                 let elems = rec.iter().map(|cell| self.dump_object(cell.get())).collect();
@@ -305,6 +306,7 @@ impl DumpState {
     }
 
     fn into_output(self) -> std::io::Result<std::string::String> {
+        if self.unsupported_hash_table{return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"Hash-table test persistence requires a versioned schema"));}
         if self.unsupported_interpreted { return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Interpreted function persistence is unsupported")); }
         if self.unsupported_obarray {return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"Obarray persistence is unsupported"));}
         if self.unsupported_marker {
@@ -650,7 +652,7 @@ use crate::core::{
     env::intern,
     object::{FnArgs, HashTable, IntoObject, Symbol},
 };
-use rune_core::hashmap::IndexMap;
+
 
 pub(crate) fn load_dump(path: &Path, env: &mut Rt<Env>, cx: &mut Context) -> Result<(), String> {
     let input = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
@@ -725,7 +727,7 @@ pub(crate) fn load_dump(path: &Path, env: &mut Rt<Env>, cx: &mut Context) -> Res
             }
             // Hash tables: allocate empty, patched in pass 2
             DumpedObject::HashTable(_entries) => {
-                let ht: HashTable = IndexMap::default();
+                let ht=HashTable::default();
                 let obj: Object = ht.into_obj(cx).into();
                 obj
             }
@@ -1330,5 +1332,16 @@ mod syntax_persistence_tests {
         let mut state = DumpState::new();
         state.dump_object(cx.standard_syntax_table().unwrap());
         assert_eq!(state.into_output().unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+    }
+}
+
+#[cfg(test)]
+mod hash_strategy_persistence_recovery_tests {
+    #[test]
+    fn hash_table_dump_is_rejected_before_output() {
+        use crate::core::{gc::{Context,RootSet},object::HashTable};
+        let roots=RootSet::default();let cx=Context::new(&roots);
+        let mut state=super::DumpState::new();state.dump_object(cx.add(HashTable::default()));
+        assert_eq!(state.into_output().unwrap_err().kind(),std::io::ErrorKind::Unsupported);
     }
 }

@@ -23,6 +23,7 @@ struct LispStringInner {
 
 impl GcMoveable for LispString {
     type Value = std::ptr::NonNull<LispString>;
+    fn weak_state(&self) -> AllocState { self.0.allocation_state() }
 
     fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         match self.0.allocation_state() {
@@ -216,6 +217,7 @@ impl Deref for ByteString {
 
 impl GcMoveable for ByteString {
     type Value = std::ptr::NonNull<ByteString>;
+    fn weak_state(&self) -> AllocState { self.0.allocation_state() }
 
     fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         match self.0.allocation_state() {

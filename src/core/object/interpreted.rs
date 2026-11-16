@@ -175,4 +175,18 @@ mod tests {
   assert_eq!(bytes,b"preserved image");
  }
 
+ #[test]
+ fn interpreted_native_equal_key_validation_rejects_root_and_nested() {
+  use super::super::{hash_key::validate_keys,HashTableTest};
+  let roots=RootSet::default(); let cx=&Context::new(&roots);
+  let body=Object::from(Cons::new(NIL,NIL,&cx.block));
+  // SAFETY: current-owner graph, shared Context excludes collection/callbacks.
+  let value=Object::from(unsafe {InterpretedFn::new(NIL,body,NIL,NIL,None,cx).unwrap()});
+  let nested=cx.add(&[value][..]);
+  assert!(validate_keys(HashTableTest::Equal,[value]).is_err());
+  assert!(validate_keys(HashTableTest::Equal,[nested]).is_err());
+  assert!(validate_keys(HashTableTest::Eq,[value]).is_ok());
+  assert!(validate_keys(HashTableTest::Eql,[value]).is_ok());
+ }
+
 }

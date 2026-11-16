@@ -650,6 +650,7 @@ impl<'ob, 'rt> Context<'rt> {
             }
         });
         state.trace_stack();
+        state.finish_weak_tables();
 
         self.next_limit = (state.to_space.allocated_bytes() * Self::GC_GROWTH_FACTOR) / 10;
         self.block.drop_stack.borrow_mut().clear();
@@ -716,6 +717,7 @@ pub(crate) unsafe fn collect_garbage_raw(
     }
 
     state.trace_stack();
+        state.finish_weak_tables();
 
     *next_limit = (state.to_space.allocated_bytes() * Context::GC_GROWTH_FACTOR) / 10;
     block.drop_stack.borrow_mut().clear();
@@ -817,7 +819,7 @@ mod test {
         let symbol = cx.add(Symbol::new_uninterned("sym", cx));
         println!("sym: {:?}", symbol.into_raw());
         let mut table = HashTable::default();
-        table.insert(symbol, string);
+        table.insert(symbol, string).unwrap();
         let _ = table.get(&symbol).unwrap();
         root!(symbol, cx);
         let table = cx.add(table);
@@ -831,7 +833,7 @@ mod test {
         let ObjectType::HashTable(table) = vec[1].get().untag() else { unreachable!() };
         let key = symbol.bind(cx);
         println!("key: {:?}", key.into_raw());
-        let val = table.get(symbol.bind(cx)).unwrap();
+        let val = table.get(symbol.bind(cx)).unwrap().unwrap();
         let ObjectType::String(string) = val.untag() else { unreachable!() };
         let ObjectType::Int(int) = cons.car().untag() else { unreachable!() };
         let ObjectType::Float(float) = cons.cdr().untag() else { unreachable!() };

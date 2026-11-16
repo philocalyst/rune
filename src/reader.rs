@@ -30,7 +30,7 @@ pub(crate) enum Error {
     InvalidEscape(usize),
     InvalidRecord(usize),
     InvalidPropertyString(usize),
-    UnsupportedHashTableRecord(usize),
+    InvalidHashTableRecord(usize),
     EmptyStream,
     ResourceLimit,
 }
@@ -48,8 +48,8 @@ impl Display for Error {
             Error::InvalidEscape(i) => write!(f, "Invalid or unsupported character escape: at {i}"),
             Error::InvalidPropertyString(i) => write!(f, "Invalid or unsupported property string syntax: at {i}"),
             Error::InvalidRecord(i) => write!(f, "Invalid record reader syntax: at {i}"),
-            Error::UnsupportedHashTableRecord(i) => {
-                write!(f, "Hash-table record reader syntax is not implemented: at {i}")
+            Error::InvalidHashTableRecord(i) => {
+                write!(f, "Invalid or unsupported hash-table record syntax: at {i}")
             }
             Error::EmptyStream => write!(f, "Empty Stream"),
             Error::ResourceLimit => write!(f, "Reader nesting limit exceeded"),
@@ -78,7 +78,7 @@ impl Error {
             | Error::InvalidEscape(i)
             | Error::InvalidPropertyString(i)
             | Error::InvalidRecord(i)
-            | Error::UnsupportedHashTableRecord(i)
+            | Error::InvalidHashTableRecord(i)
             | Error::ExtraItemInCdr(i)
             | Error::ExtraCloseParen(i)
             | Error::ExtraCloseBracket(i)
@@ -731,14 +731,56 @@ impl<'a, 'ob> Reader<'a, 'ob> {
                         return Err(Error::InvalidRecord(pos));
                     }
                     if fields[0] == self.cx.add(sym::HASH_TABLE) {
-                        return Err(Error::UnsupportedHashTableRecord(pos));
+                        return self.read_hash_table_fields(&fields[1..], pos);
                     }
                     return Ok(self.cx.add(RecordBuilder(fields)));
                 }
-                token => fields.push(self.read_sexp(token)?),
+                token => {
+                    if fields.len() >= 129 && fields.first().is_some_and(|x| *x == self.cx.add(sym::HASH_TABLE)) {
+                        return Err(Error::ResourceLimit);
+                    }
+                    fields.push(self.read_sexp(token)?);
+                }
             }
         }
         Err(Error::MissingCloseParen(open))
+    }
+
+    /// Strict builtin schema only. GNU ignores unknown metadata; this reader
+    /// rejects it rather than pretending to support its behavior.
+    fn read_hash_table_fields(&self, fields: &[Object<'ob>], pos: usize) -> Result<Object<'ob>> {
+        use crate::core::object::{HashTable, HashTableTest, HashTableWeakness, ObjectType, NIL};
+        if fields.len() > 128 || fields.len() % 2 != 0 { return Err(Error::InvalidHashTableRecord(pos)); }
+        let mut test = HashTableTest::Eql;
+        let mut weakness = HashTableWeakness::Strong;
+        let mut data = NIL;
+        let (mut seen_test, mut seen_data, mut seen_weakness) = (false, false, false);
+        for pair in fields.chunks_exact(2) {
+            let ObjectType::Symbol(field) = pair[0].untag() else { return Err(Error::InvalidHashTableRecord(pos)); };
+            // Name dispatch is safe only after canonical interned identity check.
+            if !field.interned() { return Err(Error::InvalidHashTableRecord(pos)); }
+            match field.name() {
+                "test" => if !seen_test { test = fns::hash_test_argument(pair[1]).map_err(|_| Error::InvalidHashTableRecord(pos))?; seen_test = true; },
+                "data" => if !seen_data { data = pair[1]; seen_data = true; },
+                "weakness" => if !seen_weakness { weakness = fns::hash_weakness_argument(pair[1]).map_err(|_| Error::InvalidHashTableRecord(pos))?; seen_weakness = true; },
+                _ => return Err(Error::InvalidHashTableRecord(pos)),
+            }
+        }
+        let mut pairs = Vec::new();
+        let mut tail = data;
+        while !tail.is_nil() {
+            if pairs.len() >= 4096 { return Err(Error::ResourceLimit); }
+            let ObjectType::Cons(key_cell) = tail.untag() else { return Err(Error::InvalidHashTableRecord(pos)); };
+            let key = key_cell.car();
+            let ObjectType::Cons(value_cell) = key_cell.cdr().untag() else { return Err(Error::InvalidHashTableRecord(pos)); };
+            pairs.push((key, value_cell.car()));
+            tail = value_cell.cdr();
+        }
+        let mut table = HashTable::with_test_and_weakness(test, weakness);
+        for (key, value) in pairs {
+            table.insert(key, value).map_err(|_| Error::InvalidHashTableRecord(pos))?;
+        }
+        Ok(self.cx.add(table))
     }
 
     /// Literal property strings contain data, never evaluated forms. Native
@@ -1138,7 +1180,7 @@ mod m0_reader_regressions {
         assert_eq!(read("#s(tag", &cx).unwrap_err(), Error::MissingCloseParen(2));
         assert_eq!(read("#s(tag . 1)", &cx).unwrap_err(), Error::UnexpectedChar('.', 7));
         assert_eq!(read("#s(tag]", &cx).unwrap_err(), Error::ExtraCloseBracket(6));
-        assert_eq!(read("#s(hash-table)", &cx).unwrap_err(), Error::UnsupportedHashTableRecord(0));
+        assert!(matches!(read("#s(hash-table)", &cx).unwrap().0.untag(), crate::core::object::ObjectType::HashTable(_)));
         // Uppercase #S is not a GNU record dispatch.
         assert_eq!(read("#S(tag)", &cx).unwrap_err(), Error::UnknownMacroCharacter('S', 0));
     }

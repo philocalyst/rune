@@ -124,6 +124,7 @@ impl<T> GcHeap<T> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(in crate::core) enum AllocState {
     Forwarded(NonNull<u8>),
     Global,
@@ -135,6 +136,8 @@ pub(in crate::core) enum AllocState {
 /// this trait on `GcHeap`, which will just copy the object.
 pub(in crate::core) trait GcMoveable {
     type Value;
+    /// Query only; MUST NOT move or mark the object.
+    fn weak_state(&self) -> AllocState;
     fn move_value(&self, _to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         None
     }
@@ -142,6 +145,7 @@ pub(in crate::core) trait GcMoveable {
 
 impl<'a, T: GcMoveable<Value = NonNull<T>>> GcMoveable for &'a T {
     type Value = &'a T;
+    fn weak_state(&self) -> AllocState { (*self).weak_state() }
 
     fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         let val = (*self).move_value(to_space);
@@ -154,6 +158,7 @@ macro_rules! derive_GcMoveable {
     ($name:ident) => {
         impl $crate::core::gc::GcMoveable for $name {
             type Value = std::ptr::NonNull<Self>;
+            fn weak_state(&self) -> $crate::core::gc::AllocState { self.0.allocation_state() }
 
             fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
                 match self.0.move_value(to_space) {
@@ -167,6 +172,7 @@ macro_rules! derive_GcMoveable {
 
 impl<T> GcMoveable for GcHeap<T> {
     type Value = NonNull<Self>;
+    fn weak_state(&self) -> AllocState { self.allocation_state() }
 
     fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         use std::ptr;

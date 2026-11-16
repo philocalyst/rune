@@ -404,7 +404,7 @@ mod tests {
                     unsafe { HashTable::default().into_obj(map.global_block()).with_lifetime() }
                 };
                 assert!(table.untag().insert(42.into(), graph).is_err());
-                assert!(table.untag().get(42.into()).is_none());
+                assert!(table.untag().get(42.into()).unwrap().is_none());
             } else {
                 let (_, sender, receiver) = make_channel_pair_for_test(manager.clone(), 1);
                 assert_eq!(sender.try_send(graph), Err(SendError::CopyFailed));

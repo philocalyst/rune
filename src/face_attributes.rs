@@ -20,7 +20,9 @@ defvar!(MINIBUFFER_PROMPT_PROPERTIES, crate::fns::slice_into_list(&[crate::lread
 defvar!(FACE__NEW_FRAME_DEFAULTS, crate::face_attributes::new_table(cx));
 const VECTOR_SIZE: usize = 20;
 pub(crate) fn new_table<'a>(cx: &'a Context) -> Object<'a> {
-    crate::fns::make_hash_table(&[], cx).expect("empty hash-table options are valid")
+    // Native face metadata has the genuine Lisp default Eql/strong policy.
+    // Construct it directly instead of inventing an evaluator Env/ArgSlice.
+    cx.add(crate::core::object::HashTable::with_test(crate::core::object::HashTableTest::Eql))
 }
 fn global_table<'a>(env: &mut Rt<Env>, cx: &'a Context) -> Result<&'a LispHashTable> {
     let value = if let Some(value) = env.variable_value(sym::FACE__NEW_FRAME_DEFAULTS, cx)? {
@@ -93,7 +95,7 @@ fn global_vector<'a>(
     cx: &'a Context,
 ) -> Result<Option<Object<'a>>> {
     let face = face_name(face.into(), env, cx)?.unwrap_or(face);
-    match global_table(env, cx)?.get(face.into()) {
+    match global_table(env, cx)?.get(face.into())? {
         None => Ok(None),
         Some(entry) => {
             let pair = entry.cons().ok_or_else(|| anyhow!("invalid global face entry"))?;
@@ -122,7 +124,7 @@ fn internal_make_lisp_face<'a>(
     let global = global_vector(face, env, cx)?;
     let lookup_face = face_name(face.into(), env, cx)?.unwrap_or(face);
     let local = if let Some(frame) = frame {
-        frame_table(frame, env, cx)?.get(lookup_face.into())
+        frame_table(frame, env, cx)?.get(lookup_face.into())?
     } else {
         None
     };
@@ -185,7 +187,7 @@ fn internal_lisp_face_p<'a>(
         .transpose()?;
     let Some(face) = face_name(face, env, cx)? else { return Ok(NIL) };
     let value = if let Some(frame) = frame {
-        frame_table(frame, env, cx)?.get(face.into())
+        frame_table(frame, env, cx)?.get(face.into())?
     } else {
         global_vector(face, env, cx)?
     };
@@ -230,7 +232,7 @@ fn scoped_vector<'a>(
     let value = if frame == Some(TRUE) {
         global_vector(face, env, cx)?
     } else {
-        frame_table(crate::frame::live_frame(frame, cx)?, env, cx)?.get(face.into())
+        frame_table(crate::frame::live_frame(frame, cx)?, env, cx)?.get(face.into())?
     };
     let value = value.ok_or_else(|| anyhow!("Invalid face"))?;
     checked_vector(value)?;
@@ -478,3 +480,22 @@ mod publication;
 pub(crate) use publication::{default_face as resolved_default_face, text_face_runs as resolved_text_face_runs};
 
 pub(crate) mod font_runs;
+
+#[cfg(test)]
+mod fallible_hash_lookup_tests {
+    use super::*;
+    use rune_core::macros::root;
+    #[test]
+    fn invalid_equal_key_rejects_face_lookup_before_identity_mutation() {
+        let roots = crate::core::gc::RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        crate::lread::load_internal("(setq face--new-frame-defaults (make-hash-table :test 'equal)) (let ((key (list 1))) (puthash key nil face--new-frame-defaults) (setcdr key key))", cx, env).unwrap();
+        let face = crate::core::env::intern("fallible-hash-face", cx);
+        let before = env.face_next_id;
+        assert!(internal_make_lisp_face(face, None, env, cx).is_err());
+        assert_eq!(env.face_next_id, before);
+    }
+}

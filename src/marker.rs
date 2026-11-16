@@ -272,12 +272,21 @@ mod tests {
     }
     #[test]
     fn actual_lisp_hash_wrappers_reject_marker_keys_before_lookup_or_mutation() {
-        crate::interpreter::assert_lisp(r#"(let ((m (make-marker)) (h (make-hash-table)))
+        crate::interpreter::assert_lisp(r#"(let ((m (make-marker)) (h (make-hash-table :test 'equal)))
           (puthash "plain" m h)
           (list (condition-case nil (puthash m 7 h) (error t))
                 (condition-case nil (gethash (list m) h) (error t))
                 (condition-case nil (remhash m h) (error t))
                 (eq (gethash "plain" h) m)))"#, "(t t t t)");
+    }
+    #[test]
+    fn identity_hash_strategies_keep_distinct_marker_keys_across_gc() {
+        for strategy in ["eq", "eql"] {
+            crate::interpreter::assert_lisp(&format!(r#"(let ((a (make-marker)) (b (make-marker)) (h (make-hash-table :test '{strategy})))
+              (puthash a 7 h) (puthash b 9 h) (garbage-collect)
+              (list (gethash a h) (gethash b h) (hash-table-count h)
+                    (eq (hash-table-test h) '{strategy})))"#), "(7 9 2 t)");
+        }
     }
     #[test]
     fn contextual_equality_hash_barriers_and_cycles_fail_closed() {

@@ -945,7 +945,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                         bail_err!("Invalid bytecode switch table: expected hash table")
                     };
                     let cond = self.env.stack[1].bind(cx);
-                    if let Some(offset) = table.get(cond) {
+                    if let Some(offset) = table.get(cond)? {
                         let ObjectType::Int(offset) = offset.untag() else {
                             bail_err!("Invalid bytecode switch target: expected integer")
                         };
@@ -3177,7 +3177,7 @@ mod test {
             let cx = &mut Context::new(roots);
             sym::init_symbols();
             let mut table = HashTable::default();
-            table.insert(1.into(), offset.into());
+            table.insert(1.into(), offset.into()).unwrap();
             make_bytecode!(
                 bytecode,
                 0,
@@ -3196,7 +3196,7 @@ mod test {
         let cx = &mut Context::new(roots);
         sym::init_symbols();
         let mut table = HashTable::default();
-        table.insert(1.into(), cx.add("not-an-index"));
+        table.insert(1.into(), cx.add("not-an-index")).unwrap();
         make_bytecode!(bad_target, 0, [O::Constant0, O::Constant1, O::Switch], [1, table], cx);
         root!(env, init(Env::new(cx).unwrap()), cx);
         {
@@ -3215,13 +3215,32 @@ mod test {
     }
 
     #[test]
+    fn m0_switch_invalid_mutated_equal_key_preserves_operands() {
+        use OpCode as O;
+        let roots = &RootSet::default();
+        let cx = &mut Context::new(roots);
+        sym::init_symbols();
+        let key = crate::core::cons::Cons::new(1, crate::core::object::NIL, cx);
+        let mut table = HashTable::with_test(crate::core::object::HashTableTest::Equal);
+        table.insert(key.into(), 0.into()).unwrap();
+        make_bytecode!(function, 0, [O::Constant0, O::Constant1, O::Switch], [1, table], cx);
+        key.set_cdr(key.into()).unwrap();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        let frame = &mut CallFrame::new(env);
+        frame.finalize_arguments().unwrap();
+        let before = frame.stack.len();
+        assert!(call_inner(function, 0, "invalid-equal-switch-key", frame, &[], cx).is_err());
+        assert_eq!(frame.stack.len(), before + 2);
+    }
+
+    #[test]
     fn m0_switch_preserves_targets_above_u16_range() {
         use OpCode as O;
         let roots = &RootSet::default();
         let cx = &mut Context::new(roots);
         sym::init_symbols();
         let mut table = HashTable::default();
-        table.insert(1.into(), 65_536_i64.into());
+        table.insert(1.into(), 65_536_i64.into()).unwrap();
         let constants: &LispVec =
             vec![cx.add(1_i64), cx.add(table), cx.add(9_i64)].into_obj(cx).untag();
         let mut bytes = vec![O::Return as u8; 65_538];
@@ -3241,9 +3260,9 @@ mod test {
         let cx = &mut Context::new(roots);
 
         let mut table = HashTable::default();
-        table.insert(1.into(), 6.into());
-        table.insert(2.into(), 8.into());
-        table.insert(3.into(), 10.into());
+        table.insert(1.into(), 6.into()).unwrap();
+        table.insert(2.into(), 8.into()).unwrap();
+        table.insert(3.into(), 10.into()).unwrap();
 
         // (lambda (n)
         //   (cond ((equal n 1) 1)

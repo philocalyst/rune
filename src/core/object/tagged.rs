@@ -1874,6 +1874,7 @@ where
     T: GcMoveable<Value = T> + TagType<Out = T>,
 {
     type Value = Self;
+    fn weak_state(&self) -> crate::core::gc::AllocState { self.as_obj().weak_object_state() }
 
     fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         self.untag().move_value(to_space).map(|(x, moved)| (x.tag(), moved))
@@ -1882,6 +1883,7 @@ where
 
 impl GcMoveable for Object<'_> {
     type Value = Self;
+    fn weak_state(&self) -> crate::core::gc::AllocState { self.as_obj().weak_object_state() }
 
     fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         let data = match self.untag() {
@@ -1920,6 +1922,7 @@ impl GcMoveable for Object<'_> {
 
 impl GcMoveable for Function<'_> {
     type Value = Self;
+    fn weak_state(&self) -> crate::core::gc::AllocState { self.as_obj().weak_object_state() }
 
     fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         let data = match self.untag() {
@@ -1939,6 +1942,7 @@ impl GcMoveable for Function<'_> {
 
 impl GcMoveable for List<'_> {
     type Value = Self;
+    fn weak_state(&self) -> crate::core::gc::AllocState { self.as_obj().weak_object_state() }
 
     fn move_value(&self, to_space: &bumpalo::Bump) -> Option<(Self::Value, bool)> {
         let data = match self.untag() {
@@ -2291,5 +2295,47 @@ mod object_hash_contract_tests {
         assert_eq!(hash(object), before);
         cons.set_car(cx.add("mutated")).unwrap();
         assert_eq!(hash(object), before);
+    }
+}
+
+impl Object<'_> {
+    fn weak_object_state(self) -> crate::core::gc::AllocState {
+        match self.untag() {
+            ObjectType::Int(_) | ObjectType::SubrFn(_) | ObjectType::NIL => crate::core::gc::AllocState::Global,
+            ObjectType::Float(x) => x.weak_state(),
+            ObjectType::Cons(x) => x.weak_state(),
+            ObjectType::Vec(x) => x.weak_state(),
+            ObjectType::Record(x) => x.weak_state(),
+            ObjectType::HashTable(x) => x.weak_state(),
+            ObjectType::String(x) => x.weak_state(),
+            ObjectType::ByteString(x) => x.weak_state(),
+            ObjectType::ByteFn(x) => x.weak_state(),
+            ObjectType::Buffer(x) => x.weak_state(),
+            ObjectType::Symbol(x) => x.weak_state(),
+            ObjectType::CharTable(x) => x.weak_state(),
+            ObjectType::BigInt(x) => x.weak_state(),
+            ObjectType::ChannelSender(x) => x.weak_state(),
+            ObjectType::ChannelReceiver(x) => x.weak_state(),
+            ObjectType::Process(x) => x.weak_state(),
+            ObjectType::Frame(x) => x.weak_state(),
+            ObjectType::Overlay(x) => x.weak_state(),
+            ObjectType::Marker(x) => x.weak_state(),
+            ObjectType::Obarray(x) => x.weak_state(),
+            ObjectType::InterpretedFn(x) => x.weak_state(),
+        }
+    }
+    /// Collector-only query on the still-valid from-space graph, before release.
+    pub(in crate::core) fn weak_forwarded(self) -> Option<Self> {
+        use crate::core::gc::AllocState;
+        match self.weak_object_state() {
+            AllocState::Global => Some(self),
+            AllocState::Unmoved => None,
+            AllocState::Forwarded(ptr) => {
+                let ptr = if matches!(self.untag(), ObjectType::Symbol(_)) {
+                    unsafe { Symbol::from_ptr(ptr.as_ptr().cast()).as_ptr() }
+                } else { ptr.as_ptr().cast() };
+                Some(unsafe { Self::from_ptr(ptr, self.get_tag()) })
+            }
+        }
     }
 }

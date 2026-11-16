@@ -72,7 +72,7 @@ fn default_face_data(env: &Rt<Env>, cx: &Context) -> std::result::Result<(Face,L
         name = target;
     }
     if seen.len() == 256 { return Err("default face alias limit exceeded"); }
-    let Some(value) = table.get(name.into()) else { return Ok((fallback,LineDecoration::Off,LineDecoration::Off,false)); };
+    let Some(value) = table.get(name.into()).map_err(|_| "invalid frame-local face table key")? else { return Ok((fallback,LineDecoration::Off,LineDecoration::Off,false)); };
     let vector = checked_vector(value).map_err(|_|"invalid default face vector")?;
     let inverted=inverse(vector[8].get())?.unwrap_or(false);
     let inherited=vector[16].get();
@@ -228,7 +228,7 @@ impl Resolve<'_,'_,'_> {
                 frame.validate(self.cx).map_err(|_|"invalid frame for face runs")?;
                 let table=self.env.frame_face_tables.get(Object::from(frame)).ok_or("missing frame face table")?;
                 let table:&LispHashTable=table.bind(self.cx).try_into().map_err(|_|"invalid frame face table")?;
-                let vector=checked_vector(table.get(name.into()).ok_or("unknown frame-local face")?).map_err(|_|"invalid named face vector")?;
+                let vector=checked_vector(table.get(name.into()).map_err(|_|"invalid frame-local face table key")?.ok_or("unknown frame-local face")?).map_err(|_|"invalid named face vector")?;
                 let own=Colors{fg:self.optional_color(vector[9].get(),self.base.foreground)?,bg:self.optional_color(vector[10].get(),self.base.background)?,underline:decoration(vector[7].get(),self.base.foreground)?,strike:decoration(vector[13].get(),self.base.foreground)?,inverse:inverse(vector[8].get())?};
                 let inherited=self.spec(vector[16].get(),depth+1)?;
                 Ok(own.over(inherited))

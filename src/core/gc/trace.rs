@@ -21,15 +21,37 @@ pub(crate) trait TracePtr {
 
 pub(crate) struct GcState {
     stack: Vec<RawObj>,
+    weak_progress: bool,
+    weak_tables: Vec<std::ptr::NonNull<crate::core::object::HashTableCore<'static>>>,
     pub(in crate::core) to_space: bumpalo::Bump,
 }
 
 impl GcState {
     pub fn new() -> Self {
-        GcState { stack: Vec::new(), to_space: bumpalo::Bump::new() }
+        GcState { stack: Vec::new(), weak_progress: false, weak_tables: Vec::new(), to_space: bumpalo::Bump::new() }
     }
 
+    pub(in crate::core) fn defer_weak_table(&mut self, table: std::ptr::NonNull<crate::core::object::HashTableCore<'static>>) {
+        self.weak_tables.push(table);
+    }
+    pub(in crate::core) fn finish_weak_tables(&mut self) {
+        loop {
+            self.weak_progress = false;
+            let before = self.weak_tables.len();
+            let count = self.weak_tables.len();
+            for i in 0..count {
+                let table = self.weak_tables[i];
+                // Only to-space payload pointers, alive through this GC phase.
+                unsafe { table.as_ref().mark_weak_edges(self) };
+            }
+            self.trace_stack();
+            if !self.weak_progress && before == self.weak_tables.len() { break; }
+        }
+        for table in &self.weak_tables { unsafe { table.as_ref().finish_weak_edges() }; }
+        self.weak_tables.clear();
+    }
     pub fn push(&mut self, obj: Object) {
+        self.weak_progress = true;
         self.stack.push(Gc::into_raw(obj));
     }
 

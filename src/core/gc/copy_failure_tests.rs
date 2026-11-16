@@ -148,9 +148,12 @@ fn failed_global_hash_value_copy_does_not_publish_key_or_retain_its_endpoint() {
         unsafe { table.with_lifetime() }
     };
     let table = table.untag();
-    // First the endpoint key is copied, then the injected value failure occurs.
-    assert!(table.insert_with_copy_failure(sender, source.add(42), 1).is_err());
-    assert!(table.get(sender).is_none());
+    // Portable NIL key succeeds, then value vector and sender copy succeed;
+    // failing the following scalar exercises actual endpoint rollback, not an
+    // early identity-key rejection that would make this regression vacuous.
+    let payload=source.add(vec![sender,source.add(42)]);
+    assert!(table.insert_with_copy_failure(crate::core::object::NIL,payload,3).is_err());
+    assert!(table.get(crate::core::object::NIL).unwrap().is_none());
     let ObjectType::ChannelSender(sender) = sender.untag() else { unreachable!() };
     sender.close();
     assert_eq!(manager.counts_for_test(id), Some((0, 1)));
