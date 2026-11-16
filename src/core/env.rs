@@ -33,6 +33,10 @@ type PropertyMap<'a> = ObjectMap<Slot<Symbol<'a>>, Vec<(Slot<Symbol<'a>>, Slot<O
 pub(crate) struct Env<'a> {
     #[no_trace]
     pub(crate) charset_seeded: bool,
+    #[no_trace]
+    pub(crate) charset_alias_publications: usize,
+    #[no_trace]
+    pub(crate) charset_offsets: Vec<crate::charset::OffsetDescriptor>,
     pub(crate) charset_registry: ObjectMap<Slot<Symbol<'a>>, Slot<Object<'a>>>,
     pub(crate) vars: ObjectMap<Slot<Symbol<'a>>, Slot<Object<'a>>>,
     variable_aliases: ObjectMap<Slot<Symbol<'a>>, Slot<Symbol<'a>>>,
@@ -101,6 +105,8 @@ impl<'a> Env<'a> {
         ])].into_iter().collect();
         Ok(Self {
             charset_seeded: false,
+            charset_alias_publications: 0,
+            charset_offsets: Vec::new(),
             charset_registry: Default::default(),
             vars: Default::default(),
             variable_aliases: Default::default(),
