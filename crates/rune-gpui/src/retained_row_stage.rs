@@ -248,3 +248,156 @@ mod run_font_tests {
         }
     }
 }
+
+/// Result of the diagnostic canvas callback, not a presentation or coverage receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticRowPaintStatus {
+    NotInvoked,
+    Rejected,
+    PaintReturnedOk,
+    PaintReturnedError,
+}
+
+impl StagedNativeRow {
+    /// Dormant diagnostic: paint the exact retained line only through GPUI's canvas
+    /// paint callback. This does not admit owner geometry or establish glyph coverage.
+    /// The caller must supply canvas dimensions through the normal Styled API.
+    pub fn diagnostic_canvas(
+        self: Rc<Self>,
+        receipt: AcceptedRowToken,
+        line_height: f32,
+        status: Rc<std::cell::Cell<DiagnosticRowPaintStatus>>,
+    ) -> gpui::Canvas<()> {
+        gpui::canvas(
+            |_, _, _| (),
+            move |bounds, (), window, app| {
+                let geometry = [
+                    bounds.origin.x.into(), bounds.origin.y.into(),
+                    bounds.size.width.into(), bounds.size.height.into(),
+                ];
+                if !self.matches_receipt(&receipt, window, app)
+                    || !diagnostic_paint_geometry(geometry, self.observation.width, line_height)
+                    || !diagnostic_line_arithmetic(
+                        [geometry[0], geometry[1]],
+                        self.observation.width,
+                        self.observation.ascent,
+                        self.observation.descent,
+                        line_height,
+                        self.line.runs.iter().flat_map(|run| &run.glyphs)
+                            .map(|glyph| f32::from(glyph.position.x)),
+                    )
+                {
+                    status.set(DiagnosticRowPaintStatus::Rejected);
+                    return;
+                }
+                // The public canvas calls this closure in its actual paint phase.
+                // Intersect with the enclosing mask; do not escape parent clipping.
+                let result = window.with_content_mask(
+                    Some(gpui::ContentMask { bounds }),
+                    |window| self.line.paint(bounds.origin, gpui::px(line_height), window, app),
+                );
+                status.set(if result.is_ok() {
+                    DiagnosticRowPaintStatus::PaintReturnedOk
+                } else {
+                    // SDK errors may follow partial scene recording; no rollback claim.
+                    DiagnosticRowPaintStatus::PaintReturnedError
+                });
+            },
+        )
+    }
+}
+
+/// Reject nonrepresentable rectangles and fitting dimensions before calling SDK paint.
+fn diagnostic_paint_geometry(bounds: [f32; 4], row_width: f32, line_height: f32) -> bool {
+    let [x, y, width, height] = bounds;
+    bounds.into_iter().chain([row_width, line_height]).all(f32::is_finite)
+        && width > 0.0 && height > 0.0 && row_width >= 0.0 && line_height > 0.0
+        && row_width <= width && line_height <= height
+        && (x + width).is_finite() && x + width > x
+        && (y + height).is_finite() && y + height > y
+        && (x + row_width).is_finite() && (row_width == 0.0 || x + row_width > x)
+        && (y + line_height).is_finite() && y + line_height > y
+}
+
+#[cfg(test)]
+mod diagnostic_paint_tests {
+    use super::diagnostic_paint_geometry;
+
+    #[test]
+    fn admits_fitting_rows_and_empty_source_width() {
+        assert!(diagnostic_paint_geometry([10.0, 20.0, 100.0, 30.0], 80.0, 24.0));
+        assert!(diagnostic_paint_geometry([0.0, 0.0, 100.0, 30.0], 0.0, 30.0));
+    }
+
+    #[test]
+    fn rejects_overflow_nonfinite_oversize_and_absorbed_progress() {
+        for (bounds, width, height) in [
+            ([0.0, 0.0, 100.0, 30.0], 101.0, 20.0),
+            ([0.0, 0.0, 100.0, 30.0], 90.0, 31.0),
+            ([0.0, 0.0, 0.0, 30.0], 0.0, 20.0),
+            ([f32::NAN, 0.0, 100.0, 30.0], 80.0, 20.0),
+            ([f32::MAX, 0.0, f32::MAX, 30.0], 1.0, 20.0),
+            ([1e20, 0.0, 100.0, 30.0], 80.0, 20.0),
+            ([0.0, 1e20, 100.0, 30.0], 80.0, 20.0),
+        ] {
+            assert!(!diagnostic_paint_geometry(bounds, width, height));
+        }
+    }
+}
+
+/// Mirror the finite arithmetic of the SDK's unwrapped, undecorated line path.
+/// Does not validate font bounding boxes, scaled raster coordinates or glyph ink.
+fn diagnostic_line_arithmetic(
+    origin: [f32; 2],
+    width: f32,
+    ascent: f32,
+    descent: f32,
+    line_height: f32,
+    glyph_x_positions: impl IntoIterator<Item = f32>,
+) -> bool {
+    let above = line_height - ascent;
+    let remaining = above - descent;
+    let padding = remaining / 2.0;
+    let baseline = padding + ascent;
+    if ![above, remaining, padding, baseline, origin[1] + baseline]
+        .into_iter().all(f32::is_finite)
+    {
+        return false;
+    }
+    let mut previous = 0.0;
+    let mut glyph_origin = origin[0];
+    let mut first_origin = None;
+    for position in glyph_x_positions {
+        let delta = position - previous;
+        glyph_origin += delta;
+        if !position.is_finite() || !delta.is_finite() || !glyph_origin.is_finite() {
+            return false;
+        }
+        first_origin.get_or_insert(glyph_origin);
+        previous = position;
+    }
+    (first_origin.unwrap_or(origin[0]) + width).is_finite()
+}
+
+#[cfg(test)]
+mod diagnostic_line_arithmetic_tests {
+    use super::diagnostic_line_arithmetic as valid;
+
+    #[test]
+    fn accepts_repeated_and_nonmonotonic_positions_without_claiming_coverage() {
+        assert!(valid([10.0, 20.0], 90.0, 15.0, 5.0, 24.0,
+            [0.0, 20.0, 20.0, 5.0]));
+        assert!(valid([0.0, 0.0], 0.0, 15.0, 5.0, 24.0, []));
+    }
+
+    #[test]
+    fn rejects_each_overflowing_downstream_arithmetic_step() {
+        assert!(!valid([0.0, 0.0], 10.0, -f32::MAX, 0.0, f32::MAX, []));
+        assert!(!valid([0.0, 0.0], 10.0, 0.0, -f32::MAX, f32::MAX, []));
+        assert!(!valid([0.0, f32::MAX], 10.0, f32::MAX, 0.0, f32::MAX, []));
+        assert!(!valid([0.0, 0.0], 10.0, 15.0, 5.0, 24.0,
+            [-f32::MAX, f32::MAX]));
+        assert!(!valid([f32::MAX, 0.0], 10.0, 15.0, 5.0, 24.0, [f32::MAX]));
+        assert!(!valid([0.0, 0.0], f32::MAX, 15.0, 5.0, 24.0, [f32::MAX]));
+    }
+}
