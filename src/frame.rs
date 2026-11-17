@@ -168,7 +168,7 @@ fn frame_parameters<'a>(
 mod tests {
     #[test]
     fn terminal_color_cells_match_gnu_batch_and_validate_frame() {
-        crate::assert_elprop!("(list (display-color-cells) (display-color-cells nil) (display-color-cells (selected-frame)))");
+        crate::library::elprop::assert_initialized_reference(&format!("(list (display-color-cells) (display-color-cells nil) (display-color-cells (selected-frame)))"));
         let roots = crate::core::gc::RootSet::default();
         let cx = &crate::core::gc::Context::new(&roots);
         assert!(super::display_color_cells(Some(42_i64.into()), cx).is_err());
@@ -179,7 +179,7 @@ mod tests {
     }
     #[test]
     fn terminal_window_system_matches_gnu_batch() {
-        crate::assert_elprop!("(list (window-system) (window-system (selected-frame)))");
+        crate::library::elprop::assert_initialized_reference(&format!("(list (window-system) (window-system (selected-frame)))"));
         let roots = crate::core::gc::RootSet::default();
         let cx = &crate::core::gc::Context::new(&roots);
         assert!(super::window_system(Some(42_i64.into()), cx).is_err());
@@ -190,9 +190,9 @@ mod tests {
     }
     #[test]
     fn headless_face_capabilities_match_gnu_batch() {
-        crate::assert_elprop!(
+        crate::library::elprop::assert_initialized_reference(&format!(
             "(list (display-supports-face-attributes-p nil) (display-supports-face-attributes-p '(:weight bold)) (display-supports-face-attributes-p '(:slant italic) (selected-frame)) (display-supports-face-attributes-p 42))"
-        );
+        ));
     }
     #[test]
     fn face_capability_query_rejects_non_frame() {
@@ -204,9 +204,9 @@ mod tests {
     }
     #[test]
     fn headless_frame_identity_and_capabilities_match_gnu_batch() {
-        crate::assert_elprop!(
+        crate::library::elprop::assert_initialized_reference(&format!(
             "(let ((f (selected-frame))) (list (framep f) (frame-live-p f) (eq f (selected-frame)) (eq f (car (frame-list))) (display-graphic-p f)))"
-        );
+        ));
     }
 }
 
@@ -235,9 +235,9 @@ mod internal_parameter_tests {
 mod terminal_cell_metric_tests {
     #[test]
     fn terminal_character_cells_match_gnu_valid_frame_calls() {
-        crate::assert_elprop!(
+        crate::library::elprop::assert_initialized_reference(&format!(
             "(list (frame-char-width) (frame-char-width nil) (frame-char-width (selected-frame)) (frame-char-height) (frame-char-height nil) (frame-char-height (selected-frame)))"
-        );
+        ));
     }
 
     #[test]
@@ -287,8 +287,8 @@ mod frame_parameter_snapshot_tests {
     }
     #[test]
     fn terminal_snapshot_dimension_relationship_matches_gnu() {
-        crate::assert_elprop!(
+        crate::library::elprop::assert_initialized_reference(&format!(
             "(let* ((f (selected-frame)) (p (frame-parameters f))) (list (equal (cdr (assq 'width p)) (frame-parameter f 'width)) (equal (cdr (assq 'height p)) (frame-parameter f 'height))))"
-        );
+        ));
     }
 }

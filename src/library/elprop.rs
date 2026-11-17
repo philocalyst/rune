@@ -90,3 +90,25 @@ mod tests {
         assert_elprop!["(+ 40 3)"];
     }
 }
+
+/// Explicit normal native-variable setup for the reviewed startup differential
+/// cases. The generic assert_elprop macro deliberately retains its bare Env.
+#[cfg(test)]
+pub(crate) fn assert_initialized_reference(form: &str) {
+    start_emacs().unwrap();
+    let emacs_result = eval(form).unwrap();
+    let roots = crate::core::gc::RootSet::default();
+    let cx = &mut crate::core::gc::Context::new(&roots);
+    crate::core::env::sym::init_symbols();
+    rune_core::macros::root!(env, init(crate::core::env::Env::new_isolated(cx).unwrap()), cx);
+    crate::core::env::init_variables(cx, env);
+    let object = crate::reader::read(form, cx).unwrap().0;
+    rune_core::macros::root!(object, cx);
+    // Keep the established interpreter mode; fixture declarations make shared
+    // hook ownership explicit rather than changing global evaluation semantics.
+    let rune_result = match crate::interpreter::eval(object, None, env, cx) {
+        Ok(value) => format!("{value}"),
+        Err(error) => format!("Error: {error}"),
+    };
+    assert_eq!(rune_result, emacs_result, "initialized Rune vs GNU; form: {form}");
+}

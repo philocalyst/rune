@@ -3,7 +3,7 @@
 import hashlib,json,os,pathlib,re,resource,shutil,signal,subprocess,time
 S=pathlib.Path.cwd().resolve(); C=S/'scripts/ci-v11'
 TESTS_PIN='1045a1fe1340dfaa8a223d42a7081fa9891679b389a0dc2e0141eb90e68ad604'
-SOURCE_PIN='6c12f62972cf66a1a3f94dc62062c74f98d22f3122c5a27c8da1502ea34a4ae2'
+SOURCE_PIN='f3cbd0151702af1940d8a024a6ff7442cfcfa98f5ad190c58cafa93ea3ff1899'
 EXTRAS={'.github/workflows/wip-v11-native.yml','scripts/ci-v11/run.py','scripts/ci-v11/source-inventory.json','scripts/ci-v11/native-tests.json','docs/wip-v11-ci-scope.md'}
 EXTRAS.update(['.github/workflows/wip-bootstrap.yml', 'scripts/ci-bootstrap/run.py', 'scripts/ci-bootstrap/check-sandbox.py', 'scripts/ci-bootstrap/checkpoint.el', 'docs/wip-bootstrap-scope.md'])
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()

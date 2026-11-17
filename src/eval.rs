@@ -501,7 +501,7 @@ mod hook_with_args_tests {
             "(progn (defvar ha-hook) (defvar ha-seen) (let ((ha-seen nil) (ha-hook '(lambda (a b) (setq ha-seen (list a b))))) (run-hook-with-args 'ha-hook 5 6) ha-seen))",
             "(progn (defvar ha-hook) (defvar ha-seen) (let ((ha-seen nil) (ha-hook (list (function (lambda (x) (setq ha-seen (cons x ha-seen)) t)) (function (lambda (x) (garbage-collect) (setq ha-seen (cons x ha-seen))))))) (run-hook-with-args 'ha-hook '(payload)) ha-seen))",
             "(progn (defvar ha-hook) (let ((ha-hook (list (function (lambda (x) (throw 'ha-exit x)))))) (catch 'ha-exit (run-hook-with-args 'ha-hook 7))))",
-        ] { crate::assert_elprop!("{form}"); }
+        ] { crate::library::elprop::assert_initialized_reference(&format!("{form}")); }
     }
 }
 
@@ -551,7 +551,7 @@ mod hook_until_success_tests {
             "(progn (defvar hu-hooks) (let ((hu-hooks (list (function (lambda (x) nil)) (function (lambda (x) (garbage-collect) (list x))) (function (lambda (x) (error \"must not run\")))))) (run-hook-with-args-until-success 'hu-hooks '(payload))))",
             "(progn (defvar hu-hooks) (let ((hu-hooks (list (function (lambda (x) (throw 'hu-exit x))) (function (lambda (x) (error \"must not run\")))))) (catch 'hu-exit (run-hook-with-args-until-success 'hu-hooks 7))))",
             "(progn (defvar hu-hooks) (let ((hu-hooks (list t (function (lambda () 'answer))))) (run-hook-with-args-until-success 'hu-hooks)))",
-        ] { crate::assert_elprop!("{form}"); }
+        ] { crate::library::elprop::assert_initialized_reference(&format!("{form}")); }
     }
     #[test]
     fn nil_unbound_and_all_nil_return_nil() {
@@ -1366,7 +1366,7 @@ mod active_backtrace_gnu_tests {
             "(progn (setq bt-gnu-seen nil) (list (backtrace-frame--internal (function (lambda (&rest x) (setq bt-gnu-seen t))) 999 nil) bt-gnu-seen))",
             "(progn (fset 'bt-gnu-target '(lambda () (backtrace-frame--internal #'list 1 'bt-gnu-target))) (list (eq (symbol-function 'funcall) (symbol-function 'funcall-interactively)) (nth 1 (funcall-interactively 'bt-gnu-target))))",
             "(progn (fset 'bt-gnu-target '(lambda () (backtrace-frame--internal (function (lambda (&rest a) (throw 'bt-gnu-exit 7))) 0 'bt-gnu-target))) (list (catch 'bt-gnu-exit (bt-gnu-target)) (backtrace-frame--internal #'list 0 'bt-gnu-target)))",
-        ] { crate::assert_elprop!("{form}"); }
+        ] { crate::library::elprop::assert_initialized_reference(&format!("{form}")); }
     }
 }
 
@@ -1395,7 +1395,7 @@ mod active_backtrace_edge_tests {
         assert_eq!(std::mem::size_of::<std::os::raw::c_int>(), 4);
         for offset in [2_147_483_647_i64, 2_147_483_648, 4_294_967_295, 4_294_967_296, 4_294_967_297, -2_147_483_648, -2_147_483_649] {
             let form = format!("(progn (fset 'bt-offset-gnu '(lambda (offset) (eq (nth 1 (backtrace-frame--internal #'list 0 (cons offset 'bt-offset-gnu))) 'bt-offset-gnu))) (bt-offset-gnu {offset}))");
-            crate::assert_elprop!("{form}");
+            crate::library::elprop::assert_initialized_reference(&format!("{form}"));
         }
     }
     #[test]
@@ -1414,7 +1414,7 @@ mod active_backtrace_edge_tests {
             "(condition-case e (mapbacktrace [1 2] nil) (invalid-function e))",
             "(backtrace-frame--internal 17 999 nil)",
             "(condition-case e (backtrace-frame--internal 17 -1 nil) (wrong-type-argument e))",
-        ] { crate::assert_elprop!("{form}"); }
+        ] { crate::library::elprop::assert_initialized_reference(&format!("{form}")); }
     }
 
     #[test]
@@ -1447,7 +1447,7 @@ mod active_backtrace_edge_tests {
             "(condition-case e (backtrace-frame--internal 17 -1 nil) (wrong-type-argument e))",
             "(condition-case nil (backtrace-frame--internal 17 0 nil) (error 'caught))",
             "(condition-case nil (mapbacktrace 17 nil) (error 'caught))",
-        ] { crate::assert_elprop!("{form}"); }
+        ] { crate::library::elprop::assert_initialized_reference(&format!("{form}")); }
     }
     #[test]
     fn cons_nil_base_does_not_mean_unrestricted_stack() {
@@ -1508,7 +1508,7 @@ mod run_hooks_shared_tests {
             "(progn (defvar rh-hooks) (let ((rh-hooks '(lambda () 'ignored))) (run-hooks 'rh-hooks)))",
             "(progn (defvar rh-hooks) (defvar rh-count) (let ((rh-count 0) (rh-hooks nil)) (setq rh-hooks (list t (function (lambda () (setq rh-count (1+ rh-count)))))) (run-hooks 'rh-hooks) rh-count))",
             r#"(progn (defvar rh-hooks) (let ((rh-hooks (eval '(let ((captured 8)) (function (lambda () (if (= captured 8) t (error "capture lost"))))) t))) (run-hooks 'rh-hooks)))"#,
-        ] { crate::assert_elprop!("{form}"); }
+        ] { crate::library::elprop::assert_initialized_reference(&format!("{form}")); }
     }
 }
 
@@ -1546,6 +1546,6 @@ mod hook_wrapped_tests {
             "(progn (defvar hw-hook) (let ((hw-hook 42)) (run-hook-wrapped 'hw-hook (function (lambda (f x) (list f x))) 'payload)))",
             "(progn (defvar hw-hook) (let ((hw-hook '(first second third))) (run-hook-wrapped 'hw-hook (function (lambda (f) (if (eq f 'second) f nil))))))",
             "(progn (defvar hw-hook) (let ((hw-hook (eval '(let ((captured 8)) (function (lambda () captured))) t))) (run-hook-wrapped 'hw-hook (function (lambda (f) (funcall f))))))",
-        ] { crate::assert_elprop!("{form}"); }
+        ] { crate::library::elprop::assert_initialized_reference(&format!("{form}")); }
     }
 }
