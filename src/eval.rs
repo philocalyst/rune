@@ -1457,7 +1457,7 @@ mod active_backtrace_edge_tests {
             let map = format!("(let ((seen nil)) (mapbacktrace (function (lambda (&rest args) (setq seen t))) {base}) seen)");
             crate::interpreter::assert_lisp(&map, "nil");
         }
-        crate::interpreter::assert_lisp("(not (null (backtrace-frame--internal #'list 0 nil)))", "t");
+        crate::interpreter::assert_lisp("(null (null (backtrace-frame--internal #'list 0 nil)))", "t");
         crate::interpreter::assert_lisp("(let ((seen nil)) (mapbacktrace (function (lambda (&rest args) (setq seen t))) nil) seen)", "t");
     }
     #[test]

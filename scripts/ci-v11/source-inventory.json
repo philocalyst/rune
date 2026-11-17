@@ -459,7 +459,7 @@
   "src/editor_document/trusted_open.rs": "39a9b90b6c62b142c500674c51aade51948a317d977a02da9cc2068ee9274b03",
   "src/editor_document.rs": "c2bd7680ad174e87fc1e63d4a2b95baa440f61ee8b4f8a3a3951db7c573a2001",
   "src/emacs.rs": "a7cbebf055247418fd94882a07ad7d411e345cb6f94b041fd233551121c186d4",
-  "src/eval.rs": "903f158389097a37001725b7c28d47490aaa8ec2d67c4b02a6d319f464ca63a9",
+  "src/eval.rs": "1ee48103f515c75da122f7349444efeb64959605c7cebff2e82f658d2972a97c",
   "src/face.rs": "7d9efcb5c1f217ab8106e45a8bd398eec2226acdcae3b35f7c5225da9b6d1cc0",
   "src/face_attributes/font_runs.rs": "b766f83c2b6afe66d15010a4f4cc1f72c9ab98c0bad112d643783c0514b034d2",
   "src/face_attributes/publication.rs": "1f335003e5faea4f6619da62f76bd4657856cb31bb9637021f7ab070eef77f9e",
