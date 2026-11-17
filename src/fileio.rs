@@ -1303,7 +1303,7 @@ mod lexical_filename_tests {
     #[test]
     fn unix_split_preserves_dot_components_and_repeated_separators() -> Result<()> {
         let roots = RootSet::default(); let cx = Context::new(&roots);
-        sym::init_symbols(); root!(env, init(Env::new_isolated(&cx)?), &cx);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(&cx)?), cx);
         for (name, directory, basename) in [
             ("", None, ""), ("plain", None, "plain"), (".", None, "."), ("..", None, ".."),
             ("/", Some("/"), ""), ("//", Some("//"), ""),
@@ -1327,7 +1327,7 @@ mod lexical_filename_tests {
     #[test]
     fn unibyte_splits_preserve_non_utf8_bytes_and_string_kind() -> Result<()> {
         let roots = RootSet::default(); let cx = Context::new(&roots);
-        sym::init_symbols(); root!(env, init(Env::new_isolated(&cx)?), &cx);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(&cx)?), cx);
         for (input, prefix, suffix) in [
             (b"raw-\xff/leaf-\xfe".as_slice(), b"raw-\xff/".as_slice(), b"leaf-\xfe".as_slice()),
             (b"a/".as_slice(), b"a/".as_slice(), b"".as_slice()),

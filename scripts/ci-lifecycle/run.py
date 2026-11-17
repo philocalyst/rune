@@ -12,7 +12,7 @@ import sys
 
 S=pathlib.Path.cwd().resolve()
 C=S/'scripts/ci-lifecycle'
-BASE_PIN='8fb93d16e070e97ac8abd23d6070ca6335430a61c1f41f7dfabebf543892ae33'
+BASE_PIN='52a8dac9abf12f91c7969f4116470fd882c6e09575f9c5191bfb644ab6d1b36e'
 HELPERS_PIN='8e1effaaa784d79764bec4594775f1bf0c01d05e418e26aab8264366e6f9fb4a'
 OVERLAY={'.github/workflows/wip-lifecycle.yml','docs/wip-lifecycle-scope.md'}|{'scripts/ci-lifecycle/'+n for n in ['run.py','supervisor.py','preflight.py','fixture.py','fault_adapter.py','base-inventory.json','lifecycle-inventory.json']}
 OVERLAY.update(['.github/workflows/wip-confinement.yml', 'docs/wip-confinement-scope.md', 'scripts/ci-confinement/run.py', 'scripts/ci-confinement/probe.c', 'scripts/ci-confinement/controller.py', 'scripts/ci-confinement/supervisor.py', 'scripts/ci-confinement/base-inventory.json', 'scripts/ci-confinement/helper-inventory.json'])
