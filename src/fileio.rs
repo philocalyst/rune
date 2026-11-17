@@ -1266,7 +1266,7 @@ mod symlink_target_tests {
     #[test]
     fn handler_receives_operation_expanded_name_and_propagates_return() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defun rune-symlink-handler (op name) (garbage-collect) (list op name)) (let ((default-directory "/rune-symlink-test/") (file-name-handler-alist '(("rune-symlink-test" . rune-symlink-handler)))) (file-symlink-p "virtual")))"#,
+            r#"(progn (defalias 'rune-symlink-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-symlink-test/") (file-name-handler-alist '(("rune-symlink-test" . rune-symlink-handler)))) (file-symlink-p "virtual")))"#,
             r#"(file-symlink-p "/rune-symlink-test/virtual")"#,
         );
     }
@@ -1274,7 +1274,7 @@ mod symlink_target_tests {
     #[test]
     fn handler_inhibition_is_per_operation_and_errors_propagate() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defun rune-symlink-error (op name) (signal 'error '("handler-failure"))) (let ((file-name-handler-alist '(("rune-symlink-absent" . rune-symlink-error))) (inhibit-file-name-handlers '(rune-symlink-error))) (list (let ((inhibit-file-name-operation 'file-symlink-p)) (file-symlink-p "/rune-symlink-absent/virtual")) (let ((inhibit-file-name-operation 'file-exists-p)) (condition-case nil (file-symlink-p "/rune-symlink-absent/virtual") (error 'propagated))))))"#,
+            r#"(progn (defalias 'rune-symlink-error (function (lambda (op name) (signal 'error '("handler-failure"))))) (let ((file-name-handler-alist '(("rune-symlink-absent" . rune-symlink-error))) (inhibit-file-name-handlers '(rune-symlink-error))) (list (let ((inhibit-file-name-operation 'file-symlink-p)) (file-symlink-p "/rune-symlink-absent/virtual")) (let ((inhibit-file-name-operation 'file-exists-p)) (condition-case nil (file-symlink-p "/rune-symlink-absent/virtual") (error 'propagated))))))"#,
             "(nil propagated)",
         );
     }
@@ -1282,7 +1282,7 @@ mod symlink_target_tests {
     #[test]
     fn lexical_inhibition_is_special_and_relative_default_fails_closed() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defun rune-symlink-lexical-handler (op name) 'handled) (eval '(let ((file-name-handler-alist '(("rune-symlink-lexical" . rune-symlink-lexical-handler))) (inhibit-file-name-handlers '(rune-symlink-lexical-handler))) (list (let ((inhibit-file-name-operation 'file-symlink-p)) (file-symlink-p "/rune-symlink-lexical/missing")) (let ((inhibit-file-name-operation 'file-exists-p)) (file-symlink-p "/rune-symlink-lexical/missing")) (let ((default-directory "relative-base/")) (condition-case nil (file-symlink-p "local") (error 'rejected))))) t))"#,
+            r#"(progn (defalias 'rune-symlink-lexical-handler (function (lambda (op name) 'handled))) (eval '(let ((file-name-handler-alist '(("rune-symlink-lexical" . rune-symlink-lexical-handler))) (inhibit-file-name-handlers '(rune-symlink-lexical-handler))) (list (let ((inhibit-file-name-operation 'file-symlink-p)) (file-symlink-p "/rune-symlink-lexical/missing")) (let ((inhibit-file-name-operation 'file-exists-p)) (file-symlink-p "/rune-symlink-lexical/missing")) (let ((default-directory "relative-base/")) (condition-case nil (file-symlink-p "local") (error 'rejected))))) t))"#,
             "(nil handled rejected)",
         );
     }
