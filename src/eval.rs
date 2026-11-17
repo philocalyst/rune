@@ -1332,7 +1332,7 @@ mod active_backtrace_tests {
     }
     #[test]
     fn missing_frame_never_calls_callback() {
-        crate::interpreter::assert_lisp("(progn (setq bt-seen nil) (list (backtrace-frame--internal (lambda (&rest x) (setq bt-seen t)) 999 nil) bt-seen))", "(nil nil)");
+        crate::interpreter::assert_lisp("(progn (setq bt-seen nil) (list (backtrace-frame--internal (function (lambda (&rest x) (setq bt-seen t))) 999 nil) bt-seen))", "(nil nil)");
     }
     #[test]
     fn preargument_frame_retains_unevaluated_forms() {
