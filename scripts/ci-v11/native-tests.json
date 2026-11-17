@@ -166,5 +166,9 @@
   "fileio::file_readable_linux_tests::effective_read_lookup_follows_links_and_owner_default",
   "fileio::file_readable_linux_tests::raw_readable_paths_and_invalid_nul_do_not_truncate",
   "fileio::file_readable_linux_tests::readable_handler_preserves_operation_result_and_gc",
-  "fileio::file_readable_linux_tests::readable_inhibition_errors_and_type_payload"
+  "fileio::file_readable_linux_tests::readable_inhibition_errors_and_type_payload",
+  "fileio::accessible_directory_linux_tests::owner_directory_search_is_not_file_readability",
+  "fileio::accessible_directory_linux_tests::raw_paths_and_nul_use_lossless_directory_probe",
+  "fileio::accessible_directory_linux_tests::handler_preserves_suffix_roots_result_and_gc",
+  "fileio::accessible_directory_linux_tests::inhibition_error_and_type_payload_use_directory_access_operation"
 ]

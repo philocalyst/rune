@@ -219,9 +219,16 @@ fn car_less_than_car(a: &Cons, b: &Cons) -> Result<bool> {
 }
 
 #[defun]
-fn file_accessible_directory_p(filename: &str) -> bool {
-    let path = Path::new(filename);
-    path.exists() && path.is_dir()
+fn file_accessible_directory_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Preserve existing behavior outside the scoped Linux implementation.
+        let filename = <&str>::try_from(filename.bind(cx))?;
+        let path = Path::new(filename);
+        return Ok((path.exists() && path.is_dir()).into());
+    }
+    #[cfg(target_os = "linux")]
+    local_file_predicate(filename, LocalFilePredicate::AccessibleDirectory, env, cx)
 }
 
 #[defun]
@@ -462,7 +469,7 @@ fn file_readable_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<En
 }
 
 #[derive(Clone, Copy)]
-enum LocalFilePredicate { Exists, Directory, Readable }
+enum LocalFilePredicate { Exists, Directory, Readable, AccessibleDirectory }
 
 fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalFilePredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
@@ -477,6 +484,7 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
         LocalFilePredicate::Exists => "file-exists-p",
         LocalFilePredicate::Directory => "file-directory-p",
         LocalFilePredicate::Readable => "file-readable-p",
+        LocalFilePredicate::AccessibleDirectory => "file-accessible-directory-p",
     };
     // GNU directory lookup applies directory-file-name after expansion, unlike
     // existence lookup. Local Unix suffix conversion only: magic-name handlers
@@ -513,6 +521,7 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
         LocalFilePredicate::Exists => std::fs::metadata(&path).is_ok(),
         LocalFilePredicate::Directory => std::fs::metadata(&path).is_ok_and(|value| value.is_dir()),
         LocalFilePredicate::Readable => effective_readable_access(&path)?,
+        LocalFilePredicate::AccessibleDirectory => effective_directory_access(&path)?,
     };
     Ok(result.into())
 }
@@ -533,6 +542,28 @@ fn effective_readable_access(path: &Path) -> Result<bool> {
     }
     #[cfg(not(target_os = "linux"))]
     { let _ = path; bail!("Effective readable access is not implemented on this platform") }
+}
+
+// Match GNU's POSIX directory-search probe without separate metadata/access
+// calls: appending /./ requires traversing the directory, not reading its list.
+fn effective_directory_access(path: &Path) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let mut bytes = path.as_os_str().as_bytes().to_vec();
+        if !bytes.is_empty() {
+            if bytes.last() != Some(&b'/') { bytes.push(b'/'); }
+            bytes.extend_from_slice(b"./");
+        }
+        // Preserve special root // and reject NUL rather than truncating.
+        let name = CString::new(bytes)?;
+        // SAFETY: the owned CString remains alive during the non-retaining
+        // syscall. Effective credentials match GNU file_access_p.
+        let result = unsafe { libc::faccessat(libc::AT_FDCWD, name.as_ptr(), libc::F_OK, libc::AT_EACCESS) };
+        Ok(result == 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = path; bail!("Effective directory access is not implemented on this platform") }
 }
 
 #[defun]
@@ -1952,6 +1983,84 @@ mod file_readable_linux_tests {
         crate::interpreter::assert_lisp(
             r#"(progn (defalias 'rune-readable-error (function (lambda (op name) (signal 'error '("readable-handler"))))) (let ((file-name-handler-alist '(("rune-readable-absent" . rune-readable-error))) (inhibit-file-name-handlers '(rune-readable-error))) (list (let ((inhibit-file-name-operation 'file-readable-p)) (file-readable-p "/rune-readable-absent/missing")) (let ((inhibit-file-name-operation 'file-exists-p)) (condition-case err (file-readable-p "/rune-readable-absent/missing") (error err))) (condition-case err (file-readable-p 3) (wrong-type-argument err)))))"#,
             r#"(nil (error "readable-handler") (wrong-type-argument stringp 3))"#,
+        );
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod accessible_directory_linux_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+
+    #[test]
+    fn owner_directory_search_is_not_file_readability() -> Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-directory-access-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            std::fs::create_dir(dir.join("search-only"))?;
+            std::fs::set_permissions(dir.join("search-only"), std::fs::Permissions::from_mode(0o100))?;
+            std::fs::write(dir.join("plain"), "kept")?;
+            symlink("search-only", dir.join("link"))?;
+            symlink("missing", dir.join("dangling"))?;
+            symlink("loop", dir.join("loop"))?;
+            env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.to_str().unwrap()))?;
+            // Search-only directory succeeds for ordinary owners and root;
+            // no root-dependent unreadability or mode-000 denial assertion.
+            for (name, expected) in [("", true), ("search-only", true), ("search-only/", true), ("link", true),
+                ("plain", false), ("plain/", false), ("missing", false), ("dangling", false), ("loop", false)] {
+                let name = cx.add(name); root!(name, cx);
+                assert_eq!(!file_accessible_directory_p(name, env, cx)?.is_nil(), expected);
+            }
+            Ok(())
+        })();
+        let _ = std::fs::set_permissions(dir.join("search-only"), std::fs::Permissions::from_mode(0o700));
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn raw_paths_and_nul_use_lossless_directory_probe() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-directory-access-raw-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            let path = dir.join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+            std::fs::create_dir(&path)?;
+            let mut bytes = path.as_os_str().as_bytes().to_vec();
+            let name = cx.add(bytes.clone()); root!(name, cx);
+            assert!(!file_accessible_directory_p(name, env, cx)?.is_nil());
+            bytes.extend_from_slice(b"\0suffix");
+            let invalid = cx.add(bytes.clone()); root!(invalid, cx);
+            assert!(file_accessible_directory_p(invalid, env, cx).is_err());
+            assert!(effective_directory_access(Path::new(std::ffi::OsStr::from_bytes(&bytes))).is_err());
+            env.set_var(sym::FILE_NAME_HANDLER_ALIST, list![NIL; cx])?;
+            assert!(file_accessible_directory_p(name, env, cx).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn handler_preserves_suffix_roots_result_and_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-access-directory-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-access-directory/") (file-name-handler-alist '(("/" . rune-access-directory-handler)))) (list (file-accessible-directory-p "child/") (file-accessible-directory-p "/") (file-accessible-directory-p "//"))))"#,
+            r#"((file-accessible-directory-p "/rune-access-directory/child/") (file-accessible-directory-p "/") (file-accessible-directory-p "//"))"#,
+        );
+    }
+
+    #[test]
+    fn inhibition_error_and_type_payload_use_directory_access_operation() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-access-directory-error (function (lambda (op name) (signal 'error '("directory-access"))))) (let ((file-name-handler-alist '(("rune-access-directory-absent" . rune-access-directory-error))) (inhibit-file-name-handlers '(rune-access-directory-error))) (list (let ((inhibit-file-name-operation 'file-accessible-directory-p)) (file-accessible-directory-p "/rune-access-directory-absent/missing")) (let ((inhibit-file-name-operation 'file-directory-p)) (condition-case err (file-accessible-directory-p "/rune-access-directory-absent/missing") (error err))) (condition-case err (file-accessible-directory-p 3) (wrong-type-argument err)))))"#,
+            r#"(nil (error "directory-access") (wrong-type-argument stringp 3))"#,
         );
     }
 }
