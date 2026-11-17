@@ -193,5 +193,9 @@
   "defun_scanner::tests::adjacent_attributes_and_body_literals_cannot_supply_another_name",
   "defun_scanner::tests::default_names_comments_and_nested_test_items_are_scoped",
   "defun_scanner::tests::malformed_metadata_never_borrows_a_later_attribute",
-  "defun_scanner::tests::current_repository_registration_corpus_matches_reviewed_pairs"
+  "defun_scanner::tests::current_repository_registration_corpus_matches_reviewed_pairs",
+  "fileio::readable_expansion_dispatch_tests::expansion_precedes_resolved_operation_once_across_gc",
+  "fileio::readable_expansion_dispatch_tests::operation_inhibition_does_not_suppress_expansion_stage",
+  "fileio::readable_expansion_dispatch_tests::expansion_errors_stop_before_readability_handler",
+  "fileio::readable_expansion_dispatch_tests::expansion_redirects_actual_lookup_without_creating_or_rewriting"
 ]
