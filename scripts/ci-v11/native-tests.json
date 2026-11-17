@@ -1,0 +1,22 @@
+[
+  "eval::active_backtrace_tests::evaluated_frame_preserves_original_designator_and_values",
+  "eval::active_backtrace_tests::alias_base_resolves_nearest_callable_identity",
+  "eval::active_backtrace_tests::missing_frame_never_calls_callback",
+  "eval::active_backtrace_tests::preargument_frame_retains_unevaluated_forms",
+  "eval::active_backtrace_tests::callback_heap_return_survives_gc_and_reentrance",
+  "eval::active_backtrace_tests::map_fixed_membership_ignores_callback_calls",
+  "eval::active_backtrace_tests::callback_throw_restores_frames",
+  "eval::active_backtrace_tests::interactive_marker_has_distinct_identity",
+  "eval::run_hooks_shared_tests::zero_nil_unbound_raw_lambda_and_closure",
+  "eval::run_hooks_shared_tests::multiple_hooks_and_nonnil_results_keep_source_order",
+  "eval::run_hooks_shared_tests::default_t_marker_ignores_recursive_default_t",
+  "eval::run_hooks_shared_tests::callback_mutates_live_tail_across_gc",
+  "eval::run_hooks_shared_tests::error_and_throw_stop_later_hooks_and_next_call_recovers",
+  "eval::run_hooks_shared_tests::real_cycle_reaches_existing_budget_and_recovers",
+  "eval::hook_wrapped_tests::empty_hook_does_not_validate_wrapper_and_raw_entries_are_data",
+  "eval::hook_wrapped_tests::wrapper_receives_original_entry_and_heap_args_then_short_circuits",
+  "eval::hook_wrapped_tests::real_wrapper_invokes_lambda_with_zero_original_arguments",
+  "eval::hook_wrapped_tests::default_marker_uses_same_wrapper_and_live_tail_reloads",
+  "eval::hook_wrapped_tests::nested_wrappers_keep_original_args_and_throw_error_unwind",
+  "eval::hook_wrapped_tests::cycle_is_bounded_without_calling_entries"
+]
