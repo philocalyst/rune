@@ -15,10 +15,24 @@ def need(b,msg):
 def parse(text):
  need(re.search(r'Class:\s+ELF64\b',text) and re.search(r'Data:\s+2.s complement, little endian',text) and re.search(r'Machine:\s+Advanced Micro Devices X86-64',text),'unexpected ELF ABI')
  headers=re.findall(r'^Dynamic section [^\n]* contains (\d+) entr(?:y|ies):',text,re.M);need(len(headers)==1,'one dynamic table required')
- rows=re.findall(r'^\s*0x[0-9a-fA-F]+\s+\(([^)]+)\)\s*(.*)$',text,re.M)
+ raw_rows=re.findall(r'^\s*(0x[0-9a-fA-F]+)\s+\(([^)]+)\)\s*(.*)$',text,re.M)
+ rows=[(tag,value) for number,tag,value in raw_rows]
  need(len(rows)==int(headers[0]),'unconsumed dynamic table rows')
  known=set('NEEDED PLTRELSZ PLTGOT HASH STRTAB SYMTAB RELA RELASZ RELAENT STRSZ SYMENT INIT FINI SONAME RPATH SYMBOLIC REL RELSZ RELENT PLTREL DEBUG TEXTREL JMPREL BIND_NOW INIT_ARRAY FINI_ARRAY INIT_ARRAYSZ FINI_ARRAYSZ RUNPATH FLAGS PREINIT_ARRAY PREINIT_ARRAYSZ SYMTAB_SHNDX RELRSZ RELR RELRENT GNU_HASH VERSYM VERDEF VERDEFNUM VERNEED VERNEEDNUM RELACOUNT RELCOUNT FLAGS_1 NULL AUDIT DEPAUDIT FILTER AUXILIARY'.split())
- need(all(tag in known for tag,_ in rows),'unknown dynamic tag')
+ plt_tags={'DT_X86_64_PLT':0x70000000,'DT_X86_64_PLTSZ':0x70000001,'DT_X86_64_PLTENT':0x70000003}
+ known.update(plt_tags)
+ unknown=[{'number':number[:32],'tag':tag[:80],'value':value[:120]} for number,tag,value in raw_rows if tag not in known]
+ need(not unknown,'unknown dynamic tags: '+json.dumps(unknown[:4],ensure_ascii=True))
+ plt={}
+ for number,tag,value in raw_rows:
+  if tag not in plt_tags:continue
+  need(int(number,16)==plt_tags[tag] and tag not in plt,'invalid/duplicate x86-64 PLT tag')
+  need(re.fullmatch(r'(?:0x[0-9a-fA-F]{1,16}|[0-9]{1,20})',value) is not None,'invalid x86-64 PLT scalar')
+  scalar=int(value,16) if value.startswith('0x') else int(value,10)
+  need(scalar<2**64,'x86-64 PLT scalar overflow');plt[tag]=scalar
+ if plt:
+  need(set(plt)==set(plt_tags),'incomplete x86-64 PLT metadata')
+  need(plt['DT_X86_64_PLTENT']>0 and plt['DT_X86_64_PLTSZ']%plt['DT_X86_64_PLTENT']==0,'invalid x86-64 PLT size metadata')
  dynamic={};values={}
  for tag,value in rows:
   values.setdefault(tag,[]).append(value)
@@ -54,7 +68,7 @@ def parse(text):
  vs=re.findall(r'^Version symbols section [^\n]* contains (\d+) entr(?:y|ies):',text,re.M)
  if 'VERSYM' in values:need(len(vs)==1 and int(vs[0])==count,'version symbol count mismatch')
  else:need(not vs and not any(s['version'] for s in symbols),'missing version symbol table')
- return {'needed':dynamic.get('NEEDED',[]),'soname':dynamic.get('SONAME',[]),'interpreter':interp[0] if interp else None,'version_definitions':sorted(definitions),'version_requirements':{k:sorted(v) for k,v in requirements.items()},'symbols':symbols,'dynamic_entry_count':len(rows),'dynamic_symbol_count':count}
+ return {'x86_64_plt_metadata':plt,'needed':dynamic.get('NEEDED',[]),'soname':dynamic.get('SONAME',[]),'interpreter':interp[0] if interp else None,'version_definitions':sorted(definitions),'version_requirements':{k:sorted(v) for k,v in requirements.items()},'symbols':symbols,'dynamic_entry_count':len(rows),'dynamic_symbol_count':count}
 def parser_regressions():
  # Fixed readelf-shaped inputs test grammar/count rejection, not ELF validity.
  def fixture(plural):
@@ -71,6 +85,10 @@ def parser_regressions():
  single=fixture(False);plural=fixture(True)
  need(parse(single)['version_requirements']=={'libc.so.6':['GLIBC_2.2.5']},'singleton parser regression')
  need(parse(plural)['version_requirements']=={'libc.so.6':['GLIBC_2.2.5'],'libm.so.6':['GLIBC_2.2.5']},'plural parser regression')
+ # ABI-defined PLT tags are scalar metadata, never search paths or grants.
+ plt_rows=' 0x70000000 (DT_X86_64_PLT) 0x11020\n 0x70000001 (DT_X86_64_PLTSZ) 0x260\n 0x70000003 (DT_X86_64_PLTENT) 0x10\n'
+ marked=single.replace('contains 3 entries:', 'contains 6 entries:',1).replace(' 0x0 (NULL)',plt_rows+' 0x0 (NULL)',1)
+ need(parse(marked)['x86_64_plt_metadata']=={'DT_X86_64_PLT':0x11020,'DT_X86_64_PLTSZ':0x260,'DT_X86_64_PLTENT':0x10},'PLT metadata regression')
  # Definitions followed by needs must not let DOTALL cross either heading.
  mixed=single.replace('contains 3 entries:', 'contains 4 entries:',1).replace(' 0x0 (NULL)', ' 0x6ffffffd (VERDEFNUM) 2\n 0x0 (NULL)',1)
  definition=("Version definition section '.gnu.version_d' contains 2 entries:\n"
@@ -81,6 +99,7 @@ def parser_regressions():
  need(parsed['version_definitions']==['EXAMPLE_1.0','libexample.so.1'] and parsed['version_requirements']=={'libc.so.6':['GLIBC_2.2.5']},'mixed version section regression')
  malformed=[single.replace('(VERNEEDNUM) 1','(VERNEEDNUM) 2'),single.replace('File: libc.so.6 Cnt: 1','File: libc.so.6 Cnt: 2'),single.replace(' 1: 0000 0 FUNC GLOBAL DEFAULT UND puts@GLIBC_2.2.5 (2)\n',''),single.split("Version needs section")[0]]
  malformed.extend([mixed.replace('(VERDEFNUM) 2','(VERDEFNUM) 3'),mixed.replace('Name: EXAMPLE_1.0','Unparsed: EXAMPLE_1.0'),mixed.replace('(VERNEEDNUM) 1','(VERNEEDNUM) 2'),mixed+definition,mixed+single[single.index("Version needs section"):]])
+ malformed.extend([marked.replace('0x70000000','0x70000002'),marked.replace('(DT_X86_64_PLT) 0x11020','(DT_X86_64_PLT) [unsafe]'),marked.replace('(DT_X86_64_PLTENT) 0x10','(DT_X86_64_PLTENT) 0x0'),marked.replace('(DT_X86_64_PLTSZ) 0x260','(DT_X86_64_PLTSZ) 0x261'),marked.replace('DT_X86_64_PLTENT','UNKNOWN_FUTURE_TAG'),marked.replace('DT_X86_64_PLTSZ','DT_X86_64_PLT')])
  for text in malformed:
   try:parse(text)
   except RuntimeError:continue
