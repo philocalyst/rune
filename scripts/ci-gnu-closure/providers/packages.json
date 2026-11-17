@@ -1,0 +1,20 @@
+[
+  {
+    "package": "libgccjit0",
+    "version": "12.2.0-14+deb12u1",
+    "architecture": "amd64",
+    "filename": "libgccjit0_12.2.0-14+deb12u1_amd64.deb",
+    "archive_path": "pool/main/g/gcc-12/libgccjit0_12.2.0-14+deb12u1_amd64.deb",
+    "size": 8786428,
+    "sha256": "c42f0a5f2822a6453e10c1e821cd4136459078f680c726c401dea864448c4a4b"
+  },
+  {
+    "package": "libtree-sitter0",
+    "version": "0.20.7-1",
+    "architecture": "amd64",
+    "filename": "libtree-sitter0_0.20.7-1_amd64.deb",
+    "archive_path": "pool/main/t/tree-sitter/libtree-sitter0_0.20.7-1_amd64.deb",
+    "size": 83904,
+    "sha256": "cac5e60ef6d223162ab5115ca4a47b003dd43af36ad64bc0cd40266b47f023f9"
+  }
+]

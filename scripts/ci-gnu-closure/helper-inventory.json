@@ -1,3 +1,9 @@
 {
-  "inspect.py": "cb58ff346c77d4f8433fff17aa3837c87e42f63610cb1936a6eeab0d8c741e7b"
+  "inspect.py": "eed71db8814de9a33cd09a3aec6c95444ce00314526e72a4d0accf052e1484f4",
+  "providers/archive-inventory.json": "ac0b26a7096c78e228a80e4898b61d8a129586de7ce85a5019fbbad5e1d5c622",
+  "providers/debian-archive-keyring.gpg": "506b815cbb32d9b6066b4a2aa524071e071761e7e7f68c3ac74f3061ba852017",
+  "providers/extract.py": "0264cddbba70e4b2901acb2d2094e966f608d18d847ae1f64dcbbdac1406b746",
+  "providers/packages.json": "ddc986ce8f6808bcb2776377f120348fefcfccb52de355b87419cbb1dab4e0c0",
+  "providers/selected.json": "bb0bc59e2342c5613e16423772cbe2bf7cb27db07958928806dd114cb88d2c9b",
+  "providers/verify_auth.py": "83718a7e783f0ab4fd64471bdb19274ec965ac467717e365618bfbcf2d86164b"
 }

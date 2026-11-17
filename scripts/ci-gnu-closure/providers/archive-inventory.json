@@ -1,0 +1,148 @@
+{
+  "libgccjit0": [
+    {
+      "path": ".",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/lib",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/lib/x86_64-linux-gnu",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/lib/x86_64-linux-gnu/libgccjit.so.0.0.1",
+      "type": "0",
+      "size": 32603632,
+      "mode": "0o644",
+      "link": "",
+      "sha256": "d4b6973528fb4c4b57ec3c64b64214b64f2ad738364748ca8cdb6b47feb5c10e"
+    },
+    {
+      "path": "./usr/share",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/share/doc",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/lib/x86_64-linux-gnu/libgccjit.so.0",
+      "type": "2",
+      "size": 0,
+      "mode": "0o777",
+      "link": "libgccjit.so.0.0.1"
+    },
+    {
+      "path": "./usr/share/doc/libgccjit0",
+      "type": "2",
+      "size": 0,
+      "mode": "0o777",
+      "link": "gcc-12-base"
+    }
+  ],
+  "libtree-sitter0": [
+    {
+      "path": ".",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/lib",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/lib/x86_64-linux-gnu",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/lib/x86_64-linux-gnu/libtree-sitter.so.0.0",
+      "type": "0",
+      "size": 182144,
+      "mode": "0o644",
+      "link": "",
+      "sha256": "f24b9b8850edbb8ad6f96a5b79759f5bd872fb09bae891582872d9d0181a49bd"
+    },
+    {
+      "path": "./usr/share",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/share/doc",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/share/doc/libtree-sitter0",
+      "type": "5",
+      "size": 0,
+      "mode": "0o755",
+      "link": ""
+    },
+    {
+      "path": "./usr/share/doc/libtree-sitter0/changelog.Debian.gz",
+      "type": "0",
+      "size": 717,
+      "mode": "0o644",
+      "link": ""
+    },
+    {
+      "path": "./usr/share/doc/libtree-sitter0/copyright",
+      "type": "0",
+      "size": 3103,
+      "mode": "0o644",
+      "link": ""
+    },
+    {
+      "path": "./usr/lib/x86_64-linux-gnu/libtree-sitter.so.0",
+      "type": "2",
+      "size": 0,
+      "mode": "0o777",
+      "link": "libtree-sitter.so.0.0"
+    }
+  ]
+}

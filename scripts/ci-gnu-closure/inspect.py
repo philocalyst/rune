@@ -106,9 +106,19 @@ def parser_regressions():
   raise RuntimeError('malformed parser fixture accepted')
 def main():
  parser_regressions()
- need(len(sys.argv)==4,'PAYLOAD_ROOT FRESH_EVIDENCE_DIRECTORY PINNED_PAYLOAD_INVENTORY')
+ need(len(sys.argv)==6,'PAYLOAD_ROOT FRESH_EVIDENCE_DIRECTORY PINNED_PAYLOAD_INVENTORY PROVIDER_ROOT PINNED_PROVIDER_SELECTION')
  root=pathlib.Path(sys.argv[1]);out=pathlib.Path(sys.argv[2]);need(root.is_absolute() and root.resolve()==root and out.is_absolute() and out.parent.resolve()==out.parent,'canonical paths')
  for p in (root,out.parent):need(p.is_dir() and p.stat().st_uid==os.getuid() and stat.S_IMODE(p.stat().st_mode)==0o700,'private root/parent')
+ provider_root=pathlib.Path(sys.argv[4]);selection=pathlib.Path(sys.argv[5]);need(provider_root.is_absolute() and provider_root.resolve()==provider_root,'canonical provider root')
+ st=provider_root.lstat();need(stat.S_ISDIR(st.st_mode) and st.st_uid==os.getuid() and stat.S_IMODE(st.st_mode)==0o700,'private provider root')
+ need(sha(selection)=='bb0bc59e2342c5613e16423772cbe2bf7cb27db07958928806dd114cb88d2c9b','provider selection pin')
+ selected=json.loads(selection.read_text());need(len(selected)==2,'provider count');private_providers={}
+ for item in selected:
+  need(len(item['soname'])==1 and item['soname'][0] in ('libgccjit.so.0','libtree-sitter.so.0'),'fixed provider SONAME')
+  name=item['soname'][0];p=provider_root/name;st=p.lstat()
+  need(name not in private_providers and p.resolve()==p and stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1 and stat.S_IMODE(st.st_mode)==0o400 and st.st_size==item['size'] and sha(p)==item['sha256'],'inert provider identity')
+  private_providers[name]=p
+ need({p.name for p in provider_root.iterdir()}==set(private_providers),'provider fileset')
  out.mkdir(mode=0o700);deadline=time.monotonic()+100
  elf=root/'usr/bin/emacs-nox';elns=sorted((root/'usr/lib/emacs/30.1/native-lisp').rglob('*.eln'));pdumps=sorted((root/'usr/libexec/emacs/30.1/x86_64-linux-gnu').glob('*.pdmp'))
  need(len(elns)==149 and len(pdumps)==1,'unexpected native/dump closure roots')
@@ -122,13 +132,13 @@ def main():
  def snapshot(p):
   try:st=p.lstat()
   except FileNotFoundError:return None
-  return (st.st_dev,st.st_ino,st.st_mode,st.st_uid,st.st_gid,st.st_size if not stat.S_ISDIR(st.st_mode) else None,os.readlink(p) if p.is_symlink() else None,str(p.resolve()))
+  return (st.st_dev,st.st_ino,st.st_mode,st.st_uid,st.st_gid,st.st_nlink,st.st_size if not stat.S_ISDIR(st.st_mode) else None,os.readlink(p) if p.is_symlink() else None,str(p.resolve()))
  def watch(p):
   for item in [*reversed(p.parents),p]:
    key=str(item);value=snapshot(item)
    if key in snapshots:need(snapshots[key]==value,'path changed during resolution')
    else:snapshots[key]=value
- for p in [*roots,*pdumps,tool,pathlib.Path(READ_ELF)]:watch(p)
+ for p in [*roots,*pdumps,tool,pathlib.Path(READ_ELF),provider_root,selection,*private_providers.values()]:watch(p)
  allowed_dirs=[]
  for d in DIRS:
   p=pathlib.Path(d);watch(p)
@@ -143,6 +153,8 @@ def main():
   if p.is_dir():gcc_dirs.append(p.resolve())
  def resolve(name):
   candidates={};aliases=[]
+  if name in private_providers:
+   q=private_providers[name];watch(q);candidates[str(q)]=q;aliases.append({'path':str(q),'canonical':str(q),'link':None,'source':'pinned inert Bookworm package'})
   for d in allowed_dirs+(gcc_dirs if name=='libgccjit.so.0' else []):
    p=d/name;watch(p)
    if p.exists():
@@ -200,10 +212,16 @@ def main():
   p=pathlib.Path(path);st=p.stat()
   need(sha(p)==r['sha256'] and (st.st_dev,st.st_ino,st.st_size,st.st_uid,oct(stat.S_IMODE(st.st_mode)))==(r['device'],r['inode'],r['size'],r['owner'],r['mode']),'closure file/metadata changed')
  for path,before in snapshots.items():need(snapshot(pathlib.Path(path))==before,'alias/directory/interpreter resolution changed: '+path)
+ need({p.name for p in provider_root.iterdir()}==set(private_providers) and sha(selection)=='bb0bc59e2342c5613e16423772cbe2bf7cb27db07958928806dd114cb88d2c9b','provider manifest/fileset changed')
  for p in pdumps:need(sha(p)==expected[str(p.relative_to(root))],'pdmp changed')
  need(sha(tool)==toolpin and time.monotonic()<=deadline,'tool changed/deadline')
- summary={'static_candidate_complete':not missing and not issues,'elf_files':len(records),'eln_roots':149,'pdumps':dumps,'missing_sonames':sorted(missing),'issues':issues,'records':records,'edges':edges,'resolved_aliases':resolved_aliases,'path_snapshots':snapshots,'default_search_directories':[str(p) for p in allowed_dirs],'readelf_tool_sha256':toolpin,'gnu_executed':False,'runtime_qualified':False,'limitations':['fixed default host directories only, no ld.so.cache/hwcaps model','dlopen/NSS/locale/services not resolved','static global symbol union does not establish runtime binding order','ELN/dump byte identity not runtime compatibility proof']}
+ issue_counts={};symbol_families={'ts_':0,'gcc_jit_':0,'other':0}
+ for issue in issues:
+  category=next(iter(issue));issue_counts[category]=issue_counts.get(category,0)+1
+  if category=='unresolved_strong_symbol':
+   name=issue[category];family='ts_' if name.startswith('ts_') else 'gcc_jit_' if name.startswith('gcc_jit_') else 'other';symbol_families[family]+=1
+ summary={'provider_selection_sha256':sha(selection),'provider_paths':{n:str(p) for n,p in private_providers.items()},'issue_counts':issue_counts,'unresolved_symbol_families':symbol_families,'static_candidate_complete':not missing and not issues,'elf_files':len(records),'eln_roots':149,'pdumps':dumps,'missing_sonames':sorted(missing),'issues':issues,'records':records,'edges':edges,'resolved_aliases':resolved_aliases,'path_snapshots':snapshots,'default_search_directories':[str(p) for p in allowed_dirs],'readelf_tool_sha256':toolpin,'gnu_executed':False,'runtime_qualified':False,'limitations':['fixed default host directories only, no ld.so.cache/hwcaps model','dlopen/NSS/locale/services not resolved','static global symbol union does not establish runtime binding order','ELN/dump byte identity not runtime compatibility proof']}
  with (out/'closure.json').open('x') as f:json.dump(summary,f,indent=2);f.write('\n')
- print(json.dumps({'static_candidate_complete':summary['static_candidate_complete'],'elf_files':len(records),'missing_sonames':sorted(missing),'issue_count':len(issues),'first_issues':issues[:3],'closure_sha256':sha(out/'closure.json'),'gnu_executed':False,'runtime_qualified':False}),flush=True)
+ print(json.dumps({'static_candidate_complete':summary['static_candidate_complete'],'elf_files':len(records),'missing_sonames':sorted(missing),'issue_count':len(issues),'issue_counts':issue_counts,'unresolved_symbol_families':symbol_families,'first_issues':issues[:3],'closure_sha256':sha(out/'closure.json'),'gnu_executed':False,'runtime_qualified':False}),flush=True)
  if missing or issues:raise SystemExit(1)
 if __name__=='__main__':main()
