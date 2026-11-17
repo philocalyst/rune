@@ -236,5 +236,11 @@
   "fileio::file_name_as_directory_tests::utf8_embedded_nul_is_lexically_preserved",
   "fileio::file_name_as_directory_tests::handler_returned_raw_bytes_survive_gc_without_reprocessing",
   "fileio::file_name_as_directory_tests::lexical_conversion_preserves_large_input_and_idempotence",
-  "fileio::file_name_as_directory_tests::raw_bytes_are_preserved_without_handlers"
+  "fileio::file_name_as_directory_tests::raw_bytes_are_preserved_without_handlers",
+  "lread::test::require_contract_missing_optional_returns_nil_and_allows_fallback",
+  "lread::test::require_contract_present_feature_short_circuits_and_success_loads_once",
+  "lread::test::require_contract_loaded_file_must_provide_requested_feature",
+  "lread::test::require_contract_noerror_does_not_suppress_reader_or_evaluation_errors",
+  "lread::test::require_contract_nested_load_can_provide_requested_feature",
+  "lread::test::require_contract_uninterned_feature_identity_survives_load_gc"
 ]

@@ -541,6 +541,102 @@ mod test {
         }
     }
 
+    // Result-integrity tests use isolated owners and disposable source files.
+    // They do not depend on the separately proposed after-load lifecycle patch.
+    fn require_contract_case(body: &str, expected: &str) {
+        let fixture = LoadFixture::new();
+        for (leaf, source) in [
+            ("good", "(garbage-collect) (setq integrity-count (+ integrity-count 1)) (provide 'integrity-wanted) (garbage-collect)"),
+            ("empty", "(setq integrity-ran t) (garbage-collect)"),
+            ("wrong", "(provide 'integrity-other)"),
+            ("error", "(setq integrity-ran t) (signal 'error '(\"integrity-eval-error\"))"),
+            ("broken", "("),
+            ("nested", "(load integrity-file-good)"),
+            ("uninterned", "(garbage-collect) (provide integrity-uninterned) (garbage-collect)"),
+        ] {
+            fs::write(fixture.0.join(format!("{leaf}.el")), source).unwrap();
+        }
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        env.vars.insert(sym::LOAD_PATH, list!(fixture.0.to_str().unwrap();cx));
+        for leaf in ["good", "empty", "wrong", "missing", "error", "broken", "nested", "uninterned"] {
+            env.set_var(intern(&format!("integrity-file-{leaf}"), cx),
+                cx.add(fixture.0.join(format!("{leaf}.el")).to_string_lossy().to_string())).unwrap();
+        }
+        load_internal("(setq integrity-count 0)", cx, env).unwrap();
+        load_internal(body, cx, env).unwrap();
+        let form = reader::read(expected, cx).unwrap().0;
+        root!(form, cx);
+        assert_eq!(interpreter::eval(form, None, env, cx).unwrap(), TRUE);
+    }
+
+    #[test]
+    fn require_contract_missing_optional_returns_nil_and_allows_fallback() {
+        require_contract_case(r#"
+          (setq integrity-explicit (require 'integrity-wanted integrity-file-missing t))
+          (setq integrity-implicit (require 'integrity-absent nil 'noerror))
+          (setq integrity-fallback (or (require 'integrity-wanted integrity-file-missing t) 'fallback))
+          (setq integrity-required
+            (condition-case nil (require 'integrity-wanted integrity-file-missing) (error 'caught)))
+        "#, "(and (null integrity-explicit) (null integrity-implicit) (eq integrity-fallback 'fallback) (eq integrity-required 'caught) (not (featurep 'integrity-wanted)))");
+    }
+
+    #[test]
+    fn require_contract_present_feature_short_circuits_and_success_loads_once() {
+        require_contract_case(r#"
+          (setq integrity-first (require 'integrity-wanted integrity-file-good))
+          (setq integrity-second (require 'integrity-wanted integrity-file-good t))
+          (setq integrity-present (require 'integrity-wanted integrity-file-missing))
+          (setq integrity-present-noerror (require 'integrity-wanted integrity-file-error t))
+        "#, "(and (eq integrity-first 'integrity-wanted) (eq integrity-second 'integrity-wanted) (eq integrity-present 'integrity-wanted) (eq integrity-present-noerror 'integrity-wanted) (= integrity-count 1) (featurep 'integrity-wanted))");
+    }
+
+    #[test]
+    fn require_contract_loaded_file_must_provide_requested_feature() {
+        for noerror in ["nil", "t"] {
+            require_contract_case(&format!(r#"
+              (setq integrity-empty-result
+                (condition-case nil (require 'integrity-wanted integrity-file-empty {noerror}) (error 'caught)))
+              (setq integrity-wrong-result
+                (condition-case nil (require 'integrity-wanted integrity-file-wrong {noerror}) (error 'caught)))
+              (setq integrity-before-success (featurep 'integrity-wanted))
+              (setq integrity-restored (null load-file-name))
+              (setq integrity-good-result (require 'integrity-wanted integrity-file-good {noerror}))
+            "#), "(and integrity-ran (eq integrity-empty-result 'caught) (eq integrity-wrong-result 'caught) (null integrity-before-success) integrity-restored (featurep 'integrity-other) (eq integrity-good-result 'integrity-wanted) (featurep 'integrity-wanted))");
+        }
+    }
+
+    #[test]
+    fn require_contract_noerror_does_not_suppress_reader_or_evaluation_errors() {
+        for noerror in ["nil", "t"] {
+            require_contract_case(&format!(r#"
+              (setq integrity-eval-result
+                (condition-case nil (require 'integrity-wanted integrity-file-error {noerror}) (error 'caught)))
+              (setq integrity-reader-result
+                (condition-case nil (require 'integrity-wanted integrity-file-broken {noerror}) (error 'caught)))
+            "#), "(and integrity-ran (eq integrity-eval-result 'caught) (eq integrity-reader-result 'caught) (not (featurep 'integrity-wanted)) (null load-file-name))");
+        }
+    }
+
+    #[test]
+    fn require_contract_nested_load_can_provide_requested_feature() {
+        require_contract_case(r#"
+          (setq integrity-nested-result (require 'integrity-wanted integrity-file-nested))
+        "#, "(and (eq integrity-nested-result 'integrity-wanted) (featurep 'integrity-wanted) (= integrity-count 1) (null load-file-name))");
+    }
+
+    #[test]
+    fn require_contract_uninterned_feature_identity_survives_load_gc() {
+        require_contract_case(r#"
+          (setq integrity-uninterned (make-symbol "integrity-uninterned"))
+          (setq integrity-returned (require integrity-uninterned integrity-file-uninterned))
+          (garbage-collect)
+        "#, "(and (eq integrity-returned integrity-uninterned) (featurep integrity-uninterned) (not (featurep 'integrity-uninterned)))");
+    }
+
     #[test]
     fn doom_elc_search_loads_existing_source_and_preserves_missing_noerror() {
         let fixture = LoadFixture::new();

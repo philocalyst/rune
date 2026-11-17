@@ -757,10 +757,17 @@ pub(crate) fn require<'ob>(
     };
     let file = file.into_obj(cx);
     root!(file, cx);
-    match crate::lread::load(file, noerror, None, cx, env) {
-        Ok(_) => Ok(feature.untag(cx)),
-        Err(e) => Err(e),
+    // NOERROR suppresses a missing file, not failure to provide FEATURE.
+    // FEATURE remains rooted across loading (including Lisp-triggered GC).
+    if !crate::lread::load(file, noerror, None, cx, env)? {
+        return Ok(sym::NIL);
     }
+    ensure!(
+        env.has_feature(feature.untag(cx), cx),
+        "Required feature `{}` was not provided",
+        feature.untag(cx).get().name()
+    );
+    Ok(feature.untag(cx))
 }
 
 // Copy only plist spines: property values retain Lisp eq identity. Shared Context
