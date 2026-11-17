@@ -519,7 +519,7 @@ mod hook_until_success_tests {
         let form = "(progn (fset 'hu-throw-target '(lambda (x) (garbage-collect) (throw 'hu-exit x))) (let ((hu-hooks (list 'hu-throw-target))) (list (catch 'hu-exit (run-hook-with-args-until-success 'hu-hooks 7)) (backtrace-frame--internal #'list 0 'hu-throw-target))))";
         let result = {
             let object = crate::reader::read(form, cx).unwrap().0; root!(object,cx);
-            rebind!(crate::interpreter::eval(object,None,env,cx).unwrap())
+            rebind!(crate::interpreter::eval(object,None,env,cx).unwrap(), cx)
         };
         root!(result,cx);
         assert_eq!(env.backtrace_depth(),0);
