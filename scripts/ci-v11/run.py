@@ -20,6 +20,28 @@ def caps(filecap):
  resource.setrlimit(resource.RLIMIT_CORE,(0,0))
  resource.setrlimit(resource.RLIMIT_AS,(6*1024**3,6*1024**3))
  resource.setrlimit(resource.RLIMIT_FSIZE,(filecap,filecap))
+def failure_diagnostics(out,err):
+ # Cargo emits structured compiler errors on stdout, followed by many warnings
+ # or artifact messages. Select errors rather than relying on a trailing slice.
+ errors=[];remaining=4000
+ for line in out.read_text(errors='replace').splitlines():
+  try:item=json.loads(line)
+  except json.JSONDecodeError:continue
+  if not isinstance(item,dict) or item.get('reason')!='compiler-message':continue
+  message=item.get('message',{})
+  if not isinstance(message,dict) or message.get('level')!='error':continue
+  rendered=message.get('rendered') or json.dumps(message,ensure_ascii=True)
+  if not isinstance(rendered,str):continue
+  part=rendered.encode('utf-8')[:remaining];errors.append(part.decode('utf-8',errors='replace'));remaining-=len(part)
+  if remaining<=0:break
+ stderr=err.read_bytes()
+ if not errors:
+  # Fallback for toolchain/Cargo non-JSON failures: center the first error,
+  # otherwise retain the beginning rather than losing it to later warnings.
+  match=re.search(rb'(?m)^error(?:\[E[0-9]+\])?:',stderr)
+  start=max(0,match.start()-200) if match else 0
+  errors=[stderr[start:start+4000].decode('utf-8',errors='replace')]
+ return {'compiler_errors':errors,'stderr_tail':stderr[-2000:].decode(errors='replace'),'stdout_tail':out.read_bytes()[-2000:].decode(errors='replace')}
 def run(label,cmd,seconds,logcap=16*1024**2,filecap=256*1024**2):
  out=E/(label+'.out');err=E/(label+'.err');start=time.monotonic();proc=None;stop=None
  try:
@@ -43,7 +65,7 @@ def run(label,cmd,seconds,logcap=16*1024**2,filecap=256*1024**2):
  save(E/(label+'.json'),record);print(json.dumps(record),flush=True)
  if rc or stop or elapsed>seconds or out.stat().st_size+err.stat().st_size>logcap or shutil.disk_usage(E).free<2*1024**3:
   # JSON encoding prevents multiline workflow-command interpretation.
-  print(json.dumps({'stderr_tail':err.read_bytes()[-4000:].decode(errors='replace'),'stdout_tail':out.read_bytes()[-4000:].decode(errors='replace')}),flush=True)
+  print(json.dumps(failure_diagnostics(out,err)),flush=True)
   raise RuntimeError('phase failed: '+label)
  return out.read_text(),err.read_text()
 def main():
