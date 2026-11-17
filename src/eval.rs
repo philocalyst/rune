@@ -431,7 +431,7 @@ fn hook_value<'ob>(value: &Rto<Object>, hook: &Rto<Object>, args: ArgSlice,
         let function = pair.car();
         // Keep the current cons rooted until after the callback: mutation of its
         // cdr during callback is observed, as in GNU's live list traversal.
-        if function == sym::T {
+        if function == sym::TRUE {
             if !global {
                 let symbol: Symbol = hook.bind(cx).try_into()?;
                 let defaults = crate::data::default_value(symbol, env, cx)?;
