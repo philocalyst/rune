@@ -237,8 +237,15 @@ fn file_name_as_directory(filename: &str) -> String {
 }
 
 #[defun]
-fn file_directory_p(filename: &str) -> bool {
-    if filename.is_empty() { true } else { Path::new(filename).is_dir() }
+fn file_directory_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    #[cfg(not(unix))]
+    {
+        // Keep existing platform behavior outside this Unix owner-aware change.
+        let filename = <&str>::try_from(filename.bind(cx))?;
+        return Ok((filename.is_empty() || Path::new(filename).is_dir()).into());
+    }
+    #[cfg(unix)]
+    local_metadata_predicate(filename, LocalMetadataPredicate::Directory, env, cx)
 }
 
 /// Local lexical directory conversion; existing handler/string-conversion limitations remain.
@@ -445,22 +452,40 @@ fn file_symlink_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env
 /// limitations are explicit, rather than a host-cwd or lossy-byte fallback.
 #[defun]
 fn file_exists_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    local_metadata_predicate(filename, LocalMetadataPredicate::Exists, env, cx)
+}
+
+#[derive(Clone, Copy)]
+enum LocalMetadataPredicate { Exists, Directory }
+
+fn local_metadata_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalMetadataPredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
     use rune_core::macros::root;
     let expanded = expand_file_name_lisp(filename.bind(cx), None, env, cx)?;
-    let (bytes, raw) = match expanded.untag() {
+    let (mut bytes, raw) = match expanded.untag() {
         ObjectType::String(text) => (text.as_bytes().to_vec(), false),
         ObjectType::ByteString(bytes) => (bytes.to_vec(), true),
         _ => unreachable!("filename expansion returned a non-string"),
     };
+    let operation_name = match predicate {
+        LocalMetadataPredicate::Exists => "file-exists-p",
+        LocalMetadataPredicate::Directory => "file-directory-p",
+    };
+    // GNU directory lookup applies directory-file-name after expansion, unlike
+    // existence lookup. Local Unix suffix conversion only: magic-name handlers
+    // for directory-file-name itself remain an existing unsupported feature.
+    #[cfg(unix)]
+    if matches!(predicate, LocalMetadataPredicate::Directory) && !(bytes.len() == 2 && bytes[0] == b'/') {
+        while bytes.len() > 1 && bytes.last() == Some(&b'/') { bytes.pop(); }
+    }
     // The existing regex handler engine accepts UTF-8 only. Never silently
     // bypass configured handlers for a filename that it cannot represent.
     let handler_name = std::str::from_utf8(&bytes).ok();
     if handler_name.is_none() {
         ensure!(env.variable_value(sym::FILE_NAME_HANDLER_ALIST, cx)?.unwrap_or(NIL.into()).is_nil(),
-            "Raw-byte filename handlers are unsupported for file-exists-p");
+            "Raw-byte filename handlers are unsupported for {}", operation_name);
     }
-    let operation = intern("file-exists-p", cx);
+    let operation = intern(operation_name, cx);
     if let Some(handler) = handler_name.and_then(|name| find_file_name_handler_internal(name, operation, env, cx)) {
         let target: Function = Object::from(handler).try_into()?;
         root!(target, cx);
@@ -477,7 +502,12 @@ fn file_exists_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>
     };
     #[cfg(not(unix))]
     let path = std::path::PathBuf::from(String::from_utf8(bytes)?);
-    Ok(std::fs::metadata(path).is_ok().into())
+    let metadata = std::fs::metadata(path);
+    let result = match predicate {
+        LocalMetadataPredicate::Exists => metadata.is_ok(),
+        LocalMetadataPredicate::Directory => metadata.is_ok_and(|value| value.is_dir()),
+    };
+    Ok(result.into())
 }
 
 #[defun]
@@ -1743,5 +1773,83 @@ mod file_exists_local_tests {
         let error = query(name, env, cx).unwrap_err();
         assert!(error.to_string().contains("Relative default-directory is unsupported"));
         Ok(())
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod file_directory_owner_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+
+    #[test]
+    fn owner_default_empty_names_and_directory_links() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-directory-owner-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            std::fs::create_dir(dir.join("child"))?;
+            std::fs::write(dir.join("plain"), "kept")?;
+            symlink("child", dir.join("dir-link"))?;
+            symlink("plain", dir.join("file-link"))?;
+            symlink("missing", dir.join("dangling"))?;
+            symlink("loop", dir.join("loop"))?;
+            env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.to_str().unwrap()))?;
+            for (name, expected) in [("", true), (".", true), ("child///", true), ("dir-link", true),
+                ("plain", false), ("file-link", false), ("dangling", false), ("loop", false), ("missing", false)] {
+                let name = cx.add(name); root!(name, cx);
+                assert_eq!(!file_directory_p(name, env, cx)?.is_nil(), expected);
+            }
+            env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.join("missing").to_str().unwrap()))?;
+            let empty = cx.add(""); root!(empty, cx);
+            assert!(file_directory_p(empty, env, cx)?.is_nil());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn raw_directory_paths_preserve_bytes() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-directory-raw-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            let child = dir.join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+            std::fs::create_dir(&child)?;
+            let mut bytes = child.as_os_str().as_bytes().to_vec(); bytes.extend_from_slice(b"///");
+            let name = cx.add(bytes); root!(name, cx);
+            assert!(!file_directory_p(name, env, cx)?.is_nil());
+            env.set_var(sym::FILE_NAME_HANDLER_ALIST, list![NIL; cx])?;
+            assert!(file_directory_p(name, env, cx).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn distinct_operation_and_suffix_handlers_survive_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-directory-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-directory-handler/") (file-name-handler-alist '(("rune-directory-handler" . rune-directory-handler)))) (list (file-directory-p "child///") (file-exists-p "child///"))))"#,
+            r#"((file-directory-p "/rune-directory-handler/child") (file-exists-p "/rune-directory-handler/child/"))"#,
+        );
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-root-directory-handler (function (lambda (op name) (list op name)))) (let ((file-name-handler-alist '(("/" . rune-root-directory-handler)))) (list (file-directory-p "/") (file-directory-p "//"))))"#,
+            r#"((file-directory-p "/") (file-directory-p "//"))"#,
+        );
+    }
+
+    #[test]
+    fn directory_operation_inhibition_errors_and_type_payload() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-directory-error (function (lambda (op name) (signal 'error '("directory-handler"))))) (let ((file-name-handler-alist '(("rune-directory-absent" . rune-directory-error))) (inhibit-file-name-handlers '(rune-directory-error))) (list (let ((inhibit-file-name-operation 'file-directory-p)) (file-directory-p "/rune-directory-absent/missing")) (let ((inhibit-file-name-operation 'file-exists-p)) (condition-case err (file-directory-p "/rune-directory-absent/missing") (error err))) (condition-case err (file-directory-p 3) (wrong-type-argument err)))))"#,
+            r#"(nil (error "directory-handler") (wrong-type-argument stringp 3))"#,
+        );
     }
 }

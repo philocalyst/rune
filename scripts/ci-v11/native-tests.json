@@ -158,5 +158,9 @@
   "fileio::file_exists_local_tests::raw_unix_paths_preserve_bytes_and_fail_closed_with_handlers",
   "fileio::file_exists_local_tests::handler_receives_expanded_name_and_returns_after_gc",
   "fileio::file_exists_local_tests::operation_inhibition_and_handler_errors_are_preserved",
-  "fileio::file_exists_local_tests::invalid_type_is_catchable_and_relative_default_is_rejected"
+  "fileio::file_exists_local_tests::invalid_type_is_catchable_and_relative_default_is_rejected",
+  "fileio::file_directory_owner_tests::owner_default_empty_names_and_directory_links",
+  "fileio::file_directory_owner_tests::raw_directory_paths_preserve_bytes",
+  "fileio::file_directory_owner_tests::distinct_operation_and_suffix_handlers_survive_gc",
+  "fileio::file_directory_owner_tests::directory_operation_inhibition_errors_and_type_payload"
 ]
