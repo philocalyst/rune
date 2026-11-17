@@ -12,9 +12,10 @@ import sys
 
 S=pathlib.Path.cwd().resolve()
 C=S/'scripts/ci-lifecycle'
-BASE_PIN='ab619e70d55f436946bb69e00fcb36234f249922efd05624353a3ae4ddd25bbe'
+BASE_PIN='4b25186545171e55dca447977c11eda3d5a28452f858bcb857a46a0b6c218c77'
 HELPERS_PIN='8e1effaaa784d79764bec4594775f1bf0c01d05e418e26aab8264366e6f9fb4a'
 OVERLAY={'.github/workflows/wip-lifecycle.yml','docs/wip-lifecycle-scope.md'}|{'scripts/ci-lifecycle/'+n for n in ['run.py','supervisor.py','preflight.py','fixture.py','fault_adapter.py','base-inventory.json','lifecycle-inventory.json']}
+OVERLAY.update(['.github/workflows/wip-confinement.yml', 'docs/wip-confinement-scope.md', 'scripts/ci-confinement/run.py', 'scripts/ci-confinement/probe.c', 'scripts/ci-confinement/controller.py', 'scripts/ci-confinement/supervisor.py', 'scripts/ci-confinement/base-inventory.json', 'scripts/ci-confinement/helper-inventory.json'])
 EXPECTED_CASES=['normal','nonzero','group','doublefork','detached','crash','latefork','cancel','admission','cleanup']
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 def verify(commit):
