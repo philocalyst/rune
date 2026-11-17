@@ -197,7 +197,7 @@ fn call_expand_handler<'ob>(handler: &crate::core::gc::Rto<Object>, name: &crate
     }
 }
 
-/// Lisp-facing handler stages; lexical/native callers remain separately scoped.
+/// Lisp/existence handler stages; other native callers remain separately scoped.
 #[defun(name = "expand-file-name")]
 fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory: Option<&crate::core::gc::Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::env::intern;
@@ -245,8 +245,8 @@ fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory
     expand_file_name_lisp(name.bind(cx), Some(supplied.bind(cx)), env, cx)
 }
 
-// Bounded lexical core. Native predicate helpers still use this directly;
-// their expansion-handler stage is not qualified by the Lisp dispatch wrapper.
+// Bounded lexical core. Native predicates other than file-exists-p still use
+// this directly; their expansion-handler stage remains separately unqualified.
 fn expand_file_name_lisp<'ob>(name: Object, default_directory: Option<Object>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
     #[cfg(not(unix))]
     {
@@ -575,12 +575,22 @@ enum LocalFilePredicate { Exists, Directory, Readable, AccessibleDirectory, Writ
 fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalFilePredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
     use rune_core::macros::root;
-    let expanded = expand_file_name_lisp(filename.bind(cx), None, env, cx)?;
-    let (mut bytes, raw) = match expanded.untag() {
-        ObjectType::String(text) => (text.as_bytes().to_vec(), false),
-        ObjectType::ByteString(bytes) => (bytes.to_vec(), true),
+    // Qualify expansion dispatch for existence first. Other predicates retain
+    // their separately scoped lexical path until their callbacks are qualified.
+    let expanded = if matches!(predicate, LocalFilePredicate::Exists) {
+        expand_file_name_dispatch(filename, None, env, cx)?
+    } else {
+        expand_file_name_lisp(filename.bind(cx), None, env, cx)?
+    };
+    let (storage, raw): (&[u8], bool) = match expanded.untag() {
+        ObjectType::String(text) => (text.as_bytes(), false),
+        ObjectType::ByteString(bytes) => (&**bytes, true),
         _ => unreachable!("filename expansion returned a non-string"),
     };
+    // A handler can return an arbitrary-sized string. Apply the same bounded
+    // local-path contract before copying, without truncating embedded NUL.
+    ensure!(storage.len() <= 131073 && !storage.contains(&0), "Invalid or excessive expanded filename");
+    let mut bytes = storage.to_vec();
     let operation_name = match predicate {
         LocalFilePredicate::Exists => "file-exists-p",
         LocalFilePredicate::Directory => "file-directory-p",
@@ -1935,7 +1945,7 @@ mod file_exists_local_tests {
     #[test]
     fn handler_receives_expanded_name_and_returns_after_gc() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-exists-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-exists-handler/") (file-name-handler-alist '(("rune-exists-handler" . rune-exists-handler)))) (file-exists-p "./virtual")))"#,
+            r#"(progn (defalias 'rune-exists-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-exists-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (garbage-collect) (list op name)))))) (let ((default-directory "/rune-exists-handler/") (file-name-handler-alist '(("rune-exists-handler" . rune-exists-handler)))) (file-exists-p "./virtual")))"#,
             r#"(file-exists-p "/rune-exists-handler/virtual")"#,
         );
     }
@@ -1943,7 +1953,7 @@ mod file_exists_local_tests {
     #[test]
     fn operation_inhibition_and_handler_errors_are_preserved() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-exists-error (function (lambda (op name) (signal 'error '("exists-handler"))))) (let ((file-name-handler-alist '(("rune-exists-absent" . rune-exists-error))) (inhibit-file-name-handlers '(rune-exists-error))) (list (let ((inhibit-file-name-operation 'file-exists-p)) (file-exists-p "/rune-exists-absent/missing")) (let ((inhibit-file-name-operation 'file-symlink-p)) (condition-case err (file-exists-p "/rune-exists-absent/missing") (error err))))))"#,
+            r#"(progn (defalias 'rune-exists-error (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-exists-error inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (signal 'error '("exists-handler"))))))) (let ((file-name-handler-alist '(("rune-exists-absent" . rune-exists-error))) (inhibit-file-name-handlers '(rune-exists-error))) (list (let ((inhibit-file-name-operation 'file-exists-p)) (file-exists-p "/rune-exists-absent/missing")) (let ((inhibit-file-name-operation 'file-symlink-p)) (condition-case err (file-exists-p "/rune-exists-absent/missing") (error err))))))"#,
             r#"(nil (error "exists-handler"))"#,
         );
     }
@@ -2026,7 +2036,7 @@ mod file_directory_owner_tests {
     #[test]
     fn distinct_operation_and_suffix_handlers_survive_gc() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-directory-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-directory-handler/") (file-name-handler-alist '(("rune-directory-handler" . rune-directory-handler)))) (list (file-directory-p "child///") (file-exists-p "child///"))))"#,
+            r#"(progn (defalias 'rune-directory-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-directory-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (garbage-collect) (list op name)))))) (let ((default-directory "/rune-directory-handler/") (file-name-handler-alist '(("rune-directory-handler" . rune-directory-handler)))) (list (file-directory-p "child///") (file-exists-p "child///"))))"#,
             r#"((file-directory-p "/rune-directory-handler/child") (file-exists-p "/rune-directory-handler/child/"))"#,
         );
         crate::interpreter::assert_lisp(
@@ -2420,5 +2430,53 @@ mod expansion_handler_dispatch_tests {
             r#"(progn (defvar rune-expand-explicit-base nil) (defalias 'rune-expand-nul-default-handler (function (lambda (op name base) (garbage-collect) (setq rune-expand-explicit-base base) "/handled"))) (let ((base (concat "/MAGIC/" (make-string 1 0) "suffix")) (file-name-handler-alist '(("MAGIC" . rune-expand-nul-default-handler)))) (list (expand-file-name "leaf" base) (eq rune-expand-explicit-base base) (let ((default-directory base)) (condition-case err (expand-file-name "leaf") (wrong-type-argument (list (car err) (car (cdr err)) (eq (car (cdr (cdr err))) base))))))))"#,
             r#"("/handled" t (wrong-type-argument filenamep t))"#,
         );
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod exists_expansion_dispatch_tests {
+    #[test]
+    fn expansion_precedes_resolved_operation_once_across_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-exists-stage-log nil) (defalias 'rune-exists-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-exists-stage-log (cons (list op name base) rune-exists-stage-log)) "/RESOLVED/target"))) (defalias 'rune-exists-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-exists-stage-log (cons (list op name) rune-exists-stage-log)) 'exists-answer))) (let ((rune-exists-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-exists-expand-stage) ("RESOLVED" . rune-exists-resolved-stage)))) (list (file-exists-p "MAGIC/leaf") rune-exists-stage-log)))"#,
+            r#"(exists-answer ((file-exists-p "/RESOLVED/target") (expand-file-name "MAGIC/leaf" nil)))"#,
+        );
+    }
+
+    #[test]
+    fn operation_inhibition_does_not_suppress_expansion_stage() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-exists-inhibit-log nil) (defalias 'rune-exists-inhibit-expand (function (lambda (op name &optional base) (setq rune-exists-inhibit-log (cons op rune-exists-inhibit-log)) "/rune-exists-resolved-absent/target"))) (defalias 'rune-exists-inhibit-final (function (lambda (op name) (setq rune-exists-inhibit-log (cons op rune-exists-inhibit-log)) 'should-not-run))) (let ((rune-exists-inhibit-log nil) (file-name-handler-alist '(("MAGIC" . rune-exists-inhibit-expand) ("rune-exists-resolved-absent" . rune-exists-inhibit-final))) (inhibit-file-name-handlers '(rune-exists-inhibit-expand rune-exists-inhibit-final)) (inhibit-file-name-operation 'file-exists-p)) (list (file-exists-p "MAGIC") rune-exists-inhibit-log)))"#,
+            "(nil (expand-file-name))",
+        );
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-exists-only-log nil) (defalias 'rune-exists-only-handler (function (lambda (op name &optional base) (setq rune-exists-only-log (cons (list op name) rune-exists-only-log)) 'exists-answer))) (let ((rune-exists-only-log nil) (file-name-handler-alist '(("MAGIC" . rune-exists-only-handler))) (inhibit-file-name-handlers '(rune-exists-only-handler)) (inhibit-file-name-operation 'expand-file-name)) (list (file-exists-p "/MAGIC/original") rune-exists-only-log)))"#,
+            r#"(exists-answer ((file-exists-p "/MAGIC/original")))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_errors_stop_before_existence_handler() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-exists-error-stage-log nil) (defalias 'rune-exists-invalid-expand (function (lambda (op name &optional base) (setq rune-exists-error-stage-log (cons op rune-exists-error-stage-log)) 3))) (let ((rune-exists-error-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-exists-invalid-expand)))) (list (condition-case err (file-exists-p "MAGIC") (error err)) rune-exists-error-stage-log)))"#,
+            r#"((error "Invalid handler in `file-name-handler-alist'") (expand-file-name))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_redirects_actual_lookup_without_creating_or_rewriting() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("rune-exists-expand-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> anyhow::Result<()> {
+            let present = dir.join("present"); let missing = dir.join("missing");
+            std::fs::write(&present, "kept")?;
+            let source = format!(r#"(progn (defalias 'rune-exists-redirect (function (lambda (op name &optional base) (garbage-collect) (if (equal name "SOURCE/present") {:?} {:?})))) (let ((file-name-handler-alist '(("SOURCE" . rune-exists-redirect)))) (list (file-exists-p "SOURCE/present") (file-exists-p "SOURCE/missing"))))"#, present.to_str().unwrap(), missing.to_str().unwrap());
+            crate::interpreter::assert_lisp(&source, "(t nil)");
+            assert_eq!(std::fs::read_to_string(&present)?, "kept");
+            assert!(!missing.exists());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
     }
 }

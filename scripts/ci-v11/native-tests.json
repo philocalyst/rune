@@ -184,5 +184,9 @@
   "fileio::expansion_handler_dispatch_tests::recursion_uses_per_operation_handler_inhibition",
   "fileio::expansion_handler_dispatch_tests::handler_errors_and_nonstring_returns_are_catchable",
   "fileio::expansion_handler_dispatch_tests::nil_supplied_default_and_invalid_name_payload_are_preserved",
-  "fileio::expansion_handler_dispatch_tests::native_registration_preserves_expand_and_write_region"
+  "fileio::expansion_handler_dispatch_tests::native_registration_preserves_expand_and_write_region",
+  "fileio::exists_expansion_dispatch_tests::expansion_precedes_resolved_operation_once_across_gc",
+  "fileio::exists_expansion_dispatch_tests::operation_inhibition_does_not_suppress_expansion_stage",
+  "fileio::exists_expansion_dispatch_tests::expansion_errors_stop_before_existence_handler",
+  "fileio::exists_expansion_dispatch_tests::expansion_redirects_actual_lookup_without_creating_or_rewriting"
 ]
