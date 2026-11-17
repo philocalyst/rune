@@ -190,7 +190,7 @@ fn file_name_absolute_p(filename: &str) -> bool {
 /// Local filename syntax only: split at the last native separator without
 /// Path component normalization. In particular, retain . and .. for file-truename.
 /// Existing file-name-handler and DOS drive-syntax support is not extended here.
-fn filename_component<'ob>(filename: Object, directory: bool, cx: &'ob Context) -> Result<Object<'ob>> {
+fn filename_component<'ob>(filename: Object, directory: bool, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
     fn split(bytes: &[u8]) -> Option<usize> {
         bytes.iter().rposition(|&byte| byte == MAIN_SEPARATOR as u8).map(|index| index + 1)
     }
@@ -211,20 +211,24 @@ fn filename_component<'ob>(filename: Object, directory: bool, cx: &'ob Context) 
                 Ok(cx.add(bytes[end.unwrap_or(0)..].to_vec()))
             }
         }
-        _ => Err(TypeError::new(Type::String, filename).into()),
+        _ => {
+            env.initialize_condition_metadata(cx);
+            let data = rune_core::macros::list![sym::STRINGP, filename; cx];
+            Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into())
+        },
     }
 }
 
 /// Return the lexical directory prefix, including its final separator, or nil.
 #[defun]
-fn file_name_directory<'ob>(filename: Object, cx: &'ob Context) -> Result<Object<'ob>> {
-    filename_component(filename, true, cx)
+fn file_name_directory<'ob>(filename: Object, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    filename_component(filename, true, env, cx)
 }
 
 /// Return everything after the final separator, retaining dot components.
 #[defun]
-fn file_name_nondirectory<'ob>(filename: Object, cx: &'ob Context) -> Result<Object<'ob>> {
-    filename_component(filename, false, cx)
+fn file_name_nondirectory<'ob>(filename: Object, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    filename_component(filename, false, env, cx)
 }
 
 /// Return non-nil if NAME ends with a directory separator character.
@@ -1293,11 +1297,13 @@ mod symlink_target_tests {
 mod lexical_filename_tests {
     use super::*;
     use crate::core::gc::RootSet;
+    use rune_core::macros::root;
 
     #[cfg(unix)]
     #[test]
     fn unix_split_preserves_dot_components_and_repeated_separators() -> Result<()> {
         let roots = RootSet::default(); let cx = Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(&cx)?), &cx);
         for (name, directory, basename) in [
             ("", None, ""), ("plain", None, "plain"), (".", None, "."), ("..", None, ".."),
             ("/", Some("/"), ""), ("//", Some("//"), ""),
@@ -1307,12 +1313,12 @@ mod lexical_filename_tests {
             ("é/文", Some("é/"), "文"), ("a\\b", None, "a\\b"),
         ] {
             let input = cx.add(name);
-            let actual = file_name_directory(input, &cx)?;
+            let actual = file_name_directory(input, env, &cx)?;
             match directory {
                 None => assert!(actual.is_nil(), "{name}"),
                 Some(expected) => assert_eq!(<&str>::try_from(actual)?, expected, "{name}"),
             }
-            assert_eq!(<&str>::try_from(file_name_nondirectory(input, &cx)?)?, basename, "{name}");
+            assert_eq!(<&str>::try_from(file_name_nondirectory(input, env, &cx)?)?, basename, "{name}");
         }
         Ok(())
     }
@@ -1321,12 +1327,13 @@ mod lexical_filename_tests {
     #[test]
     fn unibyte_splits_preserve_non_utf8_bytes_and_string_kind() -> Result<()> {
         let roots = RootSet::default(); let cx = Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(&cx)?), &cx);
         for (input, prefix, suffix) in [
             (b"raw-\xff/leaf-\xfe".as_slice(), b"raw-\xff/".as_slice(), b"leaf-\xfe".as_slice()),
             (b"a/".as_slice(), b"a/".as_slice(), b"".as_slice()),
         ] {
             let input = cx.add(input.to_vec());
-            for (actual, expected) in [(file_name_directory(input, &cx)?, prefix), (file_name_nondirectory(input, &cx)?, suffix)] {
+            for (actual, expected) in [(file_name_directory(input, env, &cx)?, prefix), (file_name_nondirectory(input, env, &cx)?, suffix)] {
                 let ObjectType::ByteString(bytes) = actual.untag() else { panic!("unibyte representation changed") };
                 assert_eq!(&**bytes, expected);
             }
@@ -1340,6 +1347,10 @@ mod lexical_filename_tests {
         crate::interpreter::assert_lisp(
             r#"(list (equal (file-name-nondirectory "link/..") "..") (equal (file-name-nondirectory "link/.") ".") (file-name-directory "a//../leaf") (condition-case nil (file-name-directory 3) (wrong-type-argument 'rejected)) (condition-case nil (file-name-nondirectory nil) (wrong-type-argument 'rejected)))"#,
             r#"(t t "a//../" rejected rejected)"#,
+        );
+        crate::interpreter::assert_lisp(
+            r#"(list (condition-case err (file-name-directory 3) (wrong-type-argument err)) (condition-case err (file-name-nondirectory nil) (wrong-type-argument err)))"#,
+            "((wrong-type-argument stringp 3) (wrong-type-argument stringp nil))",
         );
     }
 }
