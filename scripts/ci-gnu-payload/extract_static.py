@@ -5,7 +5,7 @@ program is invoked. Runtime dependency/launcher qualification is separate.
 """
 import datetime,hashlib,json,os,pathlib,stat,subprocess,sys,tarfile
 HERE=pathlib.Path(__file__).resolve().parent
-PINS={'packages.json':'eb1f62d2d894419f8792a52f1b41db7fecf0b761bcb24ac52a987be767797441','payload-inventory.json':'09b5580652e007149f550fbb02feb0350dcc2274ebe05ff1605125230c16e7fd','authentication-receipt.json':'15f5b5d0fcacac79a1f3a61406f9de99003fa8e0fd7249240c130941d4a17d97'}
+PINS={'packages.json':'eb1f62d2d894419f8792a52f1b41db7fecf0b761bcb24ac52a987be767797441','payload-inventory.json':'09b5580652e007149f550fbb02feb0350dcc2274ebe05ff1605125230c16e7fd','authentication-receipt.json':'dd1d9bc699aa48e69f2fb2186c6eb3793cf982502d3fb1a4bd8aec8ca6f154d2'}
 def sha(path):
  h=hashlib.sha256()
  with path.open('rb') as f:
