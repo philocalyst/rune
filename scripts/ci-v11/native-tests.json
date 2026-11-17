@@ -131,5 +131,11 @@
   "emacs::foreground_daemon_tests::foreground_state_does_not_follow_noninteractive_bindings",
   "emacs::foreground_daemon_tests::daemon_query_alias_survives_gc_and_has_zero_arity",
   "emacs::foreground_daemon_tests::independent_owners_capture_foreground_without_new_frame_state",
-  "emacs::foreground_daemon_tests::daemon_command_line_modes_remain_unsupported"
+  "emacs::foreground_daemon_tests::daemon_command_line_modes_remain_unsupported",
+  "fileio::symlink_target_tests::local_targets_preserve_relative_absolute_dangling_and_no_follow",
+  "fileio::symlink_target_tests::raw_target_bytes_are_not_lossily_decoded",
+  "fileio::symlink_target_tests::handler_receives_operation_expanded_name_and_propagates_return",
+  "fileio::symlink_target_tests::handler_inhibition_is_per_operation_and_errors_propagate",
+  "fileio::tests::test_find_file_name_handler_inhibit_handlers",
+  "fileio::symlink_target_tests::lexical_inhibition_is_special_and_relative_default_fails_closed"
 ]

@@ -234,7 +234,7 @@ fn directory_name_p(name: &str) -> bool {
 
 defvar!(FILE_NAME_HANDLER_ALIST);
 defvar!(INHIBIT_FILE_NAME_HANDLERS);
-defsym!(INHIBIT_FILE_NAME_OPERATION);
+defvar!(INHIBIT_FILE_NAME_OPERATION);
 
 /// Return FILENAME's handler function for OPERATION, if it has one.
 /// Otherwise, return nil.
@@ -265,6 +265,7 @@ fn find_file_name_handler_internal<'ob>(
     let inhibit_file_name_handlers =
         symbol_value(INHIBIT_FILE_NAME_HANDLERS, env, cx).ok().and_then(|sym| sym.as_list().ok());
 
+    let inhibited_operation = symbol_value(sym::INHIBIT_FILE_NAME_OPERATION, env, cx).ok();
     file_name_handler_alist
         .filter_map(|elem| {
             let cons = elem.ok()?.cons()?;
@@ -273,7 +274,7 @@ fn find_file_name_handler_internal<'ob>(
                 .unwrap_or_else(|err| panic!("Invalid regexp '{regexp}': {err}"));
             if re.is_match(filename).ok()? {
                 let handler = cons.cdr().symbol()?;
-                if operation != sym::INHIBIT_FILE_NAME_OPERATION
+                if inhibited_operation != Some(operation.into())
                     || !inhibit_file_name_handlers
                         .clone()
                         .is_some_and(|mut ifnh| ifnh.any(|h| h.is_ok_and(|h| h == handler)))
@@ -288,8 +289,45 @@ fn find_file_name_handler_internal<'ob>(
 }
 
 #[defun]
-fn file_symlink_p(filename: &str) -> bool {
-    Path::new(filename).is_symlink()
+fn file_symlink_p<'ob>(filename: &str, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    use crate::core::{env::{CallFrame, intern}, object::Function};
+    use rune_core::macros::root;
+    // Use the current owner/buffer binding. Unsupported relative bases fail
+    // closed rather than silently resolving against the host cwd.
+    let expanded = if Path::new(filename).is_absolute() {
+        filename.to_owned()
+    } else {
+        let directory = symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?;
+        let ObjectType::String(directory) = directory.untag() else {
+            return Err(TypeError::new(Type::String, directory).into());
+        };
+        ensure!(Path::new(&**directory).is_absolute(), "Relative default-directory is unsupported for file-symlink-p");
+        expand_file_name(filename, Some(&directory), env, cx)?
+    };
+    let operation = intern("file-symlink-p", cx);
+    if let Some(handler) = find_file_name_handler_internal(&expanded, operation, env, cx) {
+        let target: Function = Object::from(handler).try_into()?;
+        root!(target, cx);
+        let mut frame = CallFrame::new(env);
+        frame.push_arg(operation.into());
+        frame.push_arg(cx.add(expanded));
+        return target.call(&mut frame, None, cx).map_err(Into::into);
+    }
+    // read_link observes the link itself, including dangling links. Never
+    // canonicalize or read the target; OS lookup failures are nil, as in GNU.
+    let Ok(target) = std::fs::read_link(expanded) else { return Ok(NIL.into()); };
+    match target.to_str() {
+        Some(text) => Ok(cx.add(text)),
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                Ok(cx.add(target.as_os_str().as_bytes().to_vec()))
+            }
+            #[cfg(not(unix))]
+            { bail!("Symlink target cannot be represented without loss") }
+        }
+    }
 }
 
 #[defun]
@@ -591,10 +629,12 @@ mod tests {
         set(FILE_NAME_HANDLER_ALIST, file_name_handler_alist, env, cx).unwrap();
         set(INHIBIT_FILE_NAME_HANDLERS, list![inhibit_handler; cx], env, cx).unwrap();
 
+        let operation = Symbol::new_uninterned("test-operation", cx);
+        set(sym::INHIBIT_FILE_NAME_OPERATION, operation.into(), env, cx).unwrap();
         let result = find_file_name_handler("test.txt", NIL, env, cx);
         assert_eq!(result, inhibit_handler);
 
-        let result = find_file_name_handler("test.txt", sym::INHIBIT_FILE_NAME_OPERATION, env, cx);
+        let result = find_file_name_handler("test.txt", operation, env, cx);
         assert_eq!(result, handler);
     }
 
@@ -1157,5 +1197,85 @@ mod startup_directory_tests {
             Ok(())
         })();
         std::fs::remove_dir_all(&dir)?; result
+    }
+}
+
+#[cfg(test)]
+mod symlink_target_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+
+    #[cfg(unix)]
+    #[test]
+    fn local_targets_preserve_relative_absolute_dangling_and_no_follow() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-symlink-target-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            std::fs::write(dir.join("plain"), "untouched")?;
+            symlink("plain", dir.join("relative"))?;
+            symlink(dir.join("plain"), dir.join("absolute"))?;
+            symlink("missing-target", dir.join("dangling"))?;
+            symlink("relative", dir.join("chain"))?;
+            symlink("cycle", dir.join("cycle"))?;
+            env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.to_str().unwrap()))?;
+            for (name, expected) in [("relative", "plain"), ("dangling", "missing-target"), ("chain", "relative"), ("cycle", "cycle")] {
+                let actual = file_symlink_p(name, env, cx)?;
+                assert_eq!(<&str>::try_from(actual)?, expected);
+            }
+            let actual = file_symlink_p("absolute", env, cx)?;
+            assert_eq!(<&str>::try_from(actual)?, dir.join("plain").to_str().unwrap());
+            for name in ["plain", "missing", "."] { assert!(file_symlink_p(name, env, cx)?.is_nil()); }
+            let absolute = dir.join("relative");
+            assert_eq!(<&str>::try_from(file_symlink_p(absolute.to_str().unwrap(), env, cx)?)?, "plain");
+            assert_eq!(std::fs::read_to_string(dir.join("plain"))?, "untouched");
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_target_bytes_are_not_lossily_decoded() -> Result<()> {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let path = std::env::temp_dir().join(format!("rune-symlink-bytes-{}-{}", std::process::id(), rand::random::<u64>()));
+        symlink(std::ffi::OsStr::from_bytes(b"raw-\xff"), &path)?;
+        let result = (|| -> Result<()> {
+            let actual = file_symlink_p(path.to_str().unwrap(), env, cx)?;
+            let ObjectType::ByteString(actual) = actual.untag() else { panic!("raw target must remain bytes") };
+            assert_eq!(&**actual, b"raw-\xff"); Ok(())
+        })();
+        std::fs::remove_file(path)?; result
+    }
+
+    #[test]
+    fn handler_receives_operation_expanded_name_and_propagates_return() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defun rune-symlink-handler (op name) (garbage-collect) (list op name)) (let ((default-directory "/rune-symlink-test/") (file-name-handler-alist '(("rune-symlink-test" . rune-symlink-handler)))) (file-symlink-p "virtual")))"#,
+            r#"(file-symlink-p "/rune-symlink-test/virtual")"#,
+        );
+    }
+
+    #[test]
+    fn handler_inhibition_is_per_operation_and_errors_propagate() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defun rune-symlink-error (op name) (signal 'error '("handler-failure"))) (let ((file-name-handler-alist '(("rune-symlink-absent" . rune-symlink-error))) (inhibit-file-name-handlers '(rune-symlink-error))) (list (let ((inhibit-file-name-operation 'file-symlink-p)) (file-symlink-p "/rune-symlink-absent/virtual")) (let ((inhibit-file-name-operation 'file-exists-p)) (condition-case nil (file-symlink-p "/rune-symlink-absent/virtual") (error 'propagated))))))"#,
+            "(nil propagated)",
+        );
+    }
+
+    #[test]
+    fn lexical_inhibition_is_special_and_relative_default_fails_closed() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defun rune-symlink-lexical-handler (op name) 'handled) (eval '(let ((file-name-handler-alist '(("rune-symlink-lexical" . rune-symlink-lexical-handler))) (inhibit-file-name-handlers '(rune-symlink-lexical-handler))) (list (let ((inhibit-file-name-operation 'file-symlink-p)) (file-symlink-p "/rune-symlink-lexical/missing")) (let ((inhibit-file-name-operation 'file-exists-p)) (file-symlink-p "/rune-symlink-lexical/missing")) (let ((default-directory "relative-base/")) (condition-case nil (file-symlink-p "local") (error 'rejected))))) t))"#,
+            "(nil handled rejected)",
+        );
     }
 }
