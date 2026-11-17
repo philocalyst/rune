@@ -40,6 +40,8 @@ pub(crate) struct Env<'a> {
     #[no_trace]
     pub(crate) startup_system_type: &'static str,
     #[no_trace]
+    pub(crate) startup_daemon_mode: crate::emacs::StartupDaemonMode,
+    #[no_trace]
     pub(crate) startup_shell_file_name: std::ffi::OsString,
     #[no_trace]
     pub(crate) startup_data_directory: Option<std::ffi::OsString>,
@@ -110,6 +112,7 @@ impl<'a> Env<'a> {
             variable_aliases: Default::default(),
             startup_default_directory,
             startup_system_type,
+            startup_daemon_mode: crate::emacs::StartupDaemonMode::NonDaemon,
             startup_shell_file_name,
             startup_data_directory,
             props,

@@ -127,5 +127,9 @@
   "lread::test::doom_elc_search_loads_existing_source_and_preserves_missing_noerror",
   "lread::test::selected_elc_never_executes_or_falls_back_even_with_noerror_or_nosuffix",
   "lread::test::source_first_suffix_order_does_not_select_present_elc",
-  "lread::supported_load_suffix_tests::source_policy_admits_elc_search_but_rejects_other_backends_and_cycles"
+  "lread::supported_load_suffix_tests::source_policy_admits_elc_search_but_rejects_other_backends_and_cycles",
+  "emacs::foreground_daemon_tests::foreground_state_does_not_follow_noninteractive_bindings",
+  "emacs::foreground_daemon_tests::daemon_query_alias_survives_gc_and_has_zero_arity",
+  "emacs::foreground_daemon_tests::independent_owners_capture_foreground_without_new_frame_state",
+  "emacs::foreground_daemon_tests::daemon_command_line_modes_remain_unsupported"
 ]

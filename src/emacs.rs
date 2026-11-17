@@ -253,3 +253,53 @@ mod system_type_tests {
         }
     }
 }
+
+/// Actual process launch state. Rune currently supports non-daemon entry points
+/// only: normal CLI, REPL and native UI do not daemonize or implement a server.
+/// GNU foreground daemons are still daemons; Rune does not support that mode.
+/// Do not infer this from Lisp `noninteractive`, environment text or a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartupDaemonMode { NonDaemon }
+
+#[defun]
+fn daemonp(env: &Rt<Env>) -> bool {
+    match env.startup_daemon_mode { StartupDaemonMode::NonDaemon => false }
+}
+
+#[cfg(test)]
+mod foreground_daemon_tests {
+    #[test]
+    fn foreground_state_does_not_follow_noninteractive_bindings() {
+        crate::interpreter::assert_lisp(
+            "(list (daemonp) (let ((noninteractive nil)) (daemonp)) (let ((noninteractive t)) (daemonp)) (daemonp))",
+            "(nil nil nil nil)",
+        );
+    }
+
+    #[test]
+    fn daemon_query_alias_survives_gc_and_has_zero_arity() {
+        crate::interpreter::assert_lisp(
+            "(progn (defalias 'rune-foreground-query 'daemonp) (garbage-collect) (list (rune-foreground-query) (func-arity 'daemonp) (condition-case nil (daemonp 1) (wrong-number-of-arguments 'rejected))))",
+            "(nil (0 . 0) rejected)",
+        );
+    }
+
+    #[test]
+    fn independent_owners_capture_foreground_without_new_frame_state() {
+        use crate::core::{env::Env, gc::{Context, RootSet}};
+        let roots = RootSet::default();
+        let cx = Context::new(&roots);
+        let first = Env::new(&cx).unwrap();
+        let second = Env::new(&cx).unwrap();
+        assert_eq!(first.startup_daemon_mode, super::StartupDaemonMode::NonDaemon);
+        assert_eq!(second.startup_daemon_mode, super::StartupDaemonMode::NonDaemon);
+    }
+
+    #[test]
+    fn daemon_command_line_modes_remain_unsupported() {
+        use clap::Parser;
+        for flag in ["--daemon", "--daemon=named", "--fg-daemon", "--fg-daemon=named"] {
+            assert!(crate::Args::try_parse_from(["rune", flag]).is_err());
+        }
+    }
+}
