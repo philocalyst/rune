@@ -5,7 +5,7 @@ Fixed five-group source reviewed admission; never an arbitrary command runner.
 import hashlib,importlib.util,json,os,pathlib,re,stat,subprocess,sys
 sys.dont_write_bytecode=True
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-exec-admission';H=C/'helpers'
-BASE_PIN='45ab29e563aa7aaeb8c187997545d1c2e40e35d97fe7b2caa0e62f2e638726fb'
+BASE_PIN='3f20f9ceccb8f09c3f2c99962bc6d9b98023ab9d4c6169d896a4194db4371af7'
 HELPERS_PIN='acb26afbc19bc56893c5a3d720d10c8c613157f67c62cbdf4cad39a527d340de'
 GROUP_NAMES=['baseline','scalar_exec','scalar_other','process_alias','metadata']
 GROUP_COUNTS=[15,8,8,9,9]

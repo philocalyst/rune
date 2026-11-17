@@ -12,7 +12,7 @@ import sys
 
 S=pathlib.Path.cwd().resolve()
 C=S/'scripts/ci-lifecycle'
-BASE_PIN='bde227f6d61cc82705f6ad6e2c95dc1686de93110c1d189107ac70ee2442003f'
+BASE_PIN='87d37b51fdbeb3184248b992a13420aea5257cc71b32ec75bbffeb72b11d0a21'
 HELPERS_PIN='8e1effaaa784d79764bec4594775f1bf0c01d05e418e26aab8264366e6f9fb4a'
 OVERLAY={'.github/workflows/wip-lifecycle.yml','docs/wip-lifecycle-scope.md'}|{'scripts/ci-lifecycle/'+n for n in ['run.py','supervisor.py','preflight.py','fixture.py','fault_adapter.py','base-inventory.json','lifecycle-inventory.json']}
 OVERLAY.add('scripts/ci-exec-admission/helpers/cases.json')

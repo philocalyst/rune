@@ -157,7 +157,96 @@ fn normalize_local_path(input: &[u8]) -> Vec<u8> {
     out
 }
 
-#[defun(name = "expand-file-name")]
+// Validate before dispatch or copying. Preserve the original object in the
+// condition payload rather than recursively formatting invalid/cyclic values.
+fn expand_dispatch_name(value: Object, check_nul: bool, cx: &Context) -> Result<Option<String>> {
+    let bytes = match value.untag() {
+        ObjectType::String(text) => text.as_bytes(),
+        ObjectType::ByteString(bytes) => &**bytes,
+        _ => {
+            let data = list![sym::STRINGP, value; cx];
+            return Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into());
+        }
+    };
+    if check_nul && bytes.contains(&0) {
+        let data = list![sym::FILENAMEP, value; cx];
+        return Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into());
+    }
+    ensure!(bytes.len() <= 65536, "Filename handler argument exceeds limit");
+    Ok(std::str::from_utf8(bytes).ok().map(str::to_owned))
+}
+
+fn call_expand_handler<'ob>(handler: &crate::core::gc::Rto<Object>, name: &crate::core::gc::Rto<Object>, directory: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    use crate::core::{env::{CallFrame, intern}, object::Function};
+    use rune_core::macros::root;
+    let target: Function = handler.bind(cx).try_into()?;
+    root!(target, cx);
+    let operation = intern("expand-file-name", cx);
+    let mut frame = CallFrame::new(env);
+    frame.push_arg(Object::from(operation));
+    frame.push_arg(name.bind(cx));
+    frame.push_arg(directory.bind(cx));
+    root!(result, target.call(&mut frame, None, cx)?, cx);
+    drop(frame);
+    let result = result.bind(cx);
+    if matches!(result.untag(), ObjectType::String(_) | ObjectType::ByteString(_)) {
+        Ok(result)
+    } else {
+        let data = list!["Invalid handler in `file-name-handler-alist'"; cx];
+        Err(crate::eval::EvalError::signal(sym::ERROR.into(), data, cx).into())
+    }
+}
+
+/// Lisp-facing handler stages; lexical/native callers remain separately scoped.
+#[defun(name="expand-file-name")]
+fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory: Option<&crate::core::gc::Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    use crate::core::env::intern;
+    use rune_core::macros::root;
+    #[cfg(not(unix))]
+    return expand_file_name_lisp(name.bind(cx), directory.map(|value| value.bind(cx)), env, cx);
+    env.initialize_condition_metadata(cx);
+    let text = expand_dispatch_name(name.bind(cx), true, cx)?;
+    let supplied = directory.map(|value| value.bind(cx)).unwrap_or(NIL.into());
+    root!(supplied, cx);
+    let handlers = env.variable_value(sym::FILE_NAME_HANDLER_ALIST, cx)?.unwrap_or(NIL.into());
+    if handlers.is_nil() {
+        return expand_file_name_lisp(name.bind(cx), Some(supplied.bind(cx)), env, cx);
+    }
+    // The regex engine cannot safely match undecodable raw names. Do not
+    // silently skip configured handlers or substitute lossy Unicode text.
+    let text = text.ok_or_else(|| anyhow::anyhow!("Raw-byte expansion handlers are unsupported"))?;
+    let operation = intern("expand-file-name", cx);
+    if let Some(handler) = find_file_name_handler_internal(&text, operation, env, cx) {
+        let handler = Object::from(handler); root!(handler, cx);
+        return call_expand_handler(handler, name, supplied, env, cx);
+    }
+    let owner_default = supplied.bind(cx).is_nil();
+    let selected = if owner_default {
+        symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?
+    } else { supplied.bind(cx) };
+    let selected = match selected.untag() {
+        ObjectType::String(_) | ObjectType::ByteString(_) => selected,
+        _ => cx.add("/"),
+    };
+    root!(selected, cx);
+    // GNU validates an owner default's NUL bytes before lookup, but offers an
+    // explicit default to its handler first. Do not erase or pre-reject it here.
+    let selected_text = expand_dispatch_name(selected.bind(cx), owner_default, cx)?
+        .ok_or_else(|| anyhow::anyhow!("Raw-byte expansion default handlers are unsupported"))?;
+    // Relative and user-home defaults keep the existing bounded lexical path;
+    // recursive GNU default expansion is not implemented or claimed here.
+    if selected_text.starts_with('/') {
+        let operation = intern("expand-file-name", cx);
+        if let Some(handler) = find_file_name_handler_internal(&selected_text, operation, env, cx) {
+            let handler = Object::from(handler); root!(handler, cx);
+            return call_expand_handler(handler, name, selected, env, cx);
+        }
+    }
+    expand_file_name_lisp(name.bind(cx), Some(supplied.bind(cx)), env, cx)
+}
+
+// Bounded lexical core. Native predicate helpers still use this directly;
+// their expansion-handler stage is not qualified by the Lisp dispatch wrapper.
 fn expand_file_name_lisp<'ob>(name: Object, default_directory: Option<Object>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
     #[cfg(not(unix))]
     {
@@ -2270,6 +2359,58 @@ mod file_regular_local_tests {
         crate::interpreter::assert_lisp(
             r#"(progn (defalias 'rune-regular-error (function (lambda (op name) (signal 'error '("regular-handler"))))) (let ((file-name-handler-alist '(("rune-regular-absent" . rune-regular-error))) (inhibit-file-name-handlers '(rune-regular-error))) (list (let ((inhibit-file-name-operation 'file-regular-p)) (file-regular-p "/rune-regular-absent/missing")) (let ((inhibit-file-name-operation 'file-directory-p)) (condition-case err (file-regular-p "/rune-regular-absent/missing") (error err))) (condition-case err (file-regular-p 3) (wrong-type-argument err)))))"#,
             r#"(nil (error "regular-handler") (wrong-type-argument stringp 3))"#,
+        );
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod expansion_handler_dispatch_tests {
+    #[test]
+    fn name_handler_sees_original_arguments_once_and_survives_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-expand-log nil) (defalias 'rune-expand-handler (function (lambda (op name base) (garbage-collect) (setq rune-expand-log (cons (list op name base) rune-expand-log)) "/handled"))) (let ((rune-expand-log nil) (file-name-handler-alist '(("MAGIC" . rune-expand-handler)))) (list (expand-file-name "MAGIC/../leaf" "/MAGIC/base/") rune-expand-log)))"#,
+            r#"("/handled" ((expand-file-name "MAGIC/../leaf" "/MAGIC/base/")))"#,
+        );
+    }
+
+    #[test]
+    fn default_handler_uses_owner_or_explicit_default_even_for_absolute_name() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-expand-default-log nil) (defalias 'rune-expand-default-handler (function (lambda (op name base) (setq rune-expand-default-log (list op name base)) "/default-handled"))) (let ((default-directory "/MAGIC/owner/") (rune-expand-default-log nil) (file-name-handler-alist '(("MAGIC" . rune-expand-default-handler)))) (list (expand-file-name "leaf") rune-expand-default-log (expand-file-name "/absolute" "/MAGIC/explicit/") rune-expand-default-log)))"#,
+            r#"("/default-handled" (expand-file-name "leaf" "/MAGIC/owner/") "/default-handled" (expand-file-name "/absolute" "/MAGIC/explicit/"))"#,
+        );
+    }
+
+    #[test]
+    fn recursion_uses_per_operation_handler_inhibition() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-expand-delegate (function (lambda (op name base) (let ((inhibit-file-name-handlers (cons 'rune-expand-delegate inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base))))) (let ((file-name-handler-alist '(("MAGIC" . rune-expand-delegate))) (inhibit-file-name-handlers '(rune-expand-delegate)) (inhibit-file-name-operation 'file-exists-p)) (expand-file-name "MAGIC/../leaf" "/base/")))"#,
+            r#""/base/leaf""#,
+        );
+    }
+
+    #[test]
+    fn handler_errors_and_nonstring_returns_are_catchable() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-expand-bad (function (lambda (op name base) 3))) (defalias 'rune-expand-error (function (lambda (op name base) (signal 'error '("expand-handler"))))) (list (let ((file-name-handler-alist '(("MAGIC" . rune-expand-bad)))) (condition-case err (expand-file-name "MAGIC" "/") (error err))) (let ((file-name-handler-alist '(("MAGIC" . rune-expand-error)))) (condition-case err (expand-file-name "MAGIC" "/") (error err)))))"#,
+            r#"((error "Invalid handler in `file-name-handler-alist'") (error "expand-handler"))"#,
+        );
+    }
+
+    #[test]
+    fn nil_supplied_default_and_invalid_name_payload_are_preserved() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-expand-nil-log t) (defalias 'rune-expand-nil-handler (function (lambda (op name base) (setq rune-expand-nil-log base) "/handled"))) (let ((file-name-handler-alist '(("MAGIC" . rune-expand-nil-handler)))) (list (expand-file-name "MAGIC") rune-expand-nil-log (condition-case err (expand-file-name 3) (wrong-type-argument err)))))"#,
+            r#"("/handled" nil (wrong-type-argument stringp 3))"#,
+        );
+        crate::interpreter::assert_lisp(
+            r#"(let ((name (concat "x" (make-string 1 0) "y"))) (condition-case err (expand-file-name name) (wrong-type-argument (list (car err) (car (cdr err)) (eq (car (cdr (cdr err))) name)))))"#,
+            "(wrong-type-argument filenamep t)",
+        );
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-expand-explicit-base nil) (defalias 'rune-expand-nul-default-handler (function (lambda (op name base) (garbage-collect) (setq rune-expand-explicit-base base) "/handled"))) (let ((base (concat "/MAGIC/" (make-string 1 0) "suffix")) (file-name-handler-alist '(("MAGIC" . rune-expand-nul-default-handler)))) (list (expand-file-name "leaf" base) (eq rune-expand-explicit-base base) (let ((default-directory base)) (condition-case err (expand-file-name "leaf") (wrong-type-argument (list (car err) (car (cdr err)) (eq (car (cdr (cdr err))) base))))))))"#,
+            r#"("/handled" t (wrong-type-argument filenamep t))"#,
         );
     }
 }

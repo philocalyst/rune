@@ -2,7 +2,7 @@
 """Hosted authenticated Debian data-only acquisition; NEVER GNU execution."""
 import datetime,hashlib,json,os,pathlib,re,resource,shutil,signal,stat,subprocess,time
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-gnu-payload'
-BASE_PIN='c4c11c5fc62a42a35ebfd4808eb26fa21b8e6447b6d7b66feaea7d7c5d83fc77'
+BASE_PIN='6ff8ea98a1cf10f2da8a549cb675499090ebfd79c6b0f7b010745283709a584f'
 HELPERS_PIN='e840ae751aac854ba955643505fb9c740103a1c50b169381ce0006665532ac10'
 OVERLAY=set(['.github/workflows/wip-gnu-payload.yml', 'docs/wip-gnu-payload-scope.md', 'scripts/ci-gnu-payload/authentication-receipt.json', 'scripts/ci-gnu-payload/base-inventory.json', 'scripts/ci-gnu-payload/debian-archive-keyring.gpg', 'scripts/ci-gnu-payload/extract_static.py', 'scripts/ci-gnu-payload/helper-inventory.json', 'scripts/ci-gnu-payload/packages.json', 'scripts/ci-gnu-payload/payload-inventory.json', 'scripts/ci-gnu-payload/run.py', 'scripts/ci-gnu-payload/verify_auth.py'])
 OVERLAY.add('scripts/ci-exec-admission/helpers/cases.json')

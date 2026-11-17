@@ -2,7 +2,7 @@
 """WIP synthetic-only confinement compile/admission; no GNU or Rune command."""
 import hashlib,json,os,pathlib,re,resource,shutil,signal,subprocess,time
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-confinement'
-BASE_PIN='a601836199f4c472f6d904350e7b3fa7c6897cd7b8125ec1340abd06cc57ac5f'
+BASE_PIN='62db4765362c242dd3e14cd865578b8e263cc4180e0a3e2baaaeab93304b6ccd'
 HELPERS_PIN='e04360ab12e467ad1131cf842abc59ff117c1b16f8b96e61e145b0924b74e2c1'
 OVERLAY={'.github/workflows/wip-confinement.yml','docs/wip-confinement-scope.md'}|{'scripts/ci-confinement/'+n for n in ('run.py','probe.c','controller.py','supervisor.py','base-inventory.json','helper-inventory.json')}
 OVERLAY.add('scripts/ci-exec-admission/helpers/cases.json')
