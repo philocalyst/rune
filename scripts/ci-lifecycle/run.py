@@ -12,9 +12,10 @@ import sys
 
 S=pathlib.Path.cwd().resolve()
 C=S/'scripts/ci-lifecycle'
-BASE_PIN='71e4ba26d896d2a54238b667d4fbf6c990b53f2e02eaebd90d55e4a92b97fe5e'
+BASE_PIN='50653b74fc115ff66589e4250c2955478358e98cf3213dee7c67b1be6da2d220'
 HELPERS_PIN='8e1effaaa784d79764bec4594775f1bf0c01d05e418e26aab8264366e6f9fb4a'
 OVERLAY={'.github/workflows/wip-lifecycle.yml','docs/wip-lifecycle-scope.md'}|{'scripts/ci-lifecycle/'+n for n in ['run.py','supervisor.py','preflight.py','fixture.py','fault_adapter.py','base-inventory.json','lifecycle-inventory.json']}
+OVERLAY.add('scripts/ci-exec-admission/helpers/cases.json')
 OVERLAY.update(['.github/workflows/wip-exec-admission.yml', 'docs/wip-exec-admission-scope.md', 'scripts/ci-exec-admission/base-inventory.json', 'scripts/ci-exec-admission/helpers/README.md', 'scripts/ci-exec-admission/helpers/case.py', 'scripts/ci-exec-admission/helpers/config.h.example', 'scripts/ci-exec-admission/helpers/launcher.c', 'scripts/ci-exec-admission/helpers/manifest.json', 'scripts/ci-exec-admission/helpers/prepare_config.py', 'scripts/ci-exec-admission/helpers/suite.py', 'scripts/ci-exec-admission/helpers/supervisor.py', 'scripts/ci-exec-admission/helpers/target.c', 'scripts/ci-exec-admission/run.py'])
 OVERLAY.update(['.github/workflows/wip-confinement.yml', 'docs/wip-confinement-scope.md', 'scripts/ci-confinement/run.py', 'scripts/ci-confinement/probe.c', 'scripts/ci-confinement/controller.py', 'scripts/ci-confinement/supervisor.py', 'scripts/ci-confinement/base-inventory.json', 'scripts/ci-confinement/helper-inventory.json'])
 EXPECTED_CASES=['normal','nonzero','group','doublefork','detached','crash','latefork','cancel','admission','cleanup']

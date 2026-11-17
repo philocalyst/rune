@@ -1,0 +1,61 @@
+{
+  "baseline": [
+    "positive",
+    "read-denied",
+    "write-denied",
+    "truncate-denied",
+    "exec-denied",
+    "socket-inet",
+    "socket-inet6",
+    "socket-unix",
+    "socketpair",
+    "io-uring",
+    "ptrace",
+    "pidfd-getfd",
+    "inherited-fds",
+    "symlink-read",
+    "invalid-policy"
+  ],
+  "scalar_exec": [
+    "exec-fd-low",
+    "exec-fd-high",
+    "exec-flags-low",
+    "exec-flags-high",
+    "dup-dst-low",
+    "dup-dst-high",
+    "dup-flags-low",
+    "dup-flags-high"
+  ],
+  "scalar_other": [
+    "fcntl-cmd-low",
+    "fcntl-cmd-high",
+    "arch-cmd-low",
+    "arch-cmd-high",
+    "prlimit-pid-low",
+    "prlimit-pid-high",
+    "prlimit-new-low",
+    "prlimit-new-high"
+  ],
+  "process_alias": [
+    "x32-denied",
+    "execve-denied",
+    "fork-denied",
+    "vfork-denied",
+    "clone-denied",
+    "clone3-denied",
+    "symlink-write",
+    "symlink-truncate",
+    "hardlink-preadmission"
+  ],
+  "metadata": [
+    "chmod-denied",
+    "fchmod-denied",
+    "fchmodat-denied",
+    "chown-denied",
+    "fchown-denied",
+    "utimensat-denied",
+    "unlinkat-denied",
+    "renameat2-denied",
+    "linkat-denied"
+  ]
+}

@@ -6,7 +6,7 @@ import hashlib,importlib.util,json,os,pathlib,re,resource,shutil,signal,stat,sys
 sys.dont_write_bytecode=True
 HERE=pathlib.Path(__file__).resolve().parent
 SUPERVISOR='7555676495d56228986f0bd2cbdde0e62a566306937300dac691dbe70d2728a0'
-MODES=['positive','read-denied','write-denied','truncate-denied','exec-denied','socket-inet','socket-inet6','socket-unix','socketpair','io-uring','ptrace','pidfd-getfd','inherited-fds','symlink-read','invalid-policy']
+GROUPS=json.loads((HERE/'cases.json').read_text())
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def need(ok,msg):
  if not ok:raise RuntimeError(msg)
@@ -14,7 +14,8 @@ def save(p,v):
  with p.open('x') as f:json.dump(v,f,indent=2);f.write('\n')
  p.chmod(0o400)
 def main():
- need(len(sys.argv)==2,'fresh existing empty suite directory')
+ need(len(sys.argv)==3 and sys.argv[2] in GROUPS,'fresh directory and fixed group')
+ group=sys.argv[2];MODES=GROUPS[group];need(0<len(MODES)<=15,'bounded fixed group')
  need(os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('GITHUB_REPOSITORY')=='philocalyst/rune' and os.environ.get('GITHUB_EVENT_NAME')=='push' and os.environ.get('GITHUB_REF')=='refs/heads/work/rune-backtrace-untested-20261117','hosted WIP only')
  root=pathlib.Path(sys.argv[1]);need(root.is_absolute() and root.resolve()==root and root.is_dir() and not list(root.iterdir()),'fresh canonical root')
  st=root.stat();need(st.st_uid==os.getuid() and stat.S_IMODE(st.st_mode)==0o700,'private root');need(shutil.disk_usage(root).free>=1024**3,'disk admission')
@@ -61,7 +62,7 @@ def main():
   value=text.strip();candidate=pathlib.Path(value) if pathlib.Path(value).is_absolute() else pathlib.Path('/usr/bin')/value
   p=candidate.resolve();st=p.stat();need(p.is_relative_to('/usr') and stat.S_ISREG(st.st_mode) and st.st_uid==0 and not st.st_mode&0o022,'compiler helper provenance');compiler_helpers[name]={'path':str(p),'sha256':sha(p)}
  headers={}
- for name in ['linux/audit.h','linux/filter.h','linux/landlock.h','linux/seccomp.h','x86_64-linux-gnu/asm/prctl.h','x86_64-linux-gnu/asm/unistd_64.h']:
+ for name in ['linux/audit.h','linux/sched.h','linux/filter.h','linux/landlock.h','linux/seccomp.h','x86_64-linux-gnu/asm/prctl.h','x86_64-linux-gnu/asm/unistd_64.h']:
   p=pathlib.Path('/usr/include')/name;need(p.is_file(),'policy header missing');headers[str(p)]=sha(p)
  def inspect(binary,interpreter):
   text,err=phase('readelf',[tools['readelf']['path'],'-W','-h','-l','-d',str(binary)],5)
@@ -87,9 +88,11 @@ def main():
   (case/'denied-target').chmod(0o500)
   build={'root':str(case),'config_sha256':sha(case/'config.h'),'files':{n:sha(case/n) for n in ['target','launcher','denied-target']},**target_info,'source_hashes':cfg['source_hashes'],'tools':tools}
   save(case/'build.json',build)
+  if mode=='hardlink-preadmission':os.link(case/'target',case/'target-hardlink')
   out,err=phase('case-'+mode,[tools['python3']['path'],'-I',str(HERE/'case.py'),str(case),mode],5)
   need(not err,'unexpected case diagnostics');r=json.loads(out);need(r['passed'] is True and r['gnu_executed'] is False and r['mode']==mode,'case receipt');receipts.append(r)
   expected_siblings={'allowed','outside','home','tmp','config.h','config.json','target','launcher','denied-target','build.json',mode+'.out',mode+'.err'}
+  if mode=='hardlink-preadmission':expected_siblings.add('target-hardlink')
   need({p.name for p in case.iterdir()}==expected_siblings,'unexpected case siblings')
   need(not list((case/'home').iterdir()) and not list((case/'tmp').iterdir()),'unexpected home/tmp output')
   need(sha(case/'build.json')==hashlib.sha256((json.dumps(build,indent=2)+'\n').encode()).hexdigest(),'build receipt changed')
@@ -107,6 +110,6 @@ def main():
  # All children ECHILD before final signal transition; late cancellation exits.
  signal.signal(signal.SIGTERM,signal.SIG_DFL);signal.signal(signal.SIGINT,signal.SIG_DFL)
  need(not cancelled,'late cancellation')
- result={'fixed_postexec_mechanism_cases':receipts,'count':15,'gnu_executed':False,'gnu_runtime_qualified':False,'doom_executed':False,'tools':tools,'compiler_helpers':compiler_helpers,'policy_headers':headers,'old_local_process':'UNKNOWN/unaffected'}
+ result={'fixed_postexec_mechanism_cases':receipts,'count':len(MODES),'group':group,'gnu_executed':False,'gnu_runtime_qualified':False,'doom_executed':False,'tools':tools,'compiler_helpers':compiler_helpers,'policy_headers':headers,'old_local_process':'UNKNOWN/unaffected'}
  save(root/'result.json',result);print(json.dumps(result),flush=True)
 if __name__=='__main__':main()

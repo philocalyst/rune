@@ -1,4 +1,4 @@
-name: WIP fixed synthetic post-exec controls
+name: WIP fixed synthetic post-exec controls (49)
 on:
   push:
     branches: [work/rune-backtrace-untested-20261117]
@@ -10,6 +10,10 @@ concurrency:
 jobs:
   admission:
     if: github.repository == 'philocalyst/rune' && github.ref == 'refs/heads/work/rune-backtrace-untested-20261117' && github.event_name == 'push'
+    strategy:
+      fail-fast: true
+      matrix:
+        group: [baseline, scalar_exec, scalar_other, process_alias, metadata]
     runs-on: ubuntu-24.04
     timeout-minutes: 8
     steps:
@@ -23,4 +27,14 @@ jobs:
       - name: Build and check only fixed synthetic controls
         env:
           EXPECTED_COMMIT: ${{ github.sha }}
+          ADMISSION_GROUP: ${{ matrix.group }}
         run: /usr/bin/timeout --signal=TERM --kill-after=5s 445s /usr/bin/python3 -I scripts/ci-exec-admission/run.py
+
+  complete:
+    needs: admission
+    if: success() && github.repository == 'philocalyst/rune' && github.ref == 'refs/heads/work/rune-backtrace-untested-20261117' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Record completion only after all five fixed groups succeed
+        run: /usr/bin/printf '%s\n' 'All 49 fixed synthetic controls passed across five groups; no GNU or Doom executed.'

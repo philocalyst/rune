@@ -19,7 +19,7 @@
 #ifndef LANDLOCK_ACCESS_FS_TRUNCATE
 #define LANDLOCK_ACCESS_FS_TRUNCATE (1ULL<<14)
 #endif
-static const char *modes[]={"positive","read-denied","write-denied","truncate-denied","exec-denied","socket-inet","socket-inet6","socket-unix","socketpair","io-uring","ptrace","pidfd-getfd","inherited-fds","symlink-read","invalid-policy"};
+static const char *modes[]={"positive","read-denied","write-denied","truncate-denied","exec-denied","socket-inet","socket-inet6","socket-unix","socketpair","io-uring","ptrace","pidfd-getfd","inherited-fds","symlink-read","invalid-policy","exec-fd-low","exec-fd-high","exec-flags-low","exec-flags-high","dup-dst-low","dup-dst-high","dup-flags-low","dup-flags-high","fcntl-cmd-low","fcntl-cmd-high","arch-cmd-low","arch-cmd-high","prlimit-pid-low","prlimit-pid-high","prlimit-new-low","prlimit-new-high","x32-denied","execve-denied","fork-denied","vfork-denied","clone-denied","clone3-denied","symlink-write","symlink-truncate","hardlink-preadmission","chmod-denied","fchmod-denied","fchmodat-denied","chown-denied","fchown-denied","utimensat-denied","unlinkat-denied","renameat2-denied","linkat-denied"};
 #define ALLOW(n) BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,(n),0,1),BPF_STMT(BPF_RET|BPF_K,SECCOMP_RET_ALLOW)
 #define ARGLO(n) (offsetof(struct seccomp_data,args)+(n)*8)
 #define ARGHI(n) (ARGLO(n)+4)
@@ -74,7 +74,8 @@ int main(int argc,char **argv){
  /* FD4 is admission-only trusted parent marker pipe, never child JSON. */
  if(fstat(4,&s)||!S_ISFIFO(s.st_mode))return 65;
  int fd=open(TARGET_ELF,O_RDONLY|O_CLOEXEC|O_NOFOLLOW);if(fd<0)return 66;
- if(fstat(fd,&s)||!S_ISREG(s.st_mode)||s.st_nlink!=1){close(fd);return 66;}
+ if(fstat(fd,&s)||!S_ISREG(s.st_mode)){close(fd);return 66;}
+ if(s.st_nlink!=1){close(fd);return 78;} /* distinct pre-admission hardlink rejection */
  struct stat denied;if(lstat(DENIED_ELF,&denied)||!S_ISREG(denied.st_mode)||denied.st_nlink!=1||s.st_dev!=denied.st_dev||s.st_ino==denied.st_ino||!(s.st_mode&0111)||!(denied.st_mode&0111)||access(TARGET_ELF,X_OK)||access(DENIED_ELF,X_OK))return 66;
  if(fd!=3){if(dup3(fd,3,O_CLOEXEC)!=3)return 66;close(fd);}else if(fcntl(3,F_SETFD,FD_CLOEXEC))return 66;
  if(syscall(__NR_close_range,5U,~0U,0))return 67;
@@ -82,7 +83,7 @@ int main(int argc,char **argv){
  if(prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0)||prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)!=1)return 68;
  if(syscall(__NR_landlock_create_ruleset,NULL,0,LANDLOCK_CREATE_RULESET_VERSION)<3)return 69;
  if(m==14){struct landlock_ruleset_attr invalid={.handled_access_fs=1ULL<<63};errno=0;int r=syscall(__NR_landlock_create_ruleset,&invalid,sizeof(invalid),0);if(r>=0){close(r);return 70;}return errno==EINVAL?77:70;}
- if(policy(m==3)||filter())return 71;
+ if(policy(m==3||!strcmp(argv[1],"symlink-truncate"))||filter())return 71;
  char *target_argv[]={TARGET_ELF,argv[1],NULL};char *env[]={"LANG=C","LC_ALL=C","TZ=UTC",NULL};
  unsigned char mark=0xa1;if(syscall(__NR_write,4,&mark,1)!=1)_exit(72);
  syscall(__NR_execveat,3,"",target_argv,env,AT_EMPTY_PATH);_exit(73);

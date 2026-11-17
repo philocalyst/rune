@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Exact-commit hosted fixed synthetic exec preflight; no GNU or Doom execution.
-Not launch-ready until BASE_PIN and exact publication mapping are frozen.
+Fixed five-group source reviewed admission; never an arbitrary command runner.
 """
 import hashlib,importlib.util,json,os,pathlib,re,stat,subprocess,sys
 sys.dont_write_bytecode=True
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-exec-admission';H=C/'helpers'
-BASE_PIN='c93fcb805f08573b90c0f4e7de732e50533d62f9206cde8a5a22ad31354c3007'
-HELPERS_PIN='6977e579f96400ff8295be16c96c640da990e6143086d213cff1d63cbc7fe8ca'
-MODES=['positive','read-denied','write-denied','truncate-denied','exec-denied','socket-inet','socket-inet6','socket-unix','socketpair','io-uring','ptrace','pidfd-getfd','inherited-fds','symlink-read','invalid-policy']
+BASE_PIN='7d133909fc71faddf8c65ca82fbd68abd885013b395dddbffe06364ff6ebdee7'
+HELPERS_PIN='acb26afbc19bc56893c5a3d720d10c8c613157f67c62cbdf4cad39a527d340de'
+GROUP_NAMES=['baseline','scalar_exec','scalar_other','process_alias','metadata']
+GROUP_COUNTS=[15,8,8,9,9]
+def expected(mode):
+ if mode=='hardlink-preadmission':return ('',78)
+ if mode=='invalid-policy':return ('',77)
+ if mode=='inherited-fds':return ('a1a2b0b1b2',0)
+ ordinary={'positive','read-denied','write-denied','truncate-denied','exec-denied','symlink-read','symlink-write','symlink-truncate'}
+ return ('a1a2a3',0 if mode in ordinary else -31)
 def need(ok,msg):
  if not ok:raise RuntimeError(msg)
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -26,19 +33,25 @@ def verify(commit):
  need(not subprocess.check_output(['/usr/bin/git','status','--porcelain','--untracked-files=all'],cwd=S,text=True).strip(),'dirty/unexpected checkout')
 def main():
  need(os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('GITHUB_REPOSITORY')=='philocalyst/rune' and os.environ.get('GITHUB_EVENT_NAME')=='push' and os.environ.get('GITHUB_REF')=='refs/heads/work/rune-backtrace-untested-20261117','exact WIP push only')
+ group=os.environ['ADMISSION_GROUP'];need(group in GROUP_NAMES,'fixed group only')
  commit=os.environ['EXPECTED_COMMIT'];need(re.fullmatch('[0-9a-f]{40}',commit) is not None and commit==os.environ['GITHUB_SHA'],'event commit');verify(commit)
+ groups=json.loads((H/'cases.json').read_text());need(list(groups)==GROUP_NAMES and [len(groups[x]) for x in GROUP_NAMES]==GROUP_COUNTS and len(set(sum(groups.values(),[])))==49,'fixed49 roster')
+ MODES=groups[group]
  tag=os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'];need(re.fullmatch('[0-9]+-[0-9]+',tag) is not None,'run identity')
- root=pathlib.Path(os.environ['RUNNER_TEMP']).resolve()/('rune-exec-admission-'+tag);root.mkdir(mode=0o700)
+ root=pathlib.Path(os.environ['RUNNER_TEMP']).resolve()/('rune-exec-admission-'+tag+'-'+group);root.mkdir(mode=0o700)
  need(root.stat().st_uid==os.getuid() and stat.S_IMODE(root.stat().st_mode)==0o700,'private staging')
  # Suite owns fixed trusted builds and direct lifecycle receipts. No genericcmd.
  spec=importlib.util.spec_from_file_location('fixed_exec_suite',H/'suite.py');suite=importlib.util.module_from_spec(spec);spec.loader.exec_module(suite)
- oldargv=sys.argv;sys.argv=[str(H/'suite.py'),str(root)]
+ oldargv=sys.argv;sys.argv=[str(H/'suite.py'),str(root),group]
  try:suite.main()
  finally:sys.argv=oldargv
  verify(commit)
  resultpath=root/'result.json';st=resultpath.lstat();need(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1 and stat.S_IMODE(st.st_mode)==0o400,'result identity')
- r=json.loads(resultpath.read_text());need(r['count']==15 and [x['mode'] for x in r['fixed_postexec_mechanism_cases']]==MODES,'exact completed case set')
+ r=json.loads(resultpath.read_text());need(r['group']==group and r['count']==len(MODES) and [x['mode'] for x in r['fixed_postexec_mechanism_cases']]==MODES,'exact completed case set')
  need(all(x['passed'] is True and x['gnu_executed'] is False for x in r['fixed_postexec_mechanism_cases']),'case outcomes')
+ for item in r['fixed_postexec_mechanism_cases']:
+  need((item['markers'],item['exit'])==expected(item['mode']),'exact marker/status')
+  need([x['fd'] for x in item['injected']]==([100,101,102] if item['mode']=='inherited-fds' else []),'exact injected descriptors')
  need(r['gnu_executed'] is False and r['gnu_runtime_qualified'] is False and r['doom_executed'] is False,'scope flags')
- print(json.dumps({'commit':commit,'fixed_postexec_mechanism_cases':15,'result_sha256':sha(resultpath),'gnu_executed':False,'gnu_runtime_qualified':False,'doom_executed':False,'old_local_process':'UNKNOWN/unaffected'}),flush=True)
+ print(json.dumps({'commit':commit,'group':group,'fixed_postexec_mechanism_cases':len(MODES),'result_sha256':sha(resultpath),'gnu_executed':False,'gnu_runtime_qualified':False,'doom_executed':False,'old_local_process':'UNKNOWN/unaffected'}),flush=True)
 if __name__=='__main__':main()

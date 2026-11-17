@@ -3,8 +3,9 @@
 No compiler, shell, GNU or arbitrary payload. Expects already qualified pins.
 """
 import hashlib,json,os,pathlib,select,signal,socket,stat,subprocess,sys,time
-MODES=['positive','read-denied','write-denied','truncate-denied','exec-denied','socket-inet','socket-inet6','socket-unix','socketpair','io-uring','ptrace','pidfd-getfd','inherited-fds','symlink-read','invalid-policy']
-FORBIDDEN=set(MODES[5:12])
+GROUPS=json.loads((pathlib.Path(__file__).resolve().parent/'cases.json').read_text())
+MODES=sum(GROUPS.values(),[])
+FORBIDDEN=set(MODES[5:12])|set(GROUPS['scalar_exec'])|set(GROUPS['scalar_other'])|set(GROUPS['metadata'])|set(GROUPS['process_alias'][:6])
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def identity(p):
  s=p.lstat();return (s.st_dev,s.st_ino,s.st_mode,s.st_uid,s.st_gid,s.st_nlink,s.st_size)
@@ -20,7 +21,7 @@ def main():
  assert cfg['root']==str(root) and build['root']==str(root) and sha(root/'config.h')==cfg['config_sha256']==build['config_sha256']
  binaries={}
  for n in ['launcher','target','denied-target']:
-  p=root/n;s=p.lstat();assert stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o500 and sha(p)==build['files'][n];binaries[n]=identity(p)
+  p=root/n;s=p.lstat();assert stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and s.st_nlink==(2 if mode=='hardlink-preadmission' and n=='target' else 1) and stat.S_IMODE(s.st_mode)==0o500 and sha(p)==build['files'][n];binaries[n]=identity(p)
  assert sha(root/'target')==sha(root/'denied-target') and (root/'target').stat().st_dev==(root/'denied-target').stat().st_dev and (root/'target').stat().st_ino!=(root/'denied-target').stat().st_ino
  assert build['interpreter']==cfg['runtime'][0]['path'] and build['needed']==['libc.so.6']
  runtime={}
@@ -41,12 +42,17 @@ def main():
   st=p.lstat();assert stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1 and stat.S_IMODE(st.st_mode)==0o600 and p.read_bytes()==b'probe-canary\n'
   # Ordinary DAC permits read AND write before confinement; no byte mutation.
   fd=os.open(p,os.O_WRONLY|os.O_NOFOLLOW|os.O_CLOEXEC);assert os.fstat(fd).st_ino==st.st_ino;os.close(fd)
-  canaries[str(p)]=identity(p)
+  canaries[str(p)]=(identity(p),p.stat().st_mtime_ns,p.stat().st_ctime_ns)
  link=root/'allowed/outside-link';link_identity=identity(link);assert stat.S_ISLNK(link.lstat().st_mode)
  directories={str(p):identity(p) for p in [root,root/'allowed',root/'outside',root/'home',root/'tmp']}
  for name in directories:
   st=pathlib.Path(name).lstat();assert stat.S_ISDIR(st.st_mode) and st.st_uid==os.getuid() and stat.S_IMODE(st.st_mode)==0o700
  assert not (root/'allowed/output').exists();assert os.readlink(root/'allowed/outside-link')=='../outside/canary'
+ if mode=='hardlink-preadmission':
+  alias=root/'target-hardlink';a=alias.lstat();t=(root/'target').lstat()
+  assert stat.S_ISREG(a.st_mode) and a.st_nlink==t.st_nlink==2 and (a.st_dev,a.st_ino)==(t.st_dev,t.st_ino) and sha(alias)==build['files']['target']
+  # Deliberate negative fixture: actual C launcher must reject link-count before A1.
+  assert set(p.name for p in root.iterdir())=={'allowed','outside','home','tmp','config.h','config.json','target','launcher','denied-target','build.json','target-hardlink'}
  # Reserve FD4 before making pipe; do not accidentally replace its read end.
  reservation=os.open('/dev/null',os.O_RDONLY);os.dup2(reservation,4)
  if reservation!=4:os.close(reservation)
@@ -88,11 +94,11 @@ def main():
   markers+=chunk;assert len(markers)<=16
  os.close(rd)
  for h in handles:h.close()
- expected=bytes([0xa1,0xa2,0xb0,0xb1,0xb2]) if mode=='inherited-fds' else (b'' if mode=='invalid-policy' else bytes([0xa1,0xa2,0xa3]))
- status=-signal.SIGSYS if mode in FORBIDDEN else (77 if mode=='invalid-policy' else 0)
+ expected=bytes([0xa1,0xa2,0xb0,0xb1,0xb2]) if mode=='inherited-fds' else (b'' if mode in ('invalid-policy','hardlink-preadmission') else bytes([0xa1,0xa2,0xa3]))
+ status=-signal.SIGSYS if mode in FORBIDDEN else (77 if mode=='invalid-policy' else (78 if mode=='hardlink-preadmission' else 0))
  assert markers==expected and proc.returncode==status and out.stat().st_size==0 and err.stat().st_size==0,(markers.hex(),proc.returncode)
  for name,before in canaries.items():
-  p=pathlib.Path(name);assert identity(p)==before and p.read_bytes()==b'probe-canary\n'
+  p=pathlib.Path(name);assert (identity(p),p.stat().st_mtime_ns,p.stat().st_ctime_ns)==before and p.read_bytes()==b'probe-canary\n'
  assert identity(link)==link_identity and os.readlink(link)=='../outside/canary' and link.resolve()==root/'outside/canary'
  for name,before in directories.items():
   # Directory size can change with owned log/output entries; retain authority.
@@ -108,5 +114,7 @@ def main():
  assert set(p.name for p in (root/'outside').iterdir())=={'canary'}
  assert set(p.name for p in (root/'allowed').iterdir())==({'input','outside-link','output'} if mode=='positive' else {'input','outside-link'})
  for n in ['launcher','target','denied-target']:assert identity(root/n)==binaries[n] and sha(root/n)==build['files'][n]
+ if mode=='hardlink-preadmission':
+  a=(root/'target-hardlink').lstat();t=(root/'target').lstat();assert (a.st_dev,a.st_ino,a.st_nlink)==(t.st_dev,t.st_ino,2) and sha(root/'target-hardlink')==build['files']['target']
  print(json.dumps({'mode':mode,'markers':markers.hex(),'exit':proc.returncode,'injected':injected,'passed':True,'gnu_executed':False}))
 if __name__=='__main__':main()
