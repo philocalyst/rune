@@ -121,5 +121,7 @@
   "frame::frame_parameter_snapshot_tests::terminal_snapshot_uses_real_owner_dimensions_and_fresh_pairs",
   "frame::internal_parameter_tests::real_non_x_identity_list_is_mutable_rooted_and_filters_frameset",
   "frame::terminal_cell_metric_tests::terminal_character_cells_validate_owner_frame_and_keep_identity",
-  "frame::tests::face_capability_query_rejects_non_frame"
+  "frame::tests::face_capability_query_rejects_non_frame",
+  "library::elprop::batch_emacs::tests::exited_leader_with_retained_pipes_still_times_out",
+  "library::elprop::batch_emacs::tests::closed_pipes_do_not_hide_a_running_leader"
 ]

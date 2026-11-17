@@ -136,6 +136,47 @@ fn capture(mut command: Command, timeout: Duration, limit: usize) -> Result<Stri
     }
     drop(sender);
     let deadline = Instant::now() + timeout;
+    // Requires sole wait ownership and SIGCHLD without auto-reaping
+    // (no SIG_IGN/SA_NOCLDWAIT), as supplied by the hosted supervisor.
+    // Keep the leader unreaped until both readers finish. A descendant may
+    // retain either pipe after the leader exits; reaping first would release
+    // its numeric process-group identity before timeout cleanup can signal it.
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut received = 0;
+    while received < 2 {
+        if exceeded.load(Ordering::Acquire) || Instant::now() >= deadline {
+            stop(&mut child);
+            bail!("GNU batch oracle exceeded time or output limit");
+        }
+        let (is_stdout, bytes) = match receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(5)))
+        {
+            Ok(output) => output,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(error) => {
+                stop(&mut child);
+                return Err(error).context("GNU batch oracle output did not close before deadline");
+            }
+        };
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                stop(&mut child);
+                return Err(error).context("cannot read GNU batch oracle output");
+            }
+        };
+        if exceeded.load(Ordering::Acquire) || Instant::now() >= deadline {
+            stop(&mut child);
+            bail!("GNU batch oracle exceeded time or output limit");
+        }
+        received += 1;
+        if is_stdout {
+            stdout = bytes;
+        } else {
+            stderr = bytes;
+        }
+    }
     let status = loop {
         if exceeded.load(Ordering::Acquire) || Instant::now() >= deadline {
             stop(&mut child);
@@ -145,30 +186,13 @@ fn capture(mut command: Command, timeout: Duration, limit: usize) -> Result<Stri
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
-                stop(&mut child);
-                return Err(error.into());
+                // Ownership is uncertain on a wait error (e.g. ECHILD). Do not
+                // signal a numeric PID/PGID which might have been recycled.
+                return Err(error).context("cannot wait for GNU batch oracle; cleanup uncertain");
             }
         }
         thread::sleep(Duration::from_millis(5));
     };
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    for _ in 0..2 {
-        let (is_stdout, bytes) = match receiver
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        {
-            Ok(output) => output,
-            Err(error) => {
-                stop(&mut child);
-                return Err(error).context("GNU batch oracle output did not close before deadline");
-            }
-        };
-        if is_stdout {
-            stdout = bytes?;
-        } else {
-            stderr = bytes?;
-        }
-    }
     ensure!(!exceeded.load(Ordering::Acquire), "GNU batch oracle exceeded output limit");
     let stderr = String::from_utf8(stderr).context("GNU batch oracle stderr is not UTF-8")?;
     ensure!(status.success(), "GNU batch oracle exited with {status}: {stderr}");
@@ -223,6 +247,49 @@ mod tests {
         assert!(source.contains("(read-from-string tail)"));
         assert!(source.contains("(memq (aref tail i)"));
         assert!(source.contains("(eval (car parsed))"));
+    }
+
+    #[cfg(unix)]
+    fn assert_pipe_lifetime_timeout(script: &str) {
+        let mut baseline = Command::new("sh");
+        baseline.args(["-c", "printf baseline"]);
+        assert_eq!(capture(baseline, Duration::from_secs(2), 100).unwrap(), "baseline");
+        // Exclusive test-owned directory: no shared predictable file overwrite.
+        let directory = std::env::temp_dir().join(format!(
+            "rune-batch-lifetime-{}-{}",
+            std::process::id(), REQUEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let entered = directory.join("entered");
+        let survived = directory.join("survived");
+        let mut command = Command::new("sh");
+        command.args(["-c", script, "rune-batch-fixture"]);
+        command.arg(&entered).arg(&survived);
+        let error = capture(command, Duration::from_millis(500), 100).unwrap_err();
+        assert_eq!(error.to_string(), "GNU batch oracle exceeded time or output limit");
+        assert_eq!(std::fs::read(&entered).unwrap(), b"ready");
+        // The fixed child would write after one second if group cleanup failed.
+        // This is a bounded behavior check, not a subreaper/ECHILD proof.
+        thread::sleep(Duration::from_millis(1100));
+        assert!(!survived.exists(), "timed-out process survived to write its marker");
+        std::fs::remove_file(entered).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_leader_with_retained_pipes_still_times_out() {
+        assert_pipe_lifetime_timeout(
+            "(printf ready > \"$1\"; sleep 1; printf survived > \"$2\") & exit 0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_pipes_do_not_hide_a_running_leader() {
+        assert_pipe_lifetime_timeout(
+            "printf ready > \"$1\"; exec 1>&- 2>&-; sleep 1; printf survived > \"$2\""
+        );
     }
 
     #[cfg(unix)]

@@ -2,8 +2,8 @@
 """Independent hosted-runner evidence only; no local-process resolution claim."""
 import hashlib,json,os,pathlib,re,resource,shutil,signal,subprocess,time
 S=pathlib.Path.cwd().resolve(); C=S/'scripts/ci-v11'
-TESTS_PIN='1045a1fe1340dfaa8a223d42a7081fa9891679b389a0dc2e0141eb90e68ad604'
-SOURCE_PIN='f3cbd0151702af1940d8a024a6ff7442cfcfa98f5ad190c58cafa93ea3ff1899'
+TESTS_PIN='6f9eea24d4ca59d50e1aeafc402ef615174b68febab8842e4840ab0b2748eb4d'
+SOURCE_PIN='b8cafe263a2e839e1b5ead7f5bfd3ada0f65fab197d0e766204ed4895a4058e6'
 EXTRAS={'.github/workflows/wip-v11-native.yml','scripts/ci-v11/run.py','scripts/ci-v11/source-inventory.json','scripts/ci-v11/native-tests.json','docs/wip-v11-ci-scope.md'}
 EXTRAS.update(['.github/workflows/wip-bootstrap.yml', 'scripts/ci-bootstrap/run.py', 'scripts/ci-bootstrap/check-sandbox.py', 'scripts/ci-bootstrap/checkpoint.el', 'docs/wip-bootstrap-scope.md'])
 EXTRAS.update(['.github/workflows/wip-lifecycle.yml', 'docs/wip-lifecycle-scope.md', 'scripts/ci-lifecycle/run.py', 'scripts/ci-lifecycle/supervisor.py', 'scripts/ci-lifecycle/preflight.py', 'scripts/ci-lifecycle/fixture.py', 'scripts/ci-lifecycle/fault_adapter.py', 'scripts/ci-lifecycle/base-inventory.json', 'scripts/ci-lifecycle/lifecycle-inventory.json'])
@@ -50,19 +50,20 @@ def run(label,cmd,seconds,logcap=16*1024**2,filecap=256*1024**2):
  try:
   with out.open('xb') as o,err.open('xb') as r:
    proc=subprocess.Popen(cmd,cwd=S,env=ENV,stdin=subprocess.DEVNULL,stdout=o,stderr=r,start_new_session=True,close_fds=True,preexec_fn=lambda:caps(filecap))
-   while proc.poll() is None:
+   # Retain the leader identity until owned-group cleanup completes.
+   while True:
+    if os.waitid(os.P_PID,proc.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT) is not None:break
     if time.monotonic()-start>seconds:stop='wall'
     elif out.stat().st_size+err.stat().st_size>logcap:stop='sampled_log_cap'
     elif shutil.disk_usage(E).free<2*1024**3:stop='disk_floor'
     if stop:break
     time.sleep(.1)
-   if stop:os.killpg(proc.pid,signal.SIGKILL)
-   rc=proc.wait()
  finally:
   if proc is not None:
    try:os.killpg(proc.pid,signal.SIGKILL)
    except ProcessLookupError:pass
    proc.wait()
+ rc=proc.returncode
  elapsed=time.monotonic()-start
  record={'phase':label,'exit':rc,'stop':stop,'seconds':elapsed,'stdout_sha256':sha(out),'stderr_sha256':sha(err),'stdout_bytes':out.stat().st_size,'stderr_bytes':err.stat().st_size}
  save(E/(label+'.json'),record);print(json.dumps(record),flush=True)
@@ -73,6 +74,8 @@ def run(label,cmd,seconds,logcap=16*1024**2,filecap=256*1024**2):
  return out.read_text(),err.read_text()
 def main():
  global COMMIT,E,ENV
+ signal.signal(signal.SIGCHLD,signal.SIG_DFL)
+ assert hasattr(os,'waitid') and hasattr(os,'WNOWAIT'),'unreaped leader observation required'
  assert os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('GITHUB_REPOSITORY')=='philocalyst/rune'
  assert os.environ.get('GITHUB_EVENT_NAME')=='push' and os.environ.get('GITHUB_REF')=='refs/heads/work/rune-backtrace-untested-20261117'
  COMMIT=os.environ['EXPECTED_COMMIT'];assert re.fullmatch('[0-9a-f]{40}',COMMIT) and COMMIT==os.environ['GITHUB_SHA']
@@ -90,7 +93,7 @@ def main():
  ENV['PATH']=str(tool)+':/usr/bin:/bin'
  versions,_=run('versions',[str(rustc),'-Vv'],10);assert versions.startswith('rustc 1.96.0 ')
  cargo_version,_=run('cargo-version',[str(cargo),'-Vv'],10);assert cargo_version.startswith('cargo 1.96.0 ')
- save(E/'provenance.json',{'commit':COMMIT,'source_inventory_sha256':SOURCE_PIN,'rustc':versions,'cargo':cargo_version,'rustc_sha256':sha(rustc),'cargo_sha256':sha(cargo),'rustup_sha256':sha(rustup),'indexmap_git_revision':'5ceff134a843d7afc26bb63db48f927ea80883bc','scope':'native123 not GNU139 or Doom startup'})
+ save(E/'provenance.json',{'commit':COMMIT,'source_inventory_sha256':SOURCE_PIN,'rustc':versions,'cargo':cargo_version,'rustc_sha256':sha(rustc),'cargo_sha256':sha(cargo),'rustup_sha256':sha(rustup),'indexmap_git_revision':'5ceff134a843d7afc26bb63db48f927ea80883bc','scope':'native125 not GNU139 or Doom startup'})
  # Cold checkout needs locked network fetch including pinned public indexmap git.
  run('fetch',[str(cargo),'fetch','--locked','--target','x86_64-unknown-linux-gnu'],180)
  verify()
@@ -104,7 +107,7 @@ def main():
    artifacts.append(pathlib.Path(item['executable']).resolve())
  assert len(artifacts)==1;binary=artifacts[0];assert binary.is_relative_to(target.resolve()) and binary.is_file()
  binary_pin=sha(binary);assert binary.open('rb').read(4)==b'\x7fELF';verify()
- selected=json.loads((C/'native-tests.json').read_text());assert len(selected)==len(set(selected))==123
+ selected=json.loads((C/'native-tests.json').read_text());assert len(selected)==len(set(selected))==125
  listed,_=run('list',[str(binary),'--list'],20,1024**2,1024**2)
  discovered=[line.removesuffix(': test') for line in listed.splitlines() if line.endswith(': test')]
  assert all(discovered.count(n)==1 for n in selected)
@@ -116,8 +119,8 @@ def main():
   assert re.search(r'test result: ok\. 1 passed; 0 failed; 0 ignored;',out),'unexpected test accounting'
   assert time.monotonic()<=deadline
  verify();assert sha(binary)==binary_pin
- result={'qualified_native_subset':True,'passed':123,'commit':COMMIT,'artifact_sha256':binary_pin,'source_inventory_sha256':SOURCE_PIN,'tests':selected,'gnu_reference_tested':False,'doom_startup_tested':False,'old_local_process':'UNKNOWN/unaffected'}
+ result={'qualified_native_subset':True,'passed':125,'commit':COMMIT,'artifact_sha256':binary_pin,'source_inventory_sha256':SOURCE_PIN,'tests':selected,'gnu_reference_tested':False,'doom_startup_tested':False,'old_local_process':'UNKNOWN/unaffected'}
  save(E/'result.json',result);print(json.dumps(result),flush=True)
  if os.environ.get('GITHUB_STEP_SUMMARY'):
-  pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('V11 native subset only:123 passed; commit '+COMMIT+'; ELF SHA256 '+binary_pin+'. Not GNU139 or Doom startup.\n')
+  pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('V11 native subset only:125 passed; commit '+COMMIT+'; ELF SHA256 '+binary_pin+'. Not GNU139 or Doom startup.\n')
 if __name__=='__main__':main()

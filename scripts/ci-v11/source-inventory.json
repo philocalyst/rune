@@ -478,7 +478,7 @@
   "src/keymap/mapping.rs": "6716f0fe5f4a05deccbbd47c6a6f3a86c08324170bd264aa7ba1f0de3cb0cbf2",
   "src/keymap/translation.rs": "86a20447f0ee0b90f9ada07fa6e5a5bfe659cdb07705c897b7713559ca310f27",
   "src/keymap.rs": "356369257c0885e6e9bfea32e1bbdaa6a88c6675f532acc1c11c88bdc27e9efe",
-  "src/library/elprop/batch_emacs.rs": "bd6273d6026379ece4a3d74430561fc04cb7601e6463567aaae2dd4c55fe9aa0",
+  "src/library/elprop/batch_emacs.rs": "d1915a3d7061a804ef9875e03723dcbdb39f9a906a859a4478f4edf6e665e53d",
   "src/library/elprop/inf_emacs.rs": "cbf8d246a28dd040fe4be353609d1c9fffc600578d2e040d1bae680d5bc5d1ba",
   "src/library/elprop/strategies.rs": "5c3eeeb8e895e9af0d9d67e1b3a6226b53971d3a7a8bec5e66b5dbe7c2ab7583",
   "src/library/elprop.rs": "2bb45cb90acf1e21254977dbab5a0f76ca1d1f4a15200106ad045509ea8d455c",
