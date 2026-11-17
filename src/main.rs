@@ -1,4 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+#[cfg(test)]
+#[path = "../build_support/defun_scanner.rs"]
+mod defun_scanner;
 #[macro_use]
 mod macros;
 mod process_transport;

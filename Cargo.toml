@@ -78,6 +78,7 @@ libm = "0.2.11"
 interval-tree = { workspace = true }
 
 [dev-dependencies]
+syn = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 

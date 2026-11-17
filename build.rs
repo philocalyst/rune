@@ -1,3 +1,7 @@
+#[path = "build_support/defun_scanner.rs"]
+mod defun_scanner;
+use defun_scanner::scan_defuns;
+
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::MAIN_SEPARATOR;
@@ -19,16 +23,6 @@ pub fn parse_args(input: &str) -> Vec<String> {
 fn get_substring_between<'a>(contents: &'a str, start: &str, end: &str) -> &'a str {
     let start_idx = contents.find(start).unwrap() + start.len();
     let end_idx = contents[start_idx..].find(end).unwrap() + start_idx;
-    &contents[start_idx..end_idx]
-}
-
-// get substring between string and predicate function
-fn get_substring_between_predicate<'a, F>(contents: &'a str, start: &str, predicate: F) -> &'a str
-where
-    F: Fn(char) -> bool,
-{
-    let start_idx = contents.find(start).unwrap() + start.len();
-    let end_idx = contents[start_idx..].find(predicate).unwrap() + start_idx;
     &contents[start_idx..end_idx]
 }
 
@@ -57,6 +51,7 @@ enum DefvarType {
 
 #[expect(clippy::too_many_lines)]
 fn main() {
+    println!("cargo:rerun-if-changed=build_support/defun_scanner.rs");
     let mut all_defun = Vec::new();
     let mut all_defvar = Vec::new();
     let mut all_defsym = Vec::new();
@@ -77,24 +72,13 @@ fn main() {
                 continue;
             }
             let contents = fs::read_to_string(&path).unwrap();
-            for (start, end) in contents.match_indices("\n#[defun") {
-                let non_symbol = |c: char| !(c.is_alphanumeric() || c == '_');
-                let name = get_substring_between_predicate(&contents[start..], "fn ", non_symbol);
-
-                // check if the substring immdiately after end is name
-                let rest = &contents[(start + end.len())..];
-                let lisp_name = if rest.starts_with("(name") {
-                    get_substring_between(rest, "name = \"", "\"").to_string()
-                } else {
-                    name.replace('_', "-")
-                };
-                // convert the path name to a hierarchy name with slashes replaced with colons
-                let struct_name = {
-                    let basename = path.strip_prefix("src/").unwrap().file_stem().unwrap();
-                    let import_path = basename.to_str().unwrap().replace(MAIN_SEPARATOR, ":");
-                    format!("crate::{import_path}::__subr_{name}")
-                };
-                all_defun.push((struct_name, name.to_string(), lisp_name));
+            for (name, lisp_name) in scan_defuns(&contents)
+                .unwrap_or_else(|error| panic!("Invalid defun metadata in {}: {error}", path.display()))
+            {
+                let basename = path.strip_prefix("src/").unwrap().file_stem().unwrap();
+                let import_path = basename.to_str().unwrap().replace(MAIN_SEPARATOR, ":");
+                let struct_name = format!("crate::{import_path}::__subr_{name}");
+                all_defun.push((struct_name, name, lisp_name));
             }
             // process all strings starting with defvar
             for (start, _) in contents.match_indices("\ndefvar") {
