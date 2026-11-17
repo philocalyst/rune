@@ -1340,15 +1340,15 @@ mod active_backtrace_tests {
     }
     #[test]
     fn callback_heap_return_survives_gc_and_reentrance() {
-        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda (x) (backtrace-frame--internal (lambda (e f a flags) (garbage-collect) (backtrace-frame--internal #'list 999 nil) (list f a)) 0 'bt-target))) (bt-target '(1 2)))", "(bt-target ((1 2)))");
+        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda (x) (backtrace-frame--internal (function (lambda (e f a flags) (garbage-collect) (backtrace-frame--internal #'list 999 nil) (list f a))) 0 'bt-target))) (bt-target '(1 2)))", "(bt-target ((1 2)))");
     }
     #[test]
     fn map_fixed_membership_ignores_callback_calls() {
-        crate::interpreter::assert_lisp("(progn (setq bt-seen nil) (fset 'bt-target '(lambda () (mapbacktrace (lambda (e f a flags) (garbage-collect) (setq bt-seen (cons f bt-seen))) 'bt-target))) (bt-target) (eq (car (last bt-seen)) 'bt-target))", "t");
+        crate::interpreter::assert_lisp("(progn (setq bt-seen nil) (fset 'bt-target '(lambda () (mapbacktrace (function (lambda (e f a flags) (garbage-collect) (setq bt-seen (cons f bt-seen)))) 'bt-target))) (bt-target) (eq (car (last bt-seen)) 'bt-target))", "t");
     }
     #[test]
     fn callback_throw_restores_frames() {
-        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda () (backtrace-frame--internal (lambda (&rest a) (throw 'bt-exit 7)) 0 'bt-target))) (list (catch 'bt-exit (bt-target)) (backtrace-frame--internal #'list 0 'bt-target)))", "(7 nil)");
+        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda () (backtrace-frame--internal (function (lambda (&rest a) (throw 'bt-exit 7))) 0 'bt-target))) (list (catch 'bt-exit (bt-target)) (backtrace-frame--internal #'list 0 'bt-target)))", "(7 nil)");
     }
     #[test]
     fn interactive_marker_has_distinct_identity() {
@@ -1484,23 +1484,23 @@ mod run_hooks_shared_tests {
     }
     #[test]
     fn multiple_hooks_and_nonnil_results_keep_source_order() {
-        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-a (list (lambda () (setq rh-seen (cons 'a rh-seen)) t) (lambda () (garbage-collect) (setq rh-seen (cons 'b rh-seen)))) ) (rh-b (lambda () (setq rh-seen (cons 'c rh-seen))))) (list (run-hooks 'rh-a 'rh-b) rh-seen))"#, "(nil (c b a))");
+        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-a (list (function (lambda () (setq rh-seen (cons 'a rh-seen)) t)) (function (lambda () (garbage-collect) (setq rh-seen (cons 'b rh-seen))))) ) (rh-b (function (lambda () (setq rh-seen (cons 'c rh-seen)))))) (list (run-hooks 'rh-a 'rh-b) rh-seen))"#, "(nil (c b a))");
     }
     #[test]
     fn default_t_marker_ignores_recursive_default_t() {
-        crate::interpreter::assert_lisp(r#"(let ((rh-count 0) (rh-hooks nil)) (setq rh-hooks (list t (lambda () (garbage-collect) (setq rh-count (1+ rh-count))))) (list (run-hooks 'rh-hooks) rh-count))"#, "(nil 2)");
+        crate::interpreter::assert_lisp(r#"(let ((rh-count 0) (rh-hooks nil)) (setq rh-hooks (list t (function (lambda () (garbage-collect) (setq rh-count (1+ rh-count)))))) (list (run-hooks 'rh-hooks) rh-count))"#, "(nil 2)");
     }
     #[test]
     fn callback_mutates_live_tail_across_gc() {
-        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-hooks nil)) (setq rh-hooks (list (lambda () (setq rh-seen (cons 'first rh-seen)) (setcdr rh-hooks (list (lambda () (setq rh-seen (cons 'replacement rh-seen))))) (garbage-collect) t) (lambda () (error "replaced")))) (list (run-hooks 'rh-hooks) rh-seen))"#, "(nil (replacement first))");
+        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-hooks nil)) (setq rh-hooks (list (function (lambda () (setq rh-seen (cons 'first rh-seen)) (setcdr rh-hooks (list (function (lambda () (setq rh-seen (cons 'replacement rh-seen)))))) (garbage-collect) t)) (function (lambda () (error "replaced"))))) (list (run-hooks 'rh-hooks) rh-seen))"#, "(nil (replacement first))");
     }
     #[test]
     fn error_and_throw_stop_later_hooks_and_next_call_recovers() {
-        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-bad (lambda () (garbage-collect) (error "expected"))) (rh-throw (lambda () (throw 'rh-exit 'thrown))) (rh-later (lambda () (setq rh-seen 'later)))) (let ((caught (condition-case nil (run-hooks 'rh-bad 'rh-later) (error t))) (thrown (catch 'rh-exit (run-hooks 'rh-throw 'rh-later)))) (list caught thrown rh-seen (run-hooks 'rh-later) rh-seen)))"#, "(t thrown nil nil later)");
+        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-bad (function (lambda () (garbage-collect) (error "expected")))) (rh-throw (function (lambda () (throw 'rh-exit 'thrown)))) (rh-later (function (lambda () (setq rh-seen 'later))))) (let ((caught (condition-case nil (run-hooks 'rh-bad 'rh-later) (error t))) (thrown (catch 'rh-exit (run-hooks 'rh-throw 'rh-later)))) (list caught thrown rh-seen (run-hooks 'rh-later) rh-seen)))"#, "(t thrown nil nil later)");
     }
     #[test]
     fn real_cycle_reaches_existing_budget_and_recovers() {
-        crate::interpreter::assert_lisp(r#"(let ((rh-count 0) (rh-hooks nil) (rh-stop nil)) (setq rh-hooks (list (lambda () (setq rh-count (1+ rh-count))))) (setcdr rh-hooks rh-hooks) (setq rh-stop (condition-case nil (run-hooks 'rh-hooks) (error 'bounded))) (setcdr rh-hooks nil) (list rh-stop rh-count (run-hooks 'rh-hooks) rh-count))"#, "(bounded 65536 nil 65537)");
+        crate::interpreter::assert_lisp(r#"(let ((rh-count 0) (rh-hooks nil) (rh-stop nil)) (setq rh-hooks (list (function (lambda () (setq rh-count (1+ rh-count)))))) (setcdr rh-hooks rh-hooks) (setq rh-stop (condition-case nil (run-hooks 'rh-hooks) (error 'bounded))) (setcdr rh-hooks nil) (list rh-stop rh-count (run-hooks 'rh-hooks) rh-count))"#, "(bounded 65536 nil 65537)");
     }
     #[test]
     fn ordinary_finite_cases_match_gnu() {
@@ -1516,28 +1516,28 @@ mod run_hooks_shared_tests {
 mod hook_wrapped_tests {
     #[test]
     fn empty_hook_does_not_validate_wrapper_and_raw_entries_are_data() {
-        crate::interpreter::assert_lisp(r#"(let ((hw-empty nil) (hw-entry 42)) (list (run-hook-wrapped 'hw-missing 'undefined-wrapper) (run-hook-wrapped 'hw-empty 99) (run-hook-wrapped 'hw-entry (lambda (fun x) (list fun x)) 'payload)))"#, "(nil nil (42 payload))");
+        crate::interpreter::assert_lisp(r#"(let ((hw-empty nil) (hw-entry 42)) (list (run-hook-wrapped 'hw-missing 'undefined-wrapper) (run-hook-wrapped 'hw-empty 99) (run-hook-wrapped 'hw-entry (function (lambda (fun x) (list fun x))) 'payload)))"#, "(nil nil (42 payload))");
     }
     #[test]
     fn wrapper_receives_original_entry_and_heap_args_then_short_circuits() {
-        crate::interpreter::assert_lisp(r#"(let ((hw-seen nil) (hw-payload (list 'payload)) (hw-hooks '(first second third))) (let ((answer (run-hook-wrapped 'hw-hooks (lambda (fun arg) (garbage-collect) (setq hw-seen (cons fun hw-seen)) (if (eq fun 'second) arg nil)) hw-payload))) (list (eq answer hw-payload) hw-seen)))"#, "(t (second first))");
+        crate::interpreter::assert_lisp(r#"(let ((hw-seen nil) (hw-payload (list 'payload)) (hw-hooks '(first second third))) (let ((answer (run-hook-wrapped 'hw-hooks (function (lambda (fun arg) (garbage-collect) (setq hw-seen (cons fun hw-seen)) (if (eq fun 'second) arg nil))) hw-payload))) (list (eq answer hw-payload) hw-seen)))"#, "(t (second first))");
     }
     #[test]
     fn real_wrapper_invokes_lambda_with_zero_original_arguments() {
-        crate::interpreter::assert_lisp(r#"(let ((hw-hook '(lambda () 'called))) (run-hook-wrapped 'hw-hook (lambda (fun) (garbage-collect) (funcall fun))))"#, "called");
+        crate::interpreter::assert_lisp(r#"(let ((hw-hook '(lambda () 'called))) (run-hook-wrapped 'hw-hook (function (lambda (fun) (garbage-collect) (funcall fun)))))"#, "called");
     }
     #[test]
     fn default_marker_uses_same_wrapper_and_live_tail_reloads() {
-        crate::interpreter::assert_lisp(r#"(let ((hw-hooks '(t first)) (hw-seen nil)) (run-hook-wrapped 'hw-hooks (lambda (fun) (setq hw-seen (cons fun hw-seen)) nil)) hw-seen)"#, "(first first)");
-        crate::interpreter::assert_lisp(r#"(let ((hw-hooks (list 'first 'replaced)) (hw-seen nil)) (run-hook-wrapped 'hw-hooks (lambda (fun) (setq hw-seen (cons fun hw-seen)) (if (eq fun 'first) (setcdr hw-hooks (list 'last))) (garbage-collect) nil)) hw-seen)"#, "(last first)");
+        crate::interpreter::assert_lisp(r#"(let ((hw-hooks '(t first)) (hw-seen nil)) (run-hook-wrapped 'hw-hooks (function (lambda (fun) (setq hw-seen (cons fun hw-seen)) nil))) hw-seen)"#, "(first first)");
+        crate::interpreter::assert_lisp(r#"(let ((hw-hooks (list 'first 'replaced)) (hw-seen nil)) (run-hook-wrapped 'hw-hooks (function (lambda (fun) (setq hw-seen (cons fun hw-seen)) (if (eq fun 'first) (setcdr hw-hooks (list 'last))) (garbage-collect) nil))) hw-seen)"#, "(last first)");
     }
     #[test]
     fn nested_wrappers_keep_original_args_and_throw_error_unwind() {
-        crate::interpreter::assert_lisp(r#"(let ((hw-hook 'entry) (hw-nested nil) (hw-payload (list 'outer))) (let ((answer (run-hook-wrapped 'hw-hook (lambda (fun arg) (setq hw-nested (run-hook-wrapped 'hw-hook (lambda (f x) (garbage-collect) (list f x)) 'inner)) (garbage-collect) arg) hw-payload))) (list (eq answer hw-payload) hw-nested (catch 'hw-exit (run-hook-wrapped 'hw-hook (lambda (f) (throw 'hw-exit 'thrown)))) (condition-case nil (run-hook-wrapped 'hw-hook (lambda (f) (error "expected"))) (error 'caught)) (run-hook-wrapped 'hw-hook (lambda (f) 'recovered)))))"#, "(t (entry inner) thrown caught recovered)");
+        crate::interpreter::assert_lisp(r#"(let ((hw-hook 'entry) (hw-nested nil) (hw-payload (list 'outer))) (let ((answer (run-hook-wrapped 'hw-hook (function (lambda (fun arg) (setq hw-nested (run-hook-wrapped 'hw-hook (function (lambda (f x) (garbage-collect) (list f x))) 'inner)) (garbage-collect) arg)) hw-payload))) (list (eq answer hw-payload) hw-nested (catch 'hw-exit (run-hook-wrapped 'hw-hook (function (lambda (f) (throw 'hw-exit 'thrown))))) (condition-case nil (run-hook-wrapped 'hw-hook (function (lambda (f) (error "expected")))) (error 'caught)) (run-hook-wrapped 'hw-hook (function (lambda (f) 'recovered))))))"#, "(t (entry inner) thrown caught recovered)");
     }
     #[test]
     fn cycle_is_bounded_without_calling_entries() {
-        crate::interpreter::assert_lisp(r#"(let ((hw-hook (list 42)) (hw-count 0) (hw-status nil)) (setcdr hw-hook hw-hook) (setq hw-status (condition-case nil (run-hook-wrapped 'hw-hook (lambda (f) (setq hw-count (1+ hw-count)) nil)) (error 'bounded))) (setcdr hw-hook nil) (list hw-status hw-count (run-hook-wrapped 'hw-hook (lambda (f) f))))"#, "(bounded 65536 42)");
+        crate::interpreter::assert_lisp(r#"(let ((hw-hook (list 42)) (hw-count 0) (hw-status nil)) (setcdr hw-hook hw-hook) (setq hw-status (condition-case nil (run-hook-wrapped 'hw-hook (function (lambda (f) (setq hw-count (1+ hw-count)) nil))) (error 'bounded))) (setcdr hw-hook nil) (list hw-status hw-count (run-hook-wrapped 'hw-hook (function (lambda (f) f)))))"#, "(bounded 65536 42)");
     }
     #[test]
     fn finite_wrapped_contract_matches_gnu() {
