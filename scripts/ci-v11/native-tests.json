@@ -162,5 +162,9 @@
   "fileio::file_directory_owner_tests::owner_default_empty_names_and_directory_links",
   "fileio::file_directory_owner_tests::raw_directory_paths_preserve_bytes",
   "fileio::file_directory_owner_tests::distinct_operation_and_suffix_handlers_survive_gc",
-  "fileio::file_directory_owner_tests::directory_operation_inhibition_errors_and_type_payload"
+  "fileio::file_directory_owner_tests::directory_operation_inhibition_errors_and_type_payload",
+  "fileio::file_readable_linux_tests::effective_read_lookup_follows_links_and_owner_default",
+  "fileio::file_readable_linux_tests::raw_readable_paths_and_invalid_nul_do_not_truncate",
+  "fileio::file_readable_linux_tests::readable_handler_preserves_operation_result_and_gc",
+  "fileio::file_readable_linux_tests::readable_inhibition_errors_and_type_payload"
 ]
