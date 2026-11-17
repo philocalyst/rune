@@ -487,7 +487,7 @@
   "src/library/elprop/strategies.rs": "5c3eeeb8e895e9af0d9d67e1b3a6226b53971d3a7a8bec5e66b5dbe7c2ab7583",
   "src/library/filevercmp.rs": "0278c4ff72faaf04cc6682773290efc02ddba947234ce6e9b45cb077a71c1d62",
   "src/lisp.rs": "ea47b19c0b5c218713b2da295e78f6832e48b7b85542dce013f007f1d9707f7a",
-  "src/lread.rs": "abb221598316797d0979a5a8c4141aa0b2ca508f2e7b060438f6b0dd243f50b4",
+  "src/lread.rs": "380712f84787e694e4880253aa16e5fb557080671039c9b4f891f53cef757c2d",
   "src/macros.rs": "fb3fcfbca9dd0ea8fb1bf06c66bc470efa9d197f9f94443adc1d5e76f9551ada",
   "src/main.rs": "c63d03bd3641a633c08197c430f12b0352536099d5aa921b9ec131163558937a",
   "src/marker.rs": "7afab7230af0a3135dd7b5de17209dac5bd123efe9605aa406662b622aecf0e1",

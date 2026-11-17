@@ -769,9 +769,9 @@ mod test {
         sym::init_symbols();
         root!(env, init(Env::new_isolated(cx).unwrap()), cx);
         crate::core::env::init_variables(cx, env);
-        let path = cx.add(fixture.0.join("callback-error.el").to_string_lossy().to_string());
+        let path: Gc<&LispString> = cx.add(fixture.0.join("callback-error.el").to_string_lossy().to_string()).try_into().unwrap();
         root!(path, cx);
-        env.set_var_context(intern("lifecycle-path", cx), path.bind(cx), cx).unwrap();
+        env.set_var_context(intern("lifecycle-path", cx), path.bind(cx).into(), cx).unwrap();
         load_internal(r#"
             (setq lifecycle-outer-file (list 'outer-file)
                   lifecycle-outer-list (list 'outer-list)
