@@ -1,0 +1,11 @@
+/* NOT runnable: controller must generate a reviewed/pinned absolute path table.
+ * Every file is canonical, immutable, independently hashed, fresh-owned input.
+ * Runtime RO entries include the exact matched loader/library closure, NOT dirs.
+ */
+#error Generate and independently review config.h before any compilation
+#define TARGET_ELF "/UNCONFIGURED/target"
+#define DENIED_ELF "/UNCONFIGURED/denied-target"
+#define ALLOWED_DIR "/UNCONFIGURED/allowed"
+#define DENIED_FILE "/UNCONFIGURED/outside/canary"
+#define TARGET_INTERPRETER "/UNCONFIGURED/loader"
+static const char *const runtime_read_files[]={TARGET_INTERPRETER};

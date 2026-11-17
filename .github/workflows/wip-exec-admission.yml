@@ -1,0 +1,26 @@
+name: WIP fixed synthetic post-exec controls
+on:
+  push:
+    branches: [work/rune-backtrace-untested-20261117]
+permissions:
+  contents: read
+concurrency:
+  group: wip-exec-admission-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  admission:
+    if: github.repository == 'philocalyst/rune' && github.ref == 'refs/heads/work/rune-backtrace-untested-20261117' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Checkout exact event commit without retained credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+      - name: Build and check only fixed synthetic controls
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: /usr/bin/timeout --signal=TERM --kill-after=5s 445s /usr/bin/python3 -I scripts/ci-exec-admission/run.py

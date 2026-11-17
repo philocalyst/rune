@@ -12,9 +12,10 @@ import sys
 
 S=pathlib.Path.cwd().resolve()
 C=S/'scripts/ci-lifecycle'
-BASE_PIN='64c04a2949d0cf45de25b7baab42890a2e3b040cf1ef2e53424e9be56f10d9cb'
+BASE_PIN='82e562fcbc93f38f9855d7964fb2e4f650faf674fd0b75bdd6ed035324ca4e58'
 HELPERS_PIN='8e1effaaa784d79764bec4594775f1bf0c01d05e418e26aab8264366e6f9fb4a'
 OVERLAY={'.github/workflows/wip-lifecycle.yml','docs/wip-lifecycle-scope.md'}|{'scripts/ci-lifecycle/'+n for n in ['run.py','supervisor.py','preflight.py','fixture.py','fault_adapter.py','base-inventory.json','lifecycle-inventory.json']}
+OVERLAY.update(['.github/workflows/wip-exec-admission.yml', 'docs/wip-exec-admission-scope.md', 'scripts/ci-exec-admission/base-inventory.json', 'scripts/ci-exec-admission/helpers/README.md', 'scripts/ci-exec-admission/helpers/case.py', 'scripts/ci-exec-admission/helpers/config.h.example', 'scripts/ci-exec-admission/helpers/launcher.c', 'scripts/ci-exec-admission/helpers/manifest.json', 'scripts/ci-exec-admission/helpers/prepare_config.py', 'scripts/ci-exec-admission/helpers/suite.py', 'scripts/ci-exec-admission/helpers/supervisor.py', 'scripts/ci-exec-admission/helpers/target.c', 'scripts/ci-exec-admission/run.py'])
 OVERLAY.update(['.github/workflows/wip-confinement.yml', 'docs/wip-confinement-scope.md', 'scripts/ci-confinement/run.py', 'scripts/ci-confinement/probe.c', 'scripts/ci-confinement/controller.py', 'scripts/ci-confinement/supervisor.py', 'scripts/ci-confinement/base-inventory.json', 'scripts/ci-confinement/helper-inventory.json'])
 EXPECTED_CASES=['normal','nonzero','group','doublefork','detached','crash','latefork','cancel','admission','cleanup']
 OVERLAY.update(['.github/workflows/wip-gnu-payload.yml', 'docs/wip-gnu-payload-scope.md', 'scripts/ci-gnu-payload/authentication-receipt.json', 'scripts/ci-gnu-payload/base-inventory.json', 'scripts/ci-gnu-payload/debian-archive-keyring.gpg', 'scripts/ci-gnu-payload/extract_static.py', 'scripts/ci-gnu-payload/helper-inventory.json', 'scripts/ci-gnu-payload/packages.json', 'scripts/ci-gnu-payload/payload-inventory.json', 'scripts/ci-gnu-payload/run.py', 'scripts/ci-gnu-payload/verify_auth.py'])
