@@ -289,12 +289,14 @@ fn find_file_name_handler_internal<'ob>(
 }
 
 #[defun]
-fn file_symlink_p<'ob>(filename: &str, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+fn file_symlink_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    // Mutable-context defuns receive rooted arguments. Copy before any callback.
+    let filename = <&str>::try_from(filename.bind(cx))?.to_owned();
     use crate::core::{env::{CallFrame, intern}, object::Function};
     use rune_core::macros::root;
     // Use the current owner/buffer binding. Unsupported relative bases fail
     // closed rather than silently resolving against the host cwd.
-    let expanded = if Path::new(filename).is_absolute() {
+    let expanded = if Path::new(&filename).is_absolute() {
         filename.to_owned()
     } else {
         let directory = symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?;
@@ -302,14 +304,14 @@ fn file_symlink_p<'ob>(filename: &str, env: &mut Rt<Env>, cx: &'ob mut Context) 
             return Err(TypeError::new(Type::String, directory).into());
         };
         ensure!(Path::new(&**directory).is_absolute(), "Relative default-directory is unsupported for file-symlink-p");
-        expand_file_name(filename, Some(&directory), env, cx)?
+        expand_file_name(&filename, Some(&directory), env, cx)?
     };
     let operation = intern("file-symlink-p", cx);
     if let Some(handler) = find_file_name_handler_internal(&expanded, operation, env, cx) {
         let target: Function = Object::from(handler).try_into()?;
         root!(target, cx);
         let mut frame = CallFrame::new(env);
-        frame.push_arg(operation.into());
+        frame.push_arg(Object::from(operation));
         frame.push_arg(cx.add(expanded));
         return target.call(&mut frame, None, cx).map_err(Into::into);
     }
@@ -1206,6 +1208,12 @@ mod symlink_target_tests {
     use crate::core::gc::RootSet;
     use rune_core::macros::root;
 
+    fn query<'ob>(filename: &str, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+        let filename = cx.add(filename);
+        root!(filename, cx);
+        super::file_symlink_p(filename, env, cx)
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_targets_preserve_relative_absolute_dangling_and_no_follow() -> Result<()> {
@@ -1224,14 +1232,14 @@ mod symlink_target_tests {
             symlink("cycle", dir.join("cycle"))?;
             env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.to_str().unwrap()))?;
             for (name, expected) in [("relative", "plain"), ("dangling", "missing-target"), ("chain", "relative"), ("cycle", "cycle")] {
-                let actual = file_symlink_p(name, env, cx)?;
+                let actual = query(name, env, cx)?;
                 assert_eq!(<&str>::try_from(actual)?, expected);
             }
-            let actual = file_symlink_p("absolute", env, cx)?;
+            let actual = query("absolute", env, cx)?;
             assert_eq!(<&str>::try_from(actual)?, dir.join("plain").to_str().unwrap());
-            for name in ["plain", "missing", "."] { assert!(file_symlink_p(name, env, cx)?.is_nil()); }
+            for name in ["plain", "missing", "."] { assert!(query(name, env, cx)?.is_nil()); }
             let absolute = dir.join("relative");
-            assert_eq!(<&str>::try_from(file_symlink_p(absolute.to_str().unwrap(), env, cx)?)?, "plain");
+            assert_eq!(<&str>::try_from(query(absolute.to_str().unwrap(), env, cx)?)?, "plain");
             assert_eq!(std::fs::read_to_string(dir.join("plain"))?, "untouched");
             Ok(())
         })();
@@ -1248,7 +1256,7 @@ mod symlink_target_tests {
         let path = std::env::temp_dir().join(format!("rune-symlink-bytes-{}-{}", std::process::id(), rand::random::<u64>()));
         symlink(std::ffi::OsStr::from_bytes(b"raw-\xff"), &path)?;
         let result = (|| -> Result<()> {
-            let actual = file_symlink_p(path.to_str().unwrap(), env, cx)?;
+            let actual = query(path.to_str().unwrap(), env, cx)?;
             let ObjectType::ByteString(actual) = actual.untag() else { panic!("raw target must remain bytes") };
             assert_eq!(&**actual, b"raw-\xff"); Ok(())
         })();

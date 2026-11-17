@@ -1,8 +1,8 @@
 {
-  "authentication-receipt.json": "b1e75e03cd46c228ae172b65de986de95e7f92bf316d08f10aff3205c5a9d8ce",
+  "authentication-receipt.json": "15f5b5d0fcacac79a1f3a61406f9de99003fa8e0fd7249240c130941d4a17d97",
   "debian-archive-keyring.gpg": "506b815cbb32d9b6066b4a2aa524071e071761e7e7f68c3ac74f3061ba852017",
-  "extract_static.py": "a7e1ce20460a5a818cf9e065184ceb8864e15ba722227f2f0cdbdb6d5ebb8bd8",
+  "extract_static.py": "5fa71196d1ad0c92407b08c95309645611e73511c324941c7f0ef2eec7bf993b",
   "packages.json": "eb1f62d2d894419f8792a52f1b41db7fecf0b761bcb24ac52a987be767797441",
   "payload-inventory.json": "09b5580652e007149f550fbb02feb0350dcc2274ebe05ff1605125230c16e7fd",
-  "verify_auth.py": "987ae2eb1af9159236bf531fd583b3748678800faf8ba81cb1c9aa27b15c03ae"
+  "verify_auth.py": "971d74d89b9f9523870281e13432472415791c47401edb033a8f41b99e95b739"
 }

@@ -1,8 +1,8 @@
 {
-  "checked_at": "2026-11-17T07:06:20.559992+00:00",
-  "release_date": "2026-11-17 02:08:53+00:00",
-  "valid_until": "2026-11-24 02:08:53+00:00",
-  "inrelease_sha256": "933990236b8b8a1e39957362d361f92cd9fca8ccd13c0443f653762de1f70a4e",
+  "checked_at": "2026-11-17T08:48:57.997031+00:00",
+  "release_date": "2026-11-17 08:11:15+00:00",
+  "valid_until": "2026-11-24 08:11:15+00:00",
+  "inrelease_sha256": "2925561eb935754c05d261fbd7ace3ced4fd83e9507d6ee1226e3ef788f25d4a",
   "keyring_sha256": "506b815cbb32d9b6066b4a2aa524071e071761e7e7f68c3ac74f3061ba852017",
   "packages_xz_sha256": "b74b5bbca6f4701df6c5db54793a68449fb267ac10a9314e761b972ac63b3760",
   "packages": [

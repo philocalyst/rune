@@ -465,7 +465,7 @@
   "src/face_attributes/font_runs.rs": "b766f83c2b6afe66d15010a4f4cc1f72c9ab98c0bad112d643783c0514b034d2",
   "src/face_attributes/publication.rs": "1f335003e5faea4f6619da62f76bd4657856cb31bb9637021f7ab070eef77f9e",
   "src/file_access.rs": "3baa3f901929c307214439b0bce8c14223cca1c0613a4295f62ae7b9d3c6038e",
-  "src/fileio.rs": "c71c7691baba9307e2941ef5d0bf033f389bb114f1babedc066d621c45c9804c",
+  "src/fileio.rs": "178f3faea4b0bf5d890ee3a9fe4fd94629f300dcc0685b67ae5c618130f9201a",
   "src/filelock.rs": "39bced1d6d78ad6fbb43b7ce09ecd43fb661194a4359eb7d029992f44ab8a0d2",
   "src/floatfns.rs": "4869cd26c8df88fe35120626cee56dac1005e1d82a9eba375c4a548feb409854",
   "src/fns.rs": "4acdd5ad2ee24080661037322e9d952daf105d75341c59e345cd1ef61523db3d",

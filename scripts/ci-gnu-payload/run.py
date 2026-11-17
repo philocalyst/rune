@@ -2,11 +2,11 @@
 """Hosted authenticated Debian data-only acquisition; NEVER GNU execution."""
 import datetime,hashlib,json,os,pathlib,re,resource,shutil,signal,stat,subprocess,time
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-gnu-payload'
-BASE_PIN='519ca77bb85b6139279c46dc6e7126234c2f5c4358df80200659b3be32033b4f'
-HELPERS_PIN='866c2b498bfe18a25a6903b860a0664c21a2e2f78c0acb724befb8f47c9f9363'
+BASE_PIN='eb26285178e7d330d1254d7350e1a898dc7831f1a124e4992d9a170dd5287a73'
+HELPERS_PIN='e840ae751aac854ba955643505fb9c740103a1c50b169381ce0006665532ac10'
 OVERLAY=set(['.github/workflows/wip-gnu-payload.yml', 'docs/wip-gnu-payload-scope.md', 'scripts/ci-gnu-payload/authentication-receipt.json', 'scripts/ci-gnu-payload/base-inventory.json', 'scripts/ci-gnu-payload/debian-archive-keyring.gpg', 'scripts/ci-gnu-payload/extract_static.py', 'scripts/ci-gnu-payload/helper-inventory.json', 'scripts/ci-gnu-payload/packages.json', 'scripts/ci-gnu-payload/payload-inventory.json', 'scripts/ci-gnu-payload/run.py', 'scripts/ci-gnu-payload/verify_auth.py'])
 OVERLAY.update(['.github/workflows/wip-gnu-closure.yml', 'docs/wip-gnu-closure-scope.md', 'scripts/ci-gnu-closure/base-inventory.json', 'scripts/ci-gnu-closure/helper-inventory.json', 'scripts/ci-gnu-closure/inspect.py', 'scripts/ci-gnu-closure/run.py'])
-RELEASE_PIN='933990236b8b8a1e39957362d361f92cd9fca8ccd13c0443f653762de1f70a4e'
+RELEASE_PIN='2925561eb935754c05d261fbd7ace3ced4fd83e9507d6ee1226e3ef788f25d4a'
 INDEX_PIN='b74b5bbca6f4701df6c5db54793a68449fb267ac10a9314e761b972ac63b3760'
 def sha(p):
  h=hashlib.sha256()
