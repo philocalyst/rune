@@ -150,5 +150,8 @@
   "fileio::local_directory_conversion_tests::lisp_directory_conversion_composition",
   "fileio::filename_concat_filter_tests::empty_and_nil_components_do_not_create_slashes",
   "fileio::filename_concat_filter_tests::absolute_components_and_dot_segments_remain_lexical",
-  "fileio::filename_concat_filter_tests::invalid_components_signal_stringp_with_original_operand"
+  "fileio::filename_concat_filter_tests::invalid_components_signal_stringp_with_original_operand",
+  "fileio::directory_predicate_byte_tests::raw_bytes_use_only_final_separator_without_decoding",
+  "fileio::directory_predicate_byte_tests::string_predicate_is_lexical_for_empty_unicode_and_dot_names",
+  "fileio::directory_predicate_byte_tests::nonstrings_signal_exact_stringp_payload"
 ]

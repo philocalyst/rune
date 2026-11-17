@@ -325,8 +325,18 @@ fn file_name_nondirectory<'ob>(filename: Object, env: &mut Rt<Env>, cx: &'ob Con
 
 /// Return non-nil if NAME ends with a directory separator character.
 #[defun]
-fn directory_name_p(name: &str) -> bool {
-    name.ends_with(MAIN_SEPARATOR)
+fn directory_name_p(name: Object, env: &mut Rt<Env>, cx: &Context) -> Result<bool> {
+    // GNU checks the last stored byte, not filesystem state or decoded text.
+    // Empty names are not directory names; both Lisp string kinds are valid.
+    match name.untag() {
+        ObjectType::String(text) => Ok(text.as_bytes().last() == Some(&(MAIN_SEPARATOR as u8))),
+        ObjectType::ByteString(bytes) => Ok(bytes.last() == Some(&(MAIN_SEPARATOR as u8))),
+        _ => {
+            env.initialize_condition_metadata(cx);
+            let data = list![sym::STRINGP, name; cx];
+            Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into())
+        }
+    }
 }
 
 defvar!(FILE_NAME_HANDLER_ALIST);
@@ -1562,6 +1572,43 @@ mod filename_concat_filter_tests {
         crate::interpreter::assert_lisp(
             r#"(list (condition-case err (file-name-concat 3) (wrong-type-argument err)) (condition-case err (file-name-concat nil "" 7) (wrong-type-argument err)) (condition-case err (file-name-concat "base" t) (wrong-type-argument err)))"#,
             "((wrong-type-argument stringp 3) (wrong-type-argument stringp 7) (wrong-type-argument stringp t))",
+        );
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod directory_predicate_byte_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+
+    #[test]
+    fn raw_bytes_use_only_final_separator_without_decoding() -> Result<()> {
+        let roots = RootSet::default(); let cx = &Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        for (bytes, expected) in [
+            (b"".as_slice(), false), (b"/".as_slice(), true),
+            (b"raw-\xff/".as_slice(), true), (b"raw-\xff".as_slice(), false),
+            (b"a/\0".as_slice(), false), (b"a\0/".as_slice(), true),
+            (b"a\\".as_slice(), false),
+        ] { assert_eq!(directory_name_p(cx.add(bytes.to_vec()), env, cx)?, expected); }
+        Ok(())
+    }
+
+    #[test]
+    fn string_predicate_is_lexical_for_empty_unicode_and_dot_names() {
+        crate::interpreter::assert_lisp(
+            r#"(list (directory-name-p "") (directory-name-p "/") (directory-name-p "//") (directory-name-p "é/") (directory-name-p "é") (directory-name-p "./") (directory-name-p "..") (directory-name-p "missing/"))"#,
+            "(nil t t t nil t nil t)",
+        );
+    }
+
+    #[test]
+    fn nonstrings_signal_exact_stringp_payload() {
+        crate::interpreter::assert_lisp(
+            r#"(list (condition-case err (directory-name-p 3) (wrong-type-argument err)) (condition-case err (directory-name-p nil) (wrong-type-argument err)) (condition-case err (directory-name-p '(x)) (wrong-type-argument err)))"#,
+            "((wrong-type-argument stringp 3) (wrong-type-argument stringp nil) (wrong-type-argument stringp (x)))",
         );
     }
 }
