@@ -1,0 +1,25 @@
+name: WIP normal bootstrap diagnostic
+on:
+  push:
+    branches: [work/rune-backtrace-untested-20261117]
+permissions:
+  contents: read
+concurrency:
+  group: wip-bootstrap-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  bootstrap:
+    if: github.repository == 'philocalyst/rune' && github.ref == 'refs/heads/work/rune-backtrace-untested-20261117' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # official v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+      - name: Admit sandbox, build normal CLI, diagnose bundled bootstrap
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: python3 scripts/ci-bootstrap/run.py

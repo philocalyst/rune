@@ -5,6 +5,7 @@ S=pathlib.Path.cwd().resolve(); C=S/'scripts/ci-v11'
 TESTS_PIN='a95e3b99ef850a7ca1c8452e938e3108b375a28f9c7042f1166a8e1568bcdad6'
 SOURCE_PIN='45a8e02823165863105a9649589a8fc7f5259b54e00d337d8627f72553ab487a'
 EXTRAS={'.github/workflows/wip-v11-native.yml','scripts/ci-v11/run.py','scripts/ci-v11/source-inventory.json','scripts/ci-v11/native-tests.json','docs/wip-v11-ci-scope.md'}
+EXTRAS.update(['.github/workflows/wip-bootstrap.yml', 'scripts/ci-bootstrap/run.py', 'scripts/ci-bootstrap/check-sandbox.py', 'scripts/ci-bootstrap/checkpoint.el', 'docs/wip-bootstrap-scope.md'])
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def save(p,v):p.write_text(json.dumps(v,indent=2)+'\n')
 def verify():
