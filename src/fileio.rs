@@ -187,43 +187,44 @@ fn file_name_absolute_p(filename: &str) -> bool {
     path.is_absolute()
 }
 
-/// Returns the directory part of `filename`, as a directory name, or nil if filename does not include a directory part.
-#[defun]
-fn file_name_directory(filename: &str) -> Option<String> {
-    // TODO: GNU Emacs docs stipulate that "On MS-DOS [ed: presumably windows,
-    // too] it can also end in a colon."
-    if !filename.contains(MAIN_SEPARATOR) {
-        return None;
+/// Local filename syntax only: split at the last native separator without
+/// Path component normalization. In particular, retain . and .. for file-truename.
+/// Existing file-name-handler and DOS drive-syntax support is not extended here.
+fn filename_component<'ob>(filename: Object, directory: bool, cx: &'ob Context) -> Result<Object<'ob>> {
+    fn split(bytes: &[u8]) -> Option<usize> {
+        bytes.iter().rposition(|&byte| byte == MAIN_SEPARATOR as u8).map(|index| index + 1)
     }
-
-    if filename.ends_with(MAIN_SEPARATOR) {
-        return Some(filename.into());
+    match filename.untag() {
+        ObjectType::String(text) => {
+            let end = split(text.as_bytes());
+            if directory {
+                Ok(end.map_or(NIL.into(), |end| cx.add(&text[..end])))
+            } else {
+                Ok(cx.add(&text[end.unwrap_or(0)..]))
+            }
+        }
+        ObjectType::ByteString(bytes) => {
+            let end = split(&bytes);
+            if directory {
+                Ok(end.map_or(NIL.into(), |end| cx.add(bytes[..end].to_vec())))
+            } else {
+                Ok(cx.add(bytes[end.unwrap_or(0)..].to_vec()))
+            }
+        }
+        _ => Err(TypeError::new(Type::String, filename).into()),
     }
-
-    let path = Path::new(filename);
-    let parent = path.parent()?;
-
-    // Special case for root path so we don't end up returning '//'
-    if parent.parent().is_none() {
-        return Some(format!("{MAIN_SEPARATOR}"));
-    }
-    let parent_path = parent.to_str()?;
-    Some(format!("{parent_path}{MAIN_SEPARATOR}"))
 }
 
-/// Returns the non-directory part of `filename`
+/// Return the lexical directory prefix, including its final separator, or nil.
 #[defun]
-fn file_name_nondirectory(filename: &str) -> &str {
-    if filename.ends_with(MAIN_SEPARATOR) {
-        return "";
-    }
+fn file_name_directory<'ob>(filename: Object, cx: &'ob Context) -> Result<Object<'ob>> {
+    filename_component(filename, true, cx)
+}
 
-    let path = Path::new(filename);
-    let Some(file_name) = path.file_name() else {
-        return "";
-    };
-
-    file_name.to_str().unwrap()
+/// Return everything after the final separator, retaining dot components.
+#[defun]
+fn file_name_nondirectory<'ob>(filename: Object, cx: &'ob Context) -> Result<Object<'ob>> {
+    filename_component(filename, false, cx)
 }
 
 /// Return non-nil if NAME ends with a directory separator character.
@@ -1284,6 +1285,61 @@ mod symlink_target_tests {
         crate::interpreter::assert_lisp(
             r#"(progn (defalias 'rune-symlink-lexical-handler (function (lambda (op name) 'handled))) (eval '(let ((file-name-handler-alist '(("rune-symlink-lexical" . rune-symlink-lexical-handler))) (inhibit-file-name-handlers '(rune-symlink-lexical-handler))) (list (let ((inhibit-file-name-operation 'file-symlink-p)) (file-symlink-p "/rune-symlink-lexical/missing")) (let ((inhibit-file-name-operation 'file-exists-p)) (file-symlink-p "/rune-symlink-lexical/missing")) (let ((default-directory "relative-base/")) (condition-case nil (file-symlink-p "local") (error 'rejected))))) t))"#,
             "(nil handled rejected)",
+        );
+    }
+}
+
+#[cfg(test)]
+mod lexical_filename_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_split_preserves_dot_components_and_repeated_separators() -> Result<()> {
+        let roots = RootSet::default(); let cx = Context::new(&roots);
+        for (name, directory, basename) in [
+            ("", None, ""), ("plain", None, "plain"), (".", None, "."), ("..", None, ".."),
+            ("/", Some("/"), ""), ("//", Some("//"), ""),
+            ("a/.", Some("a/"), "."), ("a/..", Some("a/"), ".."),
+            ("a//b", Some("a//"), "b"), ("./a", Some("./"), "a"),
+            ("../a/", Some("../a/"), ""), ("/a/../b", Some("/a/../"), "b"),
+            ("é/文", Some("é/"), "文"), ("a\\b", None, "a\\b"),
+        ] {
+            let input = cx.add(name);
+            let actual = file_name_directory(input, &cx)?;
+            match directory {
+                None => assert!(actual.is_nil(), "{name}"),
+                Some(expected) => assert_eq!(<&str>::try_from(actual)?, expected, "{name}"),
+            }
+            assert_eq!(<&str>::try_from(file_name_nondirectory(input, &cx)?)?, basename, "{name}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unibyte_splits_preserve_non_utf8_bytes_and_string_kind() -> Result<()> {
+        let roots = RootSet::default(); let cx = Context::new(&roots);
+        for (input, prefix, suffix) in [
+            (b"raw-\xff/leaf-\xfe".as_slice(), b"raw-\xff/".as_slice(), b"leaf-\xfe".as_slice()),
+            (b"a/".as_slice(), b"a/".as_slice(), b"".as_slice()),
+        ] {
+            let input = cx.add(input.to_vec());
+            for (actual, expected) in [(file_name_directory(input, &cx)?, prefix), (file_name_nondirectory(input, &cx)?, suffix)] {
+                let ObjectType::ByteString(bytes) = actual.untag() else { panic!("unibyte representation changed") };
+                assert_eq!(&**bytes, expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lisp_truename_dot_tests_and_type_errors() {
+        crate::interpreter::assert_lisp(
+            r#"(list (equal (file-name-nondirectory "link/..") "..") (equal (file-name-nondirectory "link/.") ".") (file-name-directory "a//../leaf") (condition-case nil (file-name-directory 3) (wrong-type-argument 'rejected)) (condition-case nil (file-name-nondirectory nil) (wrong-type-argument 'rejected)))"#,
+            r#"(t t "a//../" rejected rejected)"#,
         );
     }
 }

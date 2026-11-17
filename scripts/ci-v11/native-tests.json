@@ -137,5 +137,8 @@
   "fileio::symlink_target_tests::handler_receives_operation_expanded_name_and_propagates_return",
   "fileio::symlink_target_tests::handler_inhibition_is_per_operation_and_errors_propagate",
   "fileio::tests::test_find_file_name_handler_inhibit_handlers",
-  "fileio::symlink_target_tests::lexical_inhibition_is_special_and_relative_default_fails_closed"
+  "fileio::symlink_target_tests::lexical_inhibition_is_special_and_relative_default_fails_closed",
+  "fileio::lexical_filename_tests::unix_split_preserves_dot_components_and_repeated_separators",
+  "fileio::lexical_filename_tests::unibyte_splits_preserve_non_utf8_bytes_and_string_kind",
+  "fileio::lexical_filename_tests::lisp_truename_dot_tests_and_type_errors"
 ]
