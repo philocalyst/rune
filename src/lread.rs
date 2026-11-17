@@ -581,7 +581,7 @@ mod test {
           (setq integrity-fallback (or (require 'integrity-wanted integrity-file-missing t) 'fallback))
           (setq integrity-required
             (condition-case nil (require 'integrity-wanted integrity-file-missing) (error 'caught)))
-        "#, "(and (null integrity-explicit) (null integrity-implicit) (eq integrity-fallback 'fallback) (eq integrity-required 'caught) (not (featurep 'integrity-wanted)))");
+        "#, "(and (null integrity-explicit) (null integrity-implicit) (eq integrity-fallback 'fallback) (eq integrity-required 'caught) (null (featurep 'integrity-wanted)))");
     }
 
     #[test]
@@ -617,7 +617,7 @@ mod test {
                 (condition-case nil (require 'integrity-wanted integrity-file-error {noerror}) (error 'caught)))
               (setq integrity-reader-result
                 (condition-case nil (require 'integrity-wanted integrity-file-broken {noerror}) (error 'caught)))
-            "#), "(and integrity-ran (eq integrity-eval-result 'caught) (eq integrity-reader-result 'caught) (not (featurep 'integrity-wanted)) (null load-file-name))");
+            "#), "(and integrity-ran (eq integrity-eval-result 'caught) (eq integrity-reader-result 'caught) (null (featurep 'integrity-wanted)) (null load-file-name))");
         }
     }
 
@@ -634,7 +634,7 @@ mod test {
           (setq integrity-uninterned (make-symbol "integrity-uninterned"))
           (setq integrity-returned (require integrity-uninterned integrity-file-uninterned))
           (garbage-collect)
-        "#, "(and (eq integrity-returned integrity-uninterned) (featurep integrity-uninterned) (not (featurep 'integrity-uninterned)))");
+        "#, "(and (eq integrity-returned integrity-uninterned) (featurep integrity-uninterned) (null (featurep 'integrity-uninterned)))");
     }
 
     #[test]
