@@ -174,5 +174,9 @@
   "fileio::file_writable_linux_tests::writable_existing_or_creatable_without_creating_files",
   "fileio::file_writable_linux_tests::raw_missing_child_parent_and_nul_are_byte_exact",
   "fileio::file_writable_linux_tests::handler_receives_writable_operation_and_keeps_suffix_after_gc",
-  "fileio::file_writable_linux_tests::handler_inhibition_errors_and_type_payload_remain_distinct"
+  "fileio::file_writable_linux_tests::handler_inhibition_errors_and_type_payload_remain_distinct",
+  "fileio::file_regular_local_tests::regular_files_follow_links_and_exclude_directories_and_fifo",
+  "fileio::file_regular_local_tests::raw_regular_paths_keep_bytes_and_handler_limit",
+  "fileio::file_regular_local_tests::regular_handler_receives_converted_suffix_and_roots_after_gc",
+  "fileio::file_regular_local_tests::regular_inhibition_errors_and_type_payload_are_operation_specific"
 ]

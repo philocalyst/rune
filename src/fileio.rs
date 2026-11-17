@@ -474,8 +474,14 @@ fn file_writable_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<En
     local_file_predicate(filename, LocalFilePredicate::Writable, env, cx)
 }
 
+/// Regular local file classification; follows symlinks without opening content.
+#[defun]
+fn file_regular_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    local_file_predicate(filename, LocalFilePredicate::Regular, env, cx)
+}
+
 #[derive(Clone, Copy)]
-enum LocalFilePredicate { Exists, Directory, Readable, AccessibleDirectory, Writable }
+enum LocalFilePredicate { Exists, Directory, Readable, AccessibleDirectory, Writable, Regular }
 
 fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalFilePredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
@@ -492,12 +498,13 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
         LocalFilePredicate::Readable => "file-readable-p",
         LocalFilePredicate::AccessibleDirectory => "file-accessible-directory-p",
         LocalFilePredicate::Writable => "file-writable-p",
+        LocalFilePredicate::Regular => "file-regular-p",
     };
-    // GNU directory lookup applies directory-file-name after expansion, unlike
+    // GNU directory and regular-file lookup apply directory-file-name after expansion, unlike
     // existence lookup. Local Unix suffix conversion only: magic-name handlers
     // for directory-file-name itself remain an existing unsupported feature.
     #[cfg(unix)]
-    if matches!(predicate, LocalFilePredicate::Directory) && !(bytes.len() == 2 && bytes[0] == b'/') {
+    if matches!(predicate, LocalFilePredicate::Directory | LocalFilePredicate::Regular) && !(bytes.len() == 2 && bytes[0] == b'/') {
         while bytes.len() > 1 && bytes.last() == Some(&b'/') { bytes.pop(); }
     }
     // The existing regex handler engine accepts UTF-8 only. Never silently
@@ -530,6 +537,7 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
         LocalFilePredicate::Readable => effective_readable_access(&path)?,
         LocalFilePredicate::AccessibleDirectory => effective_directory_access(&path)?,
         LocalFilePredicate::Writable => effective_writable_access(&path)?,
+        LocalFilePredicate::Regular => std::fs::metadata(&path).is_ok_and(|value| value.is_file()),
     };
     Ok(result.into())
 }
@@ -2183,6 +2191,85 @@ mod file_writable_linux_tests {
         crate::interpreter::assert_lisp(
             r#"(progn (defalias 'rune-writable-error (function (lambda (op name) (signal 'error '("writable-handler"))))) (let ((file-name-handler-alist '(("rune-writable-absent" . rune-writable-error))) (inhibit-file-name-handlers '(rune-writable-error))) (list (let ((inhibit-file-name-operation 'file-writable-p)) (file-writable-p "/rune-writable-absent/missing-parent/child")) (let ((inhibit-file-name-operation 'file-readable-p)) (condition-case err (file-writable-p "/rune-writable-absent/missing-parent/child") (error err))) (condition-case err (file-writable-p 3) (wrong-type-argument err)))))"#,
             r#"(nil (error "writable-handler") (wrong-type-argument stringp 3))"#,
+        );
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod file_regular_local_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+
+    #[test]
+    fn regular_files_follow_links_and_exclude_directories_and_fifo() -> Result<()> {
+        use std::os::unix::{ffi::OsStrExt, fs::symlink};
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-regular-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            std::fs::write(dir.join("plain"), "kept")?;
+            std::fs::create_dir(dir.join("child"))?;
+            symlink("plain", dir.join("link"))?;
+            symlink("child", dir.join("dir-link"))?;
+            symlink("missing", dir.join("dangling"))?;
+            symlink("loop", dir.join("loop"))?;
+            let fifo = std::ffi::CString::new(dir.join("pipe").as_os_str().as_bytes())?;
+            // SAFETY: owned NUL-terminated fixture pathname lives through mkfifo.
+            // Nothing opens the FIFO; the predicate must classify without blocking.
+            ensure!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } == 0, "Cannot create FIFO fixture");
+            env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.to_str().unwrap()))?;
+            for (name, expected) in [("plain", true), ("plain/", true), ("link", true),
+                ("child", false), ("dir-link", false), ("", false), ("pipe", false),
+                ("dangling", false), ("loop", false), ("missing", false)] {
+                let name = cx.add(name); root!(name, cx);
+                assert_eq!(!file_regular_p(name, env, cx)?.is_nil(), expected);
+            }
+            assert_eq!(std::fs::read_to_string(dir.join("plain"))?, "kept");
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn raw_regular_paths_keep_bytes_and_handler_limit() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-regular-raw-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            let path = dir.join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+            std::fs::write(&path, "kept")?;
+            let mut bytes = path.as_os_str().as_bytes().to_vec(); bytes.extend_from_slice(b"///");
+            let name = cx.add(bytes); root!(name, cx);
+            assert!(!file_regular_p(name, env, cx)?.is_nil());
+            let invalid = cx.add(b"invalid\0suffix".to_vec()); root!(invalid, cx);
+            assert!(file_regular_p(invalid, env, cx).is_err());
+            env.set_var(sym::FILE_NAME_HANDLER_ALIST, list![NIL; cx])?;
+            assert!(file_regular_p(name, env, cx).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn regular_handler_receives_converted_suffix_and_roots_after_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-regular-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-regular-handler/") (file-name-handler-alist '(("/" . rune-regular-handler)))) (list (file-regular-p "./virtual///") (file-regular-p "/") (file-regular-p "//"))))"#,
+            r#"((file-regular-p "/rune-regular-handler/virtual") (file-regular-p "/") (file-regular-p "//"))"#,
+        );
+    }
+
+    #[test]
+    fn regular_inhibition_errors_and_type_payload_are_operation_specific() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-regular-error (function (lambda (op name) (signal 'error '("regular-handler"))))) (let ((file-name-handler-alist '(("rune-regular-absent" . rune-regular-error))) (inhibit-file-name-handlers '(rune-regular-error))) (list (let ((inhibit-file-name-operation 'file-regular-p)) (file-regular-p "/rune-regular-absent/missing")) (let ((inhibit-file-name-operation 'file-directory-p)) (condition-case err (file-regular-p "/rune-regular-absent/missing") (error err))) (condition-case err (file-regular-p 3) (wrong-type-argument err)))))"#,
+            r#"(nil (error "regular-handler") (wrong-type-argument stringp 3))"#,
         );
     }
 }
