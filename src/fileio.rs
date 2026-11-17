@@ -197,7 +197,7 @@ fn call_expand_handler<'ob>(handler: &crate::core::gc::Rto<Object>, name: &crate
     }
 }
 
-/// Lisp/existence/readability/executable handler stages; other native callers remain separately scoped.
+/// Lisp/existence/readability/executable/writable handler stages; other native callers remain separately scoped.
 #[defun(name = "expand-file-name")]
 fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory: Option<&crate::core::gc::Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::env::intern;
@@ -245,7 +245,7 @@ fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory
     expand_file_name_lisp(name.bind(cx), Some(supplied.bind(cx)), env, cx)
 }
 
-// Bounded lexical core. Native predicates other than file-exists-p/file-readable-p/file-executable-p still use
+// Bounded lexical core. Native predicates other than file-exists-p/file-readable-p/file-executable-p/file-writable-p still use
 // this directly; their expansion-handler stage remains separately unqualified.
 fn expand_file_name_lisp<'ob>(name: Object, default_directory: Option<Object>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
     #[cfg(not(unix))]
@@ -579,9 +579,9 @@ pub(crate) fn executable_file_predicate<'ob>(filename: &crate::core::gc::Rto<Obj
 fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalFilePredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
     use rune_core::macros::root;
-    // Qualify expansion dispatch for existence/readability/executability. Other predicates retain
+    // Qualify expansion dispatch for existence/readability/executability/writability. Other predicates retain
     // their separately scoped lexical path until their callbacks are qualified.
-    let expanded = if matches!(predicate, LocalFilePredicate::Exists | LocalFilePredicate::Readable | LocalFilePredicate::Executable) {
+    let expanded = if matches!(predicate, LocalFilePredicate::Exists | LocalFilePredicate::Readable | LocalFilePredicate::Executable | LocalFilePredicate::Writable) {
         expand_file_name_dispatch(filename, None, env, cx)?
     } else {
         expand_file_name_lisp(filename.bind(cx), None, env, cx)?
@@ -2289,7 +2289,7 @@ mod file_writable_linux_tests {
     #[test]
     fn handler_receives_writable_operation_and_keeps_suffix_after_gc() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-writable-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-writable-handler/") (file-name-handler-alist '(("rune-writable-handler" . rune-writable-handler)))) (file-writable-p "./virtual/")))"#,
+            r#"(progn (defalias 'rune-writable-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-writable-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (garbage-collect) (list op name)))))) (let ((default-directory "/rune-writable-handler/") (file-name-handler-alist '(("rune-writable-handler" . rune-writable-handler)))) (file-writable-p "./virtual/")))"#,
             r#"(file-writable-p "/rune-writable-handler/virtual/")"#,
         );
     }
@@ -2297,7 +2297,7 @@ mod file_writable_linux_tests {
     #[test]
     fn handler_inhibition_errors_and_type_payload_remain_distinct() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-writable-error (function (lambda (op name) (signal 'error '("writable-handler"))))) (let ((file-name-handler-alist '(("rune-writable-absent" . rune-writable-error))) (inhibit-file-name-handlers '(rune-writable-error))) (list (let ((inhibit-file-name-operation 'file-writable-p)) (file-writable-p "/rune-writable-absent/missing-parent/child")) (let ((inhibit-file-name-operation 'file-readable-p)) (condition-case err (file-writable-p "/rune-writable-absent/missing-parent/child") (error err))) (condition-case err (file-writable-p 3) (wrong-type-argument err)))))"#,
+            r#"(progn (defalias 'rune-writable-error (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-writable-error inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (signal 'error '("writable-handler"))))))) (let ((file-name-handler-alist '(("rune-writable-absent" . rune-writable-error))) (inhibit-file-name-handlers '(rune-writable-error))) (list (let ((inhibit-file-name-operation 'file-writable-p)) (file-writable-p "/rune-writable-absent/missing-parent/child")) (let ((inhibit-file-name-operation 'file-readable-p)) (condition-case err (file-writable-p "/rune-writable-absent/missing-parent/child") (error err))) (condition-case err (file-writable-p 3) (wrong-type-argument err)))))"#,
             r#"(nil (error "writable-handler") (wrong-type-argument stringp 3))"#,
         );
     }
@@ -2595,3 +2595,53 @@ mod executable_handler_pipeline_tests {
         std::fs::remove_dir_all(&dir)?; result
     }
 }
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod writable_expansion_dispatch_tests {
+    #[test]
+    fn expansion_precedes_resolved_operation_once_across_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-writable-stage-log nil) (defalias 'rune-writable-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-writable-stage-log (cons (list op name base) rune-writable-stage-log)) "/RESOLVED/target"))) (defalias 'rune-writable-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-writable-stage-log (cons (list op name) rune-writable-stage-log)) 'writable-answer))) (let ((rune-writable-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-writable-expand-stage) ("RESOLVED" . rune-writable-resolved-stage)))) (list (file-writable-p "MAGIC/leaf") rune-writable-stage-log)))"#,
+            r#"(writable-answer ((file-writable-p "/RESOLVED/target") (expand-file-name "MAGIC/leaf" nil)))"#,
+        );
+    }
+
+    #[test]
+    fn operation_inhibition_does_not_suppress_expansion_stage() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-writable-inhibit-log nil) (defalias 'rune-writable-inhibit-expand (function (lambda (op name &optional base) (setq rune-writable-inhibit-log (cons op rune-writable-inhibit-log)) "/rune-writable-resolved-absent/target"))) (defalias 'rune-writable-inhibit-final (function (lambda (op name) (setq rune-writable-inhibit-log (cons op rune-writable-inhibit-log)) 'should-not-run))) (let ((rune-writable-inhibit-log nil) (file-name-handler-alist '(("MAGIC" . rune-writable-inhibit-expand) ("rune-writable-resolved-absent" . rune-writable-inhibit-final))) (inhibit-file-name-handlers '(rune-writable-inhibit-expand rune-writable-inhibit-final)) (inhibit-file-name-operation 'file-writable-p)) (list (file-writable-p "MAGIC") rune-writable-inhibit-log)))"#,
+            "(nil (expand-file-name))",
+        );
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-writable-only-log nil) (defalias 'rune-writable-only-handler (function (lambda (op name &optional base) (setq rune-writable-only-log (cons (list op name) rune-writable-only-log)) 'writable-answer))) (let ((rune-writable-only-log nil) (file-name-handler-alist '(("MAGIC" . rune-writable-only-handler))) (inhibit-file-name-handlers '(rune-writable-only-handler)) (inhibit-file-name-operation 'expand-file-name)) (list (file-writable-p "/MAGIC/original") rune-writable-only-log)))"#,
+            r#"(writable-answer ((file-writable-p "/MAGIC/original")))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_errors_stop_before_writability_handler() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-writable-error-stage-log nil) (defalias 'rune-writable-invalid-expand (function (lambda (op name &optional base) (setq rune-writable-error-stage-log (cons op rune-writable-error-stage-log)) 3))) (let ((rune-writable-error-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-writable-invalid-expand)))) (list (condition-case err (file-writable-p "MAGIC") (error err)) rune-writable-error-stage-log)))"#,
+            r#"((error "Invalid handler in `file-name-handler-alist'") (expand-file-name))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_redirects_creatable_lookup_without_creating_or_rewriting() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("rune-writable-expand-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> anyhow::Result<()> {
+            let present = dir.join("present"); let missing = dir.join("missing");
+            std::fs::write(&present, "kept")?;
+            let source = format!(r#"(progn (defalias 'rune-writable-redirect (function (lambda (op name &optional base) (garbage-collect) (if (equal name "SOURCE/present") {:?} {:?})))) (let ((file-name-handler-alist '(("SOURCE" . rune-writable-redirect)))) (list (file-writable-p "SOURCE/present") (file-writable-p "SOURCE/missing"))))"#, present.to_str().unwrap(), missing.to_str().unwrap());
+            crate::interpreter::assert_lisp(&source, "(t t)");
+            assert_eq!(std::fs::read_to_string(&present)?, "kept");
+            assert!(!missing.exists());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+}
+
+

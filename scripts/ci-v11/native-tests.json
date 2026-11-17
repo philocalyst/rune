@@ -202,5 +202,9 @@
   "fileio::executable_handler_pipeline_tests::expansion_precedes_resolved_operation_once_across_gc",
   "fileio::executable_handler_pipeline_tests::operation_inhibition_does_not_suppress_expansion_stage",
   "fileio::executable_handler_pipeline_tests::expansion_errors_stop_before_executable_handler",
-  "fileio::executable_handler_pipeline_tests::expansion_redirects_actual_lookup_without_creating_or_rewriting"
+  "fileio::executable_handler_pipeline_tests::expansion_redirects_actual_lookup_without_creating_or_rewriting",
+  "fileio::writable_expansion_dispatch_tests::expansion_precedes_resolved_operation_once_across_gc",
+  "fileio::writable_expansion_dispatch_tests::operation_inhibition_does_not_suppress_expansion_stage",
+  "fileio::writable_expansion_dispatch_tests::expansion_errors_stop_before_writability_handler",
+  "fileio::writable_expansion_dispatch_tests::expansion_redirects_creatable_lookup_without_creating_or_rewriting"
 ]
