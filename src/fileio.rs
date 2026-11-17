@@ -108,8 +108,8 @@ fn locate_file_internal(
     Ok(None)
 }
 
-#[defun]
-pub(crate) fn expand_file_name(
+#[cfg(not(unix))]
+fn legacy_expand_file_name(
     name: &str,
     default_directory: Option<&str>,
     env: &Rt<Env>,
@@ -132,6 +132,83 @@ pub(crate) fn expand_file_name(
             _ => unreachable!("`default-directory' should be a string"),
         }
     }
+}
+
+// Lexical local-name expansion: no canonicalize/readlink, account lookup, or IO.
+// Handler and tilde expansion remain outside the existing local implementation.
+fn normalize_local_path(input: &[u8]) -> Vec<u8> {
+    let sep = MAIN_SEPARATOR as u8;
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        let at = |n: usize| input.get(n).copied().unwrap_or(0);
+        if at(i) != sep { out.push(at(i)); i += 1; }
+        else if at(i + 1) == b'.' && (at(i + 2) == sep || at(i + 2) == 0) {
+            if out.is_empty() && at(i + 2) == 0 { out.push(sep); }
+            i += 2;
+        } else if at(i + 1) == b'.' && at(i + 2) == b'.' && !out.is_empty()
+            && (at(i + 3) == sep || at(i + 3) == 0) {
+            while let Some(byte) = out.pop() { if byte == sep { break; } }
+            if out.is_empty() && at(i + 3) == 0 { out.push(sep); }
+            i += 3;
+        } else if at(i + 1) == sep && (i != 0 || at(i + 2) == sep) { i += 1; }
+        else { out.push(sep); i += 1; }
+    }
+    out
+}
+
+#[defun(name = "expand-file-name")]
+fn expand_file_name_lisp<'ob>(name: Object, default_directory: Option<Object>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    #[cfg(not(unix))]
+    {
+        // Preserve the previous platform implementation outside this Unix fix.
+        let name = <&str>::try_from(name)?;
+        let directory = default_directory.filter(|value| !value.is_nil()).map(<&str>::try_from).transpose()?;
+        return Ok(cx.add(legacy_expand_file_name(name, directory, env, cx)?));
+    }
+
+    fn bytes(value: Object, cx: &Context) -> Result<(Vec<u8>, bool)> {
+        match value.untag() {
+            ObjectType::String(text) => Ok((text.as_bytes().to_vec(), false)),
+            ObjectType::ByteString(text) => Ok((text.to_vec(), true)),
+            _ => Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), rune_core::macros::list![sym::STRINGP, value; cx], cx).into()),
+        }
+    }
+    env.initialize_condition_metadata(cx);
+    let (name, mut raw) = bytes(name, cx)?;
+    ensure!(name.len() <= 65536 && !name.contains(&0), "Invalid or excessive filename");
+    let sep = MAIN_SEPARATOR as u8;
+    let mut joined = if name.first() == Some(&sep) { name.clone() } else {
+        let directory = match default_directory.filter(|value| !value.is_nil()) {
+            Some(value) => value,
+            None => symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?,
+        };
+        // GNU uses the filesystem root when the chosen default is not a
+        // string. No host cwd, account lookup, or guessed buffer state is used.
+        let (mut base, base_raw) = match directory.untag() {
+            ObjectType::String(_) | ObjectType::ByteString(_) => bytes(directory, cx)?,
+            _ => (vec![sep], false),
+        };
+        ensure!(base.len() <= 65536 && !base.contains(&0), "Invalid or excessive default-directory");
+        ensure!(base.first() == Some(&sep), "Relative default-directory is unsupported for local expansion");
+        // GNU keeps stored bytes when mixing string kinds: an ASCII operand
+        // can adopt the other kind; otherwise retain raw bytes, never decode.
+        if raw != base_raw {
+            raw = if raw { !name.is_ascii() } else { name.is_ascii() || !base.is_ascii() };
+        }
+        if base.last() != Some(&sep) { base.push(sep); }
+        base.extend_from_slice(&name); base
+    };
+    ensure!(joined.len() <= 131073, "Expanded filename exceeds limit");
+    // Preserve the previous literal-tilde behavior until HOME/user expansion is
+    // implemented; normalizing it would silently erase unknown ~user segments.
+    if name.first() != Some(&b'~') { joined = normalize_local_path(&joined); }
+    if raw { Ok(cx.add(joined)) } else { Ok(cx.add(String::from_utf8(joined)?)) }
+}
+
+pub(crate) fn expand_file_name(name: &str, default_directory: Option<&str>, env: &mut Rt<Env>, cx: &Context) -> Result<String> {
+    let result = expand_file_name_lisp(cx.add(name), default_directory.map(|value| cx.add(value)), env, cx)?;
+    Ok(<&str>::try_from(result)?.to_owned())
 }
 
 #[defun]
@@ -1352,6 +1429,63 @@ mod lexical_filename_tests {
         crate::interpreter::assert_lisp(
             r#"(list (condition-case err (file-name-directory 3) (wrong-type-argument err)) (condition-case err (file-name-nondirectory nil) (wrong-type-argument err)))"#,
             "((wrong-type-argument stringp 3) (wrong-type-argument stringp nil))",
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_expansion_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+
+    #[cfg(unix)]
+    #[test]
+    fn lexical_normalization_preserves_gnu_superroot_and_double_root() {
+        for (input, expected) in [
+            ("/a/./b", "/a/b"), ("/a/../b", "/b"), ("/a/..", "/"),
+            ("/..", "/.."), ("/../x", "/../x"), ("/.", "/"),
+            ("//host/a", "//host/a"), ("///host//a", "/host/a"),
+            ("/a//b/", "/a/b/"), ("/a/b/.", "/a/b"),
+            ("/a/../../x", "/../x"), ("/é/../文", "/文"),
+        ] { assert_eq!(normalize_local_path(input.as_bytes()), expected.as_bytes(), "{input}"); }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_directory_tracks_dynamic_owner_and_explicit_values() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (setq default-directory "/buffer/base/") (list (expand-file-name "../file") (let ((default-directory "/dynamic/base/")) (expand-file-name "./file")) (expand-file-name "file") (expand-file-name "file" "/explicit/base") (expand-file-name "/a/../absolute") (expand-file-name "")))"#,
+            r#"("/buffer/file" "/dynamic/base/file" "/buffer/base/file" "/explicit/base/file" "/absolute" "/buffer/base/")"#,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn byte_expansion_is_lossless_and_rejects_invalid_inputs() -> Result<()> {
+        let roots = RootSet::default(); let cx = &Context::new(&roots);
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        let actual = expand_file_name_lisp(cx.add(b"../raw-\xff".to_vec()), Some(cx.add(b"/a/b/".to_vec())), env, cx)?;
+        let ObjectType::ByteString(actual) = actual.untag() else { panic!("raw filename changed kind") };
+        assert_eq!(&**actual, b"/a/raw-\xff");
+        let mixed = expand_file_name_lisp(cx.add(b"leaf".to_vec()), Some(cx.add("/é/")), env, cx)?;
+        assert_eq!(<&str>::try_from(mixed)?, "/é/leaf");
+        let mixed = expand_file_name_lisp(cx.add("é"), Some(cx.add(b"/raw-\xff/".to_vec())), env, cx)?;
+        let ObjectType::ByteString(mixed) = mixed.untag() else { panic!("mixed raw path changed kind") };
+        assert_eq!(&**mixed, b"/raw-\xff/\xc3\xa9");
+        assert!(expand_file_name_lisp(cx.add("a\0b"), Some(cx.add("/")), env, cx).is_err());
+        assert!(expand_file_name_lisp(cx.add("file"), Some(cx.add("relative/")), env, cx).is_err());
+        assert_eq!(<&str>::try_from(expand_file_name_lisp(cx.add("file"), Some(3i64.into()), env, cx)?)?, "/file");
+        assert!(expand_file_name_lisp(cx.add("x".repeat(65537)), Some(cx.add("/")), env, cx).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_paths_ignore_invalid_defaults_and_tilde_scope_is_unchanged() {
+        crate::interpreter::assert_lisp(
+            r#"(let ((default-directory 7)) (list (expand-file-name "/a/./b") (expand-file-name "relative") (expand-file-name "~/literal/.." "/base/")))"#,
+            r#"("/a/b" "/relative" "/base/~/literal/..")"#,
         );
     }
 }

@@ -140,5 +140,9 @@
   "fileio::symlink_target_tests::lexical_inhibition_is_special_and_relative_default_fails_closed",
   "fileio::lexical_filename_tests::unix_split_preserves_dot_components_and_repeated_separators",
   "fileio::lexical_filename_tests::unibyte_splits_preserve_non_utf8_bytes_and_string_kind",
-  "fileio::lexical_filename_tests::lisp_truename_dot_tests_and_type_errors"
+  "fileio::lexical_filename_tests::lisp_truename_dot_tests_and_type_errors",
+  "fileio::local_expansion_tests::lexical_normalization_preserves_gnu_superroot_and_double_root",
+  "fileio::local_expansion_tests::default_directory_tracks_dynamic_owner_and_explicit_values",
+  "fileio::local_expansion_tests::byte_expansion_is_lossless_and_rejects_invalid_inputs",
+  "fileio::local_expansion_tests::absolute_paths_ignore_invalid_defaults_and_tilde_scope_is_unchanged"
 ]

@@ -5,7 +5,7 @@ Not launch-ready until BASE_PIN and exact publication mapping are frozen.
 import hashlib,importlib.util,json,os,pathlib,re,stat,subprocess,sys
 sys.dont_write_bytecode=True
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-exec-admission';H=C/'helpers'
-BASE_PIN='c42262356d7a6cfab8a24aeec9ca166ad133f988d75368114730f4cc725595bd'
+BASE_PIN='f51c1880f5c1f21a1af7606253b7a43b3e07908f6142bf53f0ddb64d8715b35b'
 HELPERS_PIN='6977e579f96400ff8295be16c96c640da990e6143086d213cff1d63cbc7fe8ca'
 MODES=['positive','read-denied','write-denied','truncate-denied','exec-denied','socket-inet','socket-inet6','socket-unix','socketpair','io-uring','ptrace','pidfd-getfd','inherited-fds','symlink-read','invalid-policy']
 def need(ok,msg):
