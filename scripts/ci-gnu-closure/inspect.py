@@ -14,7 +14,7 @@ def need(b,msg):
  if not b:raise RuntimeError(msg)
 def parse(text):
  need(re.search(r'Class:\s+ELF64\b',text) and re.search(r'Data:\s+2.s complement, little endian',text) and re.search(r'Machine:\s+Advanced Micro Devices X86-64',text),'unexpected ELF ABI')
- headers=re.findall(r'^Dynamic section .* contains (\d+) entr(?:y|ies):',text,re.M);need(len(headers)==1,'one dynamic table required')
+ headers=re.findall(r'^Dynamic section [^\n]* contains (\d+) entr(?:y|ies):',text,re.M);need(len(headers)==1,'one dynamic table required')
  rows=re.findall(r'^\s*0x[0-9a-fA-F]+\s+\(([^)]+)\)\s*(.*)$',text,re.M)
  need(len(rows)==int(headers[0]),'unconsumed dynamic table rows')
  known=set('NEEDED PLTRELSZ PLTGOT HASH STRTAB SYMTAB RELA RELASZ RELAENT STRSZ SYMENT INIT FINI SONAME RPATH SYMBOLIC REL RELSZ RELENT PLTREL DEBUG TEXTREL JMPREL BIND_NOW INIT_ARRAY FINI_ARRAY INIT_ARRAYSZ FINI_ARRAYSZ RUNPATH FLAGS PREINIT_ARRAY PREINIT_ARRAYSZ SYMTAB_SHNDX RELRSZ RELR RELRENT GNU_HASH VERSYM VERDEF VERDEFNUM VERNEED VERNEEDNUM RELACOUNT RELCOUNT FLAGS_1 NULL AUDIT DEPAUDIT FILTER AUXILIARY'.split())
@@ -38,8 +38,8 @@ def parse(text):
   if bind!='LOCAL' and vis in ('DEFAULT','PROTECTED'):symbols.append({'name':base,'version':ver or None,'default':default,'undefined':ndx=='UND','weak':bind=='WEAK','type':kind,'binding':bind})
  need(indices==list(range(count)),'dynamic symbol count/index mismatch')
  definitions=set();requirements={}
- defs=re.findall(r'^Version definition section .* contains (\d+) entr(?:y|ies):\n(.*?)(?=^\S|\Z)',text,re.M|re.S)
- needs=re.findall(r'^Version needs section .* contains (\d+) entr(?:y|ies):\n(.*?)(?=^\S|\Z)',text,re.M|re.S)
+ defs=re.findall(r'^Version definition section [^\n]* contains (\d+) entr(?:y|ies):\n(.*?)(?=^\S|\Z)',text,re.M|re.S)
+ needs=re.findall(r'^Version needs section [^\n]* contains (\d+) entr(?:y|ies):\n(.*?)(?=^\S|\Z)',text,re.M|re.S)
  need(len(defs)<=1 and len(needs)<=1,'duplicate version sections')
  for declared,body in defs:
   names=re.findall(r'\bName: (\S+)',body);need(len(names)==int(declared) and len(names)==len(set(names)),'unparsed definition count');definitions.update(names)
@@ -51,7 +51,7 @@ def parse(text):
  for tag,section in (('VERDEFNUM',defs),('VERNEEDNUM',needs)):
   if tag in values:need(len(values[tag])==1 and len(section)==1 and int(values[tag][0],0)==int(section[0][0]),'dynamic/version count mismatch')
   else:need(not section,'version table without dynamic count')
- vs=re.findall(r'^Version symbols section .* contains (\d+) entr(?:y|ies):',text,re.M)
+ vs=re.findall(r'^Version symbols section [^\n]* contains (\d+) entr(?:y|ies):',text,re.M)
  if 'VERSYM' in values:need(len(vs)==1 and int(vs[0])==count,'version symbol count mismatch')
  else:need(not vs and not any(s['version'] for s in symbols),'missing version symbol table')
  return {'needed':dynamic.get('NEEDED',[]),'soname':dynamic.get('SONAME',[]),'interpreter':interp[0] if interp else None,'version_definitions':sorted(definitions),'version_requirements':{k:sorted(v) for k,v in requirements.items()},'symbols':symbols,'dynamic_entry_count':len(rows),'dynamic_symbol_count':count}
@@ -71,7 +71,16 @@ def parser_regressions():
  single=fixture(False);plural=fixture(True)
  need(parse(single)['version_requirements']=={'libc.so.6':['GLIBC_2.2.5']},'singleton parser regression')
  need(parse(plural)['version_requirements']=={'libc.so.6':['GLIBC_2.2.5'],'libm.so.6':['GLIBC_2.2.5']},'plural parser regression')
+ # Definitions followed by needs must not let DOTALL cross either heading.
+ mixed=single.replace('contains 3 entries:', 'contains 4 entries:',1).replace(' 0x0 (NULL)', ' 0x6ffffffd (VERDEFNUM) 2\n 0x0 (NULL)',1)
+ definition=("Version definition section '.gnu.version_d' contains 2 entries:\n"
+  ' 000000: Rev: 1 Flags: BASE Index: 1 Cnt: 1 Name: libexample.so.1\n'
+  ' 0x001c: Rev: 1 Flags: none Index: 2 Cnt: 1 Name: EXAMPLE_1.0\n')
+ mixed=mixed.replace("Version needs section",definition+"Version needs section",1)
+ parsed=parse(mixed)
+ need(parsed['version_definitions']==['EXAMPLE_1.0','libexample.so.1'] and parsed['version_requirements']=={'libc.so.6':['GLIBC_2.2.5']},'mixed version section regression')
  malformed=[single.replace('(VERNEEDNUM) 1','(VERNEEDNUM) 2'),single.replace('File: libc.so.6 Cnt: 1','File: libc.so.6 Cnt: 2'),single.replace(' 1: 0000 0 FUNC GLOBAL DEFAULT UND puts@GLIBC_2.2.5 (2)\n',''),single.split("Version needs section")[0]]
+ malformed.extend([mixed.replace('(VERDEFNUM) 2','(VERDEFNUM) 3'),mixed.replace('Name: EXAMPLE_1.0','Unparsed: EXAMPLE_1.0'),mixed.replace('(VERNEEDNUM) 1','(VERNEEDNUM) 2'),mixed+definition,mixed+single[single.index("Version needs section"):]])
  for text in malformed:
   try:parse(text)
   except RuntimeError:continue
