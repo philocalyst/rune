@@ -343,9 +343,8 @@ fn file_directory_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<E
     local_file_predicate(filename, LocalFilePredicate::Directory, env, cx)
 }
 
-/// Local lexical directory conversion; existing handler/string-conversion limitations remain.
-#[defun]
-fn directory_file_name(dirname: &str) -> &str {
+/// Local lexical directory conversion, without handler dispatch.
+fn directory_file_name_lexical(dirname: &str) -> &str {
     #[cfg(unix)]
     {
         // GNU fileio.c directory_file_name preserves exactly "//", but strips
@@ -367,6 +366,60 @@ fn directory_file_name(dirname: &str) -> &str {
             return "/";
         }
         dirname.strip_suffix(MAIN_SEPARATOR).unwrap_or(dirname)
+    }
+}
+
+/// Scoped filename-handler dispatch; native predicate routing remains separate.
+#[defun]
+fn directory_file_name<'ob>(
+    directory: &crate::core::gc::Rto<Object>,
+    env: &mut Rt<Env>,
+    cx: &'ob mut Context,
+) -> Result<Object<'ob>> {
+    use crate::core::{env::{CallFrame, intern}, object::Function};
+    use rune_core::macros::root;
+    #[cfg(not(unix))]
+    {
+        let text = <&str>::try_from(directory.bind(cx))?;
+        return Ok(cx.add(directory_file_name_lexical(text)));
+    }
+    #[cfg(unix)]
+    {
+        env.initialize_condition_metadata(cx);
+        // Unlike filesystem access, lexical conversion does not reject NUL.
+        // The shared handler engine still cannot represent undecodable raw bytes.
+        let name = expand_dispatch_name(directory.bind(cx), false, cx)?;
+        let handlers = env.variable_value(sym::FILE_NAME_HANDLER_ALIST, cx)?.unwrap_or(NIL.into());
+        if !handlers.is_nil() {
+            let name = name.context("Raw-byte directory-file-name handlers are unsupported")?;
+            let operation = intern("directory-file-name", cx);
+            if let Some(handler) = find_file_name_handler_internal(&name, operation, env, cx) {
+                let target: Function = Object::from(handler).try_into()?;
+                root!(target, cx);
+                let mut frame = CallFrame::new(env);
+                frame.push_arg(Object::from(operation));
+                frame.push_arg(directory.bind(cx));
+                root!(result, target.call(&mut frame, None, cx)?, cx);
+                drop(frame);
+                let result = result.bind(cx);
+                if matches!(result.untag(), ObjectType::String(_) | ObjectType::ByteString(_)) {
+                    return Ok(result);
+                }
+                let data = rune_core::macros::list!["Invalid handler in `file-name-handler-alist'"; cx];
+                return Err(crate::eval::EvalError::signal(sym::ERROR.into(), data, cx).into());
+            }
+        }
+        match directory.bind(cx).untag() {
+            ObjectType::String(text) => Ok(cx.add(directory_file_name_lexical(text))),
+            ObjectType::ByteString(bytes) => {
+                let mut end = bytes.len();
+                if !(end == 2 && bytes[0] == b'/') {
+                    while end > 1 && bytes[end - 1] == b'/' { end -= 1; }
+                }
+                Ok(cx.add(bytes[..end].to_vec()))
+            }
+            _ => unreachable!("directory argument was validated before dispatch"),
+        }
     }
 }
 
@@ -1802,7 +1855,7 @@ mod local_directory_conversion_tests {
             ("a///", "a"), ("/a///", "/a"), ("//host///", "//host"),
             ("./", "."), ("../", ".."), ("/a/../", "/a/.."), ("é///", "é"),
             ("/x", "/x"), ("a\0b///", "a\0b"),
-        ] { assert_eq!(directory_file_name(input), expected, "{input:?}"); }
+        ] { assert_eq!(directory_file_name_lexical(input), expected, "{input:?}"); }
     }
 
     #[test]
@@ -2831,5 +2884,136 @@ mod regular_expansion_dispatch_tests {
             Ok(())
         })();
         result
+    }
+}
+
+#[cfg(all(test, unix))]
+mod directory_file_name_tests {
+    #[test]
+    fn original_name_and_handler_result_survive_gc_without_reprocessing() {
+        crate::interpreter::assert_lisp(
+            r#"(progn
+              (defvar rune-directory-conversion-log nil)
+              (defalias 'rune-directory-conversion-handler
+                (function (lambda (operation name)
+                  (garbage-collect)
+                  (setq rune-directory-conversion-log (list operation name))
+                  "/returned///")))
+              (let ((rune-directory-conversion-log nil)
+                    (file-name-handler-alist '(("MAGIC" . rune-directory-conversion-handler))))
+                (list (directory-file-name "MAGIC///") rune-directory-conversion-log)))"#,
+            r#"("/returned///" (directory-file-name "MAGIC///"))"#,
+        );
+    }
+
+    #[test]
+    fn operation_inhibition_allows_recursive_lexical_conversion() {
+        crate::interpreter::assert_lisp(
+            r#"(progn
+              (defvar rune-directory-conversion-count 0)
+              (defalias 'rune-directory-conversion-recursive
+                (function (lambda (operation name)
+                  (setq rune-directory-conversion-count (1+ rune-directory-conversion-count))
+                  (let ((inhibit-file-name-handlers '(rune-directory-conversion-recursive))
+                        (inhibit-file-name-operation 'directory-file-name))
+                    (directory-file-name name)))))
+              (let ((rune-directory-conversion-count 0)
+                    (file-name-handler-alist '(("MAGIC" . rune-directory-conversion-recursive)))
+                    (inhibit-file-name-handlers '(rune-directory-conversion-recursive))
+                    (inhibit-file-name-operation 'file-directory-p))
+                (list (directory-file-name "MAGIC///") rune-directory-conversion-count)))"#,
+            r#"("MAGIC" 1)"#,
+        );
+    }
+
+    #[test]
+    fn invalid_handler_results_and_argument_types_signal() {
+        crate::interpreter::assert_lisp(
+            r#"(progn
+              (defalias 'rune-directory-conversion-invalid (function (lambda (operation name) 3)))
+              (let ((file-name-handler-alist '(("MAGIC" . rune-directory-conversion-invalid))))
+                (list (condition-case err (directory-file-name "MAGIC/") (error err))
+                      (condition-case err (directory-file-name 3) (wrong-type-argument err)))))"#,
+            r#"((error "Invalid handler in `file-name-handler-alist'") (wrong-type-argument stringp 3))"#,
+        );
+    }
+
+    #[test]
+    fn utf8_embedded_nul_is_lexically_preserved() -> anyhow::Result<()> {
+        use super::*;
+        use crate::core::gc::RootSet;
+        use rune_core::macros::root;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let directory = cx.add("é\0///");
+        root!(directory, cx);
+        let result = directory_file_name(directory, env, cx)?;
+        let ObjectType::String(text) = result.untag() else {
+            anyhow::bail!("directory-file-name changed UTF-8 representation");
+        };
+        assert_eq!(&**text, "é\0");
+        Ok(())
+    }
+
+    #[test]
+    fn handler_returned_raw_bytes_survive_gc_without_reprocessing() -> anyhow::Result<()> {
+        use super::*;
+        use crate::core::gc::RootSet;
+        use rune_core::macros::root;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        env.set_var(sym::DEFAULT_DIRECTORY, cx.add(b"raw-\xff\0///".to_vec()))?;
+        crate::lread::load_internal(
+            r#"(progn
+              (defalias 'rune-directory-conversion-raw
+                (function (lambda (operation name) (garbage-collect) default-directory)))
+              (setq file-name-handler-alist '(("MAGIC" . rune-directory-conversion-raw))))"#,
+            cx, env,
+        )?;
+        let directory = cx.add("MAGIC///");
+        root!(directory, cx);
+        let result = directory_file_name(directory, env, cx)?;
+        let ObjectType::ByteString(bytes) = result.untag() else {
+            anyhow::bail!("directory-file-name changed handler-returned raw representation");
+        };
+        assert_eq!(&**bytes, b"raw-\xff\0///");
+        Ok(())
+    }
+
+    #[test]
+    fn raw_bytes_are_preserved_without_handlers() -> anyhow::Result<()> {
+        use super::*;
+        use crate::core::gc::RootSet;
+        use rune_core::macros::root;
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        for (input, expected) in [
+            (&b""[..], &b""[..]), (&b"/"[..], &b"/"[..]),
+            (&b"//"[..], &b"//"[..]), (&b"///"[..], &b"/"[..]),
+            (&b"raw-\xff///"[..], &b"raw-\xff"[..]),
+            (&b"nul\0///"[..], &b"nul\0"[..]),
+        ] {
+            let directory = cx.add(input.to_vec());
+            root!(directory, cx);
+            let result = directory_file_name(directory, env, cx)?;
+            let ObjectType::ByteString(bytes) = result.untag() else {
+                anyhow::bail!("directory-file-name changed raw string representation");
+            };
+            assert_eq!(&**bytes, expected);
+        }
+        let directory = cx.add(b"raw-\xff/".to_vec());
+        root!(directory, cx);
+        env.set_var(sym::FILE_NAME_HANDLER_ALIST, rune_core::macros::list![NIL; cx])?;
+        assert!(directory_file_name(directory, env, cx).is_err());
+        Ok(())
     }
 }

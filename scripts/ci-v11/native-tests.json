@@ -218,5 +218,11 @@
   "fileio::regular_expansion_dispatch_tests::expansion_precedes_resolved_operation_once_across_gc",
   "fileio::regular_expansion_dispatch_tests::operation_inhibition_does_not_suppress_expansion_stage",
   "fileio::regular_expansion_dispatch_tests::expansion_errors_stop_before_regular_handler",
-  "fileio::regular_expansion_dispatch_tests::expansion_redirects_regular_file_not_directory"
+  "fileio::regular_expansion_dispatch_tests::expansion_redirects_regular_file_not_directory",
+  "fileio::directory_file_name_tests::original_name_and_handler_result_survive_gc_without_reprocessing",
+  "fileio::directory_file_name_tests::operation_inhibition_allows_recursive_lexical_conversion",
+  "fileio::directory_file_name_tests::invalid_handler_results_and_argument_types_signal",
+  "fileio::directory_file_name_tests::utf8_embedded_nul_is_lexically_preserved",
+  "fileio::directory_file_name_tests::handler_returned_raw_bytes_survive_gc_without_reprocessing",
+  "fileio::directory_file_name_tests::raw_bytes_are_preserved_without_handlers"
 ]
