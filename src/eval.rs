@@ -372,70 +372,201 @@ pub(crate) fn funcall<'ob>(
 fn run_hooks<'ob>(hooks: ArgSlice, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     let hook_count = hooks.len();
     for i in 0..hook_count {
+        // CallFrame restores the original stack after each callback. Root the
+        // current symbol and selected value independently across callback GC.
         let hook = env.stack[hook_count - i - 1].bind(cx);
-        match hook.untag() {
-            ObjectType::Symbol(sym) => {
-                if let Some(val) = env.variable_value(sym,cx)? {
-                    match val.untag() {
-                        ObjectType::Cons(hook_list) => {
-                            rooted_iter!(hooks, hook_list, cx);
-                            while let Some(hook) = hooks.next()? {
-                                let func = hook.try_as()?;
-                                call!(func; env, cx)?;
-                            }
-                        }
-                        ObjectType::NIL => {}
-                        _ => {
-                            let func: Function = val.try_into()?;
-                            root!(func, cx);
-                            call!(func; env, cx)?;
-                        }
-                    }
-                }
-            }
-            x => bail!(TypeError::new(Type::Symbol, x)),
-        }
+        root!(hook, cx);
+        let symbol: Symbol = hook.bind(cx).try_into()?;
+        let value = env.variable_value(symbol, cx)?.unwrap_or(NIL);
+        root!(value, cx);
+        hook_value(value, hook, ArgSlice::new(0), false, false, None, &mut 65_536, env, cx)?;
     }
     Ok(NIL)
 }
 
 #[defun]
-fn run_hook_with_args<'ob>(
-    hook: &Rto<Object>,
-    args: ArgSlice,
-    env: &mut Rt<Env>,
-    cx: &'ob mut Context,
-) -> Result<Object<'ob>> {
-    match hook.untag(cx) {
-        ObjectType::Symbol(sym) => {
-            if let Some(val) = env.variable_value(sym,cx)? {
-                match val.untag() {
-                    ObjectType::Cons(hook_list) => {
-                        rooted_iter!(hooks, hook_list, cx);
-                        while let Some(hook) = hooks.next()? {
-                            let func: &Rto<Function> = hook.try_as()?;
-                            root!(staged, new(Vec), cx);
-                            staged.bind_mut(cx).try_reserve(args.len())?;
-                            for argument in env.stack.arg_slice(args) {
-                                staged.push(argument.bind(cx));
-                            }
-                            let mut frame = CallFrame::new(env);
-                            frame.push_arg_slice(Rt::bind_slice(staged, cx));
-                            func.call(&mut frame, None, cx)?;
-                        }
-                    }
-                    ObjectType::NIL => {}
-                    _ => {
-                        let func: Function = val.try_into()?;
-                        root!(func, cx);
-                        call!(func; env, cx)?;
-                    }
-                }
-            }
-        }
-        x => bail!(TypeError::new(Type::Symbol, x)),
+fn run_hook_with_args<'ob>(hook: &Rto<Object>, args: ArgSlice,
+    env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    let symbol: Symbol = hook.bind(cx).try_into()?;
+    let value = env.variable_value(symbol, cx)?.unwrap_or(NIL);
+    root!(value, cx);
+    hook_value(value, hook, args, false, false, None, &mut 65_536, env, cx)
+}
+
+/// Call one hook with the original arguments, retaining them across callbacks.
+fn hook_success_call<'ob>(function: Object, args: ArgSlice, wrapper: Option<&Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    // In wrapped mode the hook entry is data, not necessarily callable: only
+    // the wrapper is invoked, and it may intentionally accept any entry.
+    root!(entry, function, cx);
+    let target: Function = wrapper.map_or(entry.bind(cx), |w| w.bind(cx)).try_into()?;
+    root!(target, cx);
+    let count = args.len().checked_add(usize::from(wrapper.is_some()))
+        .ok_or_else(|| anyhow::anyhow!("Hook argument count overflow"))?;
+    ensure!(count <= usize::from(u16::MAX), "Hook argument count exceeds supported range");
+    root!(staged, new(Vec), cx);
+    staged.bind_mut(cx).try_reserve(count)?;
+    if wrapper.is_some() { staged.push(entry.bind(cx)); }
+    for argument in env.stack.arg_slice(args) { staged.push(argument.bind(cx)); }
+    let mut frame = CallFrame::new(env);
+    frame.push_arg_slice(Rt::bind_slice(staged, cx));
+    target.call(&mut frame, None, cx).map_err(Into::into)
+}
+
+fn hook_value<'ob>(value: &Rto<Object>, hook: &Rto<Object>, args: ArgSlice,
+    global: bool, until_success: bool, wrapper: Option<&Rto<Object>>, budget: &mut usize, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    if value.bind(cx).is_nil() { return Ok(NIL); }
+    let single = match value.untag(cx) {
+        ObjectType::Cons(pair) => pair.car() == sym::LAMBDA || pair.car() == sym::CLOSURE,
+        _ => true,
+    };
+    if single {
+        let result = hook_success_call(value.bind(cx), args, wrapper, env, cx)?;
+        return Ok(if until_success { result } else { NIL });
     }
-    Ok(NIL)
+    root!(tail, value.bind(cx), cx);
+    loop {
+        let ObjectType::Cons(pair) = tail.untag(cx) else { return Ok(NIL); };
+        ensure!(*budget > 0, "Hook traversal limit exceeded");
+        *budget -= 1;
+        let function = pair.car();
+        // Keep the current cons rooted until after the callback: mutation of its
+        // cdr during callback is observed, as in GNU's live list traversal.
+        if function == sym::T {
+            if !global {
+                let symbol: Symbol = hook.bind(cx).try_into()?;
+                let defaults = crate::data::default_value(symbol, env, cx)?;
+                root!(defaults, cx);
+                let result = hook_value(defaults, hook, args, true, until_success, wrapper, budget, env, cx)?;
+                if until_success && !result.is_nil() { return Ok(result); }
+            }
+        } else {
+            let result = hook_success_call(function, args, wrapper, env, cx)?;
+            if until_success && !result.is_nil() { return Ok(result); }
+        }
+        let ObjectType::Cons(pair) = tail.untag(cx) else { unreachable!() };
+        tail.set(pair.cdr());
+    }
+}
+
+#[defun]
+fn run_hook_with_args_until_success<'ob>(hook: &Rto<Object>, args: ArgSlice,
+    env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    let symbol: Symbol = hook.bind(cx).try_into()?;
+    let value = env.variable_value(symbol, cx)?.unwrap_or(NIL);
+    root!(value, cx);
+    hook_value(value, hook, args, false, true, None, &mut 65_536, env, cx)
+}
+
+
+#[defun]
+fn run_hook_wrapped<'ob>(hook: &Rto<Object>, wrapper: &Rto<Object>, args: ArgSlice,
+    env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    let symbol: Symbol = hook.bind(cx).try_into()?;
+    let value = env.variable_value(symbol, cx)?.unwrap_or(NIL);
+    root!(value, cx);
+    hook_value(value, hook, args, false, true, Some(wrapper), &mut 65_536, env, cx)
+}
+
+
+#[cfg(test)]
+mod hook_with_args_tests {
+    #[test]
+    fn unbound_nil_symbol_and_raw_lambda_receive_expected_arguments() {
+        crate::interpreter::assert_lisp("(let ((ha-empty nil) (ha-symbol 'list) (ha-lambda '(lambda (a b) (setq ha-seen (list a b)))) (ha-seen nil)) (list (run-hook-with-args 'ha-unbound 1) (run-hook-with-args 'ha-empty 1) (run-hook-with-args 'ha-symbol 3 4) (run-hook-with-args 'ha-lambda 5 6) ha-seen))", "(nil nil nil nil (5 6))");
+    }
+    #[test]
+    fn closure_keeps_captured_value_and_original_argument_identity() {
+        crate::interpreter::assert_lisp("(let ((ha-seen nil) (ha-value (list 'value)) (ha-hook '(closure ((captured . 8)) (x) (garbage-collect) (setq ha-seen (list captured x))))) (run-hook-with-args 'ha-hook ha-value) (list (car ha-seen) (eq (car (cdr ha-seen)) ha-value)))", "(8 t)");
+    }
+    #[test]
+    fn list_continues_after_nonnil_with_live_cdr_and_gc() {
+        crate::interpreter::assert_lisp("(let ((ha-seen nil) (ha-hook nil)) (setq ha-hook (list (lambda (x) (setq ha-seen (cons x ha-seen)) (setcdr ha-hook (list (lambda (y) (garbage-collect) (setq ha-seen (cons y ha-seen))))) (lambda (x) (error \"replaced callback\")))) (list (run-hook-with-args 'ha-hook '(payload)) ha-seen))", "(nil ((payload) (payload)))");
+    }
+    #[test]
+    fn errors_and_throws_stop_iteration_and_next_call_recovers() {
+        crate::interpreter::assert_lisp("(progn (fset 'ha-thrower '(lambda (x) (garbage-collect) (throw 'ha-exit x))) (let ((ha-hook (list 'ha-thrower (lambda (x) (error \"unreachable\")))) (ha-result nil)) (setq ha-result (catch 'ha-exit (run-hook-with-args 'ha-hook 7))) (setq ha-hook (list (lambda (x) (error \"expected\")))) (let ((caught (condition-case nil (run-hook-with-args 'ha-hook 8) (error t)))) (setq ha-hook 'list) (list ha-result caught (backtrace-frame--internal #'list 0 'ha-thrower) (run-hook-with-args 'ha-hook 9)))))", "(7 t nil nil)");
+    }
+    #[test]
+    fn ordinary_hook_side_effects_match_gnu_batch() {
+        for form in [
+            "(let ((ha-hook nil)) (run-hook-with-args 'ha-hook 1))",
+            "(let ((ha-hook 'list)) (run-hook-with-args 'ha-hook 3 4))",
+            "(let ((ha-seen nil) (ha-hook '(lambda (a b) (setq ha-seen (list a b))))) (run-hook-with-args 'ha-hook 5 6) ha-seen)",
+            "(let ((ha-seen nil) (ha-hook (list (lambda (x) (setq ha-seen (cons x ha-seen)) t) (lambda (x) (garbage-collect) (setq ha-seen (cons x ha-seen)))))) (run-hook-with-args 'ha-hook '(payload)) ha-seen)",
+            "(let ((ha-hook (list (lambda (x) (throw 'ha-exit x))))) (catch 'ha-exit (run-hook-with-args 'ha-hook 7)))",
+        ] { crate::assert_elprop!("{form}"); }
+    }
+}
+
+#[cfg(test)]
+mod hook_until_success_tests {
+    #[test]
+    fn recursive_hook_reentry_preserves_outer_arguments_across_gc() {
+        crate::interpreter::assert_lisp("(let ((hu-nested nil) (hu-hooks (list (lambda (n payload) (if (= n 0) nil (setq hu-nested (run-hook-with-args-until-success 'hu-hooks 0 '(inner)))) (garbage-collect) nil) (lambda (n payload) (list n payload))))) (let ((result (run-hook-with-args-until-success 'hu-hooks 1 '(outer)))) (list hu-nested result)))", "((0 (inner)) (1 (outer)))");
+    }
+
+    #[test]
+    fn recursive_hook_reentry_preserves_heap_arguments_across_gc() {
+        crate::interpreter::assert_lisp("(let ((hu-payload (list 'p 'q)) (hu-hooks nil)) (setq hu-hooks (list (lambda (payload depth) (garbage-collect) (if (= depth 0) (list 'inner payload) (let ((nested (run-hook-with-args-until-success 'hu-hooks payload 0))) (garbage-collect) (list 'outer nested payload)))) (lambda (&rest args) (error \"must not run\")))) (let ((answer (run-hook-with-args-until-success 'hu-hooks hu-payload 1))) (garbage-collect) (list (car answer) (car (nth 1 answer)) (eq (nth 1 (nth 1 answer)) hu-payload) (eq (nth 2 answer) hu-payload))))", "(outer inner t t)");
+    }
+    #[test]
+    fn hook_throw_unwinds_depth_before_following_call() {
+        use crate::core::{env::{Env, sym}, gc::{Context, RootSet}};
+        use rune_core::macros::{root, rebind};
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let form = "(progn (fset 'hu-throw-target '(lambda (x) (garbage-collect) (throw 'hu-exit x))) (let ((hu-hooks (list 'hu-throw-target))) (list (catch 'hu-exit (run-hook-with-args-until-success 'hu-hooks 7)) (backtrace-frame--internal #'list 0 'hu-throw-target))))";
+        let result = {
+            let object = crate::reader::read(form, cx).unwrap().0; root!(object,cx);
+            rebind!(crate::interpreter::eval(object,None,env,cx).unwrap())
+        };
+        root!(result,cx);
+        assert_eq!(env.backtrace_depth(),0);
+        let expected = crate::reader::read("(7 nil)",cx).unwrap().0;
+        assert_eq!(result.bind(cx),expected);
+        let object = crate::reader::read("(let ((hu-hooks (list (lambda (x) x)))) (run-hook-with-args-until-success 'hu-hooks 9))",cx).unwrap().0;
+        root!(object,cx);
+        let result = crate::interpreter::eval(object,None,env,cx).unwrap();
+        assert_eq!(result,crate::core::object::Object::from(9));
+        assert_eq!(env.backtrace_depth(),0);
+    }
+    #[test]
+    fn cyclic_hook_reaches_actual_budget_and_recovers() {
+        crate::interpreter::assert_lisp("(let ((hu-hooks nil) (hu-count 0) (hu-stop nil)) (setq hu-hooks (list (lambda () (setq hu-count (1+ hu-count)) nil))) (setcdr hu-hooks hu-hooks) (setq hu-stop (condition-case nil (run-hook-with-args-until-success 'hu-hooks) (error 'bounded))) (setq hu-hooks (list (lambda () 'recovered))) (list hu-stop hu-count (run-hook-with-args-until-success 'hu-hooks)))", "(bounded 65536 recovered)");
+    }
+
+    #[test]
+    fn ordinary_hook_contract_matches_gnu_batch() {
+        for form in [
+            "(let ((hu-empty nil)) (list (run-hook-with-args-until-success 'hu-unbound 1) (run-hook-with-args-until-success 'hu-empty 1)))",
+            "(let ((hu-one '(lambda (a b) (list b a)))) (run-hook-with-args-until-success 'hu-one 3 4))",
+            "(let ((hu-hooks (list (lambda (x) nil) (lambda (x) (garbage-collect) (list x)) (lambda (x) (error \"must not run\"))))) (run-hook-with-args-until-success 'hu-hooks '(payload)))",
+            "(let ((hu-hooks (list (lambda (x) (throw 'hu-exit x)) (lambda (x) (error \"must not run\"))))) (catch 'hu-exit (run-hook-with-args-until-success 'hu-hooks 7)))",
+            "(let ((hu-hooks (list t (lambda () 'answer)))) (run-hook-with-args-until-success 'hu-hooks))",
+        ] { crate::assert_elprop!("{form}"); }
+    }
+    #[test]
+    fn nil_unbound_and_all_nil_return_nil() {
+        crate::interpreter::assert_lisp("(let ((hu-empty nil) (hu-all (list (lambda (&rest args) nil) (lambda (&rest args) nil)))) (list (run-hook-with-args-until-success 'hu-unbound 1) (run-hook-with-args-until-success 'hu-empty 1) (run-hook-with-args-until-success 'hu-all 1)))", "(nil nil nil)");
+    }
+    #[test]
+    fn single_raw_lambda_gets_all_arguments() {
+        crate::interpreter::assert_lisp("(let ((hu-one '(lambda (a b) (list b a)))) (run-hook-with-args-until-success 'hu-one 3 4))", "(4 3)");
+    }
+    #[test]
+    fn ordered_short_circuit_keeps_return_identity_across_gc() {
+        crate::interpreter::assert_lisp("(let ((hu-seen nil) (hu-return (list 'answer)) (hu-hooks (list (lambda (x) (setq hu-seen (cons x hu-seen)) (garbage-collect) nil) (lambda (x) (setq hu-seen (cons x hu-seen)) (garbage-collect) hu-return) (lambda (x) (error \"must not run\"))))) (let ((answer (run-hook-with-args-until-success 'hu-hooks '(payload)))) (garbage-collect) (list (eq answer hu-return) hu-seen)))", "(t ((payload) (payload)))");
+    }
+    #[test]
+    fn hook_errors_propagate_and_following_call_still_works() {
+        crate::interpreter::assert_lisp("(let ((hu-hooks (list (lambda (x) (garbage-collect) (error \"hook failure\")))) (hu-result nil)) (setq hu-result (condition-case nil (run-hook-with-args-until-success 'hu-hooks 7) (error 'caught))) (setq hu-hooks (list (lambda (x) x))) (list hu-result (run-hook-with-args-until-success 'hu-hooks 9)))", "(caught 9)");
+    }
+    #[test]
+    fn live_cdr_mutation_and_global_t_sentinel_are_bounded() {
+        crate::interpreter::assert_lisp("(let ((hu-hooks nil)) (setq hu-hooks (list (lambda () (setcdr hu-hooks (list (lambda () 'replacement))) nil) (lambda () 'old))) (run-hook-with-args-until-success 'hu-hooks))", "replacement");
+        crate::interpreter::assert_lisp("(let ((hu-hooks (list t (lambda () 'answer)))) (run-hook-with-args-until-success 'hu-hooks))", "answer");
+    }
 }
 
 #[defun]
@@ -646,6 +777,19 @@ impl Rto<Function<'_>> {
         debug!("calling function");
         let name = name.unwrap_or("lambda");
         frame.finalize_arguments()?;
+        let checkpoint = frame.backtrace_depth();
+        let inherited = frame.backtrace_registered();
+        frame.register_backtrace(self.bind(cx).into(), cx);
+        let outcome = self.call_registered(frame,Some(name),cx);
+        if !inherited {
+            frame.backtrace_truncate(checkpoint);
+            frame.clear_backtrace_registration();
+        }
+        outcome
+    }
+
+    fn call_registered<'ob>(&self, frame: &mut CallFrame<'_, '_>, name: Option<&str>, cx: &'ob mut Context) -> EvalResult<'ob> {
+        let name = name.unwrap_or("lambda");
         let arg_cnt = frame.arg_count();
         cx.garbage_collect(false);
         match self.untag(cx) {
@@ -1063,4 +1207,338 @@ mod autoload_metadata_tests {
         assert_eq!(error.to_string(), "Malformed autoload metadata tail");
     }
 
+}
+
+/// A distinct native identity is the interactive marker inspected by subr.el.
+#[defun]
+pub(crate) fn funcall_interactively<'ob>(function: &Rto<Function>, arguments: ArgSlice,
+    env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    funcall(function, arguments, env, cx)
+}
+
+// Special forms dispatch directly in this interpreter rather than through a
+// native function cell. Preserve their canonical designator for base matching;
+// otherwise an undefined BASE would spuriously match every nil function cell.
+fn backtrace_identity<'ob>(mut function: Object<'ob>, env: &Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    let mut seen = Vec::new();
+    for _ in 0..256 {
+        let ObjectType::Symbol(symbol) = function.untag() else { return Ok(function) };
+        if function.is_nil() { return Ok(function); }
+        if matches!(symbol, sym::QUOTE | sym::LET | sym::LET_STAR | sym::IF | sym::AND | sym::OR |
+            sym::COND | sym::WHILE | sym::PROGN | sym::INLINE | sym::PROG1 | sym::PROG2 |
+            sym::SETQ | sym::DEFVAR | sym::DEFCONST | sym::FUNCTION | sym::INTERACTIVE |
+            sym::CATCH | sym::CONDITION_CASE | sym::SAVE_CURRENT_BUFFER | sym::SAVE_EXCURSION |
+            sym::UNWIND_PROTECT) { return Ok(function); }
+        if seen.iter().any(|old: &Object| old.ptr_eq(function)) {
+            return crate::data::resolve_owner_function(function,env,cx);
+        }
+        seen.push(function);
+        function = crate::data::symbol_function_owner(symbol,env,cx);
+    }
+    bail!("Function indirection limit exceeded")
+}
+
+/// Copy fixed membership before any user callback can extend the active stack.
+fn backtrace_snapshot<'ob>(base: Object<'ob>, env: &Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
+    // GNU decides whether to search before unpacking (OFFSET . FUNCTION).
+    // A cons with nil cdr still searches for nil; only plain nil means top.
+    let search_required = !base.is_nil();
+    let (offset, base) = match base.untag() {
+        ObjectType::Cons(pair) => match pair.car().untag() {
+            ObjectType::Int(offset) => {
+                // GNU get_backtrace_starting_at stores XFIXNUM in C int.
+                // Preserve that ABI narrowing before the positive skip test.
+                // Observed on our pinned Linux GNU30.1 (32-bit C int); this
+                // does not widen Rune fixnums or claim other-platform parity.
+                let offset = offset as std::os::raw::c_int;
+                (offset.max(0) as usize, pair.cdr())
+            },
+            _ => (0,base),
+        },
+        _ => (0,base),
+    };
+    let target = if search_required { Some(backtrace_identity(base,env,cx)?) } else { None };
+    let mut found = target.is_none();
+    let mut skip = offset;
+    let mut frames = Vec::new();
+    for entry in env.active_backtrace.iter().rev() {
+        let [evaluated,function,args,flags] = crate::core::env::backtrace_components(entry.bind(cx))?;
+        if !found {
+            found = backtrace_identity(function,env,cx)?.ptr_eq(target.unwrap());
+        }
+        if !found { continue; }
+        if skip > 0 { skip-=1; continue; }
+        let args = if !evaluated.is_nil() {
+            let args: Vec<_> = args.as_list()?.collect::<Result<Vec<_>,_>>()?;
+            crate::fns::slice_into_list(&args,None,cx)
+        } else { args };
+        frames.push(list![evaluated,function,args,flags;cx]);
+    }
+    Ok(crate::fns::slice_into_list(&frames,None,cx))
+}
+
+#[defun(name = "backtrace-frame--internal")]
+fn backtrace_frame_internal<'ob>(callback: &Rto<Object>, nframes: &Rto<Object>, base: &Rto<Object>,
+    env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    let index = match nframes.untag(cx) {
+        ObjectType::Int(index) if index >= 0 => index as usize,
+        _ => return Err(EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), list![sym::WHOLENUMP,nframes.bind(cx);cx],cx).into()),
+    };
+    let snapshot = backtrace_snapshot(base.bind(cx),env,cx)?;
+    root!(snapshot,cx);
+    let selected = snapshot.bind(cx).as_list()?.nth(index).transpose()?;
+    let Some(selected) = selected else { return Ok(NIL) };
+    let [evaluated,function,args,flags] = crate::core::env::backtrace_components(selected)?;
+    // No frame means no call: GNU does not validate a dormant callback.
+    let callback_function: Function = callback.bind(cx).try_into().map_err(|_| {
+            EvalError::signal(sym::INVALID_FUNCTION.into(), list![callback.bind(cx);cx], cx)
+        })?;
+    root!(callback_function,cx);
+    call!(callback_function,evaluated,function,args,flags;env,cx).map_err(Into::into)
+}
+
+#[defun]
+fn mapbacktrace<'ob>(callback: &Rto<Object>, base: Option<&Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    let snapshot = backtrace_snapshot(base.map_or(NIL,|base|base.bind(cx)),env,cx)?;
+    root!(snapshot,cx);
+    rooted_iter!(frames,snapshot.bind(cx),cx);
+    while let Some(entry) = frames.next()? {
+        let [evaluated,function,args,flags] = crate::core::env::backtrace_components(entry.bind(cx))?;
+        let callback_function: Function = callback.bind(cx).try_into().map_err(|_| {
+            EvalError::signal(sym::INVALID_FUNCTION.into(), list![callback.bind(cx);cx], cx)
+        })?;
+        root!(callback_function,cx);
+        call!(callback_function,evaluated,function,args,flags;env,cx)?;
+    }
+    Ok(NIL)
+}
+
+#[cfg(test)]
+mod active_backtrace_tests {
+    #[test]
+    fn evaluated_frame_preserves_original_designator_and_values() {
+        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda (x) (backtrace-frame--internal #'list 0 'bt-target))) (bt-target 17))", "(t bt-target (17) nil)");
+    }
+    #[test]
+    fn alias_base_resolves_nearest_callable_identity() {
+        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda (x) (backtrace-frame--internal #'list 0 'bt-alias))) (fset 'bt-alias 'bt-target) (bt-target 19))", "(t bt-target (19) nil)");
+    }
+    #[test]
+    fn missing_frame_never_calls_callback() {
+        crate::interpreter::assert_lisp("(progn (setq bt-seen nil) (list (backtrace-frame--internal (lambda (&rest x) (setq bt-seen t)) 999 nil) bt-seen))", "(nil nil)");
+    }
+    #[test]
+    fn preargument_frame_retains_unevaluated_forms() {
+        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda (x) x)) (bt-target (backtrace-frame--internal #'list 0 'bt-target)))", "(nil bt-target ((backtrace-frame--internal (function list) 0 (quote bt-target))) nil)");
+    }
+    #[test]
+    fn callback_heap_return_survives_gc_and_reentrance() {
+        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda (x) (backtrace-frame--internal (lambda (e f a flags) (garbage-collect) (backtrace-frame--internal #'list 999 nil) (list f a)) 0 'bt-target))) (bt-target '(1 2)))", "(bt-target ((1 2)))");
+    }
+    #[test]
+    fn map_fixed_membership_ignores_callback_calls() {
+        crate::interpreter::assert_lisp("(progn (setq bt-seen nil) (fset 'bt-target '(lambda () (mapbacktrace (lambda (e f a flags) (garbage-collect) (setq bt-seen (cons f bt-seen))) 'bt-target))) (bt-target) (eq (car (last bt-seen)) 'bt-target))", "t");
+    }
+    #[test]
+    fn callback_throw_restores_frames() {
+        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda () (backtrace-frame--internal (lambda (&rest a) (throw 'bt-exit 7)) 0 'bt-target))) (list (catch 'bt-exit (bt-target)) (backtrace-frame--internal #'list 0 'bt-target)))", "(7 nil)");
+    }
+    #[test]
+    fn interactive_marker_has_distinct_identity() {
+        crate::interpreter::assert_lisp("(progn (fset 'bt-target '(lambda () (backtrace-frame--internal #'list 1 'bt-target))) (list (eq (symbol-function 'funcall) (symbol-function 'funcall-interactively)) (nth 1 (funcall-interactively 'bt-target))))", "(nil funcall-interactively)");
+    }
+}
+
+#[cfg(test)]
+mod active_backtrace_gnu_tests {
+    #[test]
+    fn native_contract_matches_gnu_batch() {
+        for form in [
+            "(progn (fset 'bt-gnu-target '(lambda (x) (backtrace-frame--internal #'list 0 'bt-gnu-target))) (bt-gnu-target 17))",
+            "(progn (fset 'bt-gnu-target '(lambda (x) (backtrace-frame--internal #'list 0 'bt-gnu-alias))) (fset 'bt-gnu-alias 'bt-gnu-target) (bt-gnu-target 19))",
+            "(progn (setq bt-gnu-seen nil) (list (backtrace-frame--internal (lambda (&rest x) (setq bt-gnu-seen t)) 999 nil) bt-gnu-seen))",
+            "(progn (fset 'bt-gnu-target '(lambda () (backtrace-frame--internal #'list 1 'bt-gnu-target))) (list (eq (symbol-function 'funcall) (symbol-function 'funcall-interactively)) (nth 1 (funcall-interactively 'bt-gnu-target))))",
+            "(progn (fset 'bt-gnu-target '(lambda () (backtrace-frame--internal (lambda (&rest a) (throw 'bt-gnu-exit 7)) 0 'bt-gnu-target))) (list (catch 'bt-gnu-exit (bt-gnu-target)) (backtrace-frame--internal #'list 0 'bt-gnu-target)))",
+        ] { crate::assert_elprop!("{form}"); }
+    }
+}
+
+#[cfg(test)]
+mod active_backtrace_edge_tests {
+
+    #[test]
+    fn base_offset_narrows_to_c_int_before_positive_skip() {
+        // This matrix targets the independently observed 32-bit C-int ABI.
+        assert_eq!(std::mem::size_of::<std::os::raw::c_int>(), 4);
+        for (offset, found) in [
+            (-4_294_967_297_i64, true), (-4_294_967_296, true),
+            (-2_147_483_649, false), (-2_147_483_648, true), (-1, true),
+            (0, true), (1, false), (2_147_483_647, false),
+            (2_147_483_648, true), (4_294_967_295, true),
+            (4_294_967_296, true), (4_294_967_297, false),
+        ] {
+            let form = format!("(progn (fset 'bt-offset-target '(lambda (offset) (eq (nth 1 (backtrace-frame--internal #'list 0 (cons offset 'bt-offset-target))) 'bt-offset-target))) (bt-offset-target {offset}))");
+            crate::interpreter::assert_lisp(&form, if found { "t" } else { "nil" });
+            let form = format!("(progn (setq bt-offset-seen nil) (fset 'bt-offset-target '(lambda (offset) (mapbacktrace (lambda (e f a flags) (if (eq f 'bt-offset-target) (setq bt-offset-seen t))) (cons offset 'bt-offset-target)))) (bt-offset-target {offset}) bt-offset-seen)");
+            crate::interpreter::assert_lisp(&form, if found { "t" } else { "nil" });
+        }
+    }
+    #[test]
+    fn base_offset_c_int_boundaries_match_pinned_gnu() {
+        assert_eq!(std::mem::size_of::<std::os::raw::c_int>(), 4);
+        for offset in [2_147_483_647_i64, 2_147_483_648, 4_294_967_295, 4_294_967_296, 4_294_967_297, -2_147_483_648, -2_147_483_649] {
+            let form = format!("(progn (fset 'bt-offset-gnu '(lambda (offset) (eq (nth 1 (backtrace-frame--internal #'list 0 (cons offset 'bt-offset-gnu))) 'bt-offset-gnu))) (bt-offset-gnu {offset}))");
+            crate::assert_elprop!("{form}");
+        }
+    }
+    #[test]
+    fn selected_noncallable_callback_signals_invalid_function_payload() {
+        for callback in ["17", "[1 2]", "\"not a function\""] {
+            let form = format!("(condition-case e (backtrace-frame--internal {callback} 0 nil) (invalid-function (list (car e) (equal (car (cdr e)) {callback}))))");
+            crate::interpreter::assert_lisp(&form, "(invalid-function t)");
+            let form = format!("(condition-case e (mapbacktrace {callback} nil) (invalid-function (list (car e) (equal (car (cdr e)) {callback}))))");
+            crate::interpreter::assert_lisp(&form, "(invalid-function t)");
+        }
+    }
+    #[test]
+    fn selected_noncallable_condition_matches_gnu() {
+        for form in [
+            "(condition-case e (backtrace-frame--internal 17 0 nil) (invalid-function e))",
+            "(condition-case e (mapbacktrace [1 2] nil) (invalid-function e))",
+            "(backtrace-frame--internal 17 999 nil)",
+            "(condition-case e (backtrace-frame--internal 17 -1 nil) (wrong-type-argument e))",
+        ] { crate::assert_elprop!("{form}"); }
+    }
+
+    #[test]
+    fn map_callback_signal_unwinds_then_next_call_succeeds() {
+        crate::interpreter::assert_lisp("(progn (fset 'mb-target '(lambda (callback) (mapbacktrace callback 'mb-target))) (list (condition-case nil (mb-target (lambda (&rest args) (garbage-collect) (backtrace-frame--internal #'list 999 nil) (error \"callback failure\"))) (error 'caught)) (backtrace-frame--internal #'list 0 'mb-target) (mb-target (lambda (&rest args) nil))))", "(caught nil nil)");
+    }
+    #[test]
+    fn map_callback_reentry_keeps_snapshot_membership() {
+        crate::interpreter::assert_lisp("(progn (setq mb-seen nil mb-visits 0) (fset 'mb-reentry '(lambda () (garbage-collect) (backtrace-frame--internal #'list 999 nil))) (fset 'mb-target '(lambda () (mapbacktrace (lambda (e f a flags) (mb-reentry) (setq mb-seen (cons f mb-seen)) (if (eq f 'mb-target) (setq mb-visits (1+ mb-visits)))) 'mb-target))) (list (mb-target) mb-visits (memq 'mb-reentry mb-seen) (backtrace-frame--internal #'list 0 'mb-target)))", "(nil 1 nil nil)");
+    }
+    #[test]
+    fn missing_frame_does_not_validate_dormant_callback() {
+        for form in [
+            "(backtrace-frame--internal 17 999 nil)",
+            "(backtrace-frame--internal 17 0 '(0 . nil))",
+            "(mapbacktrace 17 'bt-no-such-base)",
+            "(mapbacktrace 17 '(0 . nil))",
+        ] { crate::interpreter::assert_lisp(form, "nil"); }
+        crate::interpreter::assert_lisp("(condition-case e (backtrace-frame--internal 17 -1 nil) (wrong-type-argument e))", "(wrong-type-argument wholenump -1)");
+        crate::interpreter::assert_lisp("(condition-case nil (backtrace-frame--internal 17 0 nil) (error 'caught))", "caught");
+        crate::interpreter::assert_lisp("(condition-case nil (mapbacktrace 17 nil) (error 'caught))", "caught");
+    }
+    #[test]
+    fn dormant_callback_and_index_order_match_gnu() {
+        for form in [
+            "(backtrace-frame--internal 17 999 nil)",
+            "(backtrace-frame--internal 17 0 '(0 . nil))",
+            "(mapbacktrace 17 'bt-no-such-base)",
+            "(mapbacktrace 17 '(0 . nil))",
+            "(condition-case e (backtrace-frame--internal 17 -1 nil) (wrong-type-argument e))",
+            "(condition-case nil (backtrace-frame--internal 17 0 nil) (error 'caught))",
+            "(condition-case nil (mapbacktrace 17 nil) (error 'caught))",
+        ] { crate::assert_elprop!("{form}"); }
+    }
+    #[test]
+    fn cons_nil_base_does_not_mean_unrestricted_stack() {
+        for base in ["'(0 . nil)", "'(1 . nil)", "'(-1 . nil)"] {
+            let inspect = format!("(backtrace-frame--internal #'list 0 {base})");
+            crate::interpreter::assert_lisp(&inspect, "nil");
+            let map = format!("(let ((seen nil)) (mapbacktrace (lambda (&rest args) (setq seen t)) {base}) seen)");
+            crate::interpreter::assert_lisp(&map, "nil");
+        }
+        crate::interpreter::assert_lisp("(not (null (backtrace-frame--internal #'list 0 nil)))", "t");
+        crate::interpreter::assert_lisp("(let ((seen nil)) (mapbacktrace (lambda (&rest args) (setq seen t)) nil) seen)", "t");
+    }
+    #[test]
+    fn absent_base_does_not_match_unbound_special_function_cells() {
+        crate::interpreter::assert_lisp("(let ((x 1)) (backtrace-frame--internal #'list 0 'bt-never-defined))", "nil");
+    }
+    #[test]
+    fn special_frame_uses_original_forms_and_alias_base() {
+        // Compare the whole frame: (car nil) is nil too, so checking only
+        // the evaluated flag cannot distinguish a missing frame.
+        crate::interpreter::assert_lisp("(progn (fset 'bt-let-alias 'let) (let ((x 1)) (backtrace-frame--internal #'list 0 'bt-let-alias)))", "(nil let (((x 1)) (backtrace-frame--internal (function list) 0 (quote bt-let-alias))) nil)");
+    }
+    #[test]
+    fn invalid_index_reports_gnu_wholenump_condition() {
+        crate::interpreter::assert_lisp("(condition-case e (backtrace-frame--internal #'list -1 nil) (wrong-type-argument e))", "(wrong-type-argument wholenump -1)");
+    }
+}
+
+#[cfg(test)]
+mod run_hooks_shared_tests {
+    #[test]
+    fn zero_nil_unbound_raw_lambda_and_closure() {
+        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-empty nil) (rh-lambda '(lambda () (setq rh-seen (cons 'lambda rh-seen)))) (rh-closure '(closure ((captured . 8)) () (garbage-collect) (setq rh-seen (cons captured rh-seen))))) (list (run-hooks) (run-hooks 'rh-unbound 'rh-empty 'rh-lambda 'rh-closure) rh-seen))"#, "(nil nil (8 lambda))");
+    }
+    #[test]
+    fn multiple_hooks_and_nonnil_results_keep_source_order() {
+        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-a (list (lambda () (setq rh-seen (cons 'a rh-seen)) t) (lambda () (garbage-collect) (setq rh-seen (cons 'b rh-seen)))) ) (rh-b (lambda () (setq rh-seen (cons 'c rh-seen))))) (list (run-hooks 'rh-a 'rh-b) rh-seen))"#, "(nil (c b a))");
+    }
+    #[test]
+    fn default_t_marker_ignores_recursive_default_t() {
+        crate::interpreter::assert_lisp(r#"(let ((rh-count 0) (rh-hooks nil)) (setq rh-hooks (list t (lambda () (garbage-collect) (setq rh-count (1+ rh-count))))) (list (run-hooks 'rh-hooks) rh-count))"#, "(nil 2)");
+    }
+    #[test]
+    fn callback_mutates_live_tail_across_gc() {
+        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-hooks nil)) (setq rh-hooks (list (lambda () (setq rh-seen (cons 'first rh-seen)) (setcdr rh-hooks (list (lambda () (setq rh-seen (cons 'replacement rh-seen))))) (garbage-collect) t) (lambda () (error "replaced")))) (list (run-hooks 'rh-hooks) rh-seen))"#, "(nil (replacement first))");
+    }
+    #[test]
+    fn error_and_throw_stop_later_hooks_and_next_call_recovers() {
+        crate::interpreter::assert_lisp(r#"(let ((rh-seen nil) (rh-bad (lambda () (garbage-collect) (error "expected"))) (rh-throw (lambda () (throw 'rh-exit 'thrown))) (rh-later (lambda () (setq rh-seen 'later)))) (let ((caught (condition-case nil (run-hooks 'rh-bad 'rh-later) (error t))) (thrown (catch 'rh-exit (run-hooks 'rh-throw 'rh-later)))) (list caught thrown rh-seen (run-hooks 'rh-later) rh-seen)))"#, "(t thrown nil nil later)");
+    }
+    #[test]
+    fn real_cycle_reaches_existing_budget_and_recovers() {
+        crate::interpreter::assert_lisp(r#"(let ((rh-count 0) (rh-hooks nil) (rh-stop nil)) (setq rh-hooks (list (lambda () (setq rh-count (1+ rh-count))))) (setcdr rh-hooks rh-hooks) (setq rh-stop (condition-case nil (run-hooks 'rh-hooks) (error 'bounded))) (setcdr rh-hooks nil) (list rh-stop rh-count (run-hooks 'rh-hooks) rh-count))"#, "(bounded 65536 nil 65537)");
+    }
+    #[test]
+    fn ordinary_finite_cases_match_gnu() {
+        for form in [
+            "(let ((rh-hooks '(lambda () 'ignored))) (run-hooks 'rh-hooks))",
+            "(let ((rh-count 0) (rh-hooks nil)) (setq rh-hooks (list t (lambda () (setq rh-count (1+ rh-count))))) (run-hooks 'rh-hooks) rh-count)",
+            r#"(let ((rh-hooks (eval '(let ((captured 8)) (lambda () (if (= captured 8) t (error "capture lost")))) t))) (run-hooks 'rh-hooks))"#,
+        ] { crate::assert_elprop!("{form}"); }
+    }
+}
+
+#[cfg(test)]
+mod hook_wrapped_tests {
+    #[test]
+    fn empty_hook_does_not_validate_wrapper_and_raw_entries_are_data() {
+        crate::interpreter::assert_lisp(r#"(let ((hw-empty nil) (hw-entry 42)) (list (run-hook-wrapped 'hw-missing 'undefined-wrapper) (run-hook-wrapped 'hw-empty 99) (run-hook-wrapped 'hw-entry (lambda (fun x) (list fun x)) 'payload)))"#, "(nil nil (42 payload))");
+    }
+    #[test]
+    fn wrapper_receives_original_entry_and_heap_args_then_short_circuits() {
+        crate::interpreter::assert_lisp(r#"(let ((hw-seen nil) (hw-payload (list 'payload)) (hw-hooks '(first second third))) (let ((answer (run-hook-wrapped 'hw-hooks (lambda (fun arg) (garbage-collect) (setq hw-seen (cons fun hw-seen)) (if (eq fun 'second) arg nil)) hw-payload))) (list (eq answer hw-payload) hw-seen)))"#, "(t (second first))");
+    }
+    #[test]
+    fn real_wrapper_invokes_lambda_with_zero_original_arguments() {
+        crate::interpreter::assert_lisp(r#"(let ((hw-hook '(lambda () 'called))) (run-hook-wrapped 'hw-hook (lambda (fun) (garbage-collect) (funcall fun))))"#, "called");
+    }
+    #[test]
+    fn default_marker_uses_same_wrapper_and_live_tail_reloads() {
+        crate::interpreter::assert_lisp(r#"(let ((hw-hooks '(t first)) (hw-seen nil)) (run-hook-wrapped 'hw-hooks (lambda (fun) (setq hw-seen (cons fun hw-seen)) nil)) hw-seen)"#, "(first first)");
+        crate::interpreter::assert_lisp(r#"(let ((hw-hooks (list 'first 'replaced)) (hw-seen nil)) (run-hook-wrapped 'hw-hooks (lambda (fun) (setq hw-seen (cons fun hw-seen)) (if (eq fun 'first) (setcdr hw-hooks (list 'last))) (garbage-collect) nil)) hw-seen)"#, "(last first)");
+    }
+    #[test]
+    fn nested_wrappers_keep_original_args_and_throw_error_unwind() {
+        crate::interpreter::assert_lisp(r#"(let ((hw-hook 'entry) (hw-nested nil) (hw-payload (list 'outer))) (let ((answer (run-hook-wrapped 'hw-hook (lambda (fun arg) (setq hw-nested (run-hook-wrapped 'hw-hook (lambda (f x) (garbage-collect) (list f x)) 'inner)) (garbage-collect) arg) hw-payload))) (list (eq answer hw-payload) hw-nested (catch 'hw-exit (run-hook-wrapped 'hw-hook (lambda (f) (throw 'hw-exit 'thrown)))) (condition-case nil (run-hook-wrapped 'hw-hook (lambda (f) (error "expected"))) (error 'caught)) (run-hook-wrapped 'hw-hook (lambda (f) 'recovered)))))"#, "(t (entry inner) thrown caught recovered)");
+    }
+    #[test]
+    fn cycle_is_bounded_without_calling_entries() {
+        crate::interpreter::assert_lisp(r#"(let ((hw-hook (list 42)) (hw-count 0) (hw-status nil)) (setcdr hw-hook hw-hook) (setq hw-status (condition-case nil (run-hook-wrapped 'hw-hook (lambda (f) (setq hw-count (1+ hw-count)) nil)) (error 'bounded))) (setcdr hw-hook nil) (list hw-status hw-count (run-hook-wrapped 'hw-hook (lambda (f) f))))"#, "(bounded 65536 42)");
+    }
+    #[test]
+    fn finite_wrapped_contract_matches_gnu() {
+        for form in [
+            "(let ((hw-hook nil)) (run-hook-wrapped 'hw-hook 99))",
+            "(let ((hw-hook 42)) (run-hook-wrapped 'hw-hook (lambda (f x) (list f x)) 'payload))",
+            "(let ((hw-hook '(first second third))) (run-hook-wrapped 'hw-hook (lambda (f) (if (eq f 'second) f nil))))",
+            "(let ((hw-hook (eval '(let ((captured 8)) (lambda () captured)) t))) (run-hook-wrapped 'hw-hook (lambda (f) (funcall f))))",
+        ] { crate::assert_elprop!("{form}"); }
+    }
 }

@@ -647,7 +647,7 @@ fn call_interactively<'a>(
     } else {
         list![sym::QUOTE,command.bind(cx);cx]
     };
-    let form = list![sym::FUNCALL,quoted;cx];
+    let form = list![sym::FUNCALL_INTERACTIVELY,quoted;cx];
     root!(form, cx);
     crate::interpreter::eval(form, None, env, cx).map_err(Into::into)
 }

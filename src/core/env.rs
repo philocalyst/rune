@@ -20,6 +20,7 @@ pub(crate) use symbol_map::*;
 type PropertyMap<'a> = ObjectMap<Slot<Symbol<'a>>, Vec<(Slot<Symbol<'a>>, Slot<Object<'a>>)>>;
 #[derive(Debug, Trace)]
 pub(crate) struct Env<'a> {
+    pub(crate) active_backtrace: Vec<Slot<Object<'a>>>,
     #[no_trace]
     pub(crate) charset_seeded: bool,
     #[no_trace]
@@ -97,6 +98,7 @@ impl<'a> Env<'a> {
             (Slot::new(sym::CHAR_TABLE_EXTRA_SLOTS), Slot::new(Object::from(0)))
         ])].into_iter().collect();
         Ok(Self {
+            active_backtrace: Default::default(),
             charset_seeded: false,
             charset_alias_publications: 0,
             charset_offsets: Vec::new(),
@@ -150,6 +152,25 @@ impl<'a> Env<'a> {
 
 // RootedEnv created by #[derive(Trace)]
 impl<'a> RootedEnv<'a> {
+    pub(crate) fn backtrace_depth(&self) -> usize { self.active_backtrace.len() }
+    pub(crate) fn backtrace_truncate(&mut self, depth: usize) { self.active_backtrace.truncate(depth); }
+    pub(crate) fn backtrace_push(&mut self, function: Object, args: Object, evaluated: bool, cx: &Context) -> usize {
+        use crate::core::cons::Cons;
+        use crate::core::object::NIL;
+        let index = self.backtrace_depth();
+        let entry = Cons::new(evaluated, Cons::new(function, Cons::new(args, Cons::new1(NIL,cx),cx),cx),cx);
+        self.active_backtrace.push(Object::from(entry));
+        index
+    }
+    pub(crate) fn backtrace_update(&mut self, index: usize, args: Object, cx: &Context) -> anyhow::Result<()> {
+        use crate::core::cons::Cons;
+        let old = self.active_backtrace[index].bind(cx);
+        let [_, function, _, flags] = backtrace_components(old)?;
+        let entry = Cons::new(true, Cons::new(function, Cons::new(args, Cons::new1(flags,cx),cx),cx),cx);
+        self.active_backtrace[index].set(Object::from(entry));
+        Ok(())
+    }
+
     pub(crate) fn initialize_condition_metadata(&mut self, cx: &Context) {
         self.initialize_charset_registry(cx);
         use super::cons::Cons;
@@ -804,4 +825,14 @@ mod forwarded_readonly_tests {
         assert_eq!(second.variable_value(sym::BUFFER_READ_ONLY, &cx)?, Some(TRUE));
         Ok(())
     }
+}
+
+/// Internal active entries have exactly four fields; do not rely on the public
+/// IntoArray conversions, which intentionally only support arities one/two.
+pub(crate) fn backtrace_components(value: Object<'_>) -> anyhow::Result<[Object<'_>;4]> {
+    let mut fields = value.as_list()?;
+    let mut next = || -> anyhow::Result<Object<'_>> { Ok(fields.next().ok_or_else(|| anyhow!("Short active frame"))??) };
+    let result = [next()?,next()?,next()?,next()?];
+    if let Some(extra) = fields.next() { extra?; anyhow::bail!("Long active frame"); }
+    Ok(result)
 }

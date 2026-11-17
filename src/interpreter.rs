@@ -103,6 +103,17 @@ impl Interpreter<'_, '_> {
         cons: &Rto<Gc<&Cons>>,
         cx: &'ob mut Context,
     ) -> EvalResult<'ob> {
+        let checkpoint = self.env.backtrace_depth();
+        let original = cons.bind(cx);
+        self.env.backtrace_push(original.car(),original.cdr(),false,cx);
+        root!(result, NIL, cx);
+        let outcome = self.eval_sexp_inner(cons,cx).map(|value| result.set(value));
+        self.env.backtrace_truncate(checkpoint);
+        outcome?;
+        Ok(result.bind(cx))
+    }
+
+    fn eval_sexp_inner<'ob>(&mut self, cons: &Rto<Gc<&Cons>>, cx: &'ob mut Context) -> EvalResult<'ob> {
         let cons = cons.bind(cx);
         let forms = cons.cdr();
         root!(forms, cx);
@@ -229,6 +240,7 @@ impl Interpreter<'_, '_> {
         args: &Rto<Object>,
         cx: &'ob mut Context,
     ) -> EvalResult<'ob> {
+        let active_index = self.env.backtrace_depth()-1;
         let Some(func) = crate::data::owner_callable(sym.bind(cx), self.env, cx)? else {
             return Err(EvalError::signal(
                 sym::VOID_FUNCTION.into(),
@@ -316,7 +328,10 @@ impl Interpreter<'_, '_> {
             let result = self.eval_form(x, cx)?;
             args.push(result);
         }
+        let argument_list = crate::fns::slice_into_list(Rt::bind_slice(args,cx),None,cx);
+        self.env.backtrace_update(active_index,argument_list,cx)?;
         let frame = &mut CallFrame::new(self.env);
+        frame.inherit_backtrace();
         frame.push_arg_slice(Rt::bind_slice(args, cx));
         let name = sym.bind(cx).name().to_owned();
         func.call(frame, Some(&name), cx)

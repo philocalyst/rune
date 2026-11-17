@@ -32,6 +32,8 @@ struct Handler<'ob> {
     #[no_trace]
     binding_frames: usize,
     #[no_trace]
+    backtrace_depth: usize,
+    #[no_trace]
     is_catch: bool,
     #[no_trace]
     catch_depth: usize,
@@ -56,6 +58,7 @@ impl<'old, 'new> WithLifetime<'new> for Handler<'old> {
 struct FrameCheckpoint {
     binding_depth: usize,
     catch_depth: usize,
+    backtrace_depth: usize,
 }
 
 /// The bytecode VM. This hold all the current call frames and handlers. The
@@ -276,6 +279,12 @@ impl<'ob> RootedVM<'_, '_, '_> {
             self.binding_frames.try_reserve(1).map_err(|error| {
                 anyhow::anyhow!("Cannot reserve bytecode binding frame: {error}")
             })?;
+            // Retain the actual designator and the supplied (not normalized)
+            // argument list. Shared Context allocation cannot trigger GC here.
+            let trace_depth = self.env.backtrace_depth();
+            let trace_arguments = crate::fns::slice_into_list(
+                Rt::bind_slice(&self.env.stack[..arg_cnt], cx), None, cx);
+            let trace_function = self.env.stack[arg_cnt].bind(cx);
             let frame_start = len - (arg_cnt + 1);
             self.env.stack.push_bytecode_frame(
                 frame_start,
@@ -286,11 +295,13 @@ impl<'ob> RootedVM<'_, '_, '_> {
             )?;
             // All checked frame reservations succeeded. Publishing the new
             // code/root/checkpoint now cannot expose a half-entered callee.
+            self.env.backtrace_push(trace_function, trace_arguments, true, cx);
             self.func.set(next_fn);
             self.pc = cursor;
             self.binding_frames.push(FrameCheckpoint {
                 binding_depth: self.env.binding_depth(),
                 catch_depth: self.env.catch_stack.len(),
+                backtrace_depth: trace_depth,
             });
             self.prepare_lisp_args(next_fn, arg_cnt, &name, cx)?;
         } else {
@@ -313,6 +324,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
     ) -> Result<()> {
         self.env.unwind_bindings(handler.binding_depth, cx)?;
         self.env.catch_stack.truncate(handler.catch_depth);
+        self.env.backtrace_truncate(handler.backtrace_depth);
         self.binding_frames.truncate(handler.binding_frames);
         self.unwind(handler.stack_frame, cx)?;
         self.env.stack.truncate(handler.stack_size);
@@ -513,6 +525,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                         stack_frame: self.env.stack.current_frame(),
                         binding_depth: self.env.binding_depth(),
                         binding_frames: self.binding_frames.len(),
+                        backtrace_depth: self.env.backtrace_depth(),
                         condition: Slot::new(condition),
                     };
                     self.handlers.push(handler);
@@ -791,6 +804,7 @@ impl<'ob> RootedVM<'_, '_, '_> {
                     let checkpoint = *self.binding_frames.last().expect("VM has a binding frame");
                     self.env.unwind_bindings(checkpoint.binding_depth, cx)?;
                     self.env.catch_stack.truncate(checkpoint.catch_depth);
+                    self.env.backtrace_truncate(checkpoint.backtrace_depth);
                     // Malformed bytecode may return without PopHandler. Such
                     // handlers must not outlive their frame and intercept a
                     // later caller error; the caller's lower-depth handlers stay.
@@ -1095,6 +1109,24 @@ pub(crate) fn call<'ob>(
     // Direct native callers may not have finalized metadata yet. The supplied
     // span is now validated; normalize it before retaining a reusable frame.
     frame.finalize_arguments()?;
+    let checkpoint = frame.backtrace_depth();
+    let inherited = frame.backtrace_registered();
+    frame.register_backtrace(Object::from(func.bind(cx)), cx);
+    // Keep registration scoped to this invocation, including early errors in
+    // argument snapshot preparation. Recursive generic/interpreter owners keep
+    // their original designator and retain responsibility for their own entry.
+    let outcome = call_registered(func, arg_cnt, name, frame, cx);
+    if !inherited {
+        frame.backtrace_truncate(checkpoint);
+        frame.clear_backtrace_registration();
+    }
+    outcome
+}
+
+fn call_registered<'ob>(
+    func: &Rto<&ByteFn>, arg_cnt: usize, name: &str,
+    frame: &mut CallFrame, cx: &'ob mut Context,
+) -> EvalResult<'ob> {
     let entry = frame.stack.call_entry();
     root!(arguments, new(Vec), cx);
     arguments.bind_mut(cx).try_reserve(arg_cnt).map_err(anyhow::Error::from)?;
@@ -1123,11 +1155,12 @@ fn call_inner<'ob>(
     let pc = programs.cursor(func.codes(), 0).map_err(anyhow::Error::from)?;
     let binding_depth = frame.binding_depth();
     let catch_depth = frame.catch_stack.len();
+    let backtrace_depth = frame.backtrace_depth();
     let entry_frame = frame.stack.current_frame();
     let vm = VM {
         pc,
         programs,
-        binding_frames: vec![FrameCheckpoint { binding_depth, catch_depth }],
+        binding_frames: vec![FrameCheckpoint { binding_depth, catch_depth, backtrace_depth }],
         func: Slot::new(func),
         env: frame,
         handlers: Vec::new(),
@@ -1142,6 +1175,7 @@ fn call_inner<'ob>(
         vm.env.stack.pop_frame();
     }
     vm.env.catch_stack.truncate(catch_depth);
+    vm.env.backtrace_truncate(backtrace_depth);
     vm.env.unwind_bindings(binding_depth, cx)?;
     result
 }
@@ -1229,6 +1263,153 @@ mod test {
         let val = rebind!(call(bytecode, frame.arg_count(), "test", frame, cx).unwrap());
         let expect = expect.bind(cx);
         assert_eq!(val, expect);
+    }
+
+
+    #[test]
+    fn active_backtrace_direct_entry_reuse_scopes_success_error_and_inheritance() {
+        use OpCode as O;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let callback = crate::reader::read(
+            "(lambda (evaluated function args flags) (garbage-collect) function)", cx).unwrap().0;
+        root!(callback, cx);
+        let capture = crate::core::env::intern("backtrace-frame--internal", cx);
+        make_bytecode!(first, 0,
+            [O::Constant0, O::Constant1, O::Constant2, O::Constant3, O::Call3, O::Return],
+            [capture, callback.bind(cx), 1, NIL], cx);
+        make_bytecode!(second, 0,
+            [O::Constant0, O::Constant1, O::Constant2, O::Constant3, O::Call3, O::Return],
+            [capture, callback.bind(cx), 1, NIL], cx);
+        make_bytecode!(requires_arg, 257, [O::Constant0, O::Return], [1], cx);
+        {
+            let mut frame = CallFrame::new(env); frame.finalize_arguments().unwrap();
+            let first_result = rebind!(call(first, 0, "first", &mut frame, cx).unwrap());
+            assert!(first_result.ptr_eq(Object::from(first.bind(cx))));
+            assert_eq!(frame.backtrace_depth(), 0); assert!(!frame.backtrace_registered());
+            assert!(call(requires_arg, 0, "arity-error", &mut frame, cx).is_err());
+            assert_eq!(frame.backtrace_depth(), 0); assert!(!frame.backtrace_registered());
+            let second_result = rebind!(call(second, 0, "second", &mut frame, cx).unwrap());
+            assert!(second_result.ptr_eq(Object::from(second.bind(cx))));
+            assert!(!second_result.ptr_eq(Object::from(first.bind(cx))));
+            assert_eq!(frame.backtrace_depth(), 0); assert!(!frame.backtrace_registered());
+            // An outer generic call's original symbolic designator must not be
+            // replaced by its resolved bytecode, nor removed by this inner call.
+            frame.register_backtrace(sym::IDENTITY.into(), cx);
+            let inherited = call(second, 0, "inherited", &mut frame, cx).unwrap();
+            assert!(inherited.ptr_eq(Object::from(sym::IDENTITY)));
+            assert_eq!(frame.backtrace_depth(), 1); assert!(frame.backtrace_registered());
+        }
+        assert_eq!(env.backtrace_depth(), 0);
+    }
+
+    #[test]
+    fn active_backtrace_optimized_call_keeps_original_rest_arguments_across_gc() {
+        use OpCode as O;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let callback = crate::reader::read(
+            "(lambda (evaluated function args flags) (garbage-collect) (list evaluated function args flags))", cx).unwrap().0;
+        root!(callback, cx);
+        let capture = crate::core::env::intern("backtrace-frame--internal", cx);
+        make_bytecode!(inner, 128,
+            [O::Constant0, O::Constant1, O::Constant2, O::Constant3, O::Call3, O::Return],
+            [capture, callback.bind(cx), 1, NIL], cx);
+        let argument = list![7, 8; cx]; root!(argument, cx);
+        make_bytecode!(outer, 0, [O::Constant0, O::Constant1, O::Call1, O::Return],
+            [inner.bind(cx), argument.bind(cx)], cx);
+        let result = {
+            let mut frame = CallFrame::new(env);
+            frame.finalize_arguments().unwrap();
+            let result = rebind!(call(outer, 0, "outer", &mut frame, cx).unwrap());
+            root!(result, cx);
+            assert_eq!(frame.backtrace_depth(), 0);
+            assert!(!frame.backtrace_registered());
+            drop(frame);
+            result.bind(cx)
+        };
+        root!(result, cx);
+        assert_eq!(env.backtrace_depth(), 0);
+        cx.garbage_collect(true);
+        let [evaluated, function, args, flags] = crate::core::env::backtrace_components(result.bind(cx)).unwrap();
+        assert!(!evaluated.is_nil()); assert!(flags.is_nil());
+        assert!(function.ptr_eq(Object::from(inner.bind(cx))));
+        let args: &Cons = args.try_into().unwrap();
+        assert!(args.car().ptr_eq(argument.bind(cx)));
+        assert!(args.cdr().is_nil()); // original one argument, not normalized rest list
+    }
+
+    #[test]
+    fn active_backtrace_optimized_arity_failure_removes_only_nested_frames() {
+        use OpCode as O;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new(cx).unwrap()), cx);
+        env.backtrace_push(sym::IDENTITY.into(), NIL, true, cx);
+        make_bytecode!(inner, 257, [O::Constant0, O::Return], [1], cx);
+        make_bytecode!(outer, 0, [O::Constant0, O::Call0, O::Return], [inner.bind(cx)], cx);
+        {
+            let mut frame = CallFrame::new(env); frame.finalize_arguments().unwrap();
+            assert!(call(outer, 0, "outer", &mut frame, cx).is_err());
+            assert_eq!(frame.backtrace_depth(), 1);
+            assert!(!frame.backtrace_registered());
+        }
+        assert_eq!(env.backtrace_depth(), 1);
+        env.backtrace_truncate(0);
+    }
+
+    #[test]
+    fn active_backtrace_resumed_handler_observes_outer_not_unwound_inner() {
+        use OpCode as O;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new(cx).unwrap()), cx);
+        let capture = crate::core::env::intern("backtrace-frame--internal", cx);
+        let list_function = crate::core::env::intern("list", cx);
+        make_bytecode!(inner, 0,
+            [O::Constant0, O::Constant1, O::Constant2, O::Call2, O::Return],
+            [sym::THROW, 19, 73], cx);
+        // Catch target is byte 8. Inspect while the resumed outer frame is
+        // still active: eventual outer-call cleanup cannot mask stale inner.
+        make_bytecode!(outer, 0,
+            [O::Constant0, O::PushCatch, 8, 0, O::Constant1, O::Call0, O::PopHandler, O::Return,
+             O::Discard, O::Constant2, O::Constant3, O::Constant4, O::Constant5, O::Call3, O::Return],
+            [19, inner.bind(cx), capture, list_function, 1, NIL], cx);
+        let result = {
+            let mut frame = CallFrame::new(env); frame.finalize_arguments().unwrap();
+            let result = rebind!(call(outer, 0, "outer", &mut frame, cx).unwrap());
+            root!(result, cx);
+            assert_eq!(frame.backtrace_depth(), 0);
+            drop(frame);
+            result.bind(cx)
+        };
+        root!(result, cx);
+        let [evaluated, function, args, flags] = crate::core::env::backtrace_components(result.bind(cx)).unwrap();
+        assert!(!evaluated.is_nil()); assert!(args.is_nil()); assert!(flags.is_nil());
+        assert!(function.ptr_eq(Object::from(outer.bind(cx))));
+        assert!(!function.ptr_eq(Object::from(inner.bind(cx))));
+        assert_eq!(env.backtrace_depth(), 0);
+    }
+
+    #[test]
+    fn active_backtrace_optimized_throw_restores_handler_frame_depth() {
+        use OpCode as O;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new(cx).unwrap()), cx);
+        make_bytecode!(inner, 0,
+            [O::Constant0, O::Constant1, O::Constant2, O::Call2, O::Return],
+            [sym::THROW, 19, 73], cx);
+        make_bytecode!(outer, 0,
+            [O::Constant0, O::PushCatch, 8, 0, O::Constant1, O::Call0, O::PopHandler, O::Return, O::Return],
+            [19, inner.bind(cx)], cx);
+        {
+            let mut frame = CallFrame::new(env); frame.finalize_arguments().unwrap();
+            assert_eq!(call(outer, 0, "outer", &mut frame, cx).unwrap(), Object::from(73));
+            assert_eq!(frame.backtrace_depth(), 0);
+            assert!(!frame.backtrace_registered());
+        }
+        assert_eq!(env.backtrace_depth(), 0);
     }
 
     #[test]

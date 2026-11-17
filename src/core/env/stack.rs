@@ -370,6 +370,8 @@ impl<'a> RootedLispStack<'a> {
 /// goes out of scope.
 pub(crate) struct CallFrame<'brw, 'rt> {
     env: &'brw mut Rt<super::Env<'rt>>,
+    backtrace_checkpoint: usize,
+    backtrace_registered: bool,
 }
 
 impl<'brw, 'rt> CallFrame<'brw, 'rt> {
@@ -377,7 +379,8 @@ impl<'brw, 'rt> CallFrame<'brw, 'rt> {
     /// this goes out of scope.
     pub(crate) fn new(env: &'brw mut Rt<super::Env<'rt>>) -> Self {
         env.stack.push_empty_frame();
-        Self { env }
+        let backtrace_checkpoint = env.backtrace_depth();
+        Self { env, backtrace_checkpoint, backtrace_registered: false }
     }
 
     /// Create a new function call frame with the top args on the stack. This
@@ -388,7 +391,19 @@ impl<'brw, 'rt> CallFrame<'brw, 'rt> {
         cx: &Context,
     ) -> Result<Self> {
         env.stack.push_frame(args, cx)?;
-        Ok(Self { env })
+        let backtrace_checkpoint = env.backtrace_depth();
+        Ok(Self { env, backtrace_checkpoint, backtrace_registered: false })
+    }
+
+    pub(crate) fn backtrace_registered(&self) -> bool { self.backtrace_registered }
+    pub(crate) fn clear_backtrace_registration(&mut self) { self.backtrace_registered = false; }
+    pub(crate) fn inherit_backtrace(&mut self) { self.backtrace_registered = true; }
+    pub(crate) fn register_backtrace(&mut self, function: Object, cx: &Context) {
+        if !self.backtrace_registered {
+            let args = crate::fns::slice_into_list(Rt::bind_slice(self.arg_slice(),cx),None,cx);
+            self.env.backtrace_push(function,args,true,cx);
+            self.backtrace_registered = true;
+        }
     }
 
     /// Push an argument onto the stack as part of this call frame
@@ -423,6 +438,7 @@ impl<'brw, 'rt> CallFrame<'brw, 'rt> {
 
 impl Drop for CallFrame<'_, '_> {
     fn drop(&mut self) {
+        self.env.backtrace_truncate(self.backtrace_checkpoint);
         self.env.stack.pop_frame();
     }
 }
