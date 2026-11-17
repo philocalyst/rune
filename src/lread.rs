@@ -151,7 +151,9 @@ fn configured_load_suffixes(env: &Rt<Env>, cx: &Context) -> Result<Vec<String>> 
             let format = suffix_text(*format)?;
             let representation = suffix_text(*representation)?;
             ensure!(representation.is_empty(), "Compressed load representations are unsupported");
-            ensure!(![".elc", ".eln", ".so", ".dll", ".dylib", ".gz"].iter().any(|suffix| format.ends_with(suffix)), "Compiled or compressed load suffixes are unsupported");
+            // Search admission is separate from format execution: Doom searches .elc before .el.
+            // A selected .elc still fails closed in load_lisp, without source fallback.
+            ensure!(format == ".elc" || ![".elc", ".eln", ".so", ".dll", ".dylib", ".gz"].iter().any(|suffix| format.ends_with(suffix)), "Compiled or compressed load suffixes are unsupported");
             ensure!(result.len() < 4096, "Load suffix product exceeds entry budget");
             bytes = bytes.checked_add(format.len()).context("Load suffix byte budget overflow")?;
             ensure!(bytes <= 1024 * 1024, "Load suffix product exceeds byte budget");
@@ -540,6 +542,82 @@ mod test {
     }
 
     #[test]
+    fn doom_elc_search_loads_existing_source_and_preserves_missing_noerror() {
+        let fixture = LoadFixture::new();
+        let source = "(setq rune-load-marker 7)";
+        fs::write(fixture.0.join("entry.el"), source).unwrap();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        env.vars.insert(sym::LOAD_PATH, list!(fixture.0.to_str().unwrap();cx));
+        env.vars.insert(sym::LOAD_SUFFIXES, list!(".elc", ".el";cx));
+        assert_eq!(configured_load_suffixes(env, cx).unwrap(), vec![".elc", ".el"]);
+        assert_eq!(search_load_path("entry", cx, env, false, true).unwrap(), Some(fixture.0.join("entry.el")));
+        let file: Gc<&LispString> = cx.add("entry").try_into().unwrap();
+        root!(file, cx);
+        assert!(load_lisp(file, None, Some(()), None, Some(()), cx, env).unwrap());
+        assert_eq!(env.vars.get(crate::core::env::intern("rune-load-marker", cx)).unwrap().bind(cx), Object::from(7));
+        let missing: Gc<&LispString> = cx.add("missing").try_into().unwrap();
+        root!(missing, cx);
+        assert!(!load_lisp(missing, Some(()), Some(()), None, None, cx, env).unwrap());
+        assert!(load_lisp(missing, None, Some(()), None, None, cx, env).is_err());
+        assert_eq!(fs::read_to_string(fixture.0.join("entry.el")).unwrap(), source);
+    }
+
+    #[test]
+    fn selected_elc_never_executes_or_falls_back_even_with_noerror_or_nosuffix() {
+        let fixture = LoadFixture::new();
+        let source = "(setq rune-load-marker 7)";
+        // Rune-only rejection fixture, not a GNU bytecode artifact.
+        let compiled = b"(setq rune-load-marker 99)";
+        fs::write(fixture.0.join("entry.el"), source).unwrap();
+        fs::write(fixture.0.join("entry.elc"), compiled).unwrap();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        env.vars.insert(sym::LOAD_PATH, list!(fixture.0.to_str().unwrap();cx));
+        env.vars.insert(sym::LOAD_SUFFIXES, list!(".elc", ".el";cx));
+        let marker = crate::core::env::intern("rune-load-marker", cx);
+        env.vars.insert(marker, Object::from(0));
+        let absolute = fixture.0.join("entry.elc");
+        for (name, nosuffix) in [("entry", false), ("entry.elc", false), ("entry.elc", true), (absolute.to_str().unwrap(), true)] {
+            for noerror in [false, true] {
+                assert_eq!(search_load_path(name, cx, env, nosuffix, false).unwrap(), Some(fixture.0.join("entry.elc")));
+                let file: Gc<&LispString> = cx.add(name).try_into().unwrap();
+                root!(file, cx);
+                let error = load_lisp(file, noerror.then_some(()), Some(()), nosuffix.then_some(()), None, cx, env).unwrap_err();
+                assert_eq!(error.to_string(), "Compiled Lisp and native module loading are not implemented");
+                assert_eq!(env.vars.get(marker).unwrap().bind(cx), Object::from(0));
+            }
+        }
+        assert_eq!(fs::read_to_string(fixture.0.join("entry.el")).unwrap(), source);
+        assert_eq!(fs::read(fixture.0.join("entry.elc")).unwrap(), compiled);
+    }
+
+    #[test]
+    fn source_first_suffix_order_does_not_select_present_elc() {
+        let fixture = LoadFixture::new();
+        fs::write(fixture.0.join("entry.el"), "(setq rune-load-marker 7)").unwrap();
+        fs::write(fixture.0.join("entry.elc"), "(setq rune-load-marker 99)").unwrap();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        env.vars.insert(sym::LOAD_PATH, list!(fixture.0.to_str().unwrap();cx));
+        env.vars.insert(sym::LOAD_SUFFIXES, list!(".el", ".elc";cx));
+        assert_eq!(search_load_path("entry", cx, env, false, true).unwrap(), Some(fixture.0.join("entry.el")));
+        let file: Gc<&LispString> = cx.add("entry").try_into().unwrap();
+        root!(file, cx);
+        assert!(load_lisp(file, None, Some(()), None, Some(()), cx, env).unwrap());
+        assert_eq!(env.vars.get(crate::core::env::intern("rune-load-marker", cx)).unwrap().bind(cx), Object::from(7));
+    }
+
+    #[test]
     fn source_suffix_is_appended_and_precedes_bare_file() {
         let fixture = LoadFixture::new();
         let directory = fixture.0.to_str().unwrap();
@@ -909,7 +987,7 @@ mod supported_load_suffix_tests {
         assert_eq!(super::suffix_text(oversized).unwrap_err().to_string(), "Load suffix exceeds byte budget");
     }
     #[test]
-    fn source_policy_does_not_advertise_unsupported_backends_or_loop() {
-        crate::interpreter::assert_lisp(r#"(list (get-load-suffixes) load-suffixes load-file-rep-suffixes (let ((load-file-rep-suffixes '(".gz"))) (condition-case nil (get-load-suffixes) (error 'unsupported))) (let ((load-suffixes '(".elc"))) (condition-case nil (get-load-suffixes) (error 'unsupported))) (let ((load-suffixes (list ".el"))) (setcdr load-suffixes load-suffixes) (condition-case nil (get-load-suffixes) (error 'bounded))) (let ((load-suffixes (list (propertize ".el" 'face 'bold)))) (condition-case nil (get-load-suffixes) (error 'unsupported))))"#, r#"((".el") (".el") ("") unsupported unsupported bounded unsupported)"#);
+    fn source_policy_admits_elc_search_but_rejects_other_backends_and_cycles() {
+        crate::interpreter::assert_lisp(r#"(list (get-load-suffixes) load-suffixes load-file-rep-suffixes (let ((load-file-rep-suffixes '(".gz"))) (condition-case nil (get-load-suffixes) (error 'unsupported))) (let ((load-suffixes '(".elc"))) (condition-case nil (get-load-suffixes) (error 'unsupported))) (let ((load-suffixes (list ".el"))) (setcdr load-suffixes load-suffixes) (condition-case nil (get-load-suffixes) (error 'bounded))) (let ((load-suffixes (list (propertize ".el" 'face 'bold)))) (condition-case nil (get-load-suffixes) (error 'unsupported))))"#, r#"((".el") (".el") ("") unsupported (".elc") bounded unsupported)"#);
     }
 }

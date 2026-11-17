@@ -123,5 +123,9 @@
   "frame::terminal_cell_metric_tests::terminal_character_cells_validate_owner_frame_and_keep_identity",
   "frame::tests::face_capability_query_rejects_non_frame",
   "library::elprop::batch_emacs::tests::exited_leader_with_retained_pipes_still_times_out",
-  "library::elprop::batch_emacs::tests::closed_pipes_do_not_hide_a_running_leader"
+  "library::elprop::batch_emacs::tests::closed_pipes_do_not_hide_a_running_leader",
+  "lread::test::doom_elc_search_loads_existing_source_and_preserves_missing_noerror",
+  "lread::test::selected_elc_never_executes_or_falls_back_even_with_noerror_or_nosuffix",
+  "lread::test::source_first_suffix_order_does_not_select_present_elc",
+  "lread::supported_load_suffix_tests::source_policy_admits_elc_search_but_rejects_other_backends_and_cycles"
 ]

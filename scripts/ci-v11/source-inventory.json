@@ -485,7 +485,7 @@
   "src/library/filevercmp.rs": "0278c4ff72faaf04cc6682773290efc02ddba947234ce6e9b45cb077a71c1d62",
   "src/library.rs": "1fc58eb00759b3e69a31c0ee8f63da3f202cccd6ecf118860b6ed26308a47299",
   "src/lisp.rs": "ea47b19c0b5c218713b2da295e78f6832e48b7b85542dce013f007f1d9707f7a",
-  "src/lread.rs": "dd5f7cd1eb289d87077a168ec6633150f15938f5b43396c7080623de231fdbde",
+  "src/lread.rs": "083217b521a95dd2c58d2b898460569ba6f0d7b20431aba81b85e69d5a8ee45a",
   "src/macros.rs": "fb3fcfbca9dd0ea8fb1bf06c66bc470efa9d197f9f94443adc1d5e76f9551ada",
   "src/main.rs": "3922b0114ac183210b16c4c0f6cfcb08f06028844a7caa0a37c4bc943a503a9b",
   "src/marker.rs": "7afab7230af0a3135dd7b5de17209dac5bd123efe9605aa406662b622aecf0e1",
