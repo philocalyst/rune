@@ -439,6 +439,47 @@ fn file_symlink_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env
     }
 }
 
+
+/// Local existence with owner-aware expansion and the existing handler protocol.
+/// Metadata follows symlinks; lookup errors are nil. Expansion/handler coding
+/// limitations are explicit, rather than a host-cwd or lossy-byte fallback.
+#[defun]
+fn file_exists_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    use crate::core::{env::{CallFrame, intern}, object::Function};
+    use rune_core::macros::root;
+    let expanded = expand_file_name_lisp(filename.bind(cx), None, env, cx)?;
+    let (bytes, raw) = match expanded.untag() {
+        ObjectType::String(text) => (text.as_bytes().to_vec(), false),
+        ObjectType::ByteString(bytes) => (bytes.to_vec(), true),
+        _ => unreachable!("filename expansion returned a non-string"),
+    };
+    // The existing regex handler engine accepts UTF-8 only. Never silently
+    // bypass configured handlers for a filename that it cannot represent.
+    let handler_name = std::str::from_utf8(&bytes).ok();
+    if handler_name.is_none() {
+        ensure!(env.variable_value(sym::FILE_NAME_HANDLER_ALIST, cx)?.unwrap_or(NIL).is_nil(),
+            "Raw-byte filename handlers are unsupported for file-exists-p");
+    }
+    let operation = intern("file-exists-p", cx);
+    if let Some(handler) = handler_name.and_then(|name| find_file_name_handler_internal(name, operation, env, cx)) {
+        let target: Function = Object::from(handler).try_into()?;
+        root!(target, cx);
+        let name = if raw { cx.add(bytes) } else { cx.add(String::from_utf8(bytes)?) };
+        let mut frame = CallFrame::new(env);
+        frame.push_arg(Object::from(operation));
+        frame.push_arg(name);
+        return target.call(&mut frame, None, cx).map_err(Into::into);
+    }
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    };
+    #[cfg(not(unix))]
+    let path = std::path::PathBuf::from(String::from_utf8(bytes)?);
+    Ok(std::fs::metadata(path).is_ok().into())
+}
+
 #[defun]
 fn file_name_case_insensitive_p(filename: &str) -> bool {
     if !Path::new(filename).exists() {
@@ -1610,5 +1651,97 @@ mod directory_predicate_byte_tests {
             r#"(list (condition-case err (directory-name-p 3) (wrong-type-argument err)) (condition-case err (directory-name-p nil) (wrong-type-argument err)) (condition-case err (directory-name-p '(x)) (wrong-type-argument err)))"#,
             "((wrong-type-argument stringp 3) (wrong-type-argument stringp nil) (wrong-type-argument stringp (x)))",
         );
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod file_exists_local_tests {
+    use super::*;
+    use crate::core::gc::{RootSet, Rto};
+    use rune_core::macros::root;
+
+    fn query<'ob>(name: &Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+        super::file_exists_p(name, env, cx)
+    }
+
+    #[test]
+    fn local_lookup_uses_owner_default_and_follows_links() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-exists-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            std::fs::write(dir.join("plain"), "unchanged")?;
+            symlink("plain", dir.join("link"))?;
+            symlink("missing", dir.join("dangling"))?;
+            symlink("loop", dir.join("loop"))?;
+            env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.to_str().unwrap()))?;
+            for (name, expected) in [("plain", true), ("link", true), (".", true), ("", true),
+                ("missing", false), ("dangling", false), ("loop", false), ("plain/child", false)] {
+                let name = cx.add(name); root!(name, cx);
+                assert_eq!(!query(name, env, cx)?.is_nil(), expected);
+            }
+            let name = cx.add(dir.join("plain").to_str().unwrap()); root!(name, cx);
+            assert!(!query(name, env, cx)?.is_nil());
+            assert_eq!(std::fs::read_to_string(dir.join("plain"))?, "unchanged");
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn raw_unix_paths_preserve_bytes_and_fail_closed_with_handlers() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-exists-bytes-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            let file = dir.join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+            std::fs::write(&file, "kept")?;
+            let name = cx.add(file.as_os_str().as_bytes().to_vec()); root!(name, cx);
+            assert!(!query(name, env, cx)?.is_nil());
+            env.set_var(sym::FILE_NAME_HANDLER_ALIST, list![NIL; cx])?;
+            assert!(query(name, env, cx).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn handler_receives_expanded_name_and_returns_after_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-exists-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-exists-handler/") (file-name-handler-alist '(("rune-exists-handler" . rune-exists-handler)))) (file-exists-p "./virtual")))"#,
+            r#"(file-exists-p "/rune-exists-handler/virtual")"#,
+        );
+    }
+
+    #[test]
+    fn operation_inhibition_and_handler_errors_are_preserved() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-exists-error (function (lambda (op name) (signal 'error '("exists-handler"))))) (let ((file-name-handler-alist '(("rune-exists-absent" . rune-exists-error))) (inhibit-file-name-handlers '(rune-exists-error))) (list (let ((inhibit-file-name-operation 'file-exists-p)) (file-exists-p "/rune-exists-absent/missing")) (let ((inhibit-file-name-operation 'file-symlink-p)) (condition-case err (file-exists-p "/rune-exists-absent/missing") (error err))))))"#,
+            r#"(nil (error "exists-handler"))"#,
+        );
+    }
+
+    #[test]
+    fn invalid_type_is_catchable_and_relative_default_is_rejected() -> Result<()> {
+        crate::interpreter::assert_lisp(
+            r#"(condition-case err (file-exists-p 3) (wrong-type-argument err))"#,
+            "(wrong-type-argument stringp 3)",
+        );
+        // The bounded expansion rejection is currently a Rust error, not a
+        // catchable Lisp condition. Assert that boundary without claiming more.
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        env.set_var(sym::DEFAULT_DIRECTORY, cx.add("relative"))?;
+        let name = cx.add("file"); root!(name, cx);
+        let error = query(name, env, cx).unwrap_err();
+        assert!(error.to_string().contains("Relative default-directory is unsupported"));
+        Ok(())
     }
 }

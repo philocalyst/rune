@@ -153,5 +153,10 @@
   "fileio::filename_concat_filter_tests::invalid_components_signal_stringp_with_original_operand",
   "fileio::directory_predicate_byte_tests::raw_bytes_use_only_final_separator_without_decoding",
   "fileio::directory_predicate_byte_tests::string_predicate_is_lexical_for_empty_unicode_and_dot_names",
-  "fileio::directory_predicate_byte_tests::nonstrings_signal_exact_stringp_payload"
+  "fileio::directory_predicate_byte_tests::nonstrings_signal_exact_stringp_payload",
+  "fileio::file_exists_local_tests::local_lookup_uses_owner_default_and_follows_links",
+  "fileio::file_exists_local_tests::raw_unix_paths_preserve_bytes_and_fail_closed_with_handlers",
+  "fileio::file_exists_local_tests::handler_receives_expanded_name_and_returns_after_gc",
+  "fileio::file_exists_local_tests::operation_inhibition_and_handler_errors_are_preserved",
+  "fileio::file_exists_local_tests::invalid_type_is_catchable_and_relative_default_is_rejected"
 ]
