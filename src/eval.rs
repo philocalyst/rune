@@ -394,10 +394,9 @@ fn run_hook_with_args<'ob>(hook: &Rto<Object>, args: ArgSlice,
 }
 
 /// Call one hook with the original arguments, retaining them across callbacks.
-fn hook_success_call<'ob>(function: Object, args: ArgSlice, wrapper: Option<&Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+fn hook_success_call<'ob>(entry: &Rto<Object>, args: ArgSlice, wrapper: Option<&Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     // In wrapped mode the hook entry is data, not necessarily callable: only
     // the wrapper is invoked, and it may intentionally accept any entry.
-    root!(entry, function, cx);
     let target: Function = wrapper.map_or(entry.bind(cx), |w| w.bind(cx)).try_into()?;
     root!(target, cx);
     let count = args.len().checked_add(usize::from(wrapper.is_some()))
@@ -420,7 +419,7 @@ fn hook_value<'ob>(value: &Rto<Object>, hook: &Rto<Object>, args: ArgSlice,
         _ => true,
     };
     if single {
-        let result = hook_success_call(value.bind(cx), args, wrapper, env, cx)?;
+        let result = hook_success_call(value, args, wrapper, env, cx)?;
         return Ok(if until_success { result } else { NIL });
     }
     root!(tail, value.bind(cx), cx);
@@ -444,6 +443,7 @@ fn hook_value<'ob>(value: &Rto<Object>, hook: &Rto<Object>, args: ArgSlice,
                 if until_success && !result.bind(cx).is_nil() { return Ok(result.bind(cx)); }
             }
         } else {
+            root!(function, function, cx);
             hook_success_call(function, args, wrapper, env, cx)
                 .map(|value| result.set(value))?;
             if until_success && !result.bind(cx).is_nil() { return Ok(result.bind(cx)); }
