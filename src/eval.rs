@@ -479,19 +479,19 @@ fn run_hook_wrapped<'ob>(hook: &Rto<Object>, wrapper: &Rto<Object>, args: ArgSli
 mod hook_with_args_tests {
     #[test]
     fn unbound_nil_symbol_and_raw_lambda_receive_expected_arguments() {
-        crate::interpreter::assert_lisp("(let ((ha-empty nil) (ha-symbol 'list) (ha-lambda '(lambda (a b) (setq ha-seen (list a b)))) (ha-seen nil)) (list (run-hook-with-args 'ha-unbound 1) (run-hook-with-args 'ha-empty 1) (run-hook-with-args 'ha-symbol 3 4) (run-hook-with-args 'ha-lambda 5 6) ha-seen))", "(nil nil nil nil (5 6))");
+        crate::interpreter::assert_lisp("(progn (defvar ha-empty) (defvar ha-symbol) (defvar ha-lambda) (defvar ha-seen) (let ((ha-empty nil) (ha-symbol 'list) (ha-lambda '(lambda (a b) (setq ha-seen (list a b)))) (ha-seen nil)) (list (run-hook-with-args 'ha-unbound 1) (run-hook-with-args 'ha-empty 1) (run-hook-with-args 'ha-symbol 3 4) (run-hook-with-args 'ha-lambda 5 6) ha-seen)))", "(nil nil nil nil (5 6))");
     }
     #[test]
     fn closure_keeps_captured_value_and_original_argument_identity() {
-        crate::interpreter::assert_lisp("(let ((ha-seen nil) (ha-value (list 'value)) (ha-hook '(closure ((captured . 8)) (x) (garbage-collect) (setq ha-seen (list captured x))))) (run-hook-with-args 'ha-hook ha-value) (list (car ha-seen) (eq (car (cdr ha-seen)) ha-value)))", "(8 t)");
+        crate::interpreter::assert_lisp("(progn (defvar ha-seen) (defvar ha-value) (defvar ha-hook) (let ((ha-seen nil) (ha-value (list 'value)) (ha-hook '(closure ((captured . 8)) (x) (garbage-collect) (setq ha-seen (list captured x))))) (run-hook-with-args 'ha-hook ha-value) (list (car ha-seen) (eq (car (cdr ha-seen)) ha-value))))", "(8 t)");
     }
     #[test]
     fn list_continues_after_nonnil_with_live_cdr_and_gc() {
-        crate::interpreter::assert_lisp("(let ((ha-seen nil) (ha-hook nil)) (setq ha-hook (list (lambda (x) (setq ha-seen (cons x ha-seen)) (setcdr ha-hook (list (lambda (y) (garbage-collect) (setq ha-seen (cons y ha-seen))))) (lambda (x) (error \"replaced callback\")))) (list (run-hook-with-args 'ha-hook '(payload)) ha-seen))", "(nil ((payload) (payload)))");
+        crate::interpreter::assert_lisp("(progn (defvar ha-seen) (defvar ha-hook) (let ((ha-seen nil) (ha-hook nil)) (setq ha-hook (list (function (lambda (x) (setq ha-seen (cons x ha-seen)) (setcdr ha-hook (list (function (lambda (y) (garbage-collect) (setq ha-seen (cons y ha-seen)))))))) (function (lambda (x) (error \"replaced callback\"))))) (list (run-hook-with-args 'ha-hook '(payload)) ha-seen)))", "(nil ((payload) (payload)))");
     }
     #[test]
     fn errors_and_throws_stop_iteration_and_next_call_recovers() {
-        crate::interpreter::assert_lisp("(progn (fset 'ha-thrower '(lambda (x) (garbage-collect) (throw 'ha-exit x))) (let ((ha-hook (list 'ha-thrower (lambda (x) (error \"unreachable\")))) (ha-result nil)) (setq ha-result (catch 'ha-exit (run-hook-with-args 'ha-hook 7))) (setq ha-hook (list (lambda (x) (error \"expected\")))) (let ((caught (condition-case nil (run-hook-with-args 'ha-hook 8) (error t)))) (setq ha-hook 'list) (list ha-result caught (backtrace-frame--internal #'list 0 'ha-thrower) (run-hook-with-args 'ha-hook 9)))))", "(7 t nil nil)");
+        crate::interpreter::assert_lisp("(progn (defvar ha-hook) (defvar ha-result) (progn (fset 'ha-thrower '(lambda (x) (garbage-collect) (throw 'ha-exit x))) (let ((ha-hook (list 'ha-thrower (function (lambda (x) (error \"unreachable\"))))) (ha-result nil)) (setq ha-result (catch 'ha-exit (run-hook-with-args 'ha-hook 7))) (setq ha-hook (list (function (lambda (x) (error \"expected\"))))) (let ((caught (condition-case nil (run-hook-with-args 'ha-hook 8) (error t)))) (setq ha-hook 'list) (list ha-result caught (backtrace-frame--internal #'list 0 'ha-thrower) (run-hook-with-args 'ha-hook 9))))))", "(7 t nil nil)");
     }
     #[test]
     fn ordinary_hook_side_effects_match_gnu_batch() {
@@ -509,12 +509,12 @@ mod hook_with_args_tests {
 mod hook_until_success_tests {
     #[test]
     fn recursive_hook_reentry_preserves_outer_arguments_across_gc() {
-        crate::interpreter::assert_lisp("(let ((hu-nested nil) (hu-hooks (list (lambda (n payload) (if (= n 0) nil (setq hu-nested (run-hook-with-args-until-success 'hu-hooks 0 '(inner)))) (garbage-collect) nil) (lambda (n payload) (list n payload))))) (let ((result (run-hook-with-args-until-success 'hu-hooks 1 '(outer)))) (list hu-nested result)))", "((0 (inner)) (1 (outer)))");
+        crate::interpreter::assert_lisp("(progn (defvar hu-nested) (defvar hu-hooks) (let ((hu-nested nil) (hu-hooks (list (function (lambda (n payload) (if (= n 0) nil (setq hu-nested (run-hook-with-args-until-success 'hu-hooks 0 '(inner)))) (garbage-collect) nil)) (function (lambda (n payload) (list n payload)))))) (let ((result (run-hook-with-args-until-success 'hu-hooks 1 '(outer)))) (list hu-nested result))))", "((0 (inner)) (1 (outer)))");
     }
 
     #[test]
     fn recursive_hook_reentry_preserves_heap_arguments_across_gc() {
-        crate::interpreter::assert_lisp("(let ((hu-payload (list 'p 'q)) (hu-hooks nil)) (setq hu-hooks (list (lambda (payload depth) (garbage-collect) (if (= depth 0) (list 'inner payload) (let ((nested (run-hook-with-args-until-success 'hu-hooks payload 0))) (garbage-collect) (list 'outer nested payload)))) (lambda (&rest args) (error \"must not run\")))) (let ((answer (run-hook-with-args-until-success 'hu-hooks hu-payload 1))) (garbage-collect) (list (car answer) (car (nth 1 answer)) (eq (nth 1 (nth 1 answer)) hu-payload) (eq (nth 2 answer) hu-payload))))", "(outer inner t t)");
+        crate::interpreter::assert_lisp("(progn (defvar hu-payload) (defvar hu-hooks) (let ((hu-payload (list 'p 'q)) (hu-hooks nil)) (setq hu-hooks (list (function (lambda (payload depth) (garbage-collect) (if (= depth 0) (list 'inner payload) (let ((nested (run-hook-with-args-until-success 'hu-hooks payload 0))) (garbage-collect) (list 'outer nested payload))))) (function (lambda (&rest args) (error \"must not run\"))))) (let ((answer (run-hook-with-args-until-success 'hu-hooks hu-payload 1))) (garbage-collect) (list (car answer) (car (nth 1 answer)) (eq (nth 1 (nth 1 answer)) hu-payload) (eq (nth 2 answer) hu-payload)))))", "(outer inner t t)");
     }
     #[test]
     fn hook_throw_unwinds_depth_before_following_call() {
@@ -523,7 +523,7 @@ mod hook_until_success_tests {
         let roots = RootSet::default(); let cx = &mut Context::new(&roots);
         sym::init_symbols(); root!(env, init(Env::new(cx).unwrap()), cx);
         crate::core::env::init_variables(cx, env);
-        let form = "(progn (fset 'hu-throw-target '(lambda (x) (garbage-collect) (throw 'hu-exit x))) (let ((hu-hooks (list 'hu-throw-target))) (list (catch 'hu-exit (run-hook-with-args-until-success 'hu-hooks 7)) (backtrace-frame--internal #'list 0 'hu-throw-target))))";
+        let form = "(progn (defvar hu-hooks) (progn (fset 'hu-throw-target '(lambda (x) (garbage-collect) (throw 'hu-exit x))) (let ((hu-hooks (list 'hu-throw-target))) (list (catch 'hu-exit (run-hook-with-args-until-success 'hu-hooks 7)) (backtrace-frame--internal #'list 0 'hu-throw-target)))))";
         let result = {
             let object = crate::reader::read(form, cx).unwrap().0; root!(object,cx);
             rebind!(crate::interpreter::eval(object,None,env,cx).unwrap(), cx)
@@ -532,7 +532,7 @@ mod hook_until_success_tests {
         assert_eq!(env.backtrace_depth(),0);
         let expected = crate::reader::read("(7 nil)",cx).unwrap().0;
         assert_eq!(result.bind(cx),expected);
-        let object = crate::reader::read("(let ((hu-hooks (list (lambda (x) x)))) (run-hook-with-args-until-success 'hu-hooks 9))",cx).unwrap().0;
+        let object = crate::reader::read("(progn (defvar hu-hooks) (let ((hu-hooks (list (function (lambda (x) x))))) (run-hook-with-args-until-success 'hu-hooks 9)))",cx).unwrap().0;
         root!(object,cx);
         let result = crate::interpreter::eval(object,None,env,cx).unwrap();
         assert_eq!(result,crate::core::object::Object::from(9));
@@ -540,7 +540,7 @@ mod hook_until_success_tests {
     }
     #[test]
     fn cyclic_hook_reaches_actual_budget_and_recovers() {
-        crate::interpreter::assert_lisp("(let ((hu-hooks nil) (hu-count 0) (hu-stop nil)) (setq hu-hooks (list (lambda () (setq hu-count (1+ hu-count)) nil))) (setcdr hu-hooks hu-hooks) (setq hu-stop (condition-case nil (run-hook-with-args-until-success 'hu-hooks) (error 'bounded))) (setq hu-hooks (list (lambda () 'recovered))) (list hu-stop hu-count (run-hook-with-args-until-success 'hu-hooks)))", "(bounded 65536 recovered)");
+        crate::interpreter::assert_lisp("(progn (defvar hu-hooks) (defvar hu-count) (defvar hu-stop) (let ((hu-hooks nil) (hu-count 0) (hu-stop nil)) (setq hu-hooks (list (function (lambda () (setq hu-count (1+ hu-count)) nil)))) (setcdr hu-hooks hu-hooks) (setq hu-stop (condition-case nil (run-hook-with-args-until-success 'hu-hooks) (error 'bounded))) (setq hu-hooks (list (function (lambda () 'recovered)))) (list hu-stop hu-count (run-hook-with-args-until-success 'hu-hooks))))", "(bounded 65536 recovered)");
     }
 
     #[test]
@@ -555,24 +555,24 @@ mod hook_until_success_tests {
     }
     #[test]
     fn nil_unbound_and_all_nil_return_nil() {
-        crate::interpreter::assert_lisp("(let ((hu-empty nil) (hu-all (list (lambda (&rest args) nil) (lambda (&rest args) nil)))) (list (run-hook-with-args-until-success 'hu-unbound 1) (run-hook-with-args-until-success 'hu-empty 1) (run-hook-with-args-until-success 'hu-all 1)))", "(nil nil nil)");
+        crate::interpreter::assert_lisp("(progn (defvar hu-empty) (defvar hu-all) (let ((hu-empty nil) (hu-all (list (function (lambda (&rest args) nil)) (function (lambda (&rest args) nil))))) (list (run-hook-with-args-until-success 'hu-unbound 1) (run-hook-with-args-until-success 'hu-empty 1) (run-hook-with-args-until-success 'hu-all 1))))", "(nil nil nil)");
     }
     #[test]
     fn single_raw_lambda_gets_all_arguments() {
-        crate::interpreter::assert_lisp("(let ((hu-one '(lambda (a b) (list b a)))) (run-hook-with-args-until-success 'hu-one 3 4))", "(4 3)");
+        crate::interpreter::assert_lisp("(progn (defvar hu-one) (let ((hu-one '(lambda (a b) (list b a)))) (run-hook-with-args-until-success 'hu-one 3 4)))", "(4 3)");
     }
     #[test]
     fn ordered_short_circuit_keeps_return_identity_across_gc() {
-        crate::interpreter::assert_lisp("(let ((hu-seen nil) (hu-return (list 'answer)) (hu-hooks (list (lambda (x) (setq hu-seen (cons x hu-seen)) (garbage-collect) nil) (lambda (x) (setq hu-seen (cons x hu-seen)) (garbage-collect) hu-return) (lambda (x) (error \"must not run\"))))) (let ((answer (run-hook-with-args-until-success 'hu-hooks '(payload)))) (garbage-collect) (list (eq answer hu-return) hu-seen)))", "(t ((payload) (payload)))");
+        crate::interpreter::assert_lisp("(progn (defvar hu-seen) (defvar hu-return) (defvar hu-hooks) (let ((hu-seen nil) (hu-return (list 'answer)) (hu-hooks (list (function (lambda (x) (setq hu-seen (cons x hu-seen)) (garbage-collect) nil)) (function (lambda (x) (setq hu-seen (cons x hu-seen)) (garbage-collect) hu-return)) (function (lambda (x) (error \"must not run\")))))) (let ((answer (run-hook-with-args-until-success 'hu-hooks '(payload)))) (garbage-collect) (list (eq answer hu-return) hu-seen))))", "(t ((payload) (payload)))");
     }
     #[test]
     fn hook_errors_propagate_and_following_call_still_works() {
-        crate::interpreter::assert_lisp("(let ((hu-hooks (list (lambda (x) (garbage-collect) (error \"hook failure\")))) (hu-result nil)) (setq hu-result (condition-case nil (run-hook-with-args-until-success 'hu-hooks 7) (error 'caught))) (setq hu-hooks (list (lambda (x) x))) (list hu-result (run-hook-with-args-until-success 'hu-hooks 9)))", "(caught 9)");
+        crate::interpreter::assert_lisp("(progn (defvar hu-hooks) (defvar hu-result) (let ((hu-hooks (list (function (lambda (x) (garbage-collect) (error \"hook failure\"))))) (hu-result nil)) (setq hu-result (condition-case nil (run-hook-with-args-until-success 'hu-hooks 7) (error 'caught))) (setq hu-hooks (list (function (lambda (x) x)))) (list hu-result (run-hook-with-args-until-success 'hu-hooks 9))))", "(caught 9)");
     }
     #[test]
     fn live_cdr_mutation_and_global_t_sentinel_are_bounded() {
-        crate::interpreter::assert_lisp("(let ((hu-hooks nil)) (setq hu-hooks (list (lambda () (setcdr hu-hooks (list (lambda () 'replacement))) nil) (lambda () 'old))) (run-hook-with-args-until-success 'hu-hooks))", "replacement");
-        crate::interpreter::assert_lisp("(let ((hu-hooks (list t (lambda () 'answer)))) (run-hook-with-args-until-success 'hu-hooks))", "answer");
+        crate::interpreter::assert_lisp("(progn (defvar hu-hooks) (let ((hu-hooks nil)) (setq hu-hooks (list (function (lambda () (setcdr hu-hooks (list (function (lambda () 'replacement)))) nil)) (function (lambda () 'old)))) (run-hook-with-args-until-success 'hu-hooks)))", "replacement");
+        crate::interpreter::assert_lisp("(progn (defvar hu-hooks) (let ((hu-hooks (list t (function (lambda () 'answer))))) (run-hook-with-args-until-success 'hu-hooks)))", "answer");
     }
 }
 

@@ -32,5 +32,18 @@
   "eval::active_backtrace_edge_tests::base_offset_narrows_to_c_int_before_positive_skip",
   "eval::active_backtrace_edge_tests::cons_nil_base_does_not_mean_unrestricted_stack",
   "eval::active_backtrace_edge_tests::map_callback_reentry_keeps_snapshot_membership",
-  "eval::active_backtrace_edge_tests::map_callback_signal_unwinds_then_next_call_succeeds"
+  "eval::active_backtrace_edge_tests::map_callback_signal_unwinds_then_next_call_succeeds",
+  "eval::hook_with_args_tests::unbound_nil_symbol_and_raw_lambda_receive_expected_arguments",
+  "eval::hook_with_args_tests::closure_keeps_captured_value_and_original_argument_identity",
+  "eval::hook_with_args_tests::list_continues_after_nonnil_with_live_cdr_and_gc",
+  "eval::hook_with_args_tests::errors_and_throws_stop_iteration_and_next_call_recovers",
+  "eval::hook_until_success_tests::recursive_hook_reentry_preserves_outer_arguments_across_gc",
+  "eval::hook_until_success_tests::recursive_hook_reentry_preserves_heap_arguments_across_gc",
+  "eval::hook_until_success_tests::hook_throw_unwinds_depth_before_following_call",
+  "eval::hook_until_success_tests::cyclic_hook_reaches_actual_budget_and_recovers",
+  "eval::hook_until_success_tests::nil_unbound_and_all_nil_return_nil",
+  "eval::hook_until_success_tests::single_raw_lambda_gets_all_arguments",
+  "eval::hook_until_success_tests::ordered_short_circuit_keeps_return_identity_across_gc",
+  "eval::hook_until_success_tests::hook_errors_propagate_and_following_call_still_works",
+  "eval::hook_until_success_tests::live_cdr_mutation_and_global_t_sentinel_are_bounded"
 ]
