@@ -160,6 +160,10 @@ fn normalize_local_path(input: &[u8]) -> Vec<u8> {
 // Validate before dispatch or copying. Preserve the original object in the
 // condition payload rather than recursively formatting invalid/cyclic values.
 fn expand_dispatch_name(value: Object, check_nul: bool, cx: &Context) -> Result<Option<String>> {
+    expand_dispatch_name_bounded(value, check_nul, 65536, cx)
+}
+
+fn expand_dispatch_name_bounded(value: Object, check_nul: bool, limit: usize, cx: &Context) -> Result<Option<String>> {
     let bytes = match value.untag() {
         ObjectType::String(text) => text.as_bytes(),
         ObjectType::ByteString(bytes) => &**bytes,
@@ -172,7 +176,7 @@ fn expand_dispatch_name(value: Object, check_nul: bool, cx: &Context) -> Result<
         let data = list![sym::FILENAMEP, value; cx];
         return Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into());
     }
-    ensure!(bytes.len() <= 65536, "Filename handler argument exceeds limit");
+    ensure!(bytes.len() <= limit, "Filename handler argument exceeds limit");
     Ok(std::str::from_utf8(bytes).ok().map(str::to_owned))
 }
 
@@ -369,10 +373,21 @@ fn directory_file_name_lexical(dirname: &str) -> &str {
     }
 }
 
-/// Scoped filename-handler dispatch; native predicate routing remains separate.
+/// Lexical directory-name conversion with rooted filename-handler dispatch.
 #[defun]
 fn directory_file_name<'ob>(
     directory: &crate::core::gc::Rto<Object>,
+    env: &mut Rt<Env>,
+    cx: &'ob mut Context,
+) -> Result<Object<'ob>> {
+    directory_file_name_dispatch(directory, 65536, env, cx)
+}
+
+// Predicates already admit expanded paths up to 131073 bytes. Keep that
+// existing budget while the public primitive retains its 64-KiB input limit.
+fn directory_file_name_dispatch<'ob>(
+    directory: &crate::core::gc::Rto<Object>,
+    limit: usize,
     env: &mut Rt<Env>,
     cx: &'ob mut Context,
 ) -> Result<Object<'ob>> {
@@ -388,7 +403,7 @@ fn directory_file_name<'ob>(
         env.initialize_condition_metadata(cx);
         // Unlike filesystem access, lexical conversion does not reject NUL.
         // The shared handler engine still cannot represent undecodable raw bytes.
-        let name = expand_dispatch_name(directory.bind(cx), false, cx)?;
+        let name = expand_dispatch_name_bounded(directory.bind(cx), false, limit, cx)?;
         let handlers = env.variable_value(sym::FILE_NAME_HANDLER_ALIST, cx)?.unwrap_or(NIL.into());
         if !handlers.is_nil() {
             let name = name.ok_or_else(|| anyhow::anyhow!("Raw-byte directory-file-name handlers are unsupported"))?;
@@ -631,7 +646,26 @@ pub(crate) fn executable_file_predicate<'ob>(filename: &crate::core::gc::Rto<Obj
 fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalFilePredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
     use rune_core::macros::root;
-    let expanded = expand_file_name_dispatch(filename, None, env, cx)?;
+    root!(expanded, expand_file_name_dispatch(filename, None, env, cx)?, cx);
+    #[cfg(unix)]
+    let expanded = {
+        let storage = match expanded.bind(cx).untag() {
+            ObjectType::String(text) => text.as_bytes(),
+            ObjectType::ByteString(bytes) => &**bytes,
+            _ => unreachable!("filename expansion returned a non-string"),
+        };
+        // Preserve the local-path guard before invoking another handler.
+        ensure!(storage.len() <= 131073 && !storage.contains(&0), "Invalid or excessive expanded filename");
+        if matches!(predicate, LocalFilePredicate::Directory | LocalFilePredicate::Regular)
+            && storage.len() > 1 && storage.last() == Some(&b'/')
+        {
+            directory_file_name_dispatch(expanded, 131073, env, cx)?
+        } else {
+            expanded.bind(cx)
+        }
+    };
+    #[cfg(not(unix))]
+    let expanded = expanded.bind(cx);
     let (storage, raw): (&[u8], bool) = match expanded.untag() {
         ObjectType::String(text) => (text.as_bytes(), false),
         ObjectType::ByteString(bytes) => (&**bytes, true),
@@ -643,7 +677,7 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
     if matches!(predicate, LocalFilePredicate::Executable) {
         ensure!(storage.len() <= 65536, "File access path exceeds 64 KiB limit");
     }
-    let mut bytes = storage.to_vec();
+    let bytes = storage.to_vec();
     let operation_name = match predicate {
         LocalFilePredicate::Exists => "file-exists-p",
         LocalFilePredicate::Directory => "file-directory-p",
@@ -653,13 +687,8 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
         LocalFilePredicate::Regular => "file-regular-p",
         LocalFilePredicate::Executable => "file-executable-p",
     };
-    // GNU directory and regular-file lookup apply directory-file-name after expansion, unlike
-    // existence lookup. Local Unix suffix conversion only: magic-name handlers
-    // for directory-file-name itself remain an existing unsupported feature.
-    #[cfg(unix)]
-    if matches!(predicate, LocalFilePredicate::Directory | LocalFilePredicate::Regular) && !(bytes.len() == 2 && bytes[0] == b'/') {
-        while bytes.len() > 1 && bytes.last() == Some(&b'/') { bytes.pop(); }
-    }
+    // Directory/Regular conversion results are used as-is, without re-expansion
+    // or repeated suffix conversion. The bounds/NUL guard above applies again.
     // The existing regex handler engine accepts UTF-8 only. Never silently
     // bypass configured handlers for a filename that it cannot represent.
     let handler_name = std::str::from_utf8(&bytes).ok();
@@ -2091,11 +2120,11 @@ mod file_directory_owner_tests {
     #[test]
     fn distinct_operation_and_suffix_handlers_survive_gc() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-directory-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-directory-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (garbage-collect) (list op name)))))) (let ((default-directory "/rune-directory-handler/") (file-name-handler-alist '(("rune-directory-handler" . rune-directory-handler)))) (list (file-directory-p "child///") (file-exists-p "child///"))))"#,
+            r#"(progn (defalias 'rune-directory-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-directory-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (if (eq op 'directory-file-name) (let ((inhibit-file-name-handlers (cons 'rune-directory-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'directory-file-name)) (directory-file-name name)) (progn (garbage-collect) (list op name))))))) (let ((default-directory "/rune-directory-handler/") (file-name-handler-alist '(("rune-directory-handler" . rune-directory-handler)))) (list (file-directory-p "child///") (file-exists-p "child///"))))"#,
             r#"((file-directory-p "/rune-directory-handler/child") (file-exists-p "/rune-directory-handler/child/"))"#,
         );
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-root-directory-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) name (list op name))))) (let ((file-name-handler-alist '(("/" . rune-root-directory-handler)))) (list (file-directory-p "/") (file-directory-p "//"))))"#,
+            r#"(progn (defalias 'rune-root-directory-handler (function (lambda (op name &optional base) (if (or (eq op 'expand-file-name) (eq op 'directory-file-name)) name (list op name))))) (let ((file-name-handler-alist '(("/" . rune-root-directory-handler)))) (list (file-directory-p "/") (file-directory-p "//"))))"#,
             r#"((file-directory-p "/") (file-directory-p "//"))"#,
         );
     }
@@ -2419,7 +2448,7 @@ mod file_regular_local_tests {
     #[test]
     fn regular_handler_receives_converted_suffix_and_roots_after_gc() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-regular-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-regular-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (garbage-collect) (list op name)))))) (let ((default-directory "/rune-regular-handler/") (file-name-handler-alist '(("/" . rune-regular-handler)))) (list (file-regular-p "./virtual///") (file-regular-p "/") (file-regular-p "//"))))"#,
+            r#"(progn (defalias 'rune-regular-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-regular-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (if (eq op 'directory-file-name) (let ((inhibit-file-name-handlers (cons 'rune-regular-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'directory-file-name)) (directory-file-name name)) (progn (garbage-collect) (list op name))))))) (let ((default-directory "/rune-regular-handler/") (file-name-handler-alist '(("/" . rune-regular-handler)))) (list (file-regular-p "./virtual///") (file-regular-p "/") (file-regular-p "//"))))"#,
             r#"((file-regular-p "/rune-regular-handler/virtual") (file-regular-p "/") (file-regular-p "//"))"#,
         );
     }
@@ -2773,8 +2802,8 @@ mod directory_expansion_dispatch_tests {
     #[test]
     fn expansion_precedes_resolved_operation_once_across_gc() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defvar rune-directory-stage-log nil) (defalias 'rune-directory-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-directory-stage-log (cons (list op name base) rune-directory-stage-log)) "/RESOLVED/target///"))) (defalias 'rune-directory-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-directory-stage-log (cons (list op name) rune-directory-stage-log)) 'directory-answer))) (let ((rune-directory-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-directory-expand-stage) ("RESOLVED" . rune-directory-resolved-stage)))) (list (file-directory-p "MAGIC/leaf") rune-directory-stage-log)))"#,
-            r#"(directory-answer ((file-directory-p "/RESOLVED/target") (expand-file-name "MAGIC/leaf" nil)))"#,
+            r#"(progn (defvar rune-directory-stage-log nil) (defalias 'rune-directory-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-directory-stage-log (cons (list op name base) rune-directory-stage-log)) "/RESOLVED/target///"))) (defalias 'rune-directory-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-directory-stage-log (cons (list op name) rune-directory-stage-log)) (if (eq op 'directory-file-name) "/RESOLVED/target" 'directory-answer)))) (let ((rune-directory-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-directory-expand-stage) ("RESOLVED" . rune-directory-resolved-stage)))) (list (file-directory-p "MAGIC/leaf") rune-directory-stage-log)))"#,
+            r#"(directory-answer ((file-directory-p "/RESOLVED/target") (directory-file-name "/RESOLVED/target///") (expand-file-name "MAGIC/leaf" nil)))"#,
         );
     }
 
@@ -2833,8 +2862,8 @@ mod regular_expansion_dispatch_tests {
     #[test]
     fn expansion_precedes_resolved_operation_once_across_gc() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defvar rune-regular-stage-log nil) (defalias 'rune-regular-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-regular-stage-log (cons (list op name base) rune-regular-stage-log)) "/RESOLVED/target///"))) (defalias 'rune-regular-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-regular-stage-log (cons (list op name) rune-regular-stage-log)) 'regular-answer))) (let ((rune-regular-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-regular-expand-stage) ("RESOLVED" . rune-regular-resolved-stage)))) (list (file-regular-p "MAGIC/leaf") rune-regular-stage-log)))"#,
-            r#"(regular-answer ((file-regular-p "/RESOLVED/target") (expand-file-name "MAGIC/leaf" nil)))"#,
+            r#"(progn (defvar rune-regular-stage-log nil) (defalias 'rune-regular-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-regular-stage-log (cons (list op name base) rune-regular-stage-log)) "/RESOLVED/target///"))) (defalias 'rune-regular-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-regular-stage-log (cons (list op name) rune-regular-stage-log)) (if (eq op 'directory-file-name) "/RESOLVED/target" 'regular-answer)))) (let ((rune-regular-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-regular-expand-stage) ("RESOLVED" . rune-regular-resolved-stage)))) (list (file-regular-p "MAGIC/leaf") rune-regular-stage-log)))"#,
+            r#"(regular-answer ((file-regular-p "/RESOLVED/target") (directory-file-name "/RESOLVED/target///") (expand-file-name "MAGIC/leaf" nil)))"#,
         );
     }
 
@@ -3014,6 +3043,129 @@ mod directory_file_name_tests {
         root!(directory, cx);
         env.set_var(sym::FILE_NAME_HANDLER_ALIST, rune_core::macros::list![NIL; cx])?;
         assert!(directory_file_name(directory, env, cx).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod predicate_conversion_dispatch_tests {
+    #[test]
+    fn conversion_redirects_both_predicates_once_across_gc() {
+        for predicate in ["file-directory-p", "file-regular-p"] {
+            crate::interpreter::assert_lisp(
+                &format!(r#"(progn
+                  (defvar rune-conversion-pipeline-log nil)
+                  (defalias 'rune-conversion-pipeline-handler
+                    (function (lambda (op name &optional base)
+                      (garbage-collect)
+                      (setq rune-conversion-pipeline-log (cons (list op name) rune-conversion-pipeline-log))
+                      (if (eq op 'expand-file-name) "/MAGIC/source///"
+                        (if (eq op 'directory-file-name) "/MAGIC/returned///" 'answer)))))
+                  (let ((file-name-handler-alist '(("MAGIC" . rune-conversion-pipeline-handler)))
+                        (rune-conversion-pipeline-log nil))
+                    (list ({predicate} "MAGIC/input") rune-conversion-pipeline-log)))"#),
+                &format!(r#"(answer (({predicate} "/MAGIC/returned///") (directory-file-name "/MAGIC/source///") (expand-file-name "MAGIC/input")))"#),
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_inhibition_is_per_operation_and_double_slash_is_dispatched() {
+        for predicate in ["file-directory-p", "file-regular-p"] {
+            crate::interpreter::assert_lisp(
+                &format!(r#"(progn
+                  (defvar rune-conversion-root-log nil)
+                  (defalias 'rune-conversion-root-handler
+                    (function (lambda (op name &optional base)
+                      (setq rune-conversion-root-log (cons (list op name) rune-conversion-root-log))
+                      (if (eq op 'expand-file-name) name
+                        (if (eq op 'directory-file-name) "/converted" 'answer)))))
+                  (let ((file-name-handler-alist '(("/" . rune-conversion-root-handler)))
+                        (inhibit-file-name-handlers '(rune-conversion-root-handler))
+                        (inhibit-file-name-operation 'directory-file-name)
+                        (rune-conversion-root-log nil))
+                    (list ({predicate} "//") rune-conversion-root-log
+                      (let ((inhibit-file-name-operation 'file-exists-p)
+                            (rune-conversion-root-log nil))
+                        (list ({predicate} "//") rune-conversion-root-log)))))"#),
+                &format!(r#"(answer (({predicate} "//") (expand-file-name "//")) (answer (({predicate} "/converted") (directory-file-name "//") (expand-file-name "//"))))"#),
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_errors_and_invalid_local_results_stop_final_dispatch() {
+        for predicate in ["file-directory-p", "file-regular-p"] {
+            for result in ["3", "(signal 'error '(\"conversion-error\"))", "(concat \"/MAGIC/\" (make-string 1 0))", "(make-string 131074 47)"] {
+                crate::interpreter::assert_lisp(
+                    &format!(r#"(progn
+                      (defvar rune-conversion-error-log nil)
+                      (defalias 'rune-conversion-error-handler
+                        (function (lambda (op name &optional base)
+                          (setq rune-conversion-error-log (cons op rune-conversion-error-log))
+                          (if (eq op 'expand-file-name) "/MAGIC/source/"
+                            (if (eq op 'directory-file-name) {result} 'unexpected)))))
+                      (let ((file-name-handler-alist '(("MAGIC" . rune-conversion-error-handler)))
+                            (rune-conversion-error-log nil))
+                        (list (condition-case nil ({predicate} "MAGIC/input") (error 'caught))
+                              rune-conversion-error-log)))"#),
+                    "(caught (directory-file-name expand-file-name))",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_conversion_keeps_existing_path_budget() {
+        for predicate in ["file-directory-p", "file-regular-p"] {
+            for length in [65536, 65537, 131073, 131074] {
+                let expected = if length <= 131073 {
+                    format!("(answer ({predicate} directory-file-name expand-file-name))")
+                } else {
+                    "(caught (expand-file-name))".to_owned()
+                };
+                crate::interpreter::assert_lisp(
+                    &format!(r#"(progn
+                      (defvar rune-conversion-budget-log nil)
+                      (defalias 'rune-conversion-budget-handler
+                        (function (lambda (op name &optional base)
+                          (garbage-collect)
+                          (setq rune-conversion-budget-log (cons op rune-conversion-budget-log))
+                          (if (eq op 'expand-file-name) (make-string {length} 47)
+                            (if (eq op 'directory-file-name) "/short" 'answer)))))
+                      (let ((file-name-handler-alist '(("/" . rune-conversion-budget-handler)))
+                            (rune-conversion-budget-log nil))
+                        (list (condition-case nil ({predicate} "/input") (error 'caught))
+                              rune-conversion-budget-log)))"#),
+                    &expected,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conversion_redirects_to_isolated_filesystem_targets() -> anyhow::Result<()> {
+        let fixture = super::directory_expansion_dispatch_tests::DirectoryFixture::new()?;
+        let child = fixture.0.join("child");
+        let ordinary = fixture.0.join("ordinary");
+        let missing = fixture.0.join("missing");
+        std::fs::create_dir(&child)?;
+        std::fs::write(&ordinary, "kept")?;
+        assert!(!missing.exists());
+        for (target, expected) in [(&child, "(t nil)"), (&ordinary, "(nil t)"), (&missing, "(nil nil)")] {
+            crate::interpreter::assert_lisp(
+                &format!(r#"(progn
+                  (defalias 'rune-conversion-local-handler
+                    (function (lambda (op name &optional base)
+                      (garbage-collect)
+                      (if (eq op 'expand-file-name) "/MAGIC/target/" {:?}))))
+                  (let ((file-name-handler-alist '(("MAGIC" . rune-conversion-local-handler))))
+                    (list (file-directory-p "MAGIC") (file-regular-p "MAGIC"))))"#, target.to_str().unwrap()),
+                expected,
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&ordinary)?, "kept");
+        assert!(!missing.exists());
         Ok(())
     }
 }
