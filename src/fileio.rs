@@ -391,7 +391,7 @@ fn directory_file_name<'ob>(
         let name = expand_dispatch_name(directory.bind(cx), false, cx)?;
         let handlers = env.variable_value(sym::FILE_NAME_HANDLER_ALIST, cx)?.unwrap_or(NIL.into());
         if !handlers.is_nil() {
-            let name = name.context("Raw-byte directory-file-name handlers are unsupported")?;
+            let name = name.ok_or_else(|| anyhow::anyhow!("Raw-byte directory-file-name handlers are unsupported"))?;
             let operation = intern("directory-file-name", cx);
             if let Some(handler) = find_file_name_handler_internal(&name, operation, env, cx) {
                 let target: Function = Object::from(handler).try_into()?;
