@@ -1344,7 +1344,7 @@ mod active_backtrace_tests {
     }
     #[test]
     fn map_fixed_membership_ignores_callback_calls() {
-        crate::interpreter::assert_lisp("(progn (setq bt-seen nil) (fset 'bt-target '(lambda () (mapbacktrace (function (lambda (e f a flags) (garbage-collect) (setq bt-seen (cons f bt-seen)))) 'bt-target))) (bt-target) (eq (car (last bt-seen)) 'bt-target))", "t");
+        crate::interpreter::assert_lisp("(progn (setq bt-seen nil) (fset 'bt-target '(lambda () (mapbacktrace (function (lambda (e f a flags) (garbage-collect) (setq bt-seen (cons f bt-seen)))) 'bt-target))) (bt-target) (let ((tail bt-seen)) (while (cdr tail) (setq tail (cdr tail))) (eq (car tail) 'bt-target)))", "t");
     }
     #[test]
     fn callback_throw_restores_frames() {
