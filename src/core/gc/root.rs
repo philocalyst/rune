@@ -716,6 +716,12 @@ impl<T> Rt<Vec<T>> {
         self.inner_mut().reserve(additional);
     }
 
+    /// Reserve backing storage before publishing a fallible owner-state change.
+    /// This changes capacity only, without exposing or moving out rooted elements.
+    pub(crate) fn try_reserve(&mut self, additional: usize) -> anyhow::Result<()> {
+        self.inner_mut().try_reserve(additional).map_err(Into::into)
+    }
+
     pub(crate) fn capacity(&self) -> usize {
         self.inner().capacity()
     }
