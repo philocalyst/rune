@@ -468,8 +468,14 @@ fn file_readable_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<En
     local_file_predicate(filename, LocalFilePredicate::Readable, env, cx)
 }
 
+/// Advisory Linux write-or-create access, without writing or creating a file.
+#[defun]
+fn file_writable_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    local_file_predicate(filename, LocalFilePredicate::Writable, env, cx)
+}
+
 #[derive(Clone, Copy)]
-enum LocalFilePredicate { Exists, Directory, Readable, AccessibleDirectory }
+enum LocalFilePredicate { Exists, Directory, Readable, AccessibleDirectory, Writable }
 
 fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalFilePredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
@@ -485,6 +491,7 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
         LocalFilePredicate::Directory => "file-directory-p",
         LocalFilePredicate::Readable => "file-readable-p",
         LocalFilePredicate::AccessibleDirectory => "file-accessible-directory-p",
+        LocalFilePredicate::Writable => "file-writable-p",
     };
     // GNU directory lookup applies directory-file-name after expansion, unlike
     // existence lookup. Local Unix suffix conversion only: magic-name handlers
@@ -522,6 +529,7 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
         LocalFilePredicate::Directory => std::fs::metadata(&path).is_ok_and(|value| value.is_dir()),
         LocalFilePredicate::Readable => effective_readable_access(&path)?,
         LocalFilePredicate::AccessibleDirectory => effective_directory_access(&path)?,
+        LocalFilePredicate::Writable => effective_writable_access(&path)?,
     };
     Ok(result.into())
 }
@@ -564,6 +572,35 @@ fn effective_directory_access(path: &Path) -> Result<bool> {
     }
     #[cfg(not(target_os = "linux"))]
     { let _ = path; bail!("Effective directory access is not implemented on this platform") }
+}
+
+fn effective_writable_access(path: &Path) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let bytes = path.as_os_str().as_bytes();
+        ensure!(bytes.first() == Some(&b'/'), "Writable access requires an expanded absolute path");
+        let name = CString::new(bytes)?;
+        // SAFETY: the CString lives through the non-retaining syscall; this is
+        // an effective-credential access query, not a write or creation attempt.
+        let result = unsafe { libc::faccessat(libc::AT_FDCWD, name.as_ptr(), libc::W_OK, libc::AT_EACCESS) };
+        if result == 0 { return Ok(true); }
+        // Capture errno immediately. Permission failures, ENOTDIR, and all
+        // errors other than ENOENT must not become a parent-access success.
+        let error = std::io::Error::last_os_error().raw_os_error();
+        if error != Some(libc::ENOENT) { return Ok(false); }
+        // GNU uses lexical file-name-directory: retain its final separator.
+        // A nonexistent name ending in / therefore probes that same directory,
+        // not its existing parent. Parent symlinks are resolved by the OS.
+        let end = bytes.iter().rposition(|&byte| byte == b'/').expect("absolute path has slash") + 1;
+        let parent = CString::new(&bytes[..end])?;
+        // SAFETY: owned NUL-terminated parent survives the syscall. Both write
+        // and search access are required to create a name in this directory.
+        let result = unsafe { libc::faccessat(libc::AT_FDCWD, parent.as_ptr(), libc::W_OK | libc::X_OK, libc::AT_EACCESS) };
+        Ok(result == 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = path; bail!("Effective writable access is not implemented on this platform") }
 }
 
 #[defun]
@@ -2061,6 +2098,91 @@ mod accessible_directory_linux_tests {
         crate::interpreter::assert_lisp(
             r#"(progn (defalias 'rune-access-directory-error (function (lambda (op name) (signal 'error '("directory-access"))))) (let ((file-name-handler-alist '(("rune-access-directory-absent" . rune-access-directory-error))) (inhibit-file-name-handlers '(rune-access-directory-error))) (list (let ((inhibit-file-name-operation 'file-accessible-directory-p)) (file-accessible-directory-p "/rune-access-directory-absent/missing")) (let ((inhibit-file-name-operation 'file-directory-p)) (condition-case err (file-accessible-directory-p "/rune-access-directory-absent/missing") (error err))) (condition-case err (file-accessible-directory-p 3) (wrong-type-argument err)))))"#,
             r#"(nil (error "directory-access") (wrong-type-argument stringp 3))"#,
+        );
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod file_writable_linux_tests {
+    use super::*;
+    use crate::core::gc::RootSet;
+    use rune_core::macros::root;
+
+    #[test]
+    fn writable_existing_or_creatable_without_creating_files() -> Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-writable-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::write(dir.join("plain"), "kept")?;
+            std::fs::set_permissions(dir.join("plain"), std::fs::Permissions::from_mode(0o600))?;
+            symlink("plain", dir.join("link"))?;
+            symlink("missing-target", dir.join("dangling"))?;
+            symlink(".", dir.join("parent-link"))?;
+            symlink("loop", dir.join("loop"))?;
+            env.set_var(sym::DEFAULT_DIRECTORY, cx.add(dir.to_str().unwrap()))?;
+            // Success cases work for the owner or root; ENOTDIR/ELOOP cases
+            // distinguish the ENOENT-only fallback without permission guesses.
+            for (name, expected) in [("", true), ("plain", true), ("link", true), ("missing", true),
+                ("dangling", true), ("parent-link/new", true), ("missing-parent/new", false),
+                ("missing/", false), ("plain/child", false), ("loop", false)] {
+                let name = cx.add(name); root!(name, cx);
+                assert_eq!(!file_writable_p(name, env, cx)?.is_nil(), expected);
+            }
+            for absent in ["missing", "missing-target", "new", "missing-parent"] {
+                assert!(!dir.join(absent).exists(), "access probe created {absent}");
+            }
+            assert_eq!(std::fs::read_to_string(dir.join("plain"))?, "kept");
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn raw_missing_child_parent_and_nul_are_byte_exact() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let roots = RootSet::default(); let cx = &mut Context::new(&roots);
+        sym::init_symbols(); root!(env, init(Env::new_isolated(cx)?), cx);
+        crate::core::env::init_variables(cx, env);
+        let dir = std::env::temp_dir().join(format!("rune-writable-raw-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> Result<()> {
+            let parent = dir.join(std::ffi::OsStr::from_bytes(b"raw-\xff"));
+            std::fs::create_dir(&parent)?;
+            let path = parent.join(std::ffi::OsStr::from_bytes(b"new-\xfe"));
+            let bytes = path.as_os_str().as_bytes().to_vec();
+            let name = cx.add(bytes.clone()); root!(name, cx);
+            assert!(!file_writable_p(name, env, cx)?.is_nil());
+            assert!(!path.exists());
+            let mut invalid = bytes; invalid.extend_from_slice(b"\0suffix");
+            let nul = cx.add(invalid.clone()); root!(nul, cx);
+            assert!(file_writable_p(nul, env, cx).is_err());
+            assert!(effective_writable_access(Path::new(std::ffi::OsStr::from_bytes(&invalid))).is_err());
+            env.set_var(sym::FILE_NAME_HANDLER_ALIST, list![NIL; cx])?;
+            assert!(file_writable_p(name, env, cx).is_err());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+
+    #[test]
+    fn handler_receives_writable_operation_and_keeps_suffix_after_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-writable-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-writable-handler/") (file-name-handler-alist '(("rune-writable-handler" . rune-writable-handler)))) (file-writable-p "./virtual/")))"#,
+            r#"(file-writable-p "/rune-writable-handler/virtual/")"#,
+        );
+    }
+
+    #[test]
+    fn handler_inhibition_errors_and_type_payload_remain_distinct() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defalias 'rune-writable-error (function (lambda (op name) (signal 'error '("writable-handler"))))) (let ((file-name-handler-alist '(("rune-writable-absent" . rune-writable-error))) (inhibit-file-name-handlers '(rune-writable-error))) (list (let ((inhibit-file-name-operation 'file-writable-p)) (file-writable-p "/rune-writable-absent/missing-parent/child")) (let ((inhibit-file-name-operation 'file-readable-p)) (condition-case err (file-writable-p "/rune-writable-absent/missing-parent/child") (error err))) (condition-case err (file-writable-p 3) (wrong-type-argument err)))))"#,
+            r#"(nil (error "writable-handler") (wrong-type-argument stringp 3))"#,
         );
     }
 }
