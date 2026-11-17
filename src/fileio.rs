@@ -197,7 +197,7 @@ fn call_expand_handler<'ob>(handler: &crate::core::gc::Rto<Object>, name: &crate
     }
 }
 
-/// Lisp/existence/readability handler stages; other native callers remain separately scoped.
+/// Lisp/existence/readability/executable handler stages; other native callers remain separately scoped.
 #[defun(name = "expand-file-name")]
 fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory: Option<&crate::core::gc::Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::env::intern;
@@ -245,7 +245,7 @@ fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory
     expand_file_name_lisp(name.bind(cx), Some(supplied.bind(cx)), env, cx)
 }
 
-// Bounded lexical core. Native predicates other than file-exists-p/file-readable-p still use
+// Bounded lexical core. Native predicates other than file-exists-p/file-readable-p/file-executable-p still use
 // this directly; their expansion-handler stage remains separately unqualified.
 fn expand_file_name_lisp<'ob>(name: Object, default_directory: Option<Object>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
     #[cfg(not(unix))]
@@ -570,14 +570,18 @@ fn file_regular_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env
 }
 
 #[derive(Clone, Copy)]
-enum LocalFilePredicate { Exists, Directory, Readable, AccessibleDirectory, Writable, Regular }
+enum LocalFilePredicate { Exists, Directory, Readable, AccessibleDirectory, Writable, Regular, Executable }
+
+pub(crate) fn executable_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    local_file_predicate(filename, LocalFilePredicate::Executable, env, cx)
+}
 
 fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalFilePredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
     use rune_core::macros::root;
-    // Qualify expansion dispatch for existence/readability. Other predicates retain
+    // Qualify expansion dispatch for existence/readability/executability. Other predicates retain
     // their separately scoped lexical path until their callbacks are qualified.
-    let expanded = if matches!(predicate, LocalFilePredicate::Exists | LocalFilePredicate::Readable) {
+    let expanded = if matches!(predicate, LocalFilePredicate::Exists | LocalFilePredicate::Readable | LocalFilePredicate::Executable) {
         expand_file_name_dispatch(filename, None, env, cx)?
     } else {
         expand_file_name_lisp(filename.bind(cx), None, env, cx)?
@@ -590,6 +594,9 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
     // A handler can return an arbitrary-sized string. Apply the same bounded
     // local-path contract before copying, without truncating embedded NUL.
     ensure!(storage.len() <= 131073 && !storage.contains(&0), "Invalid or excessive expanded filename");
+    if matches!(predicate, LocalFilePredicate::Executable) {
+        ensure!(storage.len() <= 65536, "File access path exceeds 64 KiB limit");
+    }
     let mut bytes = storage.to_vec();
     let operation_name = match predicate {
         LocalFilePredicate::Exists => "file-exists-p",
@@ -598,6 +605,7 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
         LocalFilePredicate::AccessibleDirectory => "file-accessible-directory-p",
         LocalFilePredicate::Writable => "file-writable-p",
         LocalFilePredicate::Regular => "file-regular-p",
+        LocalFilePredicate::Executable => "file-executable-p",
     };
     // GNU directory and regular-file lookup apply directory-file-name after expansion, unlike
     // existence lookup. Local Unix suffix conversion only: magic-name handlers
@@ -637,6 +645,7 @@ fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate:
         LocalFilePredicate::AccessibleDirectory => effective_directory_access(&path)?,
         LocalFilePredicate::Writable => effective_writable_access(&path)?,
         LocalFilePredicate::Regular => std::fs::metadata(&path).is_ok_and(|value| value.is_file()),
+        LocalFilePredicate::Executable => crate::file_access::executable_access(&path)?,
     };
     Ok(result.into())
 }
@@ -2520,6 +2529,64 @@ mod readable_expansion_dispatch_tests {
             let present = dir.join("present"); let missing = dir.join("missing");
             std::fs::write(&present, "kept")?;
             let source = format!(r#"(progn (defalias 'rune-readable-redirect (function (lambda (op name &optional base) (garbage-collect) (if (equal name "SOURCE/present") {:?} {:?})))) (let ((file-name-handler-alist '(("SOURCE" . rune-readable-redirect)))) (list (file-readable-p "SOURCE/present") (file-readable-p "SOURCE/missing"))))"#, present.to_str().unwrap(), missing.to_str().unwrap());
+            crate::interpreter::assert_lisp(&source, "(t nil)");
+            assert_eq!(std::fs::read_to_string(&present)?, "kept");
+            assert!(!missing.exists());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod executable_handler_pipeline_tests {
+    #[test]
+    fn registration_and_type_payloads_remain_native() {
+        crate::interpreter::assert_lisp(
+            r#"(list (fboundp 'file-executable-p) (condition-case err (file-executable-p 3) (wrong-type-argument err)) (condition-case err (file-executable-p "a\0b") (wrong-type-argument (list (car err) (car (cdr err))))))"#,
+            "(t (wrong-type-argument stringp 3) (wrong-type-argument filenamep))",
+        );
+    }
+
+    #[test]
+    fn expansion_precedes_resolved_operation_once_across_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-executable-stage-log nil) (defalias 'rune-executable-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-executable-stage-log (cons (list op name base) rune-executable-stage-log)) "/RESOLVED/target"))) (defalias 'rune-executable-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-executable-stage-log (cons (list op name) rune-executable-stage-log)) 'executable-answer))) (let ((rune-executable-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-executable-expand-stage) ("RESOLVED" . rune-executable-resolved-stage)))) (list (file-executable-p "MAGIC/leaf") rune-executable-stage-log)))"#,
+            r#"(executable-answer ((file-executable-p "/RESOLVED/target") (expand-file-name "MAGIC/leaf" nil)))"#,
+        );
+    }
+
+    #[test]
+    fn operation_inhibition_does_not_suppress_expansion_stage() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-executable-inhibit-log nil) (defalias 'rune-executable-inhibit-expand (function (lambda (op name &optional base) (setq rune-executable-inhibit-log (cons op rune-executable-inhibit-log)) "/rune-executable-resolved-absent/target"))) (defalias 'rune-executable-inhibit-final (function (lambda (op name) (setq rune-executable-inhibit-log (cons op rune-executable-inhibit-log)) 'should-not-run))) (let ((rune-executable-inhibit-log nil) (file-name-handler-alist '(("MAGIC" . rune-executable-inhibit-expand) ("rune-executable-resolved-absent" . rune-executable-inhibit-final))) (inhibit-file-name-handlers '(rune-executable-inhibit-expand rune-executable-inhibit-final)) (inhibit-file-name-operation 'file-executable-p)) (list (file-executable-p "MAGIC") rune-executable-inhibit-log)))"#,
+            "(nil (expand-file-name))",
+        );
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-executable-only-log nil) (defalias 'rune-executable-only-handler (function (lambda (op name &optional base) (setq rune-executable-only-log (cons (list op name) rune-executable-only-log)) 'executable-answer))) (let ((rune-executable-only-log nil) (file-name-handler-alist '(("MAGIC" . rune-executable-only-handler))) (inhibit-file-name-handlers '(rune-executable-only-handler)) (inhibit-file-name-operation 'expand-file-name)) (list (file-executable-p "/MAGIC/original") rune-executable-only-log)))"#,
+            r#"(executable-answer ((file-executable-p "/MAGIC/original")))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_errors_stop_before_executable_handler() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-executable-error-stage-log nil) (defalias 'rune-executable-invalid-expand (function (lambda (op name &optional base) (setq rune-executable-error-stage-log (cons op rune-executable-error-stage-log)) 3))) (let ((rune-executable-error-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-executable-invalid-expand)))) (list (condition-case err (file-executable-p "MAGIC") (error err)) rune-executable-error-stage-log)))"#,
+            r#"((error "Invalid handler in `file-name-handler-alist'") (expand-file-name))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_redirects_actual_lookup_without_creating_or_rewriting() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("rune-executable-expand-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> anyhow::Result<()> {
+            let present = dir.join("present"); let missing = dir.join("missing");
+            std::fs::write(&present, "kept")?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&present, std::fs::Permissions::from_mode(0o700))?;
+            let source = format!(r#"(progn (defalias 'rune-executable-redirect (function (lambda (op name &optional base) (garbage-collect) (if (equal name "SOURCE/present") {:?} {:?})))) (let ((file-name-handler-alist '(("SOURCE" . rune-executable-redirect)))) (list (file-executable-p "SOURCE/present") (file-executable-p "SOURCE/missing"))))"#, present.to_str().unwrap(), missing.to_str().unwrap());
             crate::interpreter::assert_lisp(&source, "(t nil)");
             assert_eq!(std::fs::read_to_string(&present)?, "kept");
             assert!(!missing.exists());

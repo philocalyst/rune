@@ -1,5 +1,5 @@
 //! Scoped local executable access, using effective credentials, not mode-bit guesses.
-use crate::core::{env::{Env, sym}, gc::{Context, Rt}, object::{Object, ObjectType}};
+use crate::core::{env::{Env, sym}, gc::{Context, Rt, Rto}, object::{Object, ObjectType}};
 use anyhow::{Result, ensure};
 use rune_macros::defun;
 use rune_core::macros::list;
@@ -27,8 +27,10 @@ fn local_path(value: Object, env: &mut Rt<Env>, cx: &Context) -> Result<PathBuf>
 }
 
 #[defun]
-fn file_executable_p(filename: Object, env: &mut Rt<Env>, cx: &Context) -> Result<bool> {
-    let path = local_path(filename, env, cx)?;
+fn file_executable_p<'ob>(filename: &Rto<Object>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
+    // Retain existing input/default byte, NUL and 64 KiB validation.
+    // This prevalidation remains a bounded scope restriction before handlers.
+    let path = local_path(filename.bind(cx), env, cx)?;
     // GNU local empty names denote default-directory. No ambient cwd fallback.
     let path = if path.is_absolute() { path } else {
         let directory = local_path(crate::data::symbol_value(sym::DEFAULT_DIRECTORY, env, cx)?, env, cx)?;
@@ -36,10 +38,11 @@ fn file_executable_p(filename: Object, env: &mut Rt<Env>, cx: &Context) -> Resul
         ensure!(directory.as_os_str().as_encoded_bytes().len().checked_add(path.as_os_str().as_encoded_bytes().len()).and_then(|n| n.checked_add(1)).is_some_and(|n| n <= MAX_PATH_BYTES), "Joined file access path exceeds 64 KiB limit");
         directory.join(path)
     };
-    executable_access(&path)
+    drop(path);
+    crate::fileio::executable_file_predicate(filename, env, cx)
 }
 
-fn executable_access(path: &Path) -> Result<bool> {
+pub(crate) fn executable_access(path: &Path) -> Result<bool> {
     #[cfg(target_os = "linux")] {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
         let name = CString::new(path.as_os_str().as_bytes())?;
@@ -107,6 +110,8 @@ mod path_budget_tests {
         assert!(local_path(large,env,cx).is_err());
         let directory=cx.add(format!("/{}", "x".repeat(MAX_PATH_BYTES-2)));
         env.set_var_context(sym::DEFAULT_DIRECTORY,directory,cx).unwrap();
-        assert!(file_executable_p(cx.add("relative"),env,cx).is_err());
+        let name = cx.add("relative");
+        root!(name, cx);
+        assert!(file_executable_p(name,env,cx).is_err());
     }
 }
