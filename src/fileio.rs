@@ -198,7 +198,7 @@ fn call_expand_handler<'ob>(handler: &crate::core::gc::Rto<Object>, name: &crate
 }
 
 /// Lisp-facing handler stages; lexical/native callers remain separately scoped.
-#[defun(name="expand-file-name")]
+#[defun(name = "expand-file-name")]
 fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory: Option<&crate::core::gc::Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::env::intern;
     use rune_core::macros::root;
@@ -2366,6 +2366,14 @@ mod file_regular_local_tests {
 
 #[cfg(all(test, unix))]
 mod expansion_handler_dispatch_tests {
+    #[test]
+    fn native_registration_preserves_expand_and_write_region() {
+        crate::interpreter::assert_lisp(
+            r#"(let ((default-directory "/registration/") (file-name-handler-alist nil)) (list (fboundp 'expand-file-name) (fboundp 'write-region) (eq (symbol-function 'expand-file-name) (symbol-function 'write-region)) (expand-file-name "leaf") (expand-file-name "leaf" "/explicit/")))"#,
+            r#"(t t nil "/registration/leaf" "/explicit/leaf")"#,
+        );
+    }
+
     #[test]
     fn name_handler_sees_original_arguments_once_and_survives_gc() {
         crate::interpreter::assert_lisp(

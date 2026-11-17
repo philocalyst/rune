@@ -183,5 +183,6 @@
   "fileio::expansion_handler_dispatch_tests::default_handler_uses_owner_or_explicit_default_even_for_absolute_name",
   "fileio::expansion_handler_dispatch_tests::recursion_uses_per_operation_handler_inhibition",
   "fileio::expansion_handler_dispatch_tests::handler_errors_and_nonstring_returns_are_catchable",
-  "fileio::expansion_handler_dispatch_tests::nil_supplied_default_and_invalid_name_payload_are_preserved"
+  "fileio::expansion_handler_dispatch_tests::nil_supplied_default_and_invalid_name_payload_are_preserved",
+  "fileio::expansion_handler_dispatch_tests::native_registration_preserves_expand_and_write_region"
 ]
