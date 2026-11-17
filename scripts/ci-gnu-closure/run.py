@@ -4,7 +4,7 @@ import hashlib,importlib.util,json,os,pathlib,re,subprocess,sys
 sys.dont_write_bytecode=True
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-gnu-closure'
 BASE_PIN='c920c0775d3a6dc74cee30afd2b2c9fb0e2935dcdec17b7084cef744aa0f7eb7'
-HELPERS_PIN='493dab7b67f32c5ebaea35f1274201119acdf652e5182c5a1346d17bb5c30f6f'
+HELPERS_PIN='388a4985b0e924d0b813c484e67cd1619d2f5e1a6ac31d3975c1b29100367d1c'
 OVERLAY=set(['.github/workflows/wip-gnu-closure.yml', 'docs/wip-gnu-closure-scope.md', 'scripts/ci-gnu-closure/base-inventory.json', 'scripts/ci-gnu-closure/helper-inventory.json', 'scripts/ci-gnu-closure/inspect.py', 'scripts/ci-gnu-closure/run.py'])
 def sha(p):
  h=hashlib.sha256()

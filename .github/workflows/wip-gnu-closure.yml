@@ -23,4 +23,4 @@ jobs:
       - name: Authenticate inert payload and inspect exact hosted ELF closure
         env:
           EXPECTED_COMMIT: ${{ github.sha }}
-        run: timeout --signal=TERM --kill-after=5s 570s python3 scripts/ci-gnu-closure/run.py
+        run: timeout --signal=TERM --kill-after=5s 570s python3 -I scripts/ci-gnu-closure/run.py
