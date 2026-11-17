@@ -229,5 +229,12 @@
   "fileio::predicate_conversion_dispatch_tests::conversion_inhibition_is_per_operation_and_double_slash_is_dispatched",
   "fileio::predicate_conversion_dispatch_tests::conversion_errors_and_invalid_local_results_stop_final_dispatch",
   "fileio::predicate_conversion_dispatch_tests::expanded_conversion_keeps_existing_path_budget",
-  "fileio::predicate_conversion_dispatch_tests::conversion_redirects_to_isolated_filesystem_targets"
+  "fileio::predicate_conversion_dispatch_tests::conversion_redirects_to_isolated_filesystem_targets",
+  "fileio::file_name_as_directory_tests::original_name_and_handler_result_survive_gc_without_reprocessing",
+  "fileio::file_name_as_directory_tests::operation_inhibition_allows_recursive_lexical_conversion",
+  "fileio::file_name_as_directory_tests::invalid_handler_results_and_argument_types_signal",
+  "fileio::file_name_as_directory_tests::utf8_embedded_nul_is_lexically_preserved",
+  "fileio::file_name_as_directory_tests::handler_returned_raw_bytes_survive_gc_without_reprocessing",
+  "fileio::file_name_as_directory_tests::lexical_conversion_preserves_large_input_and_idempotence",
+  "fileio::file_name_as_directory_tests::raw_bytes_are_preserved_without_handlers"
 ]
