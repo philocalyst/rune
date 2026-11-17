@@ -2,10 +2,11 @@
 """WIP synthetic-only confinement compile/admission; no GNU or Rune command."""
 import hashlib,json,os,pathlib,re,resource,shutil,signal,subprocess,time
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-confinement'
-BASE_PIN='030c17db3e670576c8bc7d5e0acaeb49a0d8543dcd8db37e3cc4e2440bc48602'
+BASE_PIN='0534e99ae345660c3d96b068446553f20b7f947daa75fbd834cae2178b060066'
 HELPERS_PIN='e04360ab12e467ad1131cf842abc59ff117c1b16f8b96e61e145b0924b74e2c1'
 OVERLAY={'.github/workflows/wip-confinement.yml','docs/wip-confinement-scope.md'}|{'scripts/ci-confinement/'+n for n in ('run.py','probe.c','controller.py','supervisor.py','base-inventory.json','helper-inventory.json')}
 CASES=('positive','read-denied','write-denied','truncate-denied','socket-inet','socket-inet6','socket-unix','socket-abstract','socketpair','io-uring','ptrace','pidfd-getfd','inherited-fd-close','inherited-policy','unavailable-policy','inherited-seccomp')
+OVERLAY.update(['.github/workflows/wip-gnu-payload.yml', 'docs/wip-gnu-payload-scope.md', 'scripts/ci-gnu-payload/authentication-receipt.json', 'scripts/ci-gnu-payload/base-inventory.json', 'scripts/ci-gnu-payload/debian-archive-keyring.gpg', 'scripts/ci-gnu-payload/extract_static.py', 'scripts/ci-gnu-payload/helper-inventory.json', 'scripts/ci-gnu-payload/packages.json', 'scripts/ci-gnu-payload/payload-inventory.json', 'scripts/ci-gnu-payload/run.py', 'scripts/ci-gnu-payload/verify_auth.py'])
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def verify(commit):
  assert sha(C/'base-inventory.json')==BASE_PIN and sha(C/'helper-inventory.json')==HELPERS_PIN

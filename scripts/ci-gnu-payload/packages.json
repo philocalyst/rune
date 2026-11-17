@@ -1,0 +1,38 @@
+[
+  {
+    "package": "emacs-nox",
+    "version": "1:30.1+1-6~bpo12+1",
+    "architecture": "amd64",
+    "filename": "emacs-nox_30.1+1-6~bpo12+1_amd64.deb",
+    "size": 7241084,
+    "sha256": "c6ac445057492352570a74e08db35f38044919f5f7ad75ba7cac100b4bb0e2fb",
+    "source": "https://packages.debian.org/bookworm-backports/amd64/emacs-nox/download"
+  },
+  {
+    "package": "emacs-common",
+    "version": "1:30.1+1-6~bpo12+1",
+    "architecture": "all",
+    "filename": "emacs-common_30.1+1-6~bpo12+1_all.deb",
+    "size": 15798328,
+    "sha256": "4c24ad0a35d2e53872ab0c182b305d0098aa8a4670682a6a39c7f7e0e70f5ff6",
+    "source": "https://packages.debian.org/bookworm-backports/all/emacs-common/download"
+  },
+  {
+    "package": "emacs-bin-common",
+    "version": "1:30.1+1-6~bpo12+1",
+    "architecture": "amd64",
+    "filename": "emacs-bin-common_30.1+1-6~bpo12+1_amd64.deb",
+    "size": 98176,
+    "sha256": "08f553e4873922299857be6c43f5dd97e1f439ab142c5d25b2900d17827c70db",
+    "source": "https://packages.debian.org/bookworm-backports/amd64/emacs-bin-common/download"
+  },
+  {
+    "package": "emacs-el",
+    "version": "1:30.1+1-6~bpo12+1",
+    "architecture": "all",
+    "filename": "emacs-el_30.1+1-6~bpo12+1_all.deb",
+    "size": 19500876,
+    "sha256": "62f8ce7827678e67d647ce139efaf68677a56d610cc0ee4ea68c0914d638b518",
+    "source": "https://packages.debian.org/bookworm-backports/all/emacs-el/download"
+  }
+]

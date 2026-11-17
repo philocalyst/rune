@@ -12,11 +12,12 @@ import sys
 
 S=pathlib.Path.cwd().resolve()
 C=S/'scripts/ci-lifecycle'
-BASE_PIN='682f47aecd2db2d2c2ae87b216e52384bd1c4fe38b37e8f19d9fd385119896b5'
+BASE_PIN='27826a92a8dc8c3002e4a504cc4254ed9c5011a3c42045f7d088f827b61309fc'
 HELPERS_PIN='8e1effaaa784d79764bec4594775f1bf0c01d05e418e26aab8264366e6f9fb4a'
 OVERLAY={'.github/workflows/wip-lifecycle.yml','docs/wip-lifecycle-scope.md'}|{'scripts/ci-lifecycle/'+n for n in ['run.py','supervisor.py','preflight.py','fixture.py','fault_adapter.py','base-inventory.json','lifecycle-inventory.json']}
 OVERLAY.update(['.github/workflows/wip-confinement.yml', 'docs/wip-confinement-scope.md', 'scripts/ci-confinement/run.py', 'scripts/ci-confinement/probe.c', 'scripts/ci-confinement/controller.py', 'scripts/ci-confinement/supervisor.py', 'scripts/ci-confinement/base-inventory.json', 'scripts/ci-confinement/helper-inventory.json'])
 EXPECTED_CASES=['normal','nonzero','group','doublefork','detached','crash','latefork','cancel','admission','cleanup']
+OVERLAY.update(['.github/workflows/wip-gnu-payload.yml', 'docs/wip-gnu-payload-scope.md', 'scripts/ci-gnu-payload/authentication-receipt.json', 'scripts/ci-gnu-payload/base-inventory.json', 'scripts/ci-gnu-payload/debian-archive-keyring.gpg', 'scripts/ci-gnu-payload/extract_static.py', 'scripts/ci-gnu-payload/helper-inventory.json', 'scripts/ci-gnu-payload/packages.json', 'scripts/ci-gnu-payload/payload-inventory.json', 'scripts/ci-gnu-payload/run.py', 'scripts/ci-gnu-payload/verify_auth.py'])
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 def verify(commit):
     assert sha(C/'base-inventory.json')==BASE_PIN
