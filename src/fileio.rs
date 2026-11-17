@@ -245,8 +245,7 @@ fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory
     expand_file_name_lisp(name.bind(cx), Some(supplied.bind(cx)), env, cx)
 }
 
-// Bounded lexical core. Directory and regular-file predicates still use
-// this directly; their expansion-handler stage remains separately unqualified.
+// Bounded lexical core used after filename-expansion handler dispatch.
 fn expand_file_name_lisp<'ob>(name: Object, default_directory: Option<Object>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
     #[cfg(not(unix))]
     {
@@ -579,13 +578,7 @@ pub(crate) fn executable_file_predicate<'ob>(filename: &crate::core::gc::Rto<Obj
 fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalFilePredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
     use rune_core::macros::root;
-    // Qualify expansion dispatch for the access predicates below. Other predicates retain
-    // their separately scoped lexical path until their callbacks are qualified.
-    let expanded = if matches!(predicate, LocalFilePredicate::Exists | LocalFilePredicate::Readable | LocalFilePredicate::Executable | LocalFilePredicate::Writable | LocalFilePredicate::AccessibleDirectory) {
-        expand_file_name_dispatch(filename, None, env, cx)?
-    } else {
-        expand_file_name_lisp(filename.bind(cx), None, env, cx)?
-    };
+    let expanded = expand_file_name_dispatch(filename, None, env, cx)?;
     let (storage, raw): (&[u8], bool) = match expanded.untag() {
         ObjectType::String(text) => (text.as_bytes(), false),
         ObjectType::ByteString(bytes) => (&**bytes, true),
@@ -2049,17 +2042,22 @@ mod file_directory_owner_tests {
             r#"((file-directory-p "/rune-directory-handler/child") (file-exists-p "/rune-directory-handler/child/"))"#,
         );
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-root-directory-handler (function (lambda (op name) (list op name)))) (let ((file-name-handler-alist '(("/" . rune-root-directory-handler)))) (list (file-directory-p "/") (file-directory-p "//"))))"#,
+            r#"(progn (defalias 'rune-root-directory-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) name (list op name))))) (let ((file-name-handler-alist '(("/" . rune-root-directory-handler)))) (list (file-directory-p "/") (file-directory-p "//"))))"#,
             r#"((file-directory-p "/") (file-directory-p "//"))"#,
         );
     }
 
     #[test]
-    fn directory_operation_inhibition_errors_and_type_payload() {
+    fn directory_operation_inhibition_errors_and_type_payload() -> anyhow::Result<()> {
+        let fixture = super::directory_expansion_dispatch_tests::DirectoryFixture::new()?;
+        let missing = fixture.0.join("rune-directory-absent");
+        assert!(!missing.exists());
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-directory-error (function (lambda (op name) (signal 'error '("directory-handler"))))) (let ((file-name-handler-alist '(("rune-directory-absent" . rune-directory-error))) (inhibit-file-name-handlers '(rune-directory-error))) (list (let ((inhibit-file-name-operation 'file-directory-p)) (file-directory-p "/rune-directory-absent/missing")) (let ((inhibit-file-name-operation 'file-exists-p)) (condition-case err (file-directory-p "/rune-directory-absent/missing") (error err))) (condition-case err (file-directory-p 3) (wrong-type-argument err)))))"#,
+            &format!(r#"(progn (defalias 'rune-directory-error (function (lambda (op name &optional base) (if (eq op 'expand-file-name) name (signal 'error '("directory-handler")))))) (let ((file-name-handler-alist '(("rune-directory-absent" . rune-directory-error))) (inhibit-file-name-handlers '(rune-directory-error))) (list (let ((inhibit-file-name-operation 'file-directory-p)) (file-directory-p {missing:?})) (let ((inhibit-file-name-operation 'file-exists-p)) (condition-case err (file-directory-p {missing:?}) (error err))) (condition-case err (file-directory-p 3) (wrong-type-argument err)))))"#, missing = missing.to_str().unwrap()),
             r#"(nil (error "directory-handler") (wrong-type-argument stringp 3))"#,
         );
+        assert!(!missing.exists());
+        Ok(())
     }
 }
 
@@ -2368,17 +2366,22 @@ mod file_regular_local_tests {
     #[test]
     fn regular_handler_receives_converted_suffix_and_roots_after_gc() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-regular-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-regular-handler/") (file-name-handler-alist '(("/" . rune-regular-handler)))) (list (file-regular-p "./virtual///") (file-regular-p "/") (file-regular-p "//"))))"#,
+            r#"(progn (defalias 'rune-regular-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-regular-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (garbage-collect) (list op name)))))) (let ((default-directory "/rune-regular-handler/") (file-name-handler-alist '(("/" . rune-regular-handler)))) (list (file-regular-p "./virtual///") (file-regular-p "/") (file-regular-p "//"))))"#,
             r#"((file-regular-p "/rune-regular-handler/virtual") (file-regular-p "/") (file-regular-p "//"))"#,
         );
     }
 
     #[test]
-    fn regular_inhibition_errors_and_type_payload_are_operation_specific() {
+    fn regular_inhibition_errors_and_type_payload_are_operation_specific() -> anyhow::Result<()> {
+        let fixture = super::directory_expansion_dispatch_tests::DirectoryFixture::new()?;
+        let missing = fixture.0.join("rune-regular-absent");
+        assert!(!missing.exists());
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-regular-error (function (lambda (op name) (signal 'error '("regular-handler"))))) (let ((file-name-handler-alist '(("rune-regular-absent" . rune-regular-error))) (inhibit-file-name-handlers '(rune-regular-error))) (list (let ((inhibit-file-name-operation 'file-regular-p)) (file-regular-p "/rune-regular-absent/missing")) (let ((inhibit-file-name-operation 'file-directory-p)) (condition-case err (file-regular-p "/rune-regular-absent/missing") (error err))) (condition-case err (file-regular-p 3) (wrong-type-argument err)))))"#,
+            &format!(r#"(progn (defalias 'rune-regular-error (function (lambda (op name &optional base) (if (eq op 'expand-file-name) name (signal 'error '("regular-handler")))))) (let ((file-name-handler-alist '(("rune-regular-absent" . rune-regular-error))) (inhibit-file-name-handlers '(rune-regular-error))) (list (let ((inhibit-file-name-operation 'file-regular-p)) (file-regular-p {missing:?})) (let ((inhibit-file-name-operation 'file-directory-p)) (condition-case err (file-regular-p {missing:?}) (error err))) (condition-case err (file-regular-p 3) (wrong-type-argument err)))))"#, missing = missing.to_str().unwrap()),
             r#"(nil (error "regular-handler") (wrong-type-argument stringp 3))"#,
         );
+        assert!(!missing.exists());
+        Ok(())
     }
 }
 
@@ -2692,5 +2695,141 @@ mod accessible_expansion_dispatch_tests {
             Ok(())
         })();
         std::fs::remove_dir_all(&dir)?; result
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod directory_expansion_dispatch_tests {
+    pub(super) struct DirectoryFixture(pub(super) std::path::PathBuf);
+
+    impl DirectoryFixture {
+        pub(super) fn new() -> std::io::Result<Self> {
+            use std::os::unix::fs::DirBuilderExt;
+            let path = std::env::temp_dir().join(format!(
+                "rune-directory-fixture-{}-{}", std::process::id(), rand::random::<u64>()
+            ));
+            std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for DirectoryFixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    #[test]
+    fn expansion_precedes_resolved_operation_once_across_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-directory-stage-log nil) (defalias 'rune-directory-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-directory-stage-log (cons (list op name base) rune-directory-stage-log)) "/RESOLVED/target///"))) (defalias 'rune-directory-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-directory-stage-log (cons (list op name) rune-directory-stage-log)) 'directory-answer))) (let ((rune-directory-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-directory-expand-stage) ("RESOLVED" . rune-directory-resolved-stage)))) (list (file-directory-p "MAGIC/leaf") rune-directory-stage-log)))"#,
+            r#"(directory-answer ((file-directory-p "/RESOLVED/target") (expand-file-name "MAGIC/leaf" nil)))"#,
+        );
+    }
+
+    #[test]
+    fn operation_inhibition_does_not_suppress_expansion_stage() -> anyhow::Result<()> {
+        let fixture = DirectoryFixture::new()?;
+        let missing = fixture.0.join("rune-directory-resolved-absent");
+        assert!(!missing.exists());
+        crate::interpreter::assert_lisp(
+            &format!(r#"(progn (defvar rune-directory-inhibit-log nil) (defalias 'rune-directory-inhibit-expand (function (lambda (op name &optional base) (setq rune-directory-inhibit-log (cons op rune-directory-inhibit-log)) {missing:?}))) (defalias 'rune-directory-inhibit-final (function (lambda (op name) (setq rune-directory-inhibit-log (cons op rune-directory-inhibit-log)) 'should-not-run))) (let ((rune-directory-inhibit-log nil) (file-name-handler-alist '(("MAGIC" . rune-directory-inhibit-expand) ("rune-directory-resolved-absent" . rune-directory-inhibit-final))) (inhibit-file-name-handlers '(rune-directory-inhibit-expand rune-directory-inhibit-final)) (inhibit-file-name-operation 'file-directory-p)) (list (file-directory-p "MAGIC") rune-directory-inhibit-log)))"#, missing = missing.to_str().unwrap()),
+            "(nil (expand-file-name))",
+        );
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-directory-only-log nil) (defalias 'rune-directory-only-handler (function (lambda (op name &optional base) (setq rune-directory-only-log (cons (list op name) rune-directory-only-log)) 'directory-answer))) (let ((rune-directory-only-log nil) (file-name-handler-alist '(("MAGIC" . rune-directory-only-handler))) (inhibit-file-name-handlers '(rune-directory-only-handler)) (inhibit-file-name-operation 'expand-file-name)) (list (file-directory-p "/MAGIC/original") rune-directory-only-log)))"#,
+            r#"(directory-answer ((file-directory-p "/MAGIC/original")))"#,
+        );
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn expansion_errors_stop_before_directory_handler() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-directory-error-stage-log nil) (defalias 'rune-directory-invalid-expand (function (lambda (op name &optional base) (setq rune-directory-error-stage-log (cons op rune-directory-error-stage-log)) 3))) (let ((rune-directory-error-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-directory-invalid-expand)))) (list (condition-case err (file-directory-p "MAGIC") (error err)) rune-directory-error-stage-log)))"#,
+            r#"((error "Invalid handler in `file-name-handler-alist'") (expand-file-name))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_redirects_directory_not_regular_file() -> anyhow::Result<()> {
+        let fixture = DirectoryFixture::new()?;
+        let dir = &fixture.0;
+        let result = (|| -> anyhow::Result<()> {
+            let child = dir.join("child"); let ordinary = dir.join("ordinary"); let missing = dir.join("missing");
+            let link = dir.join("link");
+            let dangling = dir.join("dangling");
+            std::fs::create_dir(&child)?;
+            std::fs::write(&ordinary, "kept")?;
+            std::os::unix::fs::symlink(&child, &link)?;
+            std::os::unix::fs::symlink(&missing, &dangling)?;
+            let source = format!(r#"(progn (defalias 'rune-directory-redirect (function (lambda (op name &optional base) (garbage-collect) (if (equal name "SOURCE/child") {:?} (if (equal name "SOURCE/file") {:?} (if (equal name "SOURCE/link") {:?} (if (equal name "SOURCE/dangling") {:?} {:?}))))))) (let ((file-name-handler-alist '(("SOURCE" . rune-directory-redirect)))) (list (file-directory-p "SOURCE/child") (file-directory-p "SOURCE/file") (file-directory-p "SOURCE/missing") (file-directory-p "SOURCE/link") (file-directory-p "SOURCE/dangling"))))"#, child.to_str().unwrap(), ordinary.to_str().unwrap(), link.to_str().unwrap(), dangling.to_str().unwrap(), missing.to_str().unwrap());
+            crate::interpreter::assert_lisp(&source, "(t nil nil t nil)");
+            assert_eq!(std::fs::read_to_string(&ordinary)?, "kept");
+            assert!(!missing.exists());
+            assert_eq!(std::fs::read_link(&link)?, child);
+            assert_eq!(std::fs::read_link(&dangling)?, missing);
+            Ok(())
+        })();
+        result
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod regular_expansion_dispatch_tests {
+    #[test]
+    fn expansion_precedes_resolved_operation_once_across_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-regular-stage-log nil) (defalias 'rune-regular-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-regular-stage-log (cons (list op name base) rune-regular-stage-log)) "/RESOLVED/target///"))) (defalias 'rune-regular-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-regular-stage-log (cons (list op name) rune-regular-stage-log)) 'regular-answer))) (let ((rune-regular-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-regular-expand-stage) ("RESOLVED" . rune-regular-resolved-stage)))) (list (file-regular-p "MAGIC/leaf") rune-regular-stage-log)))"#,
+            r#"(regular-answer ((file-regular-p "/RESOLVED/target") (expand-file-name "MAGIC/leaf" nil)))"#,
+        );
+    }
+
+    #[test]
+    fn operation_inhibition_does_not_suppress_expansion_stage() -> anyhow::Result<()> {
+        let fixture = super::directory_expansion_dispatch_tests::DirectoryFixture::new()?;
+        let missing = fixture.0.join("rune-regular-resolved-absent");
+        assert!(!missing.exists());
+        crate::interpreter::assert_lisp(
+            &format!(r#"(progn (defvar rune-regular-inhibit-log nil) (defalias 'rune-regular-inhibit-expand (function (lambda (op name &optional base) (setq rune-regular-inhibit-log (cons op rune-regular-inhibit-log)) {missing:?}))) (defalias 'rune-regular-inhibit-final (function (lambda (op name) (setq rune-regular-inhibit-log (cons op rune-regular-inhibit-log)) 'should-not-run))) (let ((rune-regular-inhibit-log nil) (file-name-handler-alist '(("MAGIC" . rune-regular-inhibit-expand) ("rune-regular-resolved-absent" . rune-regular-inhibit-final))) (inhibit-file-name-handlers '(rune-regular-inhibit-expand rune-regular-inhibit-final)) (inhibit-file-name-operation 'file-regular-p)) (list (file-regular-p "MAGIC") rune-regular-inhibit-log)))"#, missing = missing.to_str().unwrap()),
+            "(nil (expand-file-name))",
+        );
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-regular-only-log nil) (defalias 'rune-regular-only-handler (function (lambda (op name &optional base) (setq rune-regular-only-log (cons (list op name) rune-regular-only-log)) 'regular-answer))) (let ((rune-regular-only-log nil) (file-name-handler-alist '(("MAGIC" . rune-regular-only-handler))) (inhibit-file-name-handlers '(rune-regular-only-handler)) (inhibit-file-name-operation 'expand-file-name)) (list (file-regular-p "/MAGIC/original") rune-regular-only-log)))"#,
+            r#"(regular-answer ((file-regular-p "/MAGIC/original")))"#,
+        );
+        assert!(!missing.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn expansion_errors_stop_before_regular_handler() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-regular-error-stage-log nil) (defalias 'rune-regular-invalid-expand (function (lambda (op name &optional base) (setq rune-regular-error-stage-log (cons op rune-regular-error-stage-log)) 3))) (let ((rune-regular-error-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-regular-invalid-expand)))) (list (condition-case err (file-regular-p "MAGIC") (error err)) rune-regular-error-stage-log)))"#,
+            r#"((error "Invalid handler in `file-name-handler-alist'") (expand-file-name))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_redirects_regular_file_not_directory() -> anyhow::Result<()> {
+        let fixture = super::directory_expansion_dispatch_tests::DirectoryFixture::new()?;
+        let dir = &fixture.0;
+        let result = (|| -> anyhow::Result<()> {
+            let child = dir.join("child"); let ordinary = dir.join("ordinary"); let missing = dir.join("missing");
+            let link = dir.join("link");
+            let dangling = dir.join("dangling");
+            std::fs::create_dir(&child)?;
+            std::fs::write(&ordinary, "kept")?;
+            std::os::unix::fs::symlink(&ordinary, &link)?;
+            std::os::unix::fs::symlink(&missing, &dangling)?;
+            let source = format!(r#"(progn (defalias 'rune-regular-redirect (function (lambda (op name &optional base) (garbage-collect) (if (equal name "SOURCE/child") {:?} (if (equal name "SOURCE/file") {:?} (if (equal name "SOURCE/link") {:?} (if (equal name "SOURCE/dangling") {:?} {:?}))))))) (let ((file-name-handler-alist '(("SOURCE" . rune-regular-redirect)))) (list (file-regular-p "SOURCE/child") (file-regular-p "SOURCE/file") (file-regular-p "SOURCE/missing") (file-regular-p "SOURCE/link") (file-regular-p "SOURCE/dangling"))))"#, child.to_str().unwrap(), ordinary.to_str().unwrap(), link.to_str().unwrap(), dangling.to_str().unwrap(), missing.to_str().unwrap());
+            crate::interpreter::assert_lisp(&source, "(nil t nil t nil)");
+            assert_eq!(std::fs::read_to_string(&ordinary)?, "kept");
+            assert!(!missing.exists());
+            assert_eq!(std::fs::read_link(&link)?, ordinary);
+            assert_eq!(std::fs::read_link(&dangling)?, missing);
+            Ok(())
+        })();
+        result
     }
 }

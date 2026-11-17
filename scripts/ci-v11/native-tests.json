@@ -210,5 +210,13 @@
   "fileio::accessible_expansion_dispatch_tests::expansion_precedes_resolved_operation_once_across_gc",
   "fileio::accessible_expansion_dispatch_tests::operation_inhibition_does_not_suppress_expansion_stage",
   "fileio::accessible_expansion_dispatch_tests::expansion_errors_stop_before_directory_access_handler",
-  "fileio::accessible_expansion_dispatch_tests::expansion_redirects_searchable_directory_not_regular_file"
+  "fileio::accessible_expansion_dispatch_tests::expansion_redirects_searchable_directory_not_regular_file",
+  "fileio::directory_expansion_dispatch_tests::expansion_precedes_resolved_operation_once_across_gc",
+  "fileio::directory_expansion_dispatch_tests::operation_inhibition_does_not_suppress_expansion_stage",
+  "fileio::directory_expansion_dispatch_tests::expansion_errors_stop_before_directory_handler",
+  "fileio::directory_expansion_dispatch_tests::expansion_redirects_directory_not_regular_file",
+  "fileio::regular_expansion_dispatch_tests::expansion_precedes_resolved_operation_once_across_gc",
+  "fileio::regular_expansion_dispatch_tests::operation_inhibition_does_not_suppress_expansion_stage",
+  "fileio::regular_expansion_dispatch_tests::expansion_errors_stop_before_regular_handler",
+  "fileio::regular_expansion_dispatch_tests::expansion_redirects_regular_file_not_directory"
 ]
