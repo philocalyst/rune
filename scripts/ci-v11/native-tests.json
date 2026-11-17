@@ -18,5 +18,15 @@
   "eval::hook_wrapped_tests::real_wrapper_invokes_lambda_with_zero_original_arguments",
   "eval::hook_wrapped_tests::default_marker_uses_same_wrapper_and_live_tail_reloads",
   "eval::hook_wrapped_tests::nested_wrappers_keep_original_args_and_throw_error_unwind",
-  "eval::hook_wrapped_tests::cycle_is_bounded_without_calling_entries"
+  "eval::hook_wrapped_tests::cycle_is_bounded_without_calling_entries",
+  "bytecode::test::active_backtrace_direct_entry_reuse_scopes_success_error_and_inheritance",
+  "bytecode::test::active_backtrace_optimized_arity_failure_removes_only_nested_frames",
+  "bytecode::test::active_backtrace_optimized_call_keeps_original_rest_arguments_across_gc",
+  "bytecode::test::active_backtrace_optimized_throw_restores_handler_frame_depth",
+  "bytecode::test::active_backtrace_resumed_handler_observes_outer_not_unwound_inner",
+  "eval::active_backtrace_edge_tests::absent_base_does_not_match_unbound_special_function_cells",
+  "eval::active_backtrace_edge_tests::invalid_index_reports_gnu_wholenump_condition",
+  "eval::active_backtrace_edge_tests::missing_frame_does_not_validate_dormant_callback",
+  "eval::active_backtrace_edge_tests::selected_noncallable_callback_signals_invalid_function_payload",
+  "eval::active_backtrace_edge_tests::special_frame_uses_original_forms_and_alias_base"
 ]
