@@ -147,5 +147,8 @@
   "fileio::local_expansion_tests::absolute_paths_ignore_invalid_defaults_and_tilde_scope_is_unchanged",
   "fileio::local_directory_conversion_tests::directory_suffixes_preserve_roots_and_dot_components",
   "fileio::local_directory_conversion_tests::as_directory_empty_is_current_not_root",
-  "fileio::local_directory_conversion_tests::lisp_directory_conversion_composition"
+  "fileio::local_directory_conversion_tests::lisp_directory_conversion_composition",
+  "fileio::filename_concat_filter_tests::empty_and_nil_components_do_not_create_slashes",
+  "fileio::filename_concat_filter_tests::absolute_components_and_dot_segments_remain_lexical",
+  "fileio::filename_concat_filter_tests::invalid_components_signal_stringp_with_original_operand"
 ]

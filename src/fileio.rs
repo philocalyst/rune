@@ -2,7 +2,7 @@
 use crate::{
     core::{
         cons::Cons,
-        env::{Env, sym},
+        env::{ArgSlice, Env, sym},
         error::{Type, TypeError},
         gc::{Context, Rt},
         object::{Number, Object, ObjectType, OptionalFlag, Symbol},
@@ -638,26 +638,29 @@ fn write_region_to(
     write(&mut file)
 }
 
-/// Concatenate components to directory, inserting path separators as required.
+/// Concatenate local UTF-8 components, filtering nil/empty strings as GNU does.
+/// No expansion or normalization occurs. Existing raw-byte string support is
+/// not extended here; GNU byte/multibyte result-kind rules remain a separate gap.
 #[defun]
-fn file_name_concat(directory: &str, rest_components: &[Object]) -> Result<String> {
-    let mut path = String::from(directory);
-
-    // All components must be stringp...
-    for r_c in rest_components {
-        let ObjectType::String(s) = r_c.untag() else {
-            bail!(TypeError::new(Type::String, r_c));
+fn file_name_concat(directory: Object, rest_components: ArgSlice, env: &mut Rt<Env>, cx: &Context) -> Result<String> {
+    env.initialize_condition_metadata(cx);
+    let mut path = String::new();
+    for component in std::iter::once(directory).chain(env.stack.arg_slice(rest_components).iter().map(|value| value.bind(cx))) {
+        let text = match component.untag() {
+            ObjectType::NIL => continue,
+            ObjectType::String(text) => text,
+            ObjectType::ByteString(_) => bail!("file-name-concat raw-byte strings are unsupported"),
+            _ => {
+                let data = list![sym::STRINGP, component; cx];
+                return Err(crate::eval::EvalError::signal(sym::WRONG_TYPE_ARGUMENT.into(), data, cx).into());
+            }
         };
-
-        // Append separator before adding the new element, but only if the
-        // existing path isn't already terminated with a "/"
-        if !path.ends_with(MAIN_SEPARATOR) {
-            path.push(MAIN_SEPARATOR)
-        }
-
-        path.push_str(s.as_ref());
+        if text.is_empty() { continue; }
+        // An absolute later component is still concatenated, not a replacement
+        // for earlier components. Preserve repeated separators and dot segments.
+        if !path.is_empty() && !path.ends_with(MAIN_SEPARATOR) { path.push(MAIN_SEPARATOR); }
+        path.push_str(text.as_ref());
     }
-
     Ok(path)
 }
 
@@ -1531,6 +1534,34 @@ mod local_directory_conversion_tests {
         crate::interpreter::assert_lisp(
             r#"(list (file-name-as-directory "") (directory-file-name "//") (directory-file-name "path///") (file-name-as-directory (directory-file-name "a/../")))"#,
             r#"("./" "//" "path" "a/../")"#,
+        );
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod filename_concat_filter_tests {
+    #[test]
+    fn empty_and_nil_components_do_not_create_slashes() {
+        crate::interpreter::assert_lisp(
+            r#"(list (file-name-concat nil) (file-name-concat "") (file-name-concat nil "" nil) (file-name-concat "" "leaf") (file-name-concat "base" "" nil) (file-name-concat nil "base" nil "leaf" ""))"#,
+            r#"("" "" "" "leaf" "base" "base/leaf")"#,
+        );
+    }
+
+    #[test]
+    fn absolute_components_and_dot_segments_remain_lexical() {
+        crate::interpreter::assert_lisp(
+            r#"(list (file-name-concat "base" "/absolute") (file-name-concat "base/" "/absolute") (file-name-concat "//" "host" "./" "../leaf") (file-name-concat "é" "資料") (file-name-concat "base" "leaf///"))"#,
+            r#"("base//absolute" "base//absolute" "//host/./../leaf" "é/資料" "base/leaf///")"#,
+        );
+    }
+
+    #[test]
+    fn invalid_components_signal_stringp_with_original_operand() {
+        crate::interpreter::assert_lisp(
+            r#"(list (condition-case err (file-name-concat 3) (wrong-type-argument err)) (condition-case err (file-name-concat nil "" 7) (wrong-type-argument err)) (condition-case err (file-name-concat "base" t) (wrong-type-argument err)))"#,
+            "((wrong-type-argument stringp 3) (wrong-type-argument stringp 7) (wrong-type-argument stringp t))",
         );
     }
 }
