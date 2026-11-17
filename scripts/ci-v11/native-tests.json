@@ -28,5 +28,9 @@
   "eval::active_backtrace_edge_tests::invalid_index_reports_gnu_wholenump_condition",
   "eval::active_backtrace_edge_tests::missing_frame_does_not_validate_dormant_callback",
   "eval::active_backtrace_edge_tests::selected_noncallable_callback_signals_invalid_function_payload",
-  "eval::active_backtrace_edge_tests::special_frame_uses_original_forms_and_alias_base"
+  "eval::active_backtrace_edge_tests::special_frame_uses_original_forms_and_alias_base",
+  "eval::active_backtrace_edge_tests::base_offset_narrows_to_c_int_before_positive_skip",
+  "eval::active_backtrace_edge_tests::cons_nil_base_does_not_mean_unrestricted_stack",
+  "eval::active_backtrace_edge_tests::map_callback_reentry_keeps_snapshot_membership",
+  "eval::active_backtrace_edge_tests::map_callback_signal_unwinds_then_next_call_succeeds"
 ]

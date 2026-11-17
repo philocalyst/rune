@@ -1386,7 +1386,7 @@ mod active_backtrace_edge_tests {
         ] {
             let form = format!("(progn (fset 'bt-offset-target '(lambda (offset) (eq (nth 1 (backtrace-frame--internal #'list 0 (cons offset 'bt-offset-target))) 'bt-offset-target))) (bt-offset-target {offset}))");
             crate::interpreter::assert_lisp(&form, if found { "t" } else { "nil" });
-            let form = format!("(progn (setq bt-offset-seen nil) (fset 'bt-offset-target '(lambda (offset) (mapbacktrace (lambda (e f a flags) (if (eq f 'bt-offset-target) (setq bt-offset-seen t))) (cons offset 'bt-offset-target)))) (bt-offset-target {offset}) bt-offset-seen)");
+            let form = format!("(progn (setq bt-offset-seen nil) (fset 'bt-offset-target '(lambda (offset) (mapbacktrace (function (lambda (e f a flags) (if (eq f 'bt-offset-target) (setq bt-offset-seen t)))) (cons offset 'bt-offset-target)))) (bt-offset-target {offset}) bt-offset-seen)");
             crate::interpreter::assert_lisp(&form, if found { "t" } else { "nil" });
         }
     }
@@ -1419,11 +1419,11 @@ mod active_backtrace_edge_tests {
 
     #[test]
     fn map_callback_signal_unwinds_then_next_call_succeeds() {
-        crate::interpreter::assert_lisp("(progn (fset 'mb-target '(lambda (callback) (mapbacktrace callback 'mb-target))) (list (condition-case nil (mb-target (lambda (&rest args) (garbage-collect) (backtrace-frame--internal #'list 999 nil) (error \"callback failure\"))) (error 'caught)) (backtrace-frame--internal #'list 0 'mb-target) (mb-target (lambda (&rest args) nil))))", "(caught nil nil)");
+        crate::interpreter::assert_lisp("(progn (fset 'mb-target '(lambda (callback) (mapbacktrace callback 'mb-target))) (list (condition-case nil (mb-target (function (lambda (&rest args) (garbage-collect) (backtrace-frame--internal #'list 999 nil) (error \"callback failure\")))) (error 'caught)) (backtrace-frame--internal #'list 0 'mb-target) (mb-target (function (lambda (&rest args) nil)))))", "(caught nil nil)");
     }
     #[test]
     fn map_callback_reentry_keeps_snapshot_membership() {
-        crate::interpreter::assert_lisp("(progn (setq mb-seen nil mb-visits 0) (fset 'mb-reentry '(lambda () (garbage-collect) (backtrace-frame--internal #'list 999 nil))) (fset 'mb-target '(lambda () (mapbacktrace (lambda (e f a flags) (mb-reentry) (setq mb-seen (cons f mb-seen)) (if (eq f 'mb-target) (setq mb-visits (1+ mb-visits)))) 'mb-target))) (list (mb-target) mb-visits (memq 'mb-reentry mb-seen) (backtrace-frame--internal #'list 0 'mb-target)))", "(nil 1 nil nil)");
+        crate::interpreter::assert_lisp("(progn (setq mb-seen nil mb-visits 0) (fset 'mb-reentry '(lambda () (garbage-collect) (backtrace-frame--internal #'list 999 nil))) (fset 'mb-target '(lambda () (mapbacktrace (function (lambda (e f a flags) (mb-reentry) (setq mb-seen (cons f mb-seen)) (if (eq f 'mb-target) (setq mb-visits (1+ mb-visits))))) 'mb-target))) (list (mb-target) mb-visits (memq 'mb-reentry mb-seen) (backtrace-frame--internal #'list 0 'mb-target)))", "(nil 1 nil nil)");
     }
     #[test]
     fn missing_frame_does_not_validate_dormant_callback() {
@@ -1454,11 +1454,11 @@ mod active_backtrace_edge_tests {
         for base in ["'(0 . nil)", "'(1 . nil)", "'(-1 . nil)"] {
             let inspect = format!("(backtrace-frame--internal #'list 0 {base})");
             crate::interpreter::assert_lisp(&inspect, "nil");
-            let map = format!("(let ((seen nil)) (mapbacktrace (lambda (&rest args) (setq seen t)) {base}) seen)");
+            let map = format!("(let ((seen nil)) (mapbacktrace (function (lambda (&rest args) (setq seen t))) {base}) seen)");
             crate::interpreter::assert_lisp(&map, "nil");
         }
         crate::interpreter::assert_lisp("(not (null (backtrace-frame--internal #'list 0 nil)))", "t");
-        crate::interpreter::assert_lisp("(let ((seen nil)) (mapbacktrace (lambda (&rest args) (setq seen t)) nil) seen)", "t");
+        crate::interpreter::assert_lisp("(let ((seen nil)) (mapbacktrace (function (lambda (&rest args) (setq seen t))) nil) seen)", "t");
     }
     #[test]
     fn absent_base_does_not_match_unbound_special_function_cells() {
