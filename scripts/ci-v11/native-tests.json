@@ -45,5 +45,13 @@
   "eval::hook_until_success_tests::single_raw_lambda_gets_all_arguments",
   "eval::hook_until_success_tests::ordered_short_circuit_keeps_return_identity_across_gc",
   "eval::hook_until_success_tests::hook_errors_propagate_and_following_call_still_works",
-  "eval::hook_until_success_tests::live_cdr_mutation_and_global_t_sentinel_are_bounded"
+  "eval::hook_until_success_tests::live_cdr_mutation_and_global_t_sentinel_are_bounded",
+  "core::env::feature_ownership_tests::interned_features_follow_independent_evaluator_namespaces",
+  "core::env::feature_ownership_tests::uninterned_features_are_rooted_and_keep_identity",
+  "eval::autoload_metadata_tests::documented_autoload_loads_real_source_without_evaluating_metadata",
+  "eval::autoload_metadata_tests::malformed_autoload_metadata_rejects_before_io",
+  "interpreter::test::declared_let_does_not_hide_lexical_lambda_parameter",
+  "interpreter::test::local_declarations_do_not_make_lambda_parameters_dynamic",
+  "interpreter::test::oversized_formal_parameter_lists_error_before_binding_or_argument_unwrap",
+  "keymap::tests::direct_keymap_roots_are_owner_local_and_never_leave_stale_global_callable"
 ]

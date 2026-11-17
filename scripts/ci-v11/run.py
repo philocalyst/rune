@@ -2,7 +2,7 @@
 """Independent hosted-runner evidence only; no local-process resolution claim."""
 import hashlib,json,os,pathlib,re,resource,shutil,signal,subprocess,time
 S=pathlib.Path.cwd().resolve(); C=S/'scripts/ci-v11'
-TESTS_PIN='70899ce58ea0f2716f5dbc4b72bfd75eea3a5c464e5cd5f5a2c6084ac3b604d9'
+TESTS_PIN='870c9677dd1d5651c93b7a00675b284edb22c2b5d2088b2b3212a4275f1a54dd'
 SOURCE_PIN='a2bf59e4c504bd024d7669a08286e1f3746267a7d4f1c127c133559cdae78aaf'
 EXTRAS={'.github/workflows/wip-v11-native.yml','scripts/ci-v11/run.py','scripts/ci-v11/source-inventory.json','scripts/ci-v11/native-tests.json','docs/wip-v11-ci-scope.md'}
 EXTRAS.update(['.github/workflows/wip-bootstrap.yml', 'scripts/ci-bootstrap/run.py', 'scripts/ci-bootstrap/check-sandbox.py', 'scripts/ci-bootstrap/checkpoint.el', 'docs/wip-bootstrap-scope.md'])
@@ -77,17 +77,18 @@ def main():
  verify()
  root=pathlib.Path(os.environ['RUNNER_TEMP']).resolve();E=root/('rune-v11-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT']);E.mkdir(exist_ok=False)
  home=E/'home';home.mkdir(); target=E/'target'
+ temporary=E/'tmp';temporary.mkdir(mode=0o700,exist_ok=False)
  rustup=pathlib.Path(shutil.which('rustup')).resolve();assert rustup.is_file()
  # Explicit allowlist: no GITHUB_TOKEN, ACTIONS_RUNTIME_TOKEN, cloud credentials,
  # host Cargo config, caches, SSH agent or user environment reaches build/tests.
- ENV={'HOME':str(home),'CARGO_HOME':str(E/'cargo'),'RUSTUP_HOME':str(E/'rustup'),'PATH':str(rustup.parent)+':/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8','TZ':'UTC','CARGO_TARGET_DIR':str(target),'CARGO_BUILD_JOBS':'2','CARGO_INCREMENTAL':'0','RUNE_ELPROP_BACKEND':'batch','RUST_BACKTRACE':'0','GIT_TERMINAL_PROMPT':'0','RUSTUP_DIST_SERVER':'https://static.rust-lang.org','RUSTUP_UPDATE_ROOT':'https://static.rust-lang.org/rustup'}
+ ENV={'HOME':str(home),'TMPDIR':str(temporary),'CARGO_HOME':str(E/'cargo'),'RUSTUP_HOME':str(E/'rustup'),'PATH':str(rustup.parent)+':/usr/bin:/bin','LANG':'C.UTF-8','LC_ALL':'C.UTF-8','TZ':'UTC','CARGO_TARGET_DIR':str(target),'CARGO_BUILD_JOBS':'2','CARGO_INCREMENTAL':'0','RUNE_ELPROP_BACKEND':'batch','RUST_BACKTRACE':'0','GIT_TERMINAL_PROMPT':'0','RUSTUP_DIST_SERVER':'https://static.rust-lang.org','RUSTUP_UPDATE_ROOT':'https://static.rust-lang.org/rustup'}
  assert shutil.disk_usage(E).free>=8*1024**3,'disk admission'
  run('toolchain',[str(rustup),'toolchain','install','1.96.0','--profile','minimal','--no-self-update'],180)
  tool=E/'rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin';cargo=tool/'cargo';rustc=tool/'rustc';assert cargo.is_file() and rustc.is_file()
  ENV['PATH']=str(tool)+':/usr/bin:/bin'
  versions,_=run('versions',[str(rustc),'-Vv'],10);assert versions.startswith('rustc 1.96.0 ')
  cargo_version,_=run('cargo-version',[str(cargo),'-Vv'],10);assert cargo_version.startswith('cargo 1.96.0 ')
- save(E/'provenance.json',{'commit':COMMIT,'source_inventory_sha256':SOURCE_PIN,'rustc':versions,'cargo':cargo_version,'rustc_sha256':sha(rustc),'cargo_sha256':sha(cargo),'rustup_sha256':sha(rustup),'indexmap_git_revision':'5ceff134a843d7afc26bb63db48f927ea80883bc','scope':'native47 not GNU139 or Doom startup'})
+ save(E/'provenance.json',{'commit':COMMIT,'source_inventory_sha256':SOURCE_PIN,'rustc':versions,'cargo':cargo_version,'rustc_sha256':sha(rustc),'cargo_sha256':sha(cargo),'rustup_sha256':sha(rustup),'indexmap_git_revision':'5ceff134a843d7afc26bb63db48f927ea80883bc','scope':'native55 not GNU139 or Doom startup'})
  # Cold checkout needs locked network fetch including pinned public indexmap git.
  run('fetch',[str(cargo),'fetch','--locked','--target','x86_64-unknown-linux-gnu'],180)
  verify()
@@ -101,7 +102,7 @@ def main():
    artifacts.append(pathlib.Path(item['executable']).resolve())
  assert len(artifacts)==1;binary=artifacts[0];assert binary.is_relative_to(target.resolve()) and binary.is_file()
  binary_pin=sha(binary);assert binary.open('rb').read(4)==b'\x7fELF';verify()
- selected=json.loads((C/'native-tests.json').read_text());assert len(selected)==len(set(selected))==47
+ selected=json.loads((C/'native-tests.json').read_text());assert len(selected)==len(set(selected))==55
  listed,_=run('list',[str(binary),'--list'],20,1024**2,1024**2)
  discovered=[line.removesuffix(': test') for line in listed.splitlines() if line.endswith(': test')]
  assert all(discovered.count(n)==1 for n in selected)
@@ -113,8 +114,8 @@ def main():
   assert re.search(r'test result: ok\. 1 passed; 0 failed; 0 ignored;',out),'unexpected test accounting'
   assert time.monotonic()<=deadline
  verify();assert sha(binary)==binary_pin
- result={'qualified_native_subset':True,'passed':47,'commit':COMMIT,'artifact_sha256':binary_pin,'source_inventory_sha256':SOURCE_PIN,'tests':selected,'gnu_reference_tested':False,'doom_startup_tested':False,'old_local_process':'UNKNOWN/unaffected'}
+ result={'qualified_native_subset':True,'passed':55,'commit':COMMIT,'artifact_sha256':binary_pin,'source_inventory_sha256':SOURCE_PIN,'tests':selected,'gnu_reference_tested':False,'doom_startup_tested':False,'old_local_process':'UNKNOWN/unaffected'}
  save(E/'result.json',result);print(json.dumps(result),flush=True)
  if os.environ.get('GITHUB_STEP_SUMMARY'):
-  pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('V11 native subset only:47 passed; commit '+COMMIT+'; ELF SHA256 '+binary_pin+'. Not GNU139 or Doom startup.\n')
+  pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('V11 native subset only:55 passed; commit '+COMMIT+'; ELF SHA256 '+binary_pin+'. Not GNU139 or Doom startup.\n')
 if __name__=='__main__':main()
