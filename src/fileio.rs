@@ -226,6 +226,9 @@ fn file_accessible_directory_p(filename: &str) -> bool {
 
 #[defun]
 fn file_name_as_directory(filename: &str) -> String {
+    // GNU's local Unix empty name denotes the current directory, not root.
+    #[cfg(unix)]
+    if filename.is_empty() { return "./".to_owned(); }
     if filename.ends_with(MAIN_SEPARATOR) {
         filename.to_owned()
     } else {
@@ -238,20 +241,31 @@ fn file_directory_p(filename: &str) -> bool {
     if filename.is_empty() { true } else { Path::new(filename).is_dir() }
 }
 
-/// Return dirname sans final path separator, unless the string consists entirely of separators.
+/// Local lexical directory conversion; existing handler/string-conversion limitations remain.
 #[defun]
 fn directory_file_name(dirname: &str) -> &str {
-    let path = Path::new(dirname);
-    let mut path_components = path.components();
-    if path_components.clone().next().is_none() {
-        return "";
+    #[cfg(unix)]
+    {
+        // GNU fileio.c directory_file_name preserves exactly "//", but strips
+        // every trailing slash otherwise, leaving at least one byte. This is
+        // lexical: do not normalize dot components or touch the filesystem.
+        let bytes = dirname.as_bytes();
+        let mut end = bytes.len();
+        if !(end == 2 && bytes[0] == b'/') {
+            while end > 1 && bytes[end - 1] == b'/' { end -= 1; }
+        }
+        &dirname[..end]
     }
-
-    if path_components.all(|c| c == Component::RootDir || c == Component::Normal("".as_ref())) {
-        return "/";
+    #[cfg(not(unix))]
+    {
+        let path = Path::new(dirname);
+        let mut path_components = path.components();
+        if path_components.clone().next().is_none() { return ""; }
+        if path_components.all(|c| c == Component::RootDir || c == Component::Normal("".as_ref())) {
+            return "/";
+        }
+        dirname.strip_suffix(MAIN_SEPARATOR).unwrap_or(dirname)
     }
-
-    dirname.strip_suffix(MAIN_SEPARATOR).unwrap_or(dirname)
 }
 
 /// Returns true if the path is absolute
@@ -1486,6 +1500,37 @@ mod local_expansion_tests {
         crate::interpreter::assert_lisp(
             r#"(let ((default-directory 7)) (list (expand-file-name "/a/./b") (expand-file-name "relative") (expand-file-name "~/literal/.." "/base/")))"#,
             r#"("/a/b" "/relative" "/base/~/literal/..")"#,
+        );
+    }
+}
+
+
+#[cfg(all(test, unix))]
+mod local_directory_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn directory_suffixes_preserve_roots_and_dot_components() {
+        for (input, expected) in [
+            ("", ""), ("/", "/"), ("//", "//"), ("///", "/"), ("////", "/"),
+            ("a///", "a"), ("/a///", "/a"), ("//host///", "//host"),
+            ("./", "."), ("../", ".."), ("/a/../", "/a/.."), ("é///", "é"),
+            ("/x", "/x"), ("a\0b///", "a\0b"),
+        ] { assert_eq!(directory_file_name(input), expected, "{input:?}"); }
+    }
+
+    #[test]
+    fn as_directory_empty_is_current_not_root() {
+        for (input, expected) in [("", "./"), ("a", "a/"), ("/", "/"),
+            ("//", "//"), ("a///", "a///"), ("..", "../"), ("é", "é/")]
+        { assert_eq!(file_name_as_directory(input), expected, "{input:?}"); }
+    }
+
+    #[test]
+    fn lisp_directory_conversion_composition() {
+        crate::interpreter::assert_lisp(
+            r#"(list (file-name-as-directory "") (directory-file-name "//") (directory-file-name "path///") (file-name-as-directory (directory-file-name "a/../")))"#,
+            r#"("./" "//" "path" "a/../")"#,
         );
     }
 }
