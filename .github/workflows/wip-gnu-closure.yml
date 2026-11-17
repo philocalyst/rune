@@ -24,3 +24,22 @@ jobs:
         env:
           EXPECTED_COMMIT: ${{ github.sha }}
         run: timeout --signal=TERM --kill-after=5s 570s python3 -I scripts/ci-gnu-closure/run.py
+
+      - name: Save exact same-job static closure evidence only
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gnu-static-closure-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/rune-closure-evidence-${{ github.run_id }}-${{ github.run_attempt }}/closure.json
+            ${{ runner.temp }}/rune-closure-evidence-${{ github.run_id }}-${{ github.run_attempt }}/static-result.json
+            ${{ runner.temp }}/rune-closure-evidence-${{ github.run_id }}-${{ github.run_attempt }}/payload-result.json
+            ${{ runner.temp }}/rune-closure-evidence-${{ github.run_id }}-${{ github.run_attempt }}/authentication.json
+            ${{ runner.temp }}/rune-closure-evidence-${{ github.run_id }}-${{ github.run_attempt }}/provider-authentication.json
+            ${{ runner.temp }}/rune-closure-evidence-${{ github.run_id }}-${{ github.run_attempt }}/provenance.json
+            ${{ runner.temp }}/rune-closure-evidence-${{ github.run_id }}-${{ github.run_attempt }}/manifest.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+          overwrite: false
+          include-hidden-files: false

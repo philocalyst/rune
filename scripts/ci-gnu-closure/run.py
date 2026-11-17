@@ -57,5 +57,56 @@ def main():
  result={'static_candidate_complete':True,'provider_authentication_sha256':receipt_pin,'provider_signed_valid_until':None,'provider_local_review_not_after':authentication['review_not_after'],'commit':commit,'closure_sha256':sha(p),'elf_files':r['elf_files'],'eln_roots':149,'gnu_executed':False,'runtime_qualified':False,'gnu16_tested':False,'doom_tested':False,'image_version':os.environ.get('ImageVersion'),'image_os':os.environ.get('ImageOS')}
  with (E/'static-result.json').open('x') as f:json.dump(result,f,indent=2);f.write('\n')
  print(json.dumps(result),flush=True)
+ def export_evidence():
+  import time
+  deadline=time.monotonic()+20
+  tag=os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'];assert re.fullmatch('[0-9]+-[0-9]+',tag)
+  temp=pathlib.Path(os.environ['RUNNER_TEMP']).resolve();destination=temp/('rune-closure-evidence-'+tag)
+  destination.mkdir(mode=0o700);assert destination.resolve()==destination
+  sources={'closure.json':E/'static-closure/closure.json','static-result.json':E/'static-result.json','payload-result.json':E/'result.json','authentication.json':E/'authentication.json','provider-authentication.json':E/'provider-authentication.json'}
+  def bounded_hash(path):
+   fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK)
+   try:
+    st=os.fstat(fd);assert stat.S_ISREG(st.st_mode) and st.st_size<=32*1024**2
+    h=hashlib.sha256();size=0
+    while True:
+     assert time.monotonic()<deadline
+     data=os.read(fd,65536)
+     if not data:break
+     size+=len(data);assert size<=32*1024**2;h.update(data)
+    assert size==st.st_size;return h.hexdigest()
+   finally:os.close(fd)
+  before={};inventory={};total=0
+  for name,source in sources.items():
+   assert time.monotonic()<deadline and source.resolve()==source and source.is_relative_to(E)
+   fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC|os.O_NONBLOCK)
+   try:
+    st=os.fstat(fd);assert stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1 and st.st_size<=32*1024**2
+    identity=(st.st_dev,st.st_ino,st.st_size,st.st_mode,st.st_uid,st.st_nlink,st.st_mtime_ns,st.st_ctime_ns);before[name]=identity
+    digest=hashlib.sha256();size=0
+    with (destination/name).open('xb') as out:
+     while True:
+      assert time.monotonic()<deadline
+      chunk=os.read(fd,65536)
+      if not chunk:break
+      size+=len(chunk);total+=len(chunk);assert size<=32*1024**2 and total<=40*1024**2
+      digest.update(chunk);out.write(chunk)
+    now=os.fstat(fd);assert identity==(now.st_dev,now.st_ino,now.st_size,now.st_mode,now.st_uid,now.st_nlink,now.st_mtime_ns,now.st_ctime_ns) and size==st.st_size
+    (destination/name).chmod(0o400);inventory[name]={'size':size,'sha256':digest.hexdigest()}
+   finally:os.close(fd)
+  assert inventory['closure.json']['sha256']==result['closure_sha256'] and inventory['provider-authentication.json']['sha256']==receipt_pin
+  provenance={'commit':commit,'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'image_os':os.environ.get('ImageOS'),'image_version':os.environ.get('ImageVersion'),'closure_helper_manifest_sha256':sha(C/'helper-inventory.json'),'payload_manifest_sha256':sha(S/'scripts/ci-gnu-payload/payload-inventory.json'),'provider_selection_sha256':sha(P/'selected.json'),'scope':'same-job data-only static closure evidence; not runtime admission','gnu_executed':False,'runtime_qualified':False,'includes_package_or_elf_bytes':False}
+  with (destination/'provenance.json').open('x') as out:json.dump(provenance,out,indent=2);out.write('\n')
+  (destination/'provenance.json').chmod(0o400);inventory['provenance.json']={'size':(destination/'provenance.json').stat().st_size,'sha256':sha(destination/'provenance.json')}
+  for name,source in sources.items():
+   assert time.monotonic()<deadline
+   now=source.lstat();assert before[name]==(now.st_dev,now.st_ino,now.st_size,now.st_mode,now.st_uid,now.st_nlink,now.st_mtime_ns,now.st_ctime_ns)
+   assert bounded_hash(source)==inventory[name]['sha256']==bounded_hash(destination/name)
+  with (destination/'manifest.json').open('x') as out:json.dump({'commit':commit,'run_id':os.environ['GITHUB_RUN_ID'],'run_attempt':os.environ['GITHUB_RUN_ATTEMPT'],'files':inventory,'gnu_executed':False,'runtime_qualified':False},out,indent=2);out.write('\n')
+  (destination/'manifest.json').chmod(0o400)
+  assert {x.name for x in destination.iterdir()}==set(inventory)|{'manifest.json'} and time.monotonic()<deadline
+  check_providers();verify(commit)
+  print(json.dumps({'closure_evidence_directory':str(destination),'manifest_sha256':sha(destination/'manifest.json'),'files':len(inventory)+1,'copied_source_bytes':total,'gnu_executed':False,'runtime_qualified':False}),flush=True)
+ export_evidence()
  if os.environ.get('GITHUB_STEP_SUMMARY'):pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('Static ELF dependency candidate only; GNU/loader/ELNs were not executed. Runtime/dlopen/NSS/Doom unqualified. Commit '+commit+'\n')
 if __name__=='__main__':main()
