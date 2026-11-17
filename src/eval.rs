@@ -424,6 +424,9 @@ fn hook_value<'ob>(value: &Rto<Object>, hook: &Rto<Object>, args: ArgSlice,
         return Ok(if until_success { result } else { NIL });
     }
     root!(tail, value.bind(cx), cx);
+    // Transfer callback values into an owner-rooted slot before continuing the
+    // loop, so their Context borrow does not escape across later callbacks.
+    root!(result, NIL, cx);
     loop {
         let ObjectType::Cons(pair) = tail.untag(cx) else { return Ok(NIL); };
         ensure!(*budget > 0, "Hook traversal limit exceeded");
@@ -436,13 +439,17 @@ fn hook_value<'ob>(value: &Rto<Object>, hook: &Rto<Object>, args: ArgSlice,
                 let symbol: Symbol = hook.bind(cx).try_into()?;
                 let defaults = crate::data::default_value(symbol, env, cx)?;
                 root!(defaults, cx);
-                let result = hook_value(defaults, hook, args, true, until_success, wrapper, budget, env, cx)?;
-                if until_success && !result.is_nil() { return Ok(result); }
+                hook_value(defaults, hook, args, true, until_success, wrapper, budget, env, cx)
+                    .map(|value| result.set(value))?;
+                if until_success && !result.bind(cx).is_nil() { return Ok(result.bind(cx)); }
             }
         } else {
-            let result = hook_success_call(function, args, wrapper, env, cx)?;
-            if until_success && !result.is_nil() { return Ok(result); }
+            hook_success_call(function, args, wrapper, env, cx)
+                .map(|value| result.set(value))?;
+            if until_success && !result.bind(cx).is_nil() { return Ok(result.bind(cx)); }
         }
+        // Discard ignored callback returns before the next callback/GC.
+        result.set(NIL);
         let ObjectType::Cons(pair) = tail.untag(cx) else { unreachable!() };
         tail.set(pair.cdr());
     }
