@@ -14,6 +14,7 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use fancy_regex::Regex;
+use rune_core::macros::list;
 use rune_macros::defun;
 use std::path::{Component, MAIN_SEPARATOR, Path};
 
