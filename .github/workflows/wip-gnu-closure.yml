@@ -1,0 +1,26 @@
+name: WIP static GNU runtime dependency inspection
+on:
+  push:
+    branches: [work/rune-backtrace-untested-20261117]
+permissions:
+  contents: read
+concurrency:
+  group: wip-gnu-closure-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  closure:
+    if: github.repository == 'philocalyst/rune' && github.ref == 'refs/heads/work/rune-backtrace-untested-20261117' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact event commit without retained credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          submodules: false
+      - name: Authenticate inert payload and inspect exact hosted ELF closure
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: timeout --signal=TERM --kill-after=5s 570s python3 scripts/ci-gnu-closure/run.py

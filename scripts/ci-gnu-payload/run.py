@@ -2,9 +2,10 @@
 """Hosted authenticated Debian data-only acquisition; NEVER GNU execution."""
 import datetime,hashlib,json,os,pathlib,re,resource,shutil,signal,stat,subprocess,time
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-gnu-payload'
-BASE_PIN='16c62a98ed07d89f41c672955616577caff2d7410a2c1913acff8fe1ad32b059'
+BASE_PIN='89953f50e7a1a81f4e81951c879c9e502658fd38483a1e35d8197b2a905e946f'
 HELPERS_PIN='866c2b498bfe18a25a6903b860a0664c21a2e2f78c0acb724befb8f47c9f9363'
 OVERLAY=set(['.github/workflows/wip-gnu-payload.yml', 'docs/wip-gnu-payload-scope.md', 'scripts/ci-gnu-payload/authentication-receipt.json', 'scripts/ci-gnu-payload/base-inventory.json', 'scripts/ci-gnu-payload/debian-archive-keyring.gpg', 'scripts/ci-gnu-payload/extract_static.py', 'scripts/ci-gnu-payload/helper-inventory.json', 'scripts/ci-gnu-payload/packages.json', 'scripts/ci-gnu-payload/payload-inventory.json', 'scripts/ci-gnu-payload/run.py', 'scripts/ci-gnu-payload/verify_auth.py'])
+OVERLAY.update(['.github/workflows/wip-gnu-closure.yml', 'docs/wip-gnu-closure-scope.md', 'scripts/ci-gnu-closure/base-inventory.json', 'scripts/ci-gnu-closure/helper-inventory.json', 'scripts/ci-gnu-closure/inspect.py', 'scripts/ci-gnu-closure/run.py'])
 RELEASE_PIN='933990236b8b8a1e39957362d361f92cd9fca8ccd13c0443f653762de1f70a4e'
 INDEX_PIN='b74b5bbca6f4701df6c5db54793a68449fb267ac10a9314e761b972ac63b3760'
 def sha(p):
@@ -106,4 +107,5 @@ def main():
  result={'authenticated_payload_extracted':True,'commit':commit,'package_version':'1:30.1+1-6~bpo12+1','files':len(expected),'symlinks':len(links),'gnu_elf_sha256':sha(elf),'inrelease_sha256':RELEASE_PIN,'tools':tools,'gnu_executed':False,'runtime_closure_complete':False,'gnu16_tested':False,'doom_tested':False,'old_local_process':'UNKNOWN/unaffected'}
  save(E/'result.json',result);print(json.dumps(result),flush=True)
  if os.environ.get('GITHUB_STEP_SUMMARY'):pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('Authenticated Debian GNU30.1 payload data only. No GNU executable, reference tests or Doom startup ran. Commit '+commit+'\n')
+ return E
 if __name__=='__main__':main()
