@@ -197,7 +197,7 @@ fn call_expand_handler<'ob>(handler: &crate::core::gc::Rto<Object>, name: &crate
     }
 }
 
-/// Lisp/existence/readability/executable/writable handler stages; other native callers remain separately scoped.
+/// Lisp and qualified access-predicate handler stages; other native callers remain separately scoped.
 #[defun(name = "expand-file-name")]
 fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory: Option<&crate::core::gc::Rto<Object>>, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::env::intern;
@@ -245,7 +245,7 @@ fn expand_file_name_dispatch<'ob>(name: &crate::core::gc::Rto<Object>, directory
     expand_file_name_lisp(name.bind(cx), Some(supplied.bind(cx)), env, cx)
 }
 
-// Bounded lexical core. Native predicates other than file-exists-p/file-readable-p/file-executable-p/file-writable-p still use
+// Bounded lexical core. Directory and regular-file predicates still use
 // this directly; their expansion-handler stage remains separately unqualified.
 fn expand_file_name_lisp<'ob>(name: Object, default_directory: Option<Object>, env: &mut Rt<Env>, cx: &'ob Context) -> Result<Object<'ob>> {
     #[cfg(not(unix))]
@@ -579,9 +579,9 @@ pub(crate) fn executable_file_predicate<'ob>(filename: &crate::core::gc::Rto<Obj
 fn local_file_predicate<'ob>(filename: &crate::core::gc::Rto<Object>, predicate: LocalFilePredicate, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>> {
     use crate::core::{env::{CallFrame, intern}, object::Function};
     use rune_core::macros::root;
-    // Qualify expansion dispatch for existence/readability/executability/writability. Other predicates retain
+    // Qualify expansion dispatch for the access predicates below. Other predicates retain
     // their separately scoped lexical path until their callbacks are qualified.
-    let expanded = if matches!(predicate, LocalFilePredicate::Exists | LocalFilePredicate::Readable | LocalFilePredicate::Executable | LocalFilePredicate::Writable) {
+    let expanded = if matches!(predicate, LocalFilePredicate::Exists | LocalFilePredicate::Readable | LocalFilePredicate::Executable | LocalFilePredicate::Writable | LocalFilePredicate::AccessibleDirectory) {
         expand_file_name_dispatch(filename, None, env, cx)?
     } else {
         expand_file_name_lisp(filename.bind(cx), None, env, cx)?
@@ -2204,7 +2204,7 @@ mod accessible_directory_linux_tests {
     #[test]
     fn handler_preserves_suffix_roots_result_and_gc() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-access-directory-handler (function (lambda (op name) (garbage-collect) (list op name)))) (let ((default-directory "/rune-access-directory/") (file-name-handler-alist '(("/" . rune-access-directory-handler)))) (list (file-accessible-directory-p "child/") (file-accessible-directory-p "/") (file-accessible-directory-p "//"))))"#,
+            r#"(progn (defalias 'rune-access-directory-handler (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-access-directory-handler inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (garbage-collect) (list op name)))))) (let ((default-directory "/rune-access-directory/") (file-name-handler-alist '(("/" . rune-access-directory-handler)))) (list (file-accessible-directory-p "child/") (file-accessible-directory-p "/") (file-accessible-directory-p "//"))))"#,
             r#"((file-accessible-directory-p "/rune-access-directory/child/") (file-accessible-directory-p "/") (file-accessible-directory-p "//"))"#,
         );
     }
@@ -2212,7 +2212,7 @@ mod accessible_directory_linux_tests {
     #[test]
     fn inhibition_error_and_type_payload_use_directory_access_operation() {
         crate::interpreter::assert_lisp(
-            r#"(progn (defalias 'rune-access-directory-error (function (lambda (op name) (signal 'error '("directory-access"))))) (let ((file-name-handler-alist '(("rune-access-directory-absent" . rune-access-directory-error))) (inhibit-file-name-handlers '(rune-access-directory-error))) (list (let ((inhibit-file-name-operation 'file-accessible-directory-p)) (file-accessible-directory-p "/rune-access-directory-absent/missing")) (let ((inhibit-file-name-operation 'file-directory-p)) (condition-case err (file-accessible-directory-p "/rune-access-directory-absent/missing") (error err))) (condition-case err (file-accessible-directory-p 3) (wrong-type-argument err)))))"#,
+            r#"(progn (defalias 'rune-access-directory-error (function (lambda (op name &optional base) (if (eq op 'expand-file-name) (let ((inhibit-file-name-handlers (cons 'rune-access-directory-error inhibit-file-name-handlers)) (inhibit-file-name-operation 'expand-file-name)) (expand-file-name name base)) (progn (signal 'error '("directory-access"))))))) (let ((file-name-handler-alist '(("rune-access-directory-absent" . rune-access-directory-error))) (inhibit-file-name-handlers '(rune-access-directory-error))) (list (let ((inhibit-file-name-operation 'file-accessible-directory-p)) (file-accessible-directory-p "/rune-access-directory-absent/missing")) (let ((inhibit-file-name-operation 'file-directory-p)) (condition-case err (file-accessible-directory-p "/rune-access-directory-absent/missing") (error err))) (condition-case err (file-accessible-directory-p 3) (wrong-type-argument err)))))"#,
             r#"(nil (error "directory-access") (wrong-type-argument stringp 3))"#,
         );
     }
@@ -2645,3 +2645,52 @@ mod writable_expansion_dispatch_tests {
 }
 
 
+
+
+#[cfg(all(test, target_os = "linux"))]
+mod accessible_expansion_dispatch_tests {
+    #[test]
+    fn expansion_precedes_resolved_operation_once_across_gc() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-accessible-stage-log nil) (defalias 'rune-accessible-expand-stage (function (lambda (op name &optional base) (garbage-collect) (setq rune-accessible-stage-log (cons (list op name base) rune-accessible-stage-log)) "/RESOLVED/target"))) (defalias 'rune-accessible-resolved-stage (function (lambda (op name) (garbage-collect) (setq rune-accessible-stage-log (cons (list op name) rune-accessible-stage-log)) 'accessible-answer))) (let ((rune-accessible-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-accessible-expand-stage) ("RESOLVED" . rune-accessible-resolved-stage)))) (list (file-accessible-directory-p "MAGIC/leaf") rune-accessible-stage-log)))"#,
+            r#"(accessible-answer ((file-accessible-directory-p "/RESOLVED/target") (expand-file-name "MAGIC/leaf" nil)))"#,
+        );
+    }
+
+    #[test]
+    fn operation_inhibition_does_not_suppress_expansion_stage() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-accessible-inhibit-log nil) (defalias 'rune-accessible-inhibit-expand (function (lambda (op name &optional base) (setq rune-accessible-inhibit-log (cons op rune-accessible-inhibit-log)) "/rune-accessible-resolved-absent/target"))) (defalias 'rune-accessible-inhibit-final (function (lambda (op name) (setq rune-accessible-inhibit-log (cons op rune-accessible-inhibit-log)) 'should-not-run))) (let ((rune-accessible-inhibit-log nil) (file-name-handler-alist '(("MAGIC" . rune-accessible-inhibit-expand) ("rune-accessible-resolved-absent" . rune-accessible-inhibit-final))) (inhibit-file-name-handlers '(rune-accessible-inhibit-expand rune-accessible-inhibit-final)) (inhibit-file-name-operation 'file-accessible-directory-p)) (list (file-accessible-directory-p "MAGIC") rune-accessible-inhibit-log)))"#,
+            "(nil (expand-file-name))",
+        );
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-accessible-only-log nil) (defalias 'rune-accessible-only-handler (function (lambda (op name &optional base) (setq rune-accessible-only-log (cons (list op name) rune-accessible-only-log)) 'accessible-answer))) (let ((rune-accessible-only-log nil) (file-name-handler-alist '(("MAGIC" . rune-accessible-only-handler))) (inhibit-file-name-handlers '(rune-accessible-only-handler)) (inhibit-file-name-operation 'expand-file-name)) (list (file-accessible-directory-p "/MAGIC/original") rune-accessible-only-log)))"#,
+            r#"(accessible-answer ((file-accessible-directory-p "/MAGIC/original")))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_errors_stop_before_directory_access_handler() {
+        crate::interpreter::assert_lisp(
+            r#"(progn (defvar rune-accessible-error-stage-log nil) (defalias 'rune-accessible-invalid-expand (function (lambda (op name &optional base) (setq rune-accessible-error-stage-log (cons op rune-accessible-error-stage-log)) 3))) (let ((rune-accessible-error-stage-log nil) (file-name-handler-alist '(("MAGIC" . rune-accessible-invalid-expand)))) (list (condition-case err (file-accessible-directory-p "MAGIC") (error err)) rune-accessible-error-stage-log)))"#,
+            r#"((error "Invalid handler in `file-name-handler-alist'") (expand-file-name))"#,
+        );
+    }
+
+    #[test]
+    fn expansion_redirects_searchable_directory_not_regular_file() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("rune-accessible-expand-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir)?;
+        let result = (|| -> anyhow::Result<()> {
+            let child = dir.join("child"); let ordinary = dir.join("ordinary"); let missing = dir.join("missing");
+            std::fs::create_dir(&child)?;
+            std::fs::write(&ordinary, "kept")?;
+            let source = format!(r#"(progn (defalias 'rune-accessible-redirect (function (lambda (op name &optional base) (garbage-collect) (if (equal name "SOURCE/child") {:?} (if (equal name "SOURCE/file") {:?} {:?}))))) (let ((file-name-handler-alist '(("SOURCE" . rune-accessible-redirect)))) (list (file-accessible-directory-p "SOURCE/child") (file-accessible-directory-p "SOURCE/file") (file-accessible-directory-p "SOURCE/missing"))))"#, child.to_str().unwrap(), ordinary.to_str().unwrap(), missing.to_str().unwrap());
+            crate::interpreter::assert_lisp(&source, "(t nil nil)");
+            assert_eq!(std::fs::read_to_string(&ordinary)?, "kept");
+            assert!(!missing.exists());
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&dir)?; result
+    }
+}

@@ -2,8 +2,8 @@
 """Independent hosted-runner evidence only; no local-process resolution claim."""
 import hashlib,json,os,pathlib,re,resource,shutil,signal,subprocess,time
 S=pathlib.Path.cwd().resolve(); C=S/'scripts/ci-v11'
-TESTS_PIN='37dcc6e2549267c6d32d96774f12fc6124a0cfd74d3d51a4f4ef8310f676b318'
-SOURCE_PIN='6d71544bae60e663b4ad9f472dfbf10843e2cb22ac666f3b0b1e9794506f7cb1'
+TESTS_PIN='6f27380f4aeb4d634ad090a53ae0ba4bf7c685a76840a7b258f8899b386258ca'
+SOURCE_PIN='9acfa0150e399e861ede2baa2d69aad6f75f49f95f2e20c81f967d42ed04353c'
 EXTRAS={'.github/workflows/wip-v11-native.yml','scripts/ci-v11/run.py','scripts/ci-v11/source-inventory.json','scripts/ci-v11/native-tests.json','docs/wip-v11-ci-scope.md'}
 EXTRAS.add('scripts/ci-exec-admission/helpers/cases.json')
 EXTRAS.update(['.github/workflows/wip-exec-admission.yml', 'docs/wip-exec-admission-scope.md', 'scripts/ci-exec-admission/base-inventory.json', 'scripts/ci-exec-admission/helpers/README.md', 'scripts/ci-exec-admission/helpers/case.py', 'scripts/ci-exec-admission/helpers/config.h.example', 'scripts/ci-exec-admission/helpers/launcher.c', 'scripts/ci-exec-admission/helpers/manifest.json', 'scripts/ci-exec-admission/helpers/prepare_config.py', 'scripts/ci-exec-admission/helpers/suite.py', 'scripts/ci-exec-admission/helpers/supervisor.py', 'scripts/ci-exec-admission/helpers/target.c', 'scripts/ci-exec-admission/run.py'])
@@ -98,7 +98,7 @@ def main():
  ENV['PATH']=str(tool)+':/usr/bin:/bin'
  versions,_=run('versions',[str(rustc),'-Vv'],10);assert versions.startswith('rustc 1.96.0 ')
  cargo_version,_=run('cargo-version',[str(cargo),'-Vv'],10);assert cargo_version.startswith('cargo 1.96.0 ')
- save(E/'provenance.json',{'commit':COMMIT,'source_inventory_sha256':SOURCE_PIN,'rustc':versions,'cargo':cargo_version,'rustc_sha256':sha(rustc),'cargo_sha256':sha(cargo),'rustup_sha256':sha(rustup),'indexmap_git_revision':'5ceff134a843d7afc26bb63db48f927ea80883bc','scope':'native208 not GNU139 or Doom startup'})
+ save(E/'provenance.json',{'commit':COMMIT,'source_inventory_sha256':SOURCE_PIN,'rustc':versions,'cargo':cargo_version,'rustc_sha256':sha(rustc),'cargo_sha256':sha(cargo),'rustup_sha256':sha(rustup),'indexmap_git_revision':'5ceff134a843d7afc26bb63db48f927ea80883bc','scope':'native212 not GNU139 or Doom startup'})
  # Cold checkout needs locked network fetch including pinned public indexmap git.
  run('fetch',[str(cargo),'fetch','--locked','--target','x86_64-unknown-linux-gnu'],180)
  verify()
@@ -112,7 +112,7 @@ def main():
    artifacts.append(pathlib.Path(item['executable']).resolve())
  assert len(artifacts)==1;binary=artifacts[0];assert binary.is_relative_to(target.resolve()) and binary.is_file()
  binary_pin=sha(binary);assert binary.open('rb').read(4)==b'\x7fELF';verify()
- selected=json.loads((C/'native-tests.json').read_text());assert len(selected)==len(set(selected))==208
+ selected=json.loads((C/'native-tests.json').read_text());assert len(selected)==len(set(selected))==212
  listed,_=run('list',[str(binary),'--list'],20,1024**2,1024**2)
  discovered=[line.removesuffix(': test') for line in listed.splitlines() if line.endswith(': test')]
  assert all(discovered.count(n)==1 for n in selected)
@@ -124,8 +124,8 @@ def main():
   assert re.search(r'test result: ok\. 1 passed; 0 failed; 0 ignored;',out),'unexpected test accounting'
   assert time.monotonic()<=deadline
  verify();assert sha(binary)==binary_pin
- result={'qualified_native_subset':True,'passed':208,'commit':COMMIT,'artifact_sha256':binary_pin,'source_inventory_sha256':SOURCE_PIN,'tests':selected,'gnu_reference_tested':False,'doom_startup_tested':False,'old_local_process':'UNKNOWN/unaffected'}
+ result={'qualified_native_subset':True,'passed':212,'commit':COMMIT,'artifact_sha256':binary_pin,'source_inventory_sha256':SOURCE_PIN,'tests':selected,'gnu_reference_tested':False,'doom_startup_tested':False,'old_local_process':'UNKNOWN/unaffected'}
  save(E/'result.json',result);print(json.dumps(result),flush=True)
  if os.environ.get('GITHUB_STEP_SUMMARY'):
-  pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('V11 native subset only:208 passed; commit '+COMMIT+'; ELF SHA256 '+binary_pin+'. Not GNU139 or Doom startup.\n')
+  pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('V11 native subset only:212 passed; commit '+COMMIT+'; ELF SHA256 '+binary_pin+'. Not GNU139 or Doom startup.\n')
 if __name__=='__main__':main()
