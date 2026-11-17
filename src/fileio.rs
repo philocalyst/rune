@@ -457,7 +457,7 @@ fn file_exists_p<'ob>(filename: &crate::core::gc::Rto<Object>, env: &mut Rt<Env>
     // bypass configured handlers for a filename that it cannot represent.
     let handler_name = std::str::from_utf8(&bytes).ok();
     if handler_name.is_none() {
-        ensure!(env.variable_value(sym::FILE_NAME_HANDLER_ALIST, cx)?.unwrap_or(NIL).is_nil(),
+        ensure!(env.variable_value(sym::FILE_NAME_HANDLER_ALIST, cx)?.unwrap_or(NIL.into()).is_nil(),
             "Raw-byte filename handlers are unsupported for file-exists-p");
     }
     let operation = intern("file-exists-p", cx);

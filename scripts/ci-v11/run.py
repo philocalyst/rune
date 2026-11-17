@@ -3,7 +3,7 @@
 import hashlib,json,os,pathlib,re,resource,shutil,signal,subprocess,time
 S=pathlib.Path.cwd().resolve(); C=S/'scripts/ci-v11'
 TESTS_PIN='854133f83d314b7ce288fdd14f0faedc40acdc6093850e4e7197af4e2fdc25f1'
-SOURCE_PIN='8bd457b2acfcd20295832f8aa357798d074a7e3c1fb73eff18b465342b79af30'
+SOURCE_PIN='2de64cde3acfc324621655972d8ab646d6b80f22b850106f3c1ab179a8c282da'
 EXTRAS={'.github/workflows/wip-v11-native.yml','scripts/ci-v11/run.py','scripts/ci-v11/source-inventory.json','scripts/ci-v11/native-tests.json','docs/wip-v11-ci-scope.md'}
 EXTRAS.add('scripts/ci-exec-admission/helpers/cases.json')
 EXTRAS.update(['.github/workflows/wip-exec-admission.yml', 'docs/wip-exec-admission-scope.md', 'scripts/ci-exec-admission/base-inventory.json', 'scripts/ci-exec-admission/helpers/README.md', 'scripts/ci-exec-admission/helpers/case.py', 'scripts/ci-exec-admission/helpers/config.h.example', 'scripts/ci-exec-admission/helpers/launcher.c', 'scripts/ci-exec-admission/helpers/manifest.json', 'scripts/ci-exec-admission/helpers/prepare_config.py', 'scripts/ci-exec-admission/helpers/suite.py', 'scripts/ci-exec-admission/helpers/supervisor.py', 'scripts/ci-exec-admission/helpers/target.c', 'scripts/ci-exec-admission/run.py'])
