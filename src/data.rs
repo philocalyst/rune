@@ -33,36 +33,73 @@ pub(crate) fn defalias<'ob>(
     fset(symbol, definition)
 }
 
-/// Only direct keymap graphs are owner-local. Ordinary functions and immutable
-/// symbol-alias edges retain the existing global publication path.
-#[defun(name = "fset")]
-pub(crate) fn fset_owner<'a>(
-    symbol: Symbol<'a>,
-    definition: Object<'a>,
-    env: &mut Rt<Env>,
-    cx: &'a Context,
-) -> Result<Object<'a>> {
-    anyhow::ensure!(!symbol.is_const()||definition.is_nil(), "Attempt to set a constant symbol: {symbol}");
-    if crate::keymap::direct_map(definition) {
-        // Capacity is acquired before unbinding: insert below cannot allocate,
-        // collect, call Lisp, or fail after the namespace publication.
-        env.keymap_functions.try_reserve(1)?;
-        symbol.unbind_func();
-        env.keymap_functions.insert(symbol, definition);
-    } else {
-        crate::keymap::preflight_keymap_alias(symbol, definition, env, cx)?;
-        let result = fset(symbol, definition);
-        if let Err(error) = result {
-            if error.is::<crate::core::object::FunctionAliasCycle>() {
-                return Err(crate::eval::EvalError::signal(sym::CYCLIC_FUNCTION_INDIRECTION.into(), Cons::new1(symbol, cx).into(), cx).into());
-            }
-            return Err(error);
-        }
-        env.keymap_functions.remove(symbol);
+/// The registry is a lazily allocated Eq weak-key table. Interned symbols are
+/// always live; uninterned names retain their function graph only when the name
+/// is reachable independently (including ephemeron fixed-point activation).
+fn owner_function_table<'a>(env: &Rt<Env>, cx: &'a Context) -> Option<&'a crate::core::object::LispHashTable> {
+    match env.owner_functions.bind(cx).untag() {
+        ObjectType::HashTable(table) => Some(table),
+        ObjectType::NIL => None,
+        _ => unreachable!("invalid owner function registry"),
     }
+}
+fn publish_owner_function(symbol: Symbol, definition: Object, env: &mut Rt<Env>, cx: &Context) -> Result<()> {
+    if owner_function_table(env, cx).is_none() {
+        use crate::core::object::{HashTable, HashTableTest, HashTableWeakness};
+        let table = cx.add(HashTable::with_test_and_weakness(HashTableTest::Eq, HashTableWeakness::Key));
+        env.owner_functions.set(table);
+    }
+    owner_function_table(env, cx).unwrap().insert(symbol.into(), definition)
+}
+pub(crate) fn owner_functions_present(env: &Rt<Env>, cx: &Context) -> bool {
+    owner_function_table(env, cx).is_some_and(|table| table.len() != 0)
+}
+
+/// Owner-runtime authority retains closures and their captured mutable graphs.
+/// Immutable native/global definitions are fallback only; NIL is a tombstone.
+#[defun(name = "fset")]
+pub(crate) fn fset_owner<'a>(symbol: Symbol<'a>, definition: Object<'a>, env: &mut Rt<Env>, cx: &'a Context) -> Result<Object<'a>> {
+    anyhow::ensure!(!symbol.is_const() || definition.is_nil(), "Attempt to set a constant symbol: {symbol}");
+    if !definition.is_nil() && !crate::keymap::direct_map(definition) {
+        let _: crate::core::object::Function = definition.try_into()?;
+    }
+    // Validate the proposed edge before changing the old owner definition.
+    let mut next = definition;
+    let mut seen = Vec::new();
+    for _ in 0..255 {
+        let ObjectType::Symbol(target) = next.untag() else { break };
+        if next.is_nil() { break; }
+        if target == symbol || seen.iter().any(|x: &Object| x.ptr_eq(next)) {
+            return Err(crate::eval::EvalError::signal(sym::CYCLIC_FUNCTION_INDIRECTION.into(), Cons::new1(symbol, cx).into(), cx).into());
+        }
+        seen.push(next);
+        next = symbol_function_owner(target, env, cx);
+    }
+    anyhow::ensure!(next.is_nil() || !next.is_symbol(), "Function indirection limit exceeded");
+    publish_owner_function(symbol, definition, env, cx)?;
     crate::keymap::cancel_native_prefix(env);
     Ok(definition)
 }
+/// One owner-aware resolver shared by calls, macros and introspection.
+pub(crate) fn resolve_owner_function<'a>(mut value: Object<'a>, env: &Rt<Env>, cx: &'a Context) -> Result<Object<'a>> {
+    let mut seen = Vec::new();
+    for _ in 0..256 {
+        let ObjectType::Symbol(symbol) = value.untag() else { return Ok(value) };
+        if value.is_nil() { return Ok(value); }
+        if seen.iter().any(|x: &Object| x.ptr_eq(value)) {
+            return Err(crate::eval::EvalError::signal(sym::CYCLIC_FUNCTION_INDIRECTION.into(), Cons::new1(symbol, cx).into(), cx).into());
+        }
+        seen.push(value);
+        value = symbol_function_owner(symbol, env, cx);
+    }
+    if value.is_nil() || !value.is_symbol() { return Ok(value); }
+    anyhow::bail!("Function indirection limit exceeded")
+}
+pub(crate) fn owner_callable<'a>(symbol: Symbol, env: &Rt<Env>, cx: &'a Context) -> Result<Option<crate::core::object::Function<'a>>> {
+    let value = resolve_owner_function(cx.add(symbol), env, cx)?;
+    if value.is_nil() { Ok(None) } else { Ok(Some(value.try_into()?)) }
+}
+
 #[defun(name = "defalias")]
 fn defalias_owner<'a>(
     symbol: Symbol<'a>,
@@ -80,20 +117,19 @@ pub(crate) fn symbol_function_owner<'a>(
     env: &Rt<Env>,
     cx: &'a Context,
 ) -> Object<'a> {
-    env.keymap_functions
-        .get(symbol)
-        .map(|x| x.bind(cx))
+    // Eq query validation cannot recurse, allocate, or reject a key.
+    owner_function_table(env, cx)
+        .and_then(|table| table.get(symbol.into()).expect("Eq registry lookup"))
         .unwrap_or_else(|| symbol_function(symbol, cx))
 }
 #[defun(name = "fboundp")]
-fn fboundp_owner(symbol: Symbol, env: &Rt<Env>) -> bool {
-    env.keymap_functions.get(symbol).is_some() || fboundp(symbol)
+fn fboundp_owner(symbol: Symbol, env: &Rt<Env>, cx: &Context) -> bool {
+    !symbol_function_owner(symbol, env, cx).is_nil()
 }
 #[defun(name = "fmakunbound")]
-fn fmakunbound_owner<'a>(symbol: Symbol<'a>, env: &mut Rt<Env>) -> Result<Symbol<'a>> {
+fn fmakunbound_owner<'a>(symbol: Symbol<'a>, env: &mut Rt<Env>, cx: &Context) -> Result<Symbol<'a>> {
     anyhow::ensure!(!symbol.is_const(), "Attempt to set a constant symbol: {symbol}");
-    fmakunbound(symbol);
-    env.keymap_functions.remove(symbol);
+    publish_owner_function(symbol, NIL, env, cx)?;
     crate::keymap::cancel_native_prefix(env);
     Ok(symbol)
 }
@@ -259,10 +295,14 @@ pub(crate) fn symbolp(object: Object) -> bool {
     object.is_symbol()
 }
 
-#[defun]
+#[defun(name = "functionp")]
+fn functionp_owner(object: Object, env: &Rt<Env>, cx: &Context) -> Result<bool> {
+    functionp_resolved(object.is_symbol(), resolve_owner_function(object, env, cx)?)
+}
 pub(crate) fn functionp(object: Object, cx: &Context) -> Result<bool> {
-    let symbolic = object.is_symbol();
-    let object = resolve_function_chain(object, cx)?;
+    functionp_resolved(object.is_symbol(), resolve_function_chain(object, cx)?)
+}
+fn functionp_resolved(symbolic: bool, object: Object) -> Result<bool> {
     // An autoload is callable through its symbol, not as a raw cons. Its fifth
     // field marks macro/keymap autoloads, which are not functions (GNU FUNCTIONP).
     if symbolic
@@ -713,7 +753,9 @@ fn resolve_function_chain_with_limit<'ob>(object: Object<'ob>, cx: &'ob Context,
     }
 }
 
-#[defun]
+#[defun(name = "indirect-function")]
+fn indirect_function_owner<'a>(object: Object<'a>, env: &Rt<Env>, cx: &'a Context) -> Result<Object<'a>> { resolve_owner_function(object, env, cx) }
+
 pub(crate) fn indirect_function<'ob>(object: Object<'ob>, cx: &'ob Context) -> Result<Object<'ob>> {
     resolve_function_chain(object, cx)
 }
@@ -1574,3 +1616,7 @@ mod list_component_signal_tests {
         assert_lisp("(let ((seen 0)) (condition-case nil (funcall 'car (progn (setq seen 1) 7) (progn (setq seen 2) 8)) (wrong-number-of-arguments nil)) seen)","2");
     }
 }
+
+#[cfg(test)]
+#[path = "owner_function_tests.rs"]
+mod owner_function_tests;

@@ -5,7 +5,6 @@ use crate::editor_document::{
 };
 use anyhow::{Result, anyhow};
 use rune_macros::Trace;
-use std::sync::{LazyLock, Mutex};
 
 mod variable_aliases;
 mod quit;
@@ -15,19 +14,9 @@ mod symbol_map;
 pub(crate) use stack::*;
 pub(crate) use symbol_map::*;
 
-/// Interned feature symbols have global identity and stable storage, so provide
-/// in a worker remains visible to other Envs. Heap-local uninterned features
-/// instead live in each Env's traced feature slots below.
-#[derive(Default)]
-struct InternedFeatures(Vec<Symbol<'static>>);
-
-// SAFETY: Only provide_feature inserts entries, after checking interned().
-// All entries point into nonmoving global symbol storage; the mutex serializes
-// access. No arbitrary Symbol or moving uninterned name can enter this table.
-unsafe impl Send for InternedFeatures {}
-
-static INTERNED_FEATURES: LazyLock<Mutex<InternedFeatures>> = LazyLock::new(Mutex::default);
-
+/// Loaded features and Lisp function authority belong to this evaluator Env.
+/// A separately constructed Env is an independent Lisp namespace, even when it
+/// uses the same Context's storage owner. Native global functions are fallback.
 type PropertyMap<'a> = ObjectMap<Slot<Symbol<'a>>, Vec<(Slot<Symbol<'a>>, Slot<Object<'a>>)>>;
 #[derive(Debug, Trace)]
 pub(crate) struct Env<'a> {
@@ -59,7 +48,7 @@ pub(crate) struct Env<'a> {
     pub(crate) native_key_prefix: Slot<Object<'a>>,
     // Active keyboard map is distinct from the Lisp global-map variable.
     pub(crate) active_global_map: Slot<Object<'a>>,
-    pub(crate) keymap_functions: ObjectMap<Slot<Symbol<'a>>,Slot<Object<'a>>>,
+    pub(crate) owner_functions: Slot<Object<'a>>,
     #[no_trace]
     pub(crate) native_key_sequence: Option<u64>,
     #[no_trace]
@@ -121,7 +110,7 @@ impl<'a> Env<'a> {
             match_data: Default::default(),
             native_key_prefix: Default::default(),
             active_global_map: Default::default(),
-            keymap_functions: Default::default(),
+            owner_functions: Default::default(),
             native_key_sequence: None,
             font_selection: Default::default(),
             frame_face_tables: Default::default(),
@@ -220,21 +209,14 @@ impl<'a> RootedEnv<'a> {
         self.quit.cleanup()
     }
 
+    pub(crate) fn owner_features_present(&self) -> bool { self.features.iter().next().is_some() }
+
     pub(crate) fn has_feature(&self, feature: Symbol, cx: &Context) -> bool {
-        if feature.get().interned() {
-            return INTERNED_FEATURES.lock().unwrap().0.contains(&feature);
-        }
         self.features.iter().any(|provided| provided.bind(cx) == feature)
     }
 
     pub(crate) fn provide_feature(&mut self, feature: Symbol, cx: &Context) {
-        if feature.get().interned() {
-            let mut features = INTERNED_FEATURES.lock().unwrap();
-            if !features.0.contains(&feature) {
-                // The interned() check proves globally allocated stable storage.
-                features.0.push(unsafe { feature.with_lifetime() });
-            }
-        } else if !self.has_feature(feature, cx) {
+        if !self.has_feature(feature, cx) {
             self.features.push(feature);
         }
     }
@@ -571,7 +553,7 @@ mod feature_ownership_tests {
     use rune_core::macros::root;
 
     #[test]
-    fn interned_features_provided_by_worker_remain_globally_visible() {
+    fn interned_features_follow_independent_evaluator_namespaces() {
         let name = "ownership-global-worker-feature";
         std::thread::spawn(move || {
             let roots = RootSet::default();
@@ -579,14 +561,14 @@ mod feature_ownership_tests {
             root!(env, init(Env::new(cx).unwrap()), cx);
             let feature = intern(name, cx);
             env.provide_feature(feature, cx);
-            assert!(env.features.is_empty());
+            assert!(env.has_feature(feature, cx));
         })
         .join()
         .unwrap();
         let roots = RootSet::default();
         let cx = &mut Context::new(&roots);
         root!(env, init(Env::new(cx).unwrap()), cx);
-        assert!(env.has_feature(intern(name, cx), cx));
+        assert!(!env.has_feature(intern(name, cx), cx));
     }
 
     #[test]

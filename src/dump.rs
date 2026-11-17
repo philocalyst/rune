@@ -376,6 +376,8 @@ fn escape_str(s: &str) -> std::string::String {
 
 // ── Serialization ───────────────────────────────────────────────────────────
 pub(crate) fn dump_to_file(path: &Path, env: &Rt<Env>, cx: &Context) -> Result<(), std::io::Error> {
+    if env.owner_features_present() { return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Owner feature persistence requires a versioned schema")); }
+    if crate::data::owner_functions_present(env, cx) { return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Owner function authority persistence requires a versioned schema")); }
     let mut state = DumpState::new();
     state.dump_symbols(cx);
     state.dump_env(env, cx);
@@ -658,6 +660,26 @@ pub(crate) fn load_dump(path: &Path, env: &mut Rt<Env>, cx: &mut Context) -> Res
     let input = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
     let dump = parse_dump(&input)?;
     let subrs = subr_registry();
+    // Legacy dumps cannot faithfully restore evaluator-local captures/aliases.
+    // Reject before allocating objects, interning names or changing any state.
+    for entry in &dump.symbols {
+        if let Some(id) = entry.func_id {
+            let Some(DumpedObject::Subr(native_name)) = dump.objects.get(id as usize) else {
+                return Err("Legacy Lisp function persistence requires an owner-aware schema".into());
+            };
+            // Only canonical builtins already initialized under their own name
+            // may be omitted from restoration. Aliases/rebindings need a schema.
+            if entry.name != *native_name {
+                return Err("Noncanonical native function mapping is unsupported".into());
+            }
+            let expected = subrs.get(native_name.as_str()).ok_or_else(|| format!("unknown subr: {native_name}"))?;
+            let map = INTERNED_SYMBOLS.lock().unwrap();
+            let existing = map.get(&entry.name).and_then(|symbol| symbol.func(cx));
+            if !existing.is_some_and(|value| Object::from(value).ptr_eq(Object::from(*expected))) {
+                return Err("Canonical native function binding is not initialized".into());
+            }
+        }
+    }
 
     // Pass 1: allocate placeholder GC objects and build a id->Object lookup table
     let mut table: Vec<Object> = Vec::with_capacity(dump.objects.len());
@@ -805,31 +827,8 @@ pub(crate) fn load_dump(path: &Path, env: &mut Rt<Env>, cx: &mut Context) -> Res
         }
     }
 
-    // Rebuild symbol function cells
-    // For symbols that had a function binding at dump time, re-bind it.
-    // We go through INTERNED_SYMBOLS.set_func which clones the function
-    // into the global block and marks it immutable.
-    {
-        let mut deferred = crate::core::gc::DeferredEndpointFinalizers::default();
-        let map = INTERNED_SYMBOLS.lock().unwrap();
-        for sym_entry in &dump.symbols {
-            if let Some(func_id) = sym_entry.func_id {
-                let func_obj = table[func_id as usize];
-                // Only re-bind non-subr functions - subrs are already bound
-                // by init_symbols(). Elisp-defined functions (ByteFn, Cons
-                // closures) from bootstrap are what we need to restore.
-                if let ObjectType::SubrFn(_) = func_obj.untag() {
-                    continue;
-                }
-                if let Some(sym) = map.get(&sym_entry.name) {
-                    let func: crate::core::object::Function =
-                        unsafe { crate::core::object::Gc::from_raw(func_obj.into_raw()) };
-                    // set_func clones into the global block and marks immutable
-                    map.set_func(sym, func, &mut deferred).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-    }
+    // Native entries were validated above and already supplied by init_symbols;
+    // do not write any global function cell during dump import.
 
     // Rebuild env variable bindings
     for binding in &dump.env {

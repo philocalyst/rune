@@ -202,7 +202,7 @@ pub(crate) fn load_internal(contents: &str, cx: &mut Context, env: &mut Rt<Env>)
     root!(declarations, new(Vec<Slot<Symbol>>), cx);
     let macroexpand: Option<Function> = None;
     root!(macroexpand, cx);
-    if let Some(fun) = sym::INTERNAL_MACROEXPAND_FOR_LOAD.func(cx) {
+    if let Some(fun) = crate::data::owner_callable(sym::INTERNAL_MACROEXPAND_FOR_LOAD, env, cx)? {
         macroexpand.set(Some(fun));
     }
     loop {

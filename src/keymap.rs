@@ -481,7 +481,7 @@ mod tests {
         assert!(!keymapp(symbol.bind(cx).into(), b, cx).unwrap());
         assert!(
             crate::data::symbol_function(symbol.bind(cx), cx).is_nil(),
-            "old global callable must be retired"
+            "owner definition must not have been published globally"
         );
         assert!(crate::data::symbol_function_owner(symbol.bind(cx), b, cx).is_nil());
         assert!(keymapp(alias.bind(cx).into(), a, cx).unwrap());
@@ -498,9 +498,11 @@ mod tests {
         crate::lread::load_internal(
             "(if (= (funcall 'native-owner-only-edge) 22) nil (error \"stale alias\"))",
             cx,
-            b,
+            a,
         )
         .unwrap();
+        assert!(crate::data::symbol_function_owner(alias.bind(cx), b, cx).is_nil());
+        assert!(crate::lread::load_internal("(funcall 'native-owner-only-edge)", cx, b).is_err());
     }
     #[test]
     fn uninterned_keymap_symbol_key_and_map_value_are_traced_across_gc() {
@@ -584,21 +586,9 @@ mod tests {
     }
 }
 
-fn resolve_command<'a>(mut object: Object<'a>, cx: &'a Context) -> Result<Object<'a>> {
-    let mut seen = Vec::new();
-    for _ in 0..256 {
-        let ObjectType::Symbol(symbol) = object.untag() else { return Ok(object) };
-        if object.is_nil() {
-            return Ok(NIL);
-        }
-        ensure!(!seen.iter().any(|x: &Object| x.ptr_eq(object)), "cyclic command indirection");
-        seen.push(object);
-        object = symbol.func(cx).map(Into::into).unwrap_or(NIL);
-    }
-    bail!("command indirection too deep")
-}
-fn interactive_spec<'a>(object: Object<'a>, cx: &'a Context) -> Result<Option<Object<'a>>> {
-    let object = resolve_command(object, cx)?;
+fn resolve_command<'a>(object: Object<'a>, env: &Rt<Env>, cx: &'a Context) -> Result<Object<'a>> { crate::data::resolve_owner_function(object, env, cx) }
+fn interactive_spec<'a>(object: Object<'a>, env: &Rt<Env>, cx: &'a Context) -> Result<Option<Object<'a>>> {
+    let object = resolve_command(object, env, cx)?;
     let Some(head) = object.cons() else { return Ok(None) };
     let mut body = head.cdr();
     if head.car().ptr_eq(Object::from(sym::CLOSURE)) {
@@ -625,9 +615,10 @@ fn interactive_spec<'a>(object: Object<'a>, cx: &'a Context) -> Result<Option<Ob
 fn commandp(
     command: Object,
     _for_call_interactively: Option<Object>,
+    env: &Rt<Env>,
     cx: &Context,
 ) -> Result<bool> {
-    Ok(interactive_spec(command, cx)?.is_some())
+    Ok(interactive_spec(command, env, cx)?.is_some())
 }
 #[defun]
 fn call_interactively<'a>(
@@ -642,7 +633,7 @@ fn call_interactively<'a>(
         keys.is_none_or(|x| x.bind(cx).is_nil()),
         "explicit interactive key sequence unsupported"
     );
-    let spec = interactive_spec(command.bind(cx), cx)?
+    let spec = interactive_spec(command.bind(cx), env, cx)?
         .ok_or_else(|| anyhow!("not an interpreted interactive command"))?;
     ensure!(
         spec.is_nil()
@@ -650,7 +641,7 @@ fn call_interactively<'a>(
             || matches!(spec.untag(),ObjectType::ByteString(s) if s.is_empty()),
         "interactive arguments unsupported; only no-argument commands are supported"
     );
-    let resolved = resolve_command(command.bind(cx), cx)?;
+    let resolved = resolve_command(command.bind(cx), env, cx)?;
     let quoted = if resolved.cons().is_some_and(|c| c.car().ptr_eq(Object::from(sym::LAMBDA))) {
         list![sym::FUNCTION,resolved;cx]
     } else {

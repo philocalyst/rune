@@ -31,15 +31,29 @@ struct Interpreter<'brw, 'rt> {
     env: &'brw mut Rt<Env<'rt>>,
     local_specials: &'brw mut Rt<Vec<Slot<Symbol<'rt>>>>,
     declaration_scopes: Vec<Option<usize>>,
+    dynamic_body: bool,
 }
 
-#[defun]
+// Native embedding callers historically request the lexical evaluator explicitly
+// through this API. The Lisp-facing eval entry below follows GNU's nil default.
 pub(crate) fn eval<'ob>(
     form: &Rto<Object>,
     lexical: Option<&Rto<Object>>,
     env: &mut Rt<Env>,
     cx: &'ob mut Context,
 ) -> Result<Object<'ob>, anyhow::Error> {
+    eval_in_mode(form, lexical, false, env, cx)
+}
+
+#[defun(name = "eval")]
+fn eval_lisp<'ob>(form: &Rto<Object>, lexical: Option<&Rto<Object>>,
+    env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>, anyhow::Error> {
+    let dynamic = lexical.is_none_or(|value| value.bind(cx).is_nil());
+    eval_in_mode(form, lexical, dynamic, env, cx)
+}
+
+fn eval_in_mode<'ob>(form: &Rto<Object>, lexical: Option<&Rto<Object>>,
+    dynamic_body: bool, env: &mut Rt<Env>, cx: &'ob mut Context) -> Result<Object<'ob>, anyhow::Error> {
     cx.garbage_collect(false);
     root!(vars, new(Vec<Slot<&Cons>>), cx);
     root!(local_specials, new(Vec<Slot<Symbol>>), cx);
@@ -53,7 +67,7 @@ pub(crate) fn eval<'ob>(
             }
         }
     }
-    let mut interpreter = Interpreter { vars, env, local_specials, declaration_scopes: Vec::new() };
+    let mut interpreter = Interpreter { vars, env, local_specials, declaration_scopes: Vec::new(), dynamic_body };
     interpreter.eval_form(form, cx).map_err(Into::into)
 }
 
@@ -67,7 +81,7 @@ pub(crate) fn eval_loaded<'ob, 'rt>(
 ) -> Result<Object<'ob>, anyhow::Error> {
     cx.garbage_collect(false);
     root!(vars, new(Vec<Slot<&Cons>>), cx);
-    let mut interpreter = Interpreter { vars, env, local_specials, declaration_scopes: Vec::new() };
+    let mut interpreter = Interpreter { vars, env, local_specials, declaration_scopes: Vec::new(), dynamic_body: false };
     interpreter.eval_form(form, cx).map_err(Into::into)
 }
 
@@ -215,7 +229,7 @@ impl Interpreter<'_, '_> {
         args: &Rto<Object>,
         cx: &'ob mut Context,
     ) -> EvalResult<'ob> {
-        let Some(func) = sym.bind(cx).follow_indirect(cx) else {
+        let Some(func) = crate::data::owner_callable(sym.bind(cx), self.env, cx)? else {
             return Err(EvalError::signal(
                 sym::VOID_FUNCTION.into(),
                 Cons::new1(sym.bind(cx), cx).into(),
@@ -235,7 +249,7 @@ impl Interpreter<'_, '_> {
                     autoloads += 1;
                     crate::eval::autoload_do_load(func.cast(), None, None, self.env, cx)
                         .map_err(|e| add_trace(e, "autoload", &[]))?;
-                    let Some(loaded) = sym.bind(cx).follow_indirect(cx) else {
+                    let Some(loaded) = crate::data::owner_callable(sym.bind(cx), self.env, cx)? else {
                         return Err(EvalError::signal(
                             sym::VOID_FUNCTION.into(),
                             Cons::new1(sym.bind(cx), cx).into(),
@@ -257,16 +271,20 @@ impl Interpreter<'_, '_> {
                     continue;
                 }
                 Ok((sym::MACRO, mcro)) => {
-                    let iter = args.bind(cx).into_list()?;
-                    let mut frame = CallFrame::new(self.env);
-                    for arg in iter {
-                        frame.push_arg(arg?);
-                    }
                     root!(mcro, mcro.tag(), cx);
-                    let name = sym.bind(cx).name().to_owned();
-                    let value = mcro.call(&mut frame, Some(&name), cx)?;
-                    drop(frame);
-                    root!(value, cx);
+                    root!(value, NIL, cx);
+                    let checkpoint = self.env.binding_depth();
+                    let outcome: Result<(), EvalError> = (|| {
+                        self.env.varbind(sym::LEXICAL_BINDING, (!self.dynamic_body).into(), cx)?;
+                        let iter = args.bind(cx).into_list()?;
+                        let mut frame = CallFrame::new(self.env);
+                        for arg in iter { frame.push_arg(arg?); }
+                        let name = sym.bind(cx).name().to_owned();
+                        value.set(mcro.call(&mut frame, Some(&name), cx)?);
+                        Ok(())
+                    })();
+                    self.env.unwind_bindings(checkpoint, cx)?;
+                    outcome?;
                     return self.eval_form(value, cx);
                 }
                 _ => break,
@@ -313,13 +331,15 @@ impl Interpreter<'_, '_> {
             Ok([x]) => x,
             Err(e) => bail_err!(LispError::arg_cnt(sym::FUNCTION, 1, e, cx)),
         };
-        root!(form, cx); // Polonius
+        // A raw lambda has no lexical environment; FUNCTION must not capture
+        // caller-local cells or normalize the stored lambda object.
+        root!(form, cx); // End the input borrow before either return or mutation.
         let Ok((sym::LAMBDA, doc)) = form.bind(cx).as_cons_pair() else {
             return Ok(form.bind(cx));
         };
         root!(doc, doc.tag(), cx);
         let body = rebind!(self.replace_doc_symbol(doc, cx)?);
-        let env = {
+        let env = if self.dynamic_body { NIL } else {
             let vars = self.vars.bind_ref(cx);
             let mut tail = Object::from(Cons::new1(true, cx));
             for special in self.local_specials.bind_ref(cx) {
@@ -334,7 +354,7 @@ impl Interpreter<'_, '_> {
         // captured in the closure
         let closure_fn = self.env.variable_value(sym::INTERNAL_MAKE_INTERPRETED_CLOSURE_FUNCTION,cx)?.unwrap_or(NIL);
         root!(closure_fn,cx);
-        if !closure_fn.bind(cx).is_nil() {
+        if !self.dynamic_body && !closure_fn.bind(cx).is_nil() {
             let closure_fn: Result<&Rto<Function>, _> = closure_fn.try_as();
             if let Ok(closure_fn) = closure_fn {
                 let lambda = Object::from(Cons::new(sym::LAMBDA, body, cx));
@@ -381,7 +401,12 @@ impl Interpreter<'_, '_> {
                 _ => docstring,
             }
         };
-        // ((<args..>) (:documentation <form>) body)
+        if !matches!(docstring.untag(), ObjectType::String(_)) {
+            bail_err!("Non-string computed function documentation is unsupported");
+        }
+        // The computed documentation is metadata, never the return value of an
+        // otherwise empty body. Keep a nil expression after a sole doc form.
+        let body = if body.bind(cx).is_nil() { Cons::new1(NIL, cx).into() } else { body.bind(cx) };
         Ok(Cons::new(arg_list, Cons::new(docstring, body, cx), cx).into())
     }
 
@@ -680,7 +705,7 @@ impl Interpreter<'_, '_> {
         varbind_count: &mut u16,
         cx: &Context,
     ) -> Result<(), EvalError> {
-        if var.is_special() || self.local_specials.iter().any(|symbol| symbol.bind(cx) == var) {
+        if self.dynamic_body || var.is_special() || self.local_specials.iter().any(|symbol| symbol.bind(cx) == var) {
             let next = varbind_count
                 .checked_add(1)
                 .ok_or_else(|| error!("Too many dynamic let bindings"))?;
@@ -816,8 +841,26 @@ impl Interpreter<'_, '_> {
                         Ok(x) => x,
                         Err(_) => return Ok(NIL),
                     };
+                    root!(error, error, cx);
+                    if self.dynamic_body {
+                        rooted_iter!(handlers, list, cx);
+                        root!(value, NIL, cx);
+                        let checkpoint = self.env.binding_depth();
+                        let outcome: Result<(), EvalError> = (|| {
+                            if !var.bind(cx).is_nil() {
+                                let symbol: Symbol = var.bind(cx).try_into()?;
+                                self.env.varbind(symbol, error.bind(cx).into(), cx)?;
+                            }
+                            let result = self.implicit_progn(handlers, cx)?;
+                            value.set(result);
+                            Ok(())
+                        })();
+                        self.env.unwind_bindings(checkpoint, cx)?;
+                        outcome?;
+                        return Ok(value.bind(cx));
+                    }
                     let previous_bindings = self.vars.len();
-                    let binding = Cons::new(var, error, cx);
+                    let binding = Cons::new(var, error.bind(cx), cx);
                     self.vars.push(binding);
                     rooted_iter!(handlers, list, cx);
                     // Errors and throws from the handler must unwind its error
@@ -844,7 +887,7 @@ pub(crate) fn call_closure<'ob>(
     cx.garbage_collect(false);
     let closure: &Cons = closure.untag(cx);
     match closure.car().untag() {
-        ObjectType::Symbol(sym::CLOSURE) => {
+        ObjectType::Symbol(sym::CLOSURE) if !matches!(closure.cdr().untag(), ObjectType::Cons(parts) if parts.car().is_nil()) => {
             rooted_iter!(forms, closure.cdr(), cx);
             let args = Rt::bind_slice(&env.stack[..arg_cnt], cx);
             let (vars, local_specials) = bind_variables(&mut forms, args, name, cx)?;
@@ -852,8 +895,40 @@ pub(crate) fn call_closure<'ob>(
             debug!("call variable count: {}", vars.len());
             root!(vars, cx);
             root!(local_specials, cx);
-            Interpreter { vars, env, local_specials, declaration_scopes: Vec::new() }
+            Interpreter { vars, env, local_specials, declaration_scopes: Vec::new(), dynamic_body: false }
                 .implicit_progn(forms, cx)
+        }
+        ObjectType::Symbol(sym::LAMBDA | sym::CLOSURE) => {
+            let dynamic_forms = if closure.car() == Object::from(sym::CLOSURE) {
+                match closure.cdr().untag() { ObjectType::Cons(parts) => parts.cdr(), _ => bail_err!("Closure missing environment") }
+            } else { closure.cdr() };
+            // Raw lambda invocation uses dynamic formals AND a dynamic body.
+            // Build/validate every argument binding before publishing any, then
+            // unwind the precise checkpoint on success, throw, error or quit.
+            rooted_iter!(forms, dynamic_forms, cx);
+            let Some(parameters) = forms.next()? else { bail_err!("Lambda missing argument list") };
+            let args = Rt::bind_slice(&env.stack[..arg_cnt], cx);
+            let mut bindings = Vec::new();
+            bind_args(parameters.bind(cx), args, &mut bindings, name, cx)?;
+            root!(bindings, cx);
+            root!(vars, new(Vec<Slot<&Cons>>), cx);
+            root!(local_specials, new(Vec<Slot<Symbol>>), cx);
+            root!(value, NIL, cx);
+            let checkpoint = env.binding_depth();
+            let outcome: Result<(), EvalError> = (|| {
+                for binding in bindings.bind_ref(cx) {
+                    let symbol: Symbol = binding.car().try_into()?;
+                    env.varbind(symbol, binding.cdr(), cx)?;
+                }
+                let result = Interpreter { vars, env, local_specials,
+                    declaration_scopes: Vec::new(), dynamic_body: true }
+                    .implicit_progn(forms, cx)?;
+                value.set(result);
+                Ok(())
+            })();
+            env.unwind_bindings(checkpoint, cx)?;
+            outcome?;
+            Ok(value.bind(cx))
         }
         other => Err(TypeError::new(Type::Func, other).into()),
     }
@@ -959,20 +1034,25 @@ pub(crate) fn parse_arg_list(
     let mut required = Vec::new();
     let mut optional = Vec::new();
     let mut rest = None;
-    let mut arg_type = &mut required;
+    let mut optional_seen = false;
     let mut iter = bindings.as_list()?;
     while let Some(binding) = iter.next() {
         let sym: Symbol = binding?.try_into()?;
         match sym {
-            sym::AND_OPTIONAL => arg_type = &mut optional,
+            sym::AND_OPTIONAL => {
+                ensure!(!optional_seen, "Repeated &optional in function parameters");
+                optional_seen = true;
+            },
             sym::AND_REST => {
-                if let Some(last) = iter.next() {
-                    rest = Some(last?.try_into()?);
-                    ensure!(iter.next().is_none(), "Found multiple arguments after &rest");
-                }
+                let last = iter.next().ok_or_else(|| anyhow::anyhow!("Missing parameter after &rest"))??;
+                let rest_name: Symbol = last.try_into()?;
+                ensure!(rest_name != sym::AND_OPTIONAL && rest_name != sym::AND_REST,
+                    "Invalid rest parameter marker");
+                rest = Some(rest_name);
+                ensure!(iter.next().is_none(), "Found multiple arguments after &rest");
             }
             _ => {
-                arg_type.push(sym);
+                if optional_seen { optional.push(sym); } else { required.push(sym); }
             }
         }
     }
@@ -1566,7 +1646,7 @@ mod test {
         variable.make_special();
         root!(local_specials, new(Vec<Slot<Symbol>>), cx);
         let mut interpreter =
-            Interpreter { vars, env, local_specials, declaration_scopes: Vec::new() };
+            Interpreter { vars, env, local_specials, declaration_scopes: Vec::new(), dynamic_body: false };
         let mut count = u16::MAX;
         assert!(interpreter.create_let_binding(variable, 7_i64.into(), &mut count, cx).is_err());
         assert_eq!(count, u16::MAX);

@@ -468,7 +468,7 @@ pub(crate) fn autoload_do_load<'ob>(
     root!(file, cx);
     crate::lread::load(file, None, None, cx, env)?;
     match funname {
-        Some(func) => match func.untag(cx).func(cx) {
+        Some(func) => match crate::data::owner_callable(func.untag(cx), env, cx)? {
             Some(x) => Ok(x.into()),
             None => Err(anyhow!("autoload of {func} did not provide a definition")),
         },
@@ -483,13 +483,15 @@ fn autoload<'ob>(
     docstring: Option<Object>,
     interactive: Option<Object>,
     load_type: Option<Object>,
+    env: &mut Rt<Env>,
     cx: &'ob Context,
 ) -> Result<Symbol<'ob>> {
-    if function.has_func() {
+    if !crate::data::symbol_function_owner(function, env, cx).is_nil() {
         Ok(sym::NIL)
     } else {
         let autoload = list![sym::AUTOLOAD, file, docstring, interactive, load_type; cx];
-        crate::data::fset(function, autoload)
+        crate::data::fset_owner(function, autoload, env, cx)?;
+        Ok(function)
     }
 }
 
@@ -504,11 +506,11 @@ pub(crate) fn macroexpand<'ob>(
     let ObjectType::Symbol(sym) = cons.car().untag() else { return Ok(form.bind(cx)) };
     // shadow the macro based on ENVIRONMENT
     let func = match environment {
-        Some(env) => match assq(sym.into(), env.bind(cx).try_into()?)?.untag() {
+        Some(lexenv) => match assq(sym.into(), lexenv.bind(cx).try_into()?)?.untag() {
             ObjectType::Cons(cons) => Some(cons.cdr().try_into()?),
-            _ => get_macro_func(sym, cx),
+            _ => get_macro_func(sym, env, cx)?,
         },
-        _ => get_macro_func(sym, cx),
+        _ => get_macro_func(sym, env, cx)?,
     };
     let Some(macro_func) = func else { return Ok(form.bind(cx)) };
     let mut iter = cons.cdr().as_list()?.fallible();
@@ -529,17 +531,17 @@ pub(crate) fn macroexpand<'ob>(
     }
 }
 
-fn get_macro_func<'ob>(name: Symbol, cx: &'ob Context) -> Option<Function<'ob>> {
-    if let Some(callable) = name.follow_indirect(cx)
+fn get_macro_func<'ob>(name: Symbol, env: &Rt<Env>, cx: &'ob Context) -> Result<Option<Function<'ob>>> {
+    if let Some(callable) = crate::data::owner_callable(name, env, cx)?
         && let Ok((sym::MACRO, cdr)) = callable.as_cons_pair()
     {
-        return Some(cdr.tag());
+        return Ok(Some(cdr.tag()));
     }
-    None
+    Ok(None)
 }
 
 #[defun]
-fn func_arity<'ob>(function: Function, cx: &'ob Context) -> Result<&'ob Cons> {
+fn func_arity<'ob>(function: Function, env: &Rt<Env>, cx: &'ob Context) -> Result<&'ob Cons> {
     let from_args = |args: FnArgs| {
         let min = args.required;
         if args.rest {
@@ -571,8 +573,8 @@ fn func_arity<'ob>(function: Function, cx: &'ob Context) -> Result<&'ob Cons> {
             Ok(from_args(args))
         }
         FunctionType::Symbol(sym) => {
-            let Some(func) = sym.follow_indirect(cx) else { bail!("Void Function: {sym}") };
-            func_arity(func, cx)
+            let Some(func) = crate::data::owner_callable(sym, env, cx)? else { bail!("Void Function: {sym}") };
+            func_arity(func, env, cx)
         }
     }
 }
@@ -670,23 +672,25 @@ impl Rto<Function<'_>> {
                     .map_err(|e| e.add_trace(name, frame.arg_slice()))
             }
             FunctionType::Symbol(sym) => {
-                let Some(func) = sym.follow_indirect(cx) else { bail_err!("Void Function: {sym}") };
-                if let Ok((sym::AUTOLOAD, _)) = func.as_cons_pair() {
-                    // TODO: inifinite loop if autoload does not resolve
-                    root!(sym, cx);
-                    crate::eval::autoload_do_load(self.cast(), None, None, frame, cx)
+                let Some(func) = crate::data::owner_callable(sym, frame, cx)? else { bail_err!("Void Function: {sym}") };
+                root!(sym, cx);
+                root!(func, cx);
+                let mut autoloads = 0usize;
+                while matches!(func.bind(cx).as_cons_pair(), Ok((sym::AUTOLOAD, _))) {
+                    if autoloads == 64 { bail_err!("Autoload chain exceeds 64 loads") }
+                    autoloads += 1;
+                    crate::eval::autoload_do_load(func.cast(), None, None, frame, cx)
                         .map_err(|e| add_trace(e, name, frame.arg_slice()))?;
-                    let Some(func) = sym.bind(cx).follow_indirect(cx) else {
-                        bail_err!("autoload for {sym} failed to define function")
+                    let Some(loaded) = crate::data::owner_callable(sym.bind(cx), frame, cx)? else {
+                        bail_err!("autoload failed to define function")
                     };
-                    root!(func, cx);
-                    let name = sym.bind(cx).name().to_owned();
-                    func.call(frame, Some(&name), cx)
-                } else {
-                    root!(func, cx);
-                    let name = sym.name().to_owned();
-                    func.call(frame, Some(&name), cx)
+                    if Object::from(loaded).ptr_eq(Object::from(func.bind(cx))) {
+                        bail_err!("autoload did not change function definition")
+                    }
+                    func.set(loaded);
                 }
+                let name = sym.bind(cx).name().to_owned();
+                func.call(frame, Some(&name), cx)
             }
         }
     }
@@ -1043,7 +1047,7 @@ mod autoload_metadata_tests {
         let metadata = list![sym::AUTOLOAD, file.to_str().unwrap(), "Official-style documentation", true, NIL; cx];
         root!(metadata, cx);
         autoload_do_load(metadata, None, None, env, cx).unwrap();
-        let loaded: Object = crate::core::env::intern("rune-documented-autoload", cx).func(cx).unwrap().into();
+        let loaded: Object = crate::data::symbol_function_owner(crate::core::env::intern("rune-documented-autoload", cx), env, cx);
         assert!(!loaded.is_nil());
         assert_ne!(loaded.as_cons_pair().unwrap().0, sym::AUTOLOAD);
         std::fs::remove_dir_all(directory).unwrap();
