@@ -581,8 +581,7 @@ mod test {
         crate::core::env::init_variables(cx, env);
         env.vars.insert(sym::LOAD_PATH, list!(fixture.0.to_str().unwrap();cx));
         env.vars.insert(sym::LOAD_SUFFIXES, list!(".elc", ".el";cx));
-        let marker = crate::core::env::intern("rune-load-marker", cx);
-        env.vars.insert(marker, Object::from(0));
+        env.vars.insert(crate::core::env::intern("rune-load-marker", cx), Object::from(0));
         let absolute = fixture.0.join("entry.elc");
         for (name, nosuffix) in [("entry", false), ("entry.elc", false), ("entry.elc", true), (absolute.to_str().unwrap(), true)] {
             for noerror in [false, true] {
@@ -591,7 +590,7 @@ mod test {
                 root!(file, cx);
                 let error = load_lisp(file, noerror.then_some(()), Some(()), nosuffix.then_some(()), None, cx, env).unwrap_err();
                 assert_eq!(error.to_string(), "Compiled Lisp and native module loading are not implemented");
-                assert_eq!(env.vars.get(marker).unwrap().bind(cx), Object::from(0));
+                assert_eq!(env.vars.get(crate::core::env::intern("rune-load-marker", cx)).unwrap().bind(cx), Object::from(0));
             }
         }
         assert_eq!(fs::read_to_string(fixture.0.join("entry.el")).unwrap(), source);

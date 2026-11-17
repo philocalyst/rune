@@ -3,7 +3,7 @@
 import hashlib,json,os,pathlib,re,resource,shutil,signal,subprocess,time
 S=pathlib.Path.cwd().resolve(); C=S/'scripts/ci-v11'
 TESTS_PIN='9be6cde623f6a058b04e3a0d06ddab0337220d9ae8959b55a06e298ed568c6cd'
-SOURCE_PIN='d849343c97390423597e72647340257bf5a9442f0925c1083d6e392b8c12461e'
+SOURCE_PIN='ae5fa6a66eb62a7f0ca75c2ea9422f89fd4a7725d88ea68b76e265bd9d8b192a'
 EXTRAS={'.github/workflows/wip-v11-native.yml','scripts/ci-v11/run.py','scripts/ci-v11/source-inventory.json','scripts/ci-v11/native-tests.json','docs/wip-v11-ci-scope.md'}
 EXTRAS.update(['.github/workflows/wip-bootstrap.yml', 'scripts/ci-bootstrap/run.py', 'scripts/ci-bootstrap/check-sandbox.py', 'scripts/ci-bootstrap/checkpoint.el', 'docs/wip-bootstrap-scope.md'])
 EXTRAS.update(['.github/workflows/wip-lifecycle.yml', 'docs/wip-lifecycle-scope.md', 'scripts/ci-lifecycle/run.py', 'scripts/ci-lifecycle/supervisor.py', 'scripts/ci-lifecycle/preflight.py', 'scripts/ci-lifecycle/fixture.py', 'scripts/ci-lifecycle/fault_adapter.py', 'scripts/ci-lifecycle/base-inventory.json', 'scripts/ci-lifecycle/lifecycle-inventory.json'])
