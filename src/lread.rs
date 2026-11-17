@@ -394,20 +394,60 @@ fn load_with_options(
     }
     let new_load_file = cx.add(final_file.to_string_lossy().to_string());
     let binding_depth = env.binding_depth();
-    env.varbind(sym::LOAD_FILE_NAME,new_load_file,cx)?;
-    let result = match fs::read_to_string(&final_file) {
+    root!(new_load_file, cx);
+    let initial_list = Cons::new(new_load_file.bind(cx), NIL, cx);
+    root!(initial_list, cx);
+    // Every exit, including a failed second binding or history publication,
+    // restores the enclosing loader's dynamic state.
+    let result = (|| -> Result<bool> {
+    env.varbind(sym::LOAD_FILE_NAME, new_load_file.bind(cx), cx)?;
+    env.varbind(sym::CURRENT_LOAD_LIST, initial_list.bind(cx).into(), cx)?;
+    let loaded = match fs::read_to_string(&final_file) {
         Ok(content) => load_internal(&content, cx, env),
         Err(error) if noerror && error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => {
             Err(error).with_context(|| format!("Couldn't open file {:?}", final_file.as_os_str()))
         }
-    };
-
-    if !nomessage && result.is_ok() {
-        println!("Loading {filename} Done");
-    }
+    }?;
+    if loaded { publish_load_history(new_load_file.bind(cx), env, cx)?; }
+    Ok(loaded)
+    })();
     env.unwind_bindings(binding_depth,cx)?;
-    result
+    let loaded = result?;
+    if loaded {
+        // GNU invokes the real Lisp dispatcher after restoring outer state.
+        if let Some(callback) = crate::data::owner_callable(sym::DO_AFTER_LOAD_EVALUATION, env, cx)? {
+            root!(callback, cx);
+            let name = "do-after-load-evaluation";
+            call!(callback, new_load_file; name, env, cx)?;
+        }
+        if !nomessage { println!("Loading {filename} Done"); }
+    }
+    Ok(loaded)
+}
+
+/// Record real successful source loads. Definition-site collection is a
+/// separate increment; this consumes whatever CURRENT_LOAD_LIST actually holds.
+fn publish_load_history(file: Object, env: &mut Rt<Env>, cx: &Context) -> Result<()> {
+    let current = env.variable_value(sym::CURRENT_LOAD_LIST, cx)?.unwrap_or(NIL);
+    let mut definitions = Vec::new();
+    for item in current.as_list()? {
+        ensure!(definitions.len() < 100_000, "current-load-list exceeds traversal budget");
+        definitions.push(item?);
+    }
+    definitions.reverse();
+    ensure!(definitions.first().is_some_and(|name| *name == file), "current-load-list lost its filename");
+    let entry = crate::fns::slice_into_list(&definitions, None, cx);
+    let history = env.variable_value(sym::LOAD_HISTORY, cx)?.unwrap_or(NIL);
+    let mut entries = vec![entry];
+    for item in history.as_list()? {
+        ensure!(entries.len() < 100_000, "load-history exceeds traversal budget");
+        let item = item?;
+        let duplicate = matches!(item.untag(), ObjectType::Cons(pair) if pair.car() == file);
+        if !duplicate { entries.push(item); }
+    }
+    let history = crate::fns::slice_into_list(&entries, None, cx);
+    env.set_var_context(sym::LOAD_HISTORY, history, cx)
 }
 
 pub(crate) fn intern<'a>(string:&str,cx:&'a Context)->Symbol<'a> {crate::core::env::intern(string,cx)}
@@ -437,6 +477,7 @@ pub(crate) fn intern_soft_lisp<'a>(string:Object<'a>,obarray:Option<Object<'a>>,
 }
 
 defsym!(INTERNAL_MACROEXPAND_FOR_LOAD);
+defsym!(DO_AFTER_LOAD_EVALUATION);
 defvar!(LEXICAL_BINDING, true);
 defvar!(CURRENT_LOAD_LIST);
 defvar!(LOAD_HISTORY);
@@ -635,6 +676,231 @@ mod test {
           (setq integrity-returned (require integrity-uninterned integrity-file-uninterned))
           (garbage-collect)
         "#, "(and (eq integrity-returned integrity-uninterned) (featurep integrity-uninterned) (null (featurep 'integrity-uninterned)))");
+    }
+
+    #[test]
+    fn after_load_callback_reenters_with_restored_context_and_live_history() {
+        let fixture = LoadFixture::new();
+        fs::write(fixture.0.join("parent.el"), "(setq lifecycle-parent-ran t) (garbage-collect)").unwrap();
+        fs::write(fixture.0.join("child.el"), "(setq lifecycle-child-ran t) (garbage-collect)").unwrap();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        for (name, leaf) in [("lifecycle-parent", "parent.el"), ("lifecycle-child", "child.el")] {
+            let name = intern(name, cx);
+            env.set_var_context(name, cx.add(fixture.0.join(leaf).to_string_lossy().to_string()), cx).unwrap();
+        }
+        load_internal(r#"
+            (setq lifecycle-outer-file (list 'outer-file)
+                  lifecycle-outer-list (list 'outer-list)
+                  load-file-name lifecycle-outer-file
+                  current-load-list lifecycle-outer-list
+                  lifecycle-events nil lifecycle-busy nil)
+            (defalias 'do-after-load-evaluation
+              (function (lambda (filename)
+                (garbage-collect)
+                (setq lifecycle-events
+                  (cons (list (equal filename lifecycle-parent)
+                              (eq load-file-name lifecycle-outer-file)
+                              (eq current-load-list lifecycle-outer-list)
+                              (null (null (assoc filename load-history))))
+                        lifecycle-events))
+                (if lifecycle-busy nil
+                  (setq lifecycle-busy t)
+                  (load lifecycle-child nil t))
+                (garbage-collect))))
+            (load lifecycle-parent nil t)
+        "#, cx, env).unwrap();
+        let form = reader::read(r#"(and lifecycle-parent-ran lifecycle-child-ran
+            (equal lifecycle-events '((nil t t t) (t t t t)))
+            (= (length load-history) 2)
+            (eq load-file-name lifecycle-outer-file)
+            (eq current-load-list lifecycle-outer-list))"#, cx).unwrap().0;
+        root!(form, cx);
+        assert_eq!(interpreter::eval(form, None, env, cx).unwrap(), TRUE);
+    }
+
+    #[test]
+    fn after_load_throw_keeps_committed_history_and_restores_outer_bindings() {
+        let fixture = LoadFixture::new();
+        fs::write(fixture.0.join("throw.el"), "(setq lifecycle-side-effect t)").unwrap();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let path = cx.add(fixture.0.join("throw.el").to_string_lossy().to_string());
+        env.set_var_context(intern("lifecycle-path", cx), path, cx).unwrap();
+        load_internal(r#"
+            (setq lifecycle-outer-file (list 'outer-file)
+                  lifecycle-outer-list (list 'outer-list)
+                  load-file-name lifecycle-outer-file
+                  current-load-list lifecycle-outer-list)
+            (defalias 'do-after-load-evaluation
+              (function (lambda (filename)
+                (garbage-collect)
+                (throw 'lifecycle-stop
+                  (list filename
+                        (eq load-file-name lifecycle-outer-file)
+                        (eq current-load-list lifecycle-outer-list))))))
+            (setq lifecycle-thrown
+              (catch 'lifecycle-stop (load lifecycle-path nil t) 'unexpected-return))
+            (garbage-collect)
+        "#, cx, env).unwrap();
+        let form = reader::read(r#"(and lifecycle-side-effect
+            (equal lifecycle-thrown (list lifecycle-path t t))
+            (= (length load-history) 1)
+            (null (null (assoc lifecycle-path load-history)))
+            (eq load-file-name lifecycle-outer-file)
+            (eq current-load-list lifecycle-outer-list))"#, cx).unwrap().0;
+        root!(form, cx);
+        assert_eq!(interpreter::eval(form, None, env, cx).unwrap(), TRUE);
+    }
+
+    #[test]
+    fn after_load_error_propagates_even_with_noerror_and_keeps_committed_state() {
+        let fixture = LoadFixture::new();
+        fs::write(fixture.0.join("callback-error.el"),
+            "(setq lifecycle-file-runs (+ lifecycle-file-runs 1))").unwrap();
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        let path = cx.add(fixture.0.join("callback-error.el").to_string_lossy().to_string());
+        root!(path, cx);
+        env.set_var_context(intern("lifecycle-path", cx), path.bind(cx), cx).unwrap();
+        load_internal(r#"
+            (setq lifecycle-outer-file (list 'outer-file)
+                  lifecycle-outer-list (list 'outer-list)
+                  load-file-name lifecycle-outer-file
+                  current-load-list lifecycle-outer-list
+                  lifecycle-file-runs 0 lifecycle-callback-runs 0
+                  lifecycle-error-observations nil)
+            (defalias 'do-after-load-evaluation
+              (function (lambda (filename)
+                (garbage-collect)
+                (setq lifecycle-callback-runs (+ lifecycle-callback-runs 1))
+                (setq lifecycle-error-observations
+                  (cons (list (equal filename lifecycle-path)
+                              (eq load-file-name lifecycle-outer-file)
+                              (eq current-load-list lifecycle-outer-list)
+                              (null (null (assoc filename load-history))))
+                        lifecycle-error-observations))
+                (signal 'error nil))))
+        "#, cx, env).unwrap();
+        let binding_depth = env.binding_depth();
+        for noerror in [None, Some(())] {
+            // NOERROR suppresses missing files, never callback errors. Each
+            // reload commits its actual file side effects/history first.
+            assert!(load(path, noerror, Some(()), cx, env).is_err());
+            assert_eq!(env.binding_depth(), binding_depth);
+        }
+        let form = reader::read(r#"(and (= lifecycle-file-runs 2)
+            (= lifecycle-callback-runs 2)
+            (equal lifecycle-error-observations '((t t t t) (t t t t)))
+            (= (length load-history) 1)
+            (null (null (assoc lifecycle-path load-history)))
+            (eq load-file-name lifecycle-outer-file)
+            (eq current-load-list lifecycle-outer-list))"#, cx).unwrap().0;
+        root!(form, cx);
+        assert_eq!(interpreter::eval(form, None, env, cx).unwrap(), TRUE);
+    }
+
+    fn lifecycle_protocol_case(body: &str, expected: &str) {
+        let fixture = LoadFixture::new();
+        for (leaf, source) in [
+            ("early", "(provide 'lifecycle-early) (garbage-collect) (setq lifecycle-body-done t)"),
+            ("error", "(provide 'lifecycle-failed) (signal 'error '(\"body error\"))"),
+            ("broken", "("),
+            ("bad-list", "(setq current-load-list 7)"),
+            ("good", "(provide 'lifecycle-good)"),
+        ] { fs::write(fixture.0.join(format!("{leaf}.el")), source).unwrap(); }
+        let roots = RootSet::default();
+        let cx = &mut Context::new(&roots);
+        sym::init_symbols();
+        root!(env, init(Env::new_isolated(cx).unwrap()), cx);
+        crate::core::env::init_variables(cx, env);
+        for leaf in ["early", "error", "broken", "bad-list", "good", "missing"] {
+            env.set_var_context(intern(&format!("lifecycle-file-{leaf}"), cx),
+                cx.add(fixture.0.join(format!("{leaf}.el")).to_string_lossy().to_string()), cx).unwrap();
+        }
+        let depth = env.binding_depth();
+        load_internal(body, cx, env).unwrap();
+        let (form, consumed) = reader::read(expected, cx).unwrap();
+        assert!(expected[consumed..].trim().is_empty(), "trailing expected forms");
+        root!(form, cx);
+        assert_eq!(interpreter::eval(form, None, env, cx).unwrap(), TRUE);
+        assert_eq!(env.binding_depth(), depth);
+    }
+
+    #[test]
+    fn provide_then_eof_dispatch_observes_committed_history_and_restored_state() {
+        // Native protocol seam, not a replacement for/authentic execution of subr.el.
+        lifecycle_protocol_case(r#"
+          (setq lifecycle-outer-file (list 'outer) lifecycle-outer-list (list 'outer-list)
+                load-file-name lifecycle-outer-file current-load-list lifecycle-outer-list
+                lifecycle-count 0 lifecycle-body-done nil)
+          (setq after-load-alist
+            (list (list 'lifecycle-early (lambda ()
+              (garbage-collect)
+              (setq lifecycle-scheduled-file load-file-name
+                    lifecycle-early-saw-body lifecycle-body-done)))))
+          (defalias 'do-after-load-evaluation (function (lambda (file)
+            (garbage-collect)
+            (setq lifecycle-count (1+ lifecycle-count)
+                  lifecycle-observed (list
+                    (equal file lifecycle-scheduled-file) lifecycle-body-done
+                    (eq load-file-name lifecycle-outer-file)
+                    (eq current-load-list lifecycle-outer-list)
+                    (equal (cdr (assoc file load-history)) '((provide . lifecycle-early))))))))
+          (load lifecycle-file-early nil t)
+        "#, "(and (= lifecycle-count 1) (null lifecycle-early-saw-body) (equal lifecycle-observed '(t t t t t)))");
+    }
+
+    #[test]
+    fn failed_and_missing_loads_never_dispatch_or_publish_completed_history() {
+        lifecycle_protocol_case(r#"
+          (setq lifecycle-count 0)
+          (defalias 'do-after-load-evaluation (function (lambda (file) (setq lifecycle-count (1+ lifecycle-count)))))
+          (setq lifecycle-error (condition-case nil (load lifecycle-file-error t t) (error 'caught))
+                lifecycle-broken (condition-case nil (load lifecycle-file-broken t t) (error 'caught))
+                lifecycle-missing (load lifecycle-file-missing t t))
+        "#, "(and (eq lifecycle-error 'caught) (eq lifecycle-broken 'caught) (null lifecycle-missing) (= lifecycle-count 0) (null load-history) (featurep 'lifecycle-failed) (null load-file-name) (null current-load-list))");
+    }
+
+    #[test]
+    fn malformed_history_or_current_list_unwinds_without_dispatch() {
+        lifecycle_protocol_case(r#"
+          (setq lifecycle-outer-file (list 'outer) lifecycle-outer-list (list 'outer-list)
+                load-file-name lifecycle-outer-file current-load-list lifecycle-outer-list
+                lifecycle-count 0)
+          (defalias 'do-after-load-evaluation (function (lambda (file) (setq lifecycle-count (1+ lifecycle-count)))))
+          (setq lifecycle-bad-list (condition-case nil (load lifecycle-file-bad-list nil t) (error 'caught)))
+          (setq load-history 7)
+          (setq lifecycle-bad-history (condition-case nil (load lifecycle-file-good nil t) (error 'caught)))
+        "#, "(and (eq lifecycle-bad-list 'caught) (eq lifecycle-bad-history 'caught) (= lifecycle-count 0) (= load-history 7) (eq load-file-name lifecycle-outer-file) (eq current-load-list lifecycle-outer-list))");
+    }
+
+    #[test]
+    fn require_propagates_completion_errors_for_both_noerror_values() {
+        for noerror in ["nil", "t"] {
+            lifecycle_protocol_case(&format!(r#"
+              (defalias 'do-after-load-evaluation (function (lambda (file) (garbage-collect) (signal 'error '("completion error")))))
+              (setq lifecycle-result (condition-case nil (require 'lifecycle-good lifecycle-file-good {noerror}) (error 'caught)))
+            "#), "(and (eq lifecycle-result 'caught) (featurep 'lifecycle-good) (equal (cdr (assoc lifecycle-file-good load-history)) '((provide . lifecycle-good))) (null load-file-name) (null current-load-list))");
+        }
+    }
+
+    #[test]
+    fn second_loader_binding_failure_restores_first_binding() {
+        lifecycle_protocol_case(r#"
+          (setq lifecycle-outer-file (list 'outer) load-file-name lifecycle-outer-file)
+          (defvaralias 'current-load-list 'enable-multibyte-characters)
+          (setq lifecycle-result (condition-case nil (load lifecycle-file-good nil t) (setting-constant 'caught)))
+        "#, "(and (eq lifecycle-result 'caught) (eq load-file-name lifecycle-outer-file) (eq current-load-list t) (null load-history) (null (featurep 'lifecycle-good)))");
     }
 
     #[test]

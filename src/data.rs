@@ -762,13 +762,74 @@ pub(crate) fn indirect_function<'ob>(object: Object<'ob>, cx: &'ob Context) -> R
 
 #[defun]
 pub(crate) fn provide<'ob>(
-    feature: Symbol<'ob>,
-    _subfeatures: Option<&Cons>,
+    feature: &crate::core::gc::Rto<crate::core::object::Gc<Symbol>>,
+    subfeatures: Option<&crate::core::gc::Rto<Object>>,
     env: &mut Rt<Env>,
-    cx: &Context,
-) -> Symbol<'ob> {
-    env.provide_feature(feature, cx);
-    feature
+    cx: &'ob mut Context,
+) -> Result<Symbol<'ob>> {
+    use rune_core::macros::{root, call};
+    // Validate before publication, retaining supplied subfeature cons identity.
+    let subfeatures: List = subfeatures.map_or(NIL, |value| value.bind(cx)).try_into()?;
+    env.provide_feature(feature.untag(cx), cx);
+    if !matches!(subfeatures.untag(), ListType::Nil) {
+        env.set_prop(feature.untag(cx), sym::SUBFEATURES, subfeatures.into());
+    }
+    // GNU LOADHIST_ATTACH in an initialized runtime also records outside loads.
+    let record = Cons::new(sym::PROVIDE, feature.bind(cx), cx);
+    let current = env.variable_value(sym::CURRENT_LOAD_LIST, cx)?.unwrap_or(NIL);
+    let current = Cons::new(record, current, cx);
+    env.set_var_context(sym::CURRENT_LOAD_LIST, current.into(), cx)?;
+
+    // Select the first eq feature entry once. Never invoke filename entries.
+    let alist = env.variable_value(sym::AFTER_LOAD_ALIST, cx)?.unwrap_or(NIL);
+    let mut callbacks = NIL;
+    for (index, entry) in alist.as_list()?.enumerate() {
+        anyhow::ensure!(index < 65_536, "after-load-alist traversal limit exceeded");
+        if let ObjectType::Cons(entry) = entry?.untag()
+            && entry.car().ptr_eq(feature.bind(cx).into()) {
+            callbacks = entry.cdr();
+            break;
+        }
+    }
+    root!(callbacks, cx);
+    // GNU mapc prevalidates length, then visits at most that initial count.
+    // Preserve live-tail mutation while preventing appended callbacks extending
+    // the iteration or a newly introduced cycle making the traversal unbounded.
+    let count = match callbacks.untag(cx) {
+        ObjectType::Cons(_) | ObjectType::NIL => {
+            let mut count = 0;
+            for entry in callbacks.bind(cx).as_list()? {
+                anyhow::ensure!(count < 65_536, "Feature callback traversal limit exceeded");
+                entry?;
+                count += 1;
+            }
+            count
+        }
+        _ => {
+            let count = crate::fns::length(callbacks.bind(cx))?;
+            anyhow::ensure!(count <= 65_536, "Feature callback traversal limit exceeded");
+            count
+        }
+    };
+    if matches!(callbacks.untag(cx), ObjectType::Cons(_) | ObjectType::NIL) {
+        root!(tail, callbacks.bind(cx), cx);
+        for _ in 0..count {
+            let ObjectType::Cons(pair) = tail.untag(cx) else { break; };
+            let function: crate::core::object::Function = pair.car().try_into()?;
+            root!(function, cx);
+            call!(function; env, cx)?;
+            let ObjectType::Cons(pair) = tail.untag(cx) else { unreachable!() };
+            tail.set(pair.cdr());
+        }
+    } else {
+        for index in 0..count {
+            let callback = aref(callbacks.bind(cx), index, cx)?;
+            let function: crate::core::object::Function = callback.try_into()?;
+            root!(function, cx);
+            call!(function; env, cx)?;
+        }
+    }
+    Ok(feature.untag(cx))
 }
 
 pub(crate) fn car(list: List) -> Object {
@@ -1620,3 +1681,7 @@ mod list_component_signal_tests {
 #[cfg(test)]
 #[path = "owner_function_tests.rs"]
 mod owner_function_tests;
+
+#[cfg(test)]
+#[path = "provide_lifecycle_tests.rs"]
+mod provide_lifecycle_tests;
