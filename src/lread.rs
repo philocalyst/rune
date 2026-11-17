@@ -419,7 +419,7 @@ fn load_with_options(
         if let Some(callback) = crate::data::owner_callable(sym::DO_AFTER_LOAD_EVALUATION, env, cx)? {
             root!(callback, cx);
             let name = "do-after-load-evaluation";
-            call!(callback, new_load_file; name, env, cx)?;
+            call!(callback, new_load_file.bind(cx); name, env, cx)?;
         }
         if !nomessage { println!("Loading {filename} Done"); }
     }

@@ -786,7 +786,7 @@ pub(crate) fn provide<'ob>(
     for (index, entry) in alist.as_list()?.enumerate() {
         anyhow::ensure!(index < 65_536, "after-load-alist traversal limit exceeded");
         if let ObjectType::Cons(entry) = entry?.untag()
-            && entry.car().ptr_eq(feature.bind(cx).into()) {
+            && entry.car().ptr_eq(feature.bind(cx)) {
             callbacks = entry.cdr();
             break;
         }
