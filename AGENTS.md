@@ -1,0 +1,447 @@
+# AGENTS.md — Rune: full Emacs compatibility and a faster editor
+
+This file is the execution charter for the Claude swarm working on `philocalyst/rune`. Read it together with repository instructions and the exact source tree you actually have. The goal is an ambitious, daily-drivable, **1:1 GNU Emacs competitor**, not a demo, a checklist of function names, or a partial editor branded as complete. Preserve unmodified real-world Emacs Lisp and configurations wherever compatibility is promised, while deliberately improving responsiveness, diagnostics, resource use, platform integration and discoverability. Reproduce observable behavior, including edge cases and errors; improvements must not silently break compatible packages. Record deviations and user-visible switches.
+
+## Priority and non-negotiable architecture
+
+1. **Make real Doom Emacs startup and use work first**, then Org and the rest of GNU Emacs and package workflows. Neither Doom nor `.elc` support is currently demonstrated by source review.
+2. **Adopt `philocalyst/lorelei` embedded as Rune's long-term native UI/rendering framework.** Rune remains the owner of Lisp, editor state and correctness. Lorelei is an in-process dependency/adapter, not a remote protocol, web shell, screenshot or separately shipped permanent editor. Existing GPUI is a temporary reference/fallback during migration; do not create two authorities or declare migration complete because one window opens. Pin an audited Lorelei revision and build its actual dependency closure; work with the Lorelei project to add missing embedding/platform APIs instead of faking them. A separate temporary executable may be used only as an integration spike, never the final architecture. See the detailed migration section.
+3. **Correctness, safety and measured performance are coequal.** No silent stubs, source-only claims of passing, benchmark theater, or unbounded rework. Unsupported behavior signals a useful explicit condition. Never trade semantics, memory safety, accessibility, input correctness, or user data for a favorable chart.
+4. **Parallelize six real lanes** with explicit interfaces, independent review, coordinated ownership, and frequent integration. The lead owns the critical path and reports actual outputs, not agents spawned. Use additional specialists when useful; worktrees and build targets are independent and only the integration owner touches the shared branch.
+5. Use substantial Rust dependencies when they earn their place: compare documented semantics, safety, performance, portability, maintenance, license, build and binary cost. Favor existing high-quality implementations over rebuilding generic infrastructure. Experiment with current stable Rust and, when a measured architectural win warrants it, bleeding-edge/nightly Rust behind an explicit pinned toolchain and compatibility plan. Do not assume a nightly feature, collector, SIMD kernel or crate is faster or sound without evidence. Preserve the existing toolchain until a migration has an approved, reproducible path.
+
+## Evidence, scope and first actions
+
+- User-supplied `ROADMAP.md` (about 954 KB, Nov 13) is the historical research source: runtime/text/editor/redisplay audits, generated primitive and preload inventories, package survey, milestones and GNU/Zed research notes. Its counts were based on Rune `94c392b`, not today's branch; its own paper references were partly memory-derived and it explicitly reports no performance measurements. Recheck claims and sources. The full document was not accessible in this drafting session because of Library folder permissions; only indexed excerpts were available. **Do not imply all Claude articles or hundreds of external articles were read.** Locate the user's full Claude-generated research articles and this roadmap in the authorized checkout or Library; read them, preserve their work-package IDs and reconcile them with current code, this charter and direct primary-source evidence. Record inaccessible material rather than inventing content. This charter is not a substitute for those source documents.
+- Exact-source reference observations from this work: last verified public Rune work head `f74ad6c58064095942089d422d0a19db2b953c16`; verify branch and current commit yourself. At that head, compilation succeeded, 244 selected native checks passed, the first lifecycle fixture failed and 26 later tests did not run. Other independent workflows and bootstrap had failures. An unpushed, source-reviewed private stack advanced through feature/load/regex work, but its latest 332 selected tests have **not** been compiled or run. Some copies are local checkpoints, not a remote commit. Re-discover exact artifacts and confirm hashes before using them. Do not confuse a tree ID, private patch, source audit, selected test or synthetic control with a passing public build.
+- As last checked, public push had been denied even after the owner's explicit approval and a retry; bootstrap admission failed on user namespaces, and the local isolated runner failed network-namespace setup. Do not circumvent a safety denial, change host security, disable isolation, fabricate success, or route a denied action through another channel. Use an explicitly supported, qualified execution environment, preserving the same security boundary. Ask the responsible system/owner only for a genuinely necessary unblock; do not repeatedly ask the user for approval already given.
+- Source evidence observed in current code, not a measured end-to-end failure: feature-list authority, source loader/handlers, lexical binding, authentic `env.el` explicit-number regex capture, `.elc` reader/VM and default-directory/path identity are critical. A reviewed source-only regex projection candidate exists for the `env.el` seam; it remains unqualified. Doom's early initialization derives paths from `load-file-name`; test relative source and sibling `require` with owner default-directory different from process cwd. Do not say Doom starts until it actually does.
+- First hour: (a) inspect branch, status, worktrees, `AGENTS.md`/`CLAUDE.md`, workspace manifests/lockfiles, research docs and CI; never destroy another agent's work; (b) pin GNU release/tag and Rune/Lorelei commits; (c) inventory each private patch, base, hash, tests and conflict, quarantine unreviewed/incorrect drafts; (d) select smallest coherent candidate and qualify build and tests before stacking more; (e) establish a current evidence ledger and issue matrix. Rebase carefully, never overwrite a newer whole file with a stale copy. Consult user preferences and the most specific instructions in the actual checkout.
+
+## Definition of done: full competitor
+
+- GNU-compatible CLI/batch/daemon/server, init loading, Lisp evaluation, text, UI, files, processes and package workflows with documented platform/version caveats. Match return values, errors and condition data, ordering, dynamic state, GC behavior, hook timing and side effects, not just API signatures.
+- A versioned, machine-readable compatibility matrix covers every portable primitive, variable, byte opcode, reader form, standard library, relevant C/native module API, supported platform feature, standard command, and major package. Each row has scope, upstream version, test, current result and explicit non-goals; coverage counts include tests that fail, skip or cannot load. Inventory dynamically rather than freezing historical counts.
+- Run unmodified GNU ERT and actual pinned upstream package suites. Test Doom, Org, Magit/Transient, Evil, completion/minibuffer stacks, TRAMP, Eglot/LSP, Dired, terminals and representative language modes as end-to-end workflows, not merely imports. Add package variants and real configs; record first failure and retry after each fix. Prove editing, save/revert, hooks, markers, undo, navigation, process I/O, subprocess cancellation and restart. Compare with the same GNU version and document version-specific differences.
+- Cross-platform native application, reliable IME/dead-key/compose, fonts/fallback/bidi, accessibility and keyboard navigation; lifecycle, DPI, multiple windows, clipboard, menus, DnD, dialogs and session recovery. Define a supported Linux/macOS/Windows matrix and explicit staged support for mobile/web only where viable. TTY, daemon and remote behavior are required for a true broad competitor; no headless smoke substitutes for UI accessibility or interactive parity.
+- Reliable persistence: no text loss, crashes, invisible mutations, stale writes, hangs or corrupted undo on ordinary inputs; crash/restart and autosave/recovery exercised with fault injection. Clear actionable errors preserve original Lisp condition identity/data and context. User-facing experience improvements are additive and configurable where behavior is observable to Lisp.
+- Performance targets are baselines to establish, then budgets to ratify—not invented measured results. Capture cold/warm startup, key-to-present latency p50/p95/p99, frame misses, CPU and GPU time, allocation, RSS/peak, binary size, GC pause distributions, power/idle wakeups and throughput. Compare same hardware, input, configuration, corpus, build settings and output correctness against GNU and relevant peers. Report regressions and independent repeats; never promise universal speedups.
+
+## Swarm protocol
+
+- Six lanes with one accountable integration owner and separate worktrees/targets: (1) runtime/GC/object/conditions, (2) reader/evaluator/VM/loader/regexp, (3) text/markers/properties/undo, (4) editor/command/process/files, (5) Lorelei/platform/display/accessibility, (6) reference, CI, adversarial review, metrics and release. Break into smaller specialists; appoint one integrator per shared interface. A reviewer is independent of the author. Coordinate source ownership, review cross-lane changes and serialize integration; no shared Cargo target locks.
+- A work package names exact base, owned paths, dependencies, interface, acceptance tests, regression cases, deterministic artifacts, risks and stop condition. Return a small reviewable patch, explicit changed behavior, commands/outcomes, known gaps and whether external state changed. Preserve candidate provenance. Integrator rebases only reviewed deltas, runs tests on the resulting tree, fixes root causes and verifies the remote only when publishing is authorized. No force pushes or silent cleanup of user work. Do not circumvent a denied action.
+- Run safe independent investigation and design while qualification is blocked, but stop accumulating large speculative untested stacks. Freeze each candidate, run the smallest exact-tree compilation and regression first as soon as a legitimately qualified runner exists; then expand. Source audits and dry-run accounting are not execution tests. Keep a status ledger per milestone: planned / implemented / source-reviewed / compiled / native-tested / GNU-differential / real workflow / released, with date, revision and evidence.
+- Scope public reports and claims honestly. Any vendored GNU source, compatibility shims or dependency must comply with its license and distribution obligations; assess GPL compatibility, native-module ABI and bundled Lisp redistribution before committing architecture. No license laundering.
+
+# Rune → credible Emacs competitor: evidence-backed gaps and phases
+
+## Status discipline (2026-11-18 source audit)
+
+- Repository README.org says experimental Rust Emacs core, early-phase editor MVP, aiming at bug-compatible existing packages and multithreaded Elisp. design.org is historical exploration, not a shipped-feature roadmap. Both local files were Git-blob verified against the latest private candidate tree.
+- Latest independently audited PRIVATE candidate: `28d587d5f2adc5069fd9822c15f39e3a0277e8a9`, on substitution tree `6e0d5a95...`; 584 files, exact 14-file last delta, 332 selected native tests. **332 selected is not 332 passed.** Entire new stack remains NOT_READY pending qualified compilation/runtime evidence.
+- Public head last checked on November 18, 2026 at 01:50 UTC: `f74ad6c58064095942089d422d0a19db2b953c16`. Recheck the live branch before any integration or publication. Do not describe any private tree as published.
+- Private stack adds/corrects feature authority, provide/load lifecycle, lexical headers, diagnostics, original-name handlers, require flags, shared bounded handler selection, ByteFn metadata, substitution, and a narrow explicit-capture regex correction. These have independent source/data audits, not runtime qualification in this lane.
+- Source-only review caught actual defects before admission: generic Rust ptr_eq ambiguity/root-call errors earlier; unsafe legacy matcher malformed-list loops; wrong require handler flags; POSIX class parsing; quadratic backreference rewrite. Static review is valuable but cannot substitute for compiling/running the accumulated stack.
+
+## Phase 0: make evidence trustworthy before expanding scope
+
+1. Qualify exact frozen tree/lock/toolchain under approved harness; compile first, then focused tests, then all 332 selectors. Preserve six independent inventory/pin lanes and fail-closed ignored-test/admission rules.
+2. Resolve failures narrowly against exact parent, refresh manifests and independent review. Keep green results attributable to exact tree, platform, test set and date.
+3. Separate unit, GNU differential, bootstrap, actual package, editor/UI, process, and performance evidence. Count passing user workflows, not just primitive count or selector count.
+4. No fake package features, alternate MIME viewers, host-environment shortcuts, silently falling back from compiled files, bypassing execution restrictions, or moving untested drafts into the admitted tree.
+
+Exit: reproducible approved build/test results and a source/runtime coverage ledger. This is the immediate priority.
+
+## Phase 1: authentic source bootstrap and first Doom seam
+
+Earliest grounded Doom need: at Doom commit `7ccac7f643ad67baa25b216717cf8617a0903c69`, early-init.el295 derives its root from file-truename(load-file-name); doom.el71–75 adds that directory to load-path; doom.el138 requires doom-lib. Existing native search still uses local host path joins rather than full owner-default-directory expansion.
+
+First fixture: owner default-directory differs from cwd, relative initial source, body records absolute lexical load-file-name and adds its directory to load-path, nested implicit require loads sibling/provides feature. Verify one history/completion per real file and restoration after error/throw/GC. Absolute-path source is the control case. This is a source-backed need, not a claim that Doom already reached that failure.
+
+Authentic env.el is another immediate seam: its explicit-number group1 alternatives were unsupported by prior translator; even no-dollar filenames call string-match once the real environment hook is bound. Private correction now maps physical→logical captures with a deliberately narrow duplicate/backreference subset, but eight tests and actual env.el remain unrun. Qualify real env.el and real subr.el completion dispatcher, not only stubs.
+
+Do not conflate loader progress with complete bootstrap: genuine macroexpand/declarations, owner function/variable state, special vs lexical scope, conditions/quit/throw, match-data and reader semantics all interact.
+
+Exit: authentic bounded source bootstrap plus the first genuine Doom source path, with exact earliest-failure trace and no mocked dependencies.
+
+## Phase 2: complete coherent loader/reader/bytecode contract
+
+Staged-search design is reviewed, initial code sketch explicitly quarantined. Outstanding gates:
+- handler-aware file-name-directory/MUSTSUFFIX; nil filename is implicit but empty string explicit;
+- rooted live path/suffix cursors, no moving-address HashSet across GC, documented mutation subset;
+- GNU suffix product/representation-tail order; nil path versus nil path entry;
+- original6 versus selected5 handler arguments; selected lookup t only if FOUND differs from substituted FILE; preserve arbitrary handler return and flag identity;
+- magic candidate must not fall back to host filesystem without modeled semantics;
+- retained readable regular-file descriptor, no check-close-reopen TOCTOU, no blocking FIFO/device opens;
+- load-prefer-newer implement-or-reject; failed-open SearchFailure distinct from Unsupported and callback throws;
+- compressed/native formats remain explicitly unsupported until admitted.
+
+Doom early-init329–337 binds (.elc .el), so `.elc` selection cannot silently become `.el` source fallback. ByteFn optional metadata preservation is NOT an ELC reader/loader. Inert lazy byte/span parser research is NOT executable bytecode validation. Finish encoding/lazy-reference/object-shape/opcode/stack/provenance validation, GC-safe cyclic graph handling and explicit dump schema policy before admitting compiled input. Do not let a 64-slot constructor budget redefine printed reader grammar.
+
+Exit: GNU-derived differential fixtures for source/compiled load paths and a real Doom dependency chain. Full arbitrary regex, filename-handler, coding, native-module parity remains separate unless actually implemented.
+
+## Phase 3: usable editor semantics, not only a rendered buffer
+
+Exact-current docs/native-editor.md describes an opt-in GPUI owner-thread frontend with immutable prepared frames, persistent rooted Env, ordered input/evaluation and cancellation. It explicitly does NOT load the full Lisp bootstrap; fixed movement/edit commands, typed C-x keymaps, shift selection and full complex shaping are not all supplied by the document renderer. Do not equate these foundations with an Emacs UI.
+
+Prioritize command loop/keymaps/prefix arguments/minibuffer/completion/quit; buffer-local and selected-window authority; undo/redo/narrowing/markers/overlays; file visit/save/revert/encoding; windows/frames, redisplay/faces/font fallback/bidi/shaping/IME/accessibility; mouse/clipboard. Test through genuine Lisp commands and actual UI, not an independent hardcoded editor path.
+
+Exit: a person can edit, save, navigate and recover using familiar Emacs packages/keybindings in sustained sessions. Avoid replacing authentic package behavior with native lookalikes while calling it compatibility.
+
+## Phase 4: package/process ecosystem and daily-driver reliability
+
+Exact-current docs/process-primitives.md documents genuine process objects, owner-rooted filter/sentinel registry and pipe transport, but scoped coding and remaining PTY/TTY, process-marker, networking/TLS and lifecycle limitations. Later narrower docs may supersede individual bullets: audit current implementation before declaring each absent. Process/child-environment improvements alone do not establish real mu4e, TRAMP, Magit, shell or language-server compatibility.
+
+Use isolated synthetic children and fixtures first, then authorized real workloads. Preserve bytes, event ordering, GC roots, partial output, cancellation, process exit and dead metadata. Distinguish safe fixture Maildir tests from real account access/sync/send. Build explicit compatibility tiers for Doom core, packages, terminal/network integrations and platforms.
+
+Exit: reproducible full package workflows, controlled subprocess/network authority, long-session leak/root retirement and recovery evidence.
+
+## Phase 5: performance and differentiated concurrency
+
+Only after semantic/workflow baselines: measure startup time, input latency, redisplay latency, allocation/GC pauses, package load and process throughput against pinned GNU Emacs workloads. JIT/multithreading are aspirations in design.org, not established speedups. Preserve single-owner semantics, safe graph transfer and callback ordering; no UI worker receives raw Lisp objects. Require real workloads and tail-latency improvements without behavior regressions.
+
+## Meaning of “1:1 competitor”
+
+Treat as several independent contracts: Elisp language/runtime, bundled Lisp and compiled formats, editor interaction model, package ecosystem, platform behavior, persistence/IO/process integration, and reliability/performance. Current evidence supports foundations and many narrow corrections, not full 1:1 parity. Define observable acceptance workflows per tier and expose unsupported behavior honestly. A faster Rust core that cannot load the real environment is not yet an Emacs competitor.
+
+## Historical local evidence references for coordinator
+
+The following are names of private scratch artifacts from the original investigation, **not portable repository paths**. They may be unavailable to a new swarm. Discover and verify them if accessible; otherwise reconstruct from authorized sources without assuming they exist.
+
+- Exact-current README.org, design.org, docs/native-editor.md and docs/process-primitives.md verified from rune-library-checkpoint-20261116T2055Z/local-restored/source against candidate tree blobs.
+- rune-explicit-captures-integrated-v1/evidence/independent-doom-review.json (latest full-tree audit).
+- rune-explicit-captures-independent-review-v1/REVIEW.md (regex scope and fixed review blockers).
+- rune-loader-staged-search-private-v1/{DESIGN.md,TEST-SPEC.md,NOT_FOR_INTEGRATION}; rune-loader-staged-search-design-review-v1/review.json.
+- rune-doom-staged-search-evidence-v1/REVIEW.md (exact Doom source call trace).
+- rune-bytefn-metadata-independent-review-v3/REVIEW.md and parser-lazy-bytes-independent-review-v1/REVIEW.md (metadata/inert parser nonclaims).
+
+No compiler, candidate project code, GNU Emacs, Doom, GUI, process workload or external publication was executed for this report.
+
+---
+## Lisp, loader, bytecode, packages, and Doom compatibility roadmap
+
+### Current state and evidence boundary
+
+Rune has a growing native Lisp runtime and a source-reviewed compatibility stack covering feature authority, `provide`/`require`, load lifecycle, lexical headers, file handlers, substitution, and byte-function metadata. These are not evidence of complete Emacs compatibility. The latest private exact tree is `28d587d5f2adc5069fd9822c15f39e3a0277e8a9`, layered on substitution tree `6e0d5a95fd8023398d13a3bff067476eb128a70d`. Its inventory contains 584 files and 332 selected native tests; those counts describe the candidate, not a passing run. Source/data review accepted its mapping and preservation of earlier changes. It remains explicitly NOT_READY for publication or functional claims pending qualified execution.
+
+The most recent concrete dependency blocker was authentic GNU `env.el`: its environment-variable regexp uses duplicate explicit-number captures (`\\(?1:...\\)`), which the previous Rust translation passed to an engine that rejects that syntax. Because the authentic substitution function calls `string-match` even for ordinary filenames, this can break loading without a `$` in the name. A narrow text `string-match` correction is now source-reviewed and integrated privately. It supports bounded explicit numbering, sparse capture projection, provably exclusive duplicate groups, and selected numeric backreferences. It does not establish general GNU regexp parity or extend those semantics to buffer and handler regex paths. Authentic `env.el` execution is still required.
+
+### Delivery order and acceptance gates
+
+1. **Qualify and stabilize the existing stack before adding behavior.** Compile the exact reviewed tree in the approved isolated runner, run selected tests and the retained regression suite, then exercise authentic GNU `env.el` and a minimal source-loading chain. Resolve compiler/test-fixture failures separately from production semantic failures. Every result must identify exact commit/tree, runner admission, selected tests, exit status and relevant logs. No host-Emacs fallback or silent substitution of unsupported formats. Preserve file inventories, hash pins and test-order provenance. A source review alone never closes this gate.
+2. **Establish an executable Lisp semantic baseline.** Cover evaluation order; lexical and dynamic binding; closures and special-variable behavior; aliases and unbound variables; symbol function cells; `condition-case`, `catch`/`throw`, `unwind-protect` and quit; argument arity/type errors; list mutation; and moving-GC rooting across callback reentry. Use small differential fixtures against a pinned GNU Emacs version, plus authentic Lisp modules. Prioritize observable condition identity/data rather than merely detecting that some error occurred. Regressions must cover both successful paths and unwind restoration. Extend macros, autoloads, advice and byte-code entry points only against documented tests, not recognition of a few bootstrap forms.
+3. **Complete source-load search and lifecycle semantics as one coherent protocol.** Keep original handler dispatch, substitution, search and selected-handler dispatch distinct. Preserve exact Lisp argument identities and arbitrary handler return values. Search must use the Lisp owner's `default-directory`, not process cwd, and keep post-substitution FILE distinct from selected FOUND. Implement or explicitly reject `load-prefer-newer`; do not silently choose first suffix. Match suffix/representation ordering and MUSTSUFFIX behavior; make empty substituted filename fail before search callbacks. Preserve descriptor identity through local reads to avoid close/reopen races. Treat magic-handler selection separately from local files, with no local fallback after missing selected-handler support. Final failed-open NOERROR behavior is broader than ENOENT; unsupported admission failures and callback errors need explicit policy. Maintain rooted live list cursors across GC and document which list mutations are admitted, rather than promising arbitrary mutation equivalence.
+4. **Finish loader observability and restoration.** Validate `load-file-name`, `current-load-list`, `load-history`, `provide`, `require` postconditions, `after-load-alist` and `do-after-load-evaluation` ordering against authentic GNU callbacks. File body bindings, lexical mode and temporary state must restore on normal completion, signals and throws, before completion callbacks where GNU does so. Headers need byte/encoding-aware tests, shebang handling and documented unsupported cases. Current narrow header handling must not be advertised as all GNU coding-system behavior. Add relative-load/sibling-require fixtures with owner directory different from cwd, then symlink spelling and true-name cases.
+5. **Make bytecode a separately qualified subsystem.** Metadata/accessor support and a detached ELC parser are not execution support. Define versioned `.elc` admission, reader syntax, compiled-function representation, constants, stack/local-variable model and instruction validation before connecting a production loader bridge. Reject unsupported versions/opcodes and malformed graphs before execution. Implement instruction families with differential tests, bounded resource use, GC maps/rooting, call frames, error unwinding and source/debug metadata. Exercise closures, optional/rest arguments, nonlocal exits and reentrant native calls. Only then admit compiled dependencies into bootstrap. Never silently fall back to `.el` after selecting unsupported `.elc` unless that fallback is explicitly part of the promised loader contract.
+6. **Grow authentic package compatibility in layers.** First qualify core GNU libraries needed by bootstrap, including environment/path utilities, subr/macro helpers and the relevant sequence/CL dependencies. Track a dependency graph and first-failure traces rather than a flat count of implemented function names. Next cover autoload loading, feature visibility, library discovery, directory/file primitives, regexp match-data, buffers/readers and package-generated forms. Keep package download/build/install, subprocesses and network writes behind their own approval and execution gates. Use pinned offline package fixtures to separate Lisp compatibility from installer/environment failures. Add package-manager workflows only after their filesystem and process contracts are explicitly supported.
+7. **Advance Doom through named, reproducible milestones.** Start with a minimal owner-directory-relative initial file and implicit sibling `require`; then authentic early-init and Doom core library discovery; then module declaration/config evaluation; then pinned package autoload loading; then representative interactive behavior. Record the first unsupported primitive or semantic mismatch at every milestone. Recovered Doom early-init derives its root from `load-file-name`, and doom.el prepends its directory before requiring doom-lib, so correct path identity/search matters before exotic handlers. Early bootstrap commonly disables handlers, but gzip/compression and handler restoration still need later coverage. Doom explicitly searches `.elc` before `.el`; the recovered package set has 759 `.elc` files paired with `.el`, making compiled-load admission a real milestone, not a theoretical edge case. Some Doom branches set `load-prefer-newer` nonnil, so an interactive-only nil setting cannot justify ignoring it.
+
+### Loader obligations discovered in the current audit
+
+- Test `require` records its dependency in `current-load-list` even when the feature was already present, enforces the pinned GNU recursion/nesting behavior, and restores state through errors and throws. Compare exact values and history, not just truthy success.
+- Implement and test GNU autoload transactions: failed require/autoload rolls back definitions and `provide` effects as GNU specifies, including nested load/error/throw/GC and prior definitions; distinguish explicit load behavior. Preserve and restore match-data around require/autoload and the string-matching environment hook, including failures and nested calls. Never allow a failed autoload to leave plausible but partial state. Reference: [GNU autoload manual](https://www.gnu.org/software/emacs/manual/html_node/elisp/Autoload.html).
+- The private explicit-number capture proposal covers text `string-match` only; byte-string matching, buffer search and filename-handler matching require independent semantics and tests. It has not been run against authentic `env.el`: stubbed substitution callbacks cannot close this gate.
+
+### Binary compatibility is not one feature
+
+Track portable source `.el`, GNU-versioned `.elc` reader/bytecode, platform/build-specific `.eln` native-compiled files, and the GNU dynamic-module C ABI as four distinct contracts. Match load precedence, version and platform admission, ABI and licensing; reject unsupported binaries explicitly, do not imply that running bytecode establishes native compilation or module compatibility. Specify a credible compatible strategy and test real modules where supported; if full `.eln` ABI cannot be implemented, record the concrete gap rather than calling 1:1 complete.
+
+### Cross-cutting compatibility matrix
+
+Maintain explicit status for each observable contract: unsupported, designed, source-reviewed, compiled, native-tested, differential-tested, authentic-package-tested, and user-workflow-qualified. Include the exact evidence and limitations for each status. Suggested rows:
+
+- Reader: integers/floats, symbols/escapes, lists/vectors, quoting/backquote, strings/multibyte data, character syntax, circular/shared structures, compiled objects and file encodings.
+- Evaluator: scope, closures, macros, function indirection/autoload, arity, mutation, signals/quit/throws and unwind.
+- State: feature list authority and dynamic bindings, symbol properties, buffer-local variables, hooks, match-data and load history.
+- Loader: original and selected handlers, substitution, default directory/load-path, suffixes/representations, descriptor lifetime, lexical headers, coding systems, callbacks and NOERROR.
+- Regexp: Emacs syntax/numbering/backreferences, POSIX classes, text versus byte/buffer domains, Unicode offsets, match-data preservation and resource admission.
+- Bytecode: parser/validator, object representation, instruction families, GC/reentry, unwinding, version support and production loader integration.
+- Packages/Doom: authentic dependency chains, autoloads, package fixtures, bootstrap, configuration, interactive buffer/UI/process behavior and performance.
+
+### Practical release criteria and non-goals
+
+A credible next release claim is a narrow, tested milestone, such as “authentic environment substitution and relative source-load/require work in an isolated fixture,” not “Doom compatible.” Publish known exclusions and fail closed where admitting unsupported input could select a different evaluation mode or dispatch path. Bound filename, regex, graph and traversal resources, while preserving previously supported call-site budgets. Track compile time, startup latency and GC behavior only after correctness tests are stable. Broad editor equivalence additionally needs buffers, display/input, processes, timers, file notifications and platform behavior; Lisp bootstrap progress must not be confused with that larger product goal.
+
+---
+## Editor, buffers, windows, display, OS and process parity roadmap
+
+### Scope and gates
+
+Treat the GNU reference version pinned by this repository as the semantic oracle, not another editor's behavior. Track each API as unsupported, implemented/source-reviewed, compiled, runtime-tested, or reference-parity-tested. Do not equate an API name, a passing unit test, a native renderer demo, or a loader smoke test with full editor or Doom startup parity.
+
+Every work item below must include the exact implementation parent, changed interfaces, failure/rollback behavior, GC and owner-lifetime analysis where applicable, and executable acceptance tests. Unknown behavior must be investigated against pinned reference source or a qualified reference run. Keep unsupported behavior explicit; do not silently approximate it.
+
+Never enable narrowing, compiled editor opcodes, native process launching, or an OS capability merely because a prerequisite exists. Qualification and authorization requirements for executing workloads, publication, OS access and external effects remain in force. An AGENTS.md roadmap is not standing permission to perform those actions.
+
+### 1. Owner identity, lifetime and transactions
+
+**Dependencies:** one authoritative editor session per runtime owner; authenticated buffer/window handles; monotonic identity and publication epochs; immutable snapshots; transactional mutation; precise rooted values and property leases.
+
+**Work:** eliminate duplicate text/point/state authorities. Explicitly separate current buffer from selected window. Define live, killed, foreign-owner and stale identities. Distinguish reversible state changes from irreversible lifetime transitions. Preserve current live marker membership when restoring history. Keep owner/RefCell borrows out of callbacks, Lisp evaluation and GC.
+
+**Acceptance:** foreign and killed handle rejection; identity non-reuse; stale epoch and away-and-back sequence rejection; counter-exhaustion no-partial-write tests; injected backend failure/panic rollback; two independent runtime contexts; GC during callback/reentry; killed shells retain only approved native metadata, not text/history/property roots.
+
+### 2. Buffer namespace and lifecycle
+
+**Dependencies:** owner identity and rooted namespace bindings.
+
+**Work:** buffer creation, lookup, unique naming, rename, MRU/list order, current-buffer selection, read-only/modified flags, visited-file identity, kill queries/hooks and cleanup. Resolve base/indirect buffers and shared-text versus per-buffer state explicitly before claiming support. Implement buffer-local variables and permanent-local behavior through owner-aware bindings, not copied global mirrors.
+
+**Acceptance:** same-name/unique-name cases; hidden/internal buffer listing rules; rename and kill hook errors; reentrant callbacks that create/select/kill buffers; current/selected divergence; independent local values and dynamic unwind; saved/modified state through undo and save; live windows and markers after buffer death; refusal paths preserve state.
+
+### 3. Text, coordinates, properties and markers
+
+**Dependencies:** immutable text snapshots, scalar/byte conversions, owner-bound property registry and marker identities.
+
+**Work:** define multibyte and unibyte storage and conversions; make absolute versus accessible coordinates explicit. Implement insert/delete/replace, substring/string extraction, property-preserving operations, insertion stickiness, overlays, marker insertion types and marker transfer. Distinguish pure text equality from property lineage and owner identity. Do not reconstruct GC values from numeric property IDs without the appropriate live registry lease.
+
+**Acceptance:** ASCII, combining characters, non-BMP characters, embedded NUL and non-ASCII unibyte data; scalar/byte round trips; insertion at both marker biases; deletion and reinsertion; overlapping property runs and last-write-wins batches; stale prepared property publication; live marker movement between undo cycles; forced GC with properties retained only by history; foreign property handles and failed preparation leave no partial changes.
+
+### 4. Point, narrowing, reads and motion
+
+**Dependencies:** owner bounds, same-publication bounds/document/point snapshot, all ordinary access paths, typed applied-motion outcomes, window coordination.
+
+**Work:** implement point-min/max, goto-char, character and line motion, substring/read/search access, narrow/widen and saved/labeled restrictions as one coordinated contract. Keep full buffer-size, file saving and explicit erase behavior separate from ordinary accessible reads/edits. Use source-buffer bounds when copying/reading another buffer. Saved restrictions require authenticated target identity and owner markers that follow edits and retire on every unwind path.
+
+**Critical rules:** boundary motion may commit point before signaling; an ordinary transaction error that rolls back point is not equivalent. A caller-supplied property range does not prove actual property-diff containment. Keep narrowed metadata publication fail-closed until a sealed backend proof or actual containment verification exists. Reject undo changes outside accessible bounds rather than silently widening. Byte-output caps do not bound scanning hidden property runs; use indexed interval traversal or an explicit work budget.
+
+**Acceptance:** empty and nested restrictions; reversed/invalid endpoints; Unicode point and EOF; hidden text never returned by ordinary reads; hidden properties do not contaminate visible plain reads; boundary signal point state; no-op versus genuine mutation at exhausted counters; multiple windows and current/selected divergence; saved restriction after insert/delete/throw/error/GC; killed target cleanup; labeled widen constraints; undo of hidden text/property changes; erase removes the complete buffer according to the pinned reference.
+
+**Current gate:** existing private narrowing groundwork is inactive and unqualified. Do not expose a commit method or remove full-only guards until all listed access paths are coherent and qualified. Its 34 source-defined Rust tests and separate semantic contracts are specifications, not passing results.
+
+### Syntax, keymaps and change hooks: mandatory compatibility gates
+
+Implement syntax tables, case tables, categories, parser state and `syntax-ppss` caching/invalidation, `scan-sexps`, comments/strings and multibyte semantics; compare state after edits, narrowing and syntax-property changes. Implement input/keymap precedence across overriding, transient, minor, local and global maps, key translation, remapping, prefix resolution, keyboard macros and `interactive` argument/command history, including Evil's representative workflows. Reproduce `before-change-functions` and `after-change-functions` arguments, current buffer, order, inhibited recursion, batching, reentrancy, and documented behavior on errors; do not promise blanket rollback of arbitrary Lisp hook side effects. Verify GNU reference for each and include nested callback/GC tests.
+
+### 5. Undo, redo, modification and saved state
+
+**Dependencies:** transactional text/property changes, actual affected intervals, current marker/view reconciliation, save-generation identity.
+
+**Work:** represent text and metadata history distinctly; retain affected property intervals or conservative full-document scope. Implement undo boundaries/grouping, disabled undo, selective behavior where required, hooks and read-only inhibition. Reconcile current live markers and windows rather than resurrecting dead historical identities. Saving between undo/redo cycles must update the correct clean baseline without treating content-version equality as sufficient.
+
+**Acceptance:** text/property/mixed history; undo/redo across a save; explicit modified-flag changes between cycles; marker removal/transfer after recording; inaccessible history rejection; GC when only redo retains a value; stale/error/panic publication leaves history and visible state unchanged; failed writes never mark clean.
+
+### 6. Windows, frames and configuration restoration
+
+**Dependencies:** owner buffer state, window-tree identity, layout validation, current accessible bounds and frame ownership.
+
+**Work:** split/delete/select/resize, window start/point/hscroll, scrolling, buffer assignment, dedicated/minibuffer windows, frame creation/deletion and parameters. Preserve the distinction between selected-window point and nonselected saved points. Restore configurations against current live buffers and current restrictions, with explicit killed-buffer fallback. Bound tree depth and geometry work; reject impossible layouts atomically.
+
+**Acceptance:** mixed buffers with distinct restrictions; split/delete at minimum sizes; selected versus current buffer; stale pointer events; pixel/cell geometry boundaries; saved configuration after edits/narrowing/kills; foreign configuration rejection; no-op scroll under exhausted sequence versus real mutation failure; multi-frame independence; minibuffer recursion; failure preserves tree, selection and all view coordinates.
+
+### 7. Display, redisplay and input
+
+**Dependencies:** immutable owner snapshots, frame/window geometry, font and terminal abstraction, bounded incremental invalidation.
+
+**Work:** implement character-width and display-column semantics separately from scalar counts. Cover tabs, combining/wide characters, bidi, compositions, invisibility, display properties, overlays, faces, font fallback, line wrapping/truncation, fringes/margins, cursor, region, modeline/headerline, echo area and minibuffer. Establish input events, modifiers, keymaps, command loop, keyboard macros, quit handling, IME/paste and accessibility. Snapshot rendering must not retain unsafe Lisp borrows.
+
+**Acceptance:** deterministic headless layout fixtures and reference-backed display cases; tabs/Unicode/bidi/composition; property and overlay precedence; horizontal/vertical scrolling; resize and invalidation after edits; stale render/input rejection; bounded work on large/deep inputs; input method/paste ownership; command errors and quit restore loop state; GUI/TTY-specific tests clearly separated from language-runtime tests.
+
+### 8. Filesystem and OS services
+
+**Dependencies:** explicit OS capability boundary, path/coding model, file-baseline identity and safe asynchronous completion.
+
+**Work:** expand/canonicalize paths without conflating spelling with visited identity; local and remote-handler dispatch; file attributes, directories, symlinks, permissions, coding systems, newline conversion, file visiting/insertion, atomic writes, locking, backups/autosave, file notifications, environment variables, clocks/timers, clipboard and platform opening services. Model platform-specific behavior instead of assuming one host's semantics are universal.
+
+**Acceptance:** temporary-directory tests for symlinks and path aliases; non-UTF-8 paths where supported; permission/encoding/partial-write failures; externally modified file conflict; atomic replacement and baseline compare-and-swap; cancellation and stale completion; failed save preserves modified state; notification rename/delete races; handler dispatch; environment isolation; clipboard and OS calls use approved scope and test doubles unless real access is explicitly qualified.
+
+### 9. Processes, networking and asynchronous callbacks
+
+**Dependencies:** OS capability boundary, event loop, rooted callback/state ownership, typed process lifecycle and cleanup.
+
+**Work:** synchronous call-process and asynchronous start/make-process, pipes/PTYs, stdout/stderr routing, coding, environment/default-directory inheritance, process buffers, filters/sentinels, send/EOF/signals, cancellation, exit status and wait semantics. Add network/TLS services only with explicit transport and security contracts. Filters/sentinels must run outside owner borrows and tolerate reentrancy, buffer death and further process creation.
+
+**Acceptance:** controlled approved fixture subprocesses for success/failure/signal/timeout; bounded output and backpressure; split multibyte sequences; independent stderr; filter throws/quits; sentinel exactly-once policy; process buffer killed mid-stream; cancellation during launch; rooted callbacks across GC; no leaked child/FD/PTY; environment/working-directory correctness; network tests use isolated fixtures and distinguish transport, TLS and application failures. Do not run arbitrary repository or network payloads to obtain a smoke-test result.
+
+### 10. Cross-layer integration and release acceptance
+
+**Order:** owner/lifetime → buffer/text/property/marker semantics → coherent access/motion/undo/window contracts → Lisp adapter and compiled-opcode routes → display/input → OS/process integration. Work may proceed in parallel only when shared interfaces and ownership contracts are explicit.
+
+**Qualification:** exact source/tree and toolchain pins; compile affected crates together; enumerate real test binaries and require unique expected selectors; bounded isolated tests with captured exits/output; run pre-existing regressions as well as new cases; compare relevant cases to the pinned GNU reference. Keep source review, compile success, runtime success, reference parity and GUI/OS integration evidence separate.
+
+**End-to-end gate:** use a clean, reproducibly provisioned Doom profile only after required reader, feature/loader, bytecode and editor primitives are qualified. Capture the first failing operation and dependencies rather than masking it with stubs. Successful profile installation is not successful startup; successful startup is not editing/process/display parity. Acceptance requires documented workflows such as visiting/editing/saving a Unicode file, splitting/restoring windows, narrowed edits with undo, property/overlay display, command completion/minibuffer interaction, and a controlled subprocess workflow, with no hidden fallback to a different state authority.
+
+---
+# Lorelei into Rune: evidence-backed migration roadmap
+
+## Recommendation
+
+Begin with an opt-in **rune-lorelei presentation adapter** as the staged route to the mandated embedded Lorelei default, not a wholesale editor rewrite. Keep Rune's authoritative editor/runtime, display snapshots, ordered input transport and GC ownership boundaries. Use Lorelei's current `bough` façade with a reviewed custom editor-surface seam for the first runnable slice; application shell follows `bough::prelude` and any direct raw/backend access requires an approved integration exception or upstream API; do not assume its separate `bough-x` experimental core is a drop-in replacement or that its benchmark wins transfer to editing.
+
+Evidence inspected on 2026-11-18: Lorelei `main` resolved to **e0b7a4c8891d5f9b6c67cda44413b0d73c494668**. Pinned source reads below; Rune comparison source pinned to **f74ad6c58064095942089d422d0a19db2b953c16**. This is source analysis, not a successful build, embedding demo or performance claim. Nothing executed or pushed.
+
+## Actual architecture
+
+Lorelei is renamed from bough, but crate names remain `bough*`. `bough` is the application façade: `View`, `Signal`, `Element`, `Application::run`, window and input builders. Its raw API exports absolutely positioned quads/text, clipping, templates, virtual lists and `App`. Below it sit `bough-core` records/damage, `bough-text` shaping, cephal layout, and platform presentation. This is distinct from the round8 typed-dataflow `bough-x` family. [Façade exports](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/crates/bough/src/lib.rs).
+
+The current manifest has Linux Wayland and fused GPU dependencies; macOS has AppKit/direct Metal and optional wgpu backend dependencies. Therefore old README wording saying macOS-only is stale relative to source. Do not promise Windows/X11/web availability from portable shader aspirations. The workspace uses nightly-2026-10-17 and unstable features, path-local sibling crates and vendored cephal: importing one source folder is insufficient. [Manifest](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/crates/bough/Cargo.toml), [toolchain](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/rust-toolchain.toml).
+
+`App<V>` owns the view/runtime and drives turns, writes, flush/poll/frame, damage and presentation. This is a potential host integration seam, not evidence an externally hosted surface API is ready. `Application::run` takes ownership and does not return; `ui.rs` uses a static WINDOW OnceLock. If necessary, start with a separate optional application executable as a temporary build/first-light spike only, not two competing loops in a GPUI window. The end state is the embedded Rune application described above, never a permanent separate editor. [App driver](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/crates/bough/src/app.rs), [window/application API](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/crates/bough/src/ui.rs).
+
+A text-input API exists, but it is a one-line field bound to Signal<String>; input includes text commit and key handling. This is not an editor storage model or proof of complete IME composition. Rune must retain rope/document ownership and translate platform composition to its existing validated replacement protocol. [Input implementation](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/crates/bough/src/input.rs).
+
+The closing report distinguishes façade results from new-core fixtures and records open editor-text/IME, native accessibility, identity, platform and measurement work. It also reports heavy-scene failures and compilation blowups in deeply monomorphized layouts. Treat reported benchmark/test numbers as the repository authors' scoped historical results, not our verification of the current head. [Closing report](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/docs/r8/final/REPORT.md).
+
+## Blocking Lorelei host and input contract
+
+At inspected Lorelei commit `e0b7a4c8891d5f9b6c67cda44413b0d73c494668`, do not infer platform completeness from exported types. Its [contributor policy](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/AGENTS.md) reserves raw APIs for existing scene ports; new application code uses the prelude. Agree and test an upstream-supported custom editor-surface seam or obtain an explicit integration exception. An in-process Rune can let Lorelei own the single native event loop; it need not embed an external NSView or run two loops.
+
+Before interactive adoption implement an event-loop-integrated, bounded/coalesced owner-to-UI wake, not a polling timer; verify ordered input, cancellation, reentry, disconnect and shutdown. Pinned source review found Wayland drops key-up, collapses non-right buttons, omits horizontal scroll and only warns on runtime scale change; AppKit path handles key-down and vertical scroll but not a complete IME bridge. Preserve physical/logical key identity, releases/repeats/modifiers, mouse buttons, both axes, text composition and focus before lossy conversion. Implement native preedit/commit/cancel, surrounding-text conversion and owner-epoch acknowledgment to prevent duplicate or stale commits. Runtime DPI changes must update surface, font metrics, layout generation and hit coordinates atomically. Verify each claimed platform; an input method or accessibility projection is not proof of native IME/screen-reader integration. [Wayland dispatch](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/crates/bough/src/backend/wayland.rs), [AppKit dispatch](https://github.com/philocalyst/lorelei/blob/e0b7a4c8891d5f9b6c67cda44413b0d73c494668/crates/bough/src/backend/host.rs).
+
+Before snapshot parity define a glyph/cluster/font-resource lease and generation contract so shaping, measurement, clipping, hit tests and caret/selection agree in byte, scalar and cluster coordinates. Exact pixel equality applies only under identical font/raster assumptions; otherwise specify a quality envelope without relaxing semantic geometry. Native accessibility adapters are separate work, not established by a projection type.
+
+## Rune's seam to preserve
+
+Rune's GPUI adapter already paints immutable FrameDisplay snapshots with no Lisp objects/locks/layout in paint, bounded input and wake-driven notification. EditorBridge owns the EditorHost, snapshots style/visible ranges and checks window/buffer identity, publication epoch and owner sequence before composition replacement. These invariants are reusable; GPUI types are not. [GPUI adapter](https://github.com/philocalyst/rune/blob/f74ad6c58064095942089d422d0a19db2b953c16/crates/rune-gpui/src/lib.rs), [owner bridge](https://github.com/philocalyst/rune/blob/f74ad6c58064095942089d422d0a19db2b953c16/crates/rune-gpui/src/editor_bridge.rs).
+
+## Ordered deliverables and acceptance gates
+
+1. **Dependency/build spike, no backend switch.** Pin Lorelei commit and toolchain; audit the full dependency/vendor closure and licenses. Add optional adapter/executable without making headless Rune or current GPUI builds depend on Lorelei by default. Gate: qualified builds on one supported target, unchanged Rune headless tests. No floating main dependency.
+2. **Read-only first light.** Feed an existing immutable FrameDisplay fixture through a reviewed Lorelei editor-surface contract; raw/backend use requires a documented integration exception or upstream-supported API. Reuse Rune's display layout rather than laying the document out again in cephal. Explicit font metrics/fallback capabilities must match painter and hit-test geometry. Gate: clip/cursor/selection/font snapshot parity, Unicode/bidi/emoji fixtures, resize and DPI tests; old adapter retained as oracle. A visual window alone is insufficient.
+3. **Owner transport extraction.** Extract only genuinely GPUI-free bridge/DTO/ordered-mailbox pieces to a neutral module/crate, leaving GPUI native font/event types in its adapter. Lorelei callbacks enqueue owned input; owner produces newer immutable generations; wake once per publication, not a perpetual frame timer. Keep request-scoped quit and bounded rejection/backpressure. Gate: queue saturation, cancellation, stale hit, close/disconnect, repeated layout failure and no duplicate mutation tests.
+4. **Editing parity before default.** Wire command/key provenance, pointer hits, scrolling, undo and save through EditorHost. Never mirror the full editable buffer into Lorelei Signal<String> or mutate it from paint. Gate: same command trace yields same owner state in both adapters, including failed edits and read-only policy.
+5. **Platform release blockers.** Implement explicit preedit/commit/cancel and surrounding-text/range conversions with owner epoch acknowledgments; test composed text, dead keys, grapheme boundaries, focus changes and stale commits. Qualify clipboard, accessibility adapters/screen readers, multiwindow, DPI and shutdown rather than inferring them from exports. Keep unsupported capabilities visibly disabled. This is likely substantial framework work, not just glue.
+6. **Measure, then switch the default to Lorelei after parity gates.** Replay real large Rune documents, rapid edits, split windows, scrolling, font fallback and IME on quiet matched hosts. Measure input-to-present p95/p99, idle wakeups, memory, startup, retained-vs-full repaint correctness and build time. Switch the default to the embedded Lorelei adapter after feature parity and measured nonregression; retain GPUI fallback during rollout and explicitly retire or maintain it by recorded decision.
+
+## Stop conditions and boundaries
+
+Stop the integration spike if its toolchain/vendor graph cannot coexist cleanly, if safe host/publication APIs cannot preserve owner/GC boundaries, or if text/IME gaps require silently reducing editor functionality. Do not start by porting the new typed core, implementing a second document model, or rewriting Rune's bytecode/ELC work. Those are independent concerns. A host/rendering change does not solve Rune's compiled-loading gate or missing VM operations.
+
+Immediate next practical task: one optional read-only FrameDisplay adapter plus a bounded host/font capability assessment. Scope any later direct-GPU/external-surface embedding separately after proving ownership and surface lifetime contracts; source inspection here does not establish that contract.
+
+---
+# Rune swarm execution and acceptance protocol
+
+## Ground truth and objective
+
+Move reviewed Rune changes into reproducible, meaningful runtime evidence without confusing private source review, synthetic controls, native unit tests and real GNU/Doom compatibility. As last verified November18,2026 01:50:53UTC, public work branch remains f74ad6c58064095942089d422d0a19db2b953c16. Its native build passed, then244 selected tests passed before first lifecycle fixture failed;26 suffix tests did not run. Seven original workflows remain attempt1: native, payload, closure and bootstrap failed; synthetic lifecycle, confinement and49 post-exec controls succeeded. Private fixes are not public runtime results.
+
+Two independent blockers must remain visible: publication is denied/pending resolution, and no alternate executor has qualified the required isolation. Existing cloud admission failed NETLINK_ROUTE; hosted bootstrap failed uid_map. Desktop is offline. Do not retry publication via another route, weaken controls, or execute cargo/GNU locally on the assumption that source review makes it safe.
+
+## Six immediate CI and bootstrap subroles
+
+These are temporary cross-cutting assignments within the six canonical domain lanes defined above, not a second competing permanent ownership taxonomy. The lead can assign one person multiple subroles or split them as needed.
+
+1. **Integration owner:** maintains the exact immutable dependency graph, reviewed delta hashes and one selected release candidate. Applies narrow changes only, resolves shared-file conflicts and refreshes six inventory sets/pins. Owns publication only after root resolves authorization and exact disclosure scope. Never treats private tree SHA as remote commit.
+2. **Language/feature semantics:** owns feature forwarding/detachment, aliases, dynamic restoration and GC identity. Produces narrow code plus regression cases and source/oracle rationale. Distinguishes known compatibility limits from harness mistakes.
+3. **Loader/reader semantics:** owns lexical-binding cookies, handler/load behavior, source parsing and callback/history invariants. Coordinates src/lread.rs edits with lane2 and diagnostics before integration. No whole-file replacement from stale parent.
+4. **CI/authentication:** owns source admission, native selector accounting, signed snapshot lifetime, package bindings, exact artifact evidence and failure triage. Preserves baseline selectors and test expectations; no opportunistic pin relaxation.
+5. **Security/executor qualification:** owns the trusted admission-only inspector, namespace/mount/capability/network checks, bounded cleanup and adversarial negative controls. Qualifies build and runtime separately; no project workloads before admission succeeds in the same execution boundary.
+6. **Independent review/compatibility/performance:** reviews lanes2–5 without author self-acceptance; defines GNU differential cases, Doom startup milestones and repeatable benchmarks. Reviews mapping/inventory integration separately from source semantics. Reports evidence scope rather than a single ambiguous green status.
+
+The integration lead owns consequential decisions and communication, and stops any lane whose task would cross unresolved authorization. Independent work continues as source/data review while runtime/publication is blocked.
+
+## Lane contract and handoff
+
+Every task names: exact parent tree, owned paths, intended semantic change, invariant/assertions to preserve, permitted checks, explicit forbidden actions, artifact path, acceptance reviewer and stop condition. Return a sparse delta, SHA256/Git blob mapping, expected full tree, tests added/retained, observed checks, unresolved risks and whether any external state changed. No hidden network acquisition, tool installation or scope expansion.
+
+Use immutable versioned candidate directories. Never mutate an accepted parent. Send early notice for shared-file overlap; integration owner chooses ordering before either lane overwrites another. A discovered incorrect assumption triggers correction of its source contract, not a test deletion or blanket handler.
+
+## Candidate dependency order
+
+Historical prefix (not an instruction to replay blindly): public f74ad6c -> combined fixture/pin c870aeba -> signed snapshot1deabaa -> featureV3 dfa75ed3 -> loader header03dc94ca -> bounded diagnostics25f46cf5. Later audited private descendants include original-handler tree 5d6afe1b, require flags 1100d15f, shared selector 744da40d, ByteFn metadata edeed331, substitution 6e0d5a95 and explicit captures 28d587d5. This is still an uncompiled, unrun and unpublished stack; independently verify full parent manifests and all source before using any edge. Select the smallest qualified increment rather than assuming the last tree is safe.
+
+FeatureV4 e51ca2c1 is an optional test-only sibling on snapshot1deabaa, NOT a descendant of diagnostics and NOT the selected parent. Do not concatenate its mapping. Any adoption requires explicit selection and narrow rebase of descendants with new independent review.
+
+Freeze integration inputs before cascading pins. Validate every changed blob/mode, complete tracked membership, unchanged unrelated files, six inventory memberships/hash bindings and runner constants, selector identity, workflow/admission/trust policy and full expected Git tree. Validate parent tree at every edge. Source and integration reviews are separate required gates.
+
+## Test ladder and exact acceptance
+
+### A. Safe private checks now
+
+Read source, parse JSON/Python as data, check fixture form structure, exact blob/tree mappings and inventory fixed point. Verify signed metadata using the retained exact public keyring with installed trusted verifier as an explicitly scoped data check. Own isolated staging-function tests can prove bounded-copy behavior but never project/runtime admission. Cargo check and --no-run execute build machinery and are not data-only checks.
+
+### B. Publication and source admission
+
+The integration lead resolves any existing publication block through its intended approval channel. Recheck remote expected head; non-force publish only the exact approved payload when allowed. A changed head requires ancestry review. Verify resulting commit tree matches the frozen candidate before attributing a single result to it. Do not rerun old public CI as evidence for private fixes.
+
+### C. Native build and regression suite
+
+Use authenticated fixed toolchain/dependencies, locked offline build, exact source admission and existing finite resource limits. Preserve compiler diagnostics and binary hash. A compile failure means zero newly verified runtime tests.
+
+Historical diagnostics candidate had 291 selectors; the latest private explicit-capture candidate lists 332. These are selected counts, not passing results. Actual final-child selector count must be checked against its manifest, not assumed. Each exact name runs in its own process; require exit0, exactly1passed,0failed,0ignored. The sole exact-name specialness test uses --ignored explicitly and must actually pass, not be silently skipped. No selector removals or widened accounting.
+
+The first 271 selectors must pass within the final-commit run to establish that baseline; descendants then execute in order. Stop-first failure must report completed count and unrun suffix. Fixed tests must retain callback ordering, live-list mutation, root identity, unwind depth, load-history and error semantics unless independent evidence justifies a changed contract.
+
+### D. Authentication and structural control lanes
+
+Synthetic lifecycle, confinement and49 post-exec checks can proceed independently but prove only their named controls. Payload must freshly verify both exact Debian signer pairs, release identity/date, index checksum and four package/version/arch/size/hash bindings. Static closure runs only after authenticated payload admission and proves inspected dependency closure, not GNU execution.
+
+### E. Qualified execution and real startup
+
+Admission must verify all required namespace identities against parent, capability sets including bounding/ambient, NoNewPrivs, exact readonly input mounts, fresh empty HOME, absent host sockets/secrets, absent network access and finite timeout/descendant teardown. Negative controls must fail for the expected reason and show downstream workload markers absent. Unknown failure is inconclusive, not pass.
+
+The inspected process must exec workload in the SAME admitted boundary. A successful inspector followed by an unsandboxed build is not qualification. Build scripts/proc macros need the admitted build profile; real GNU/Rune/Doom need admitted runtime profile. Keep canonical vendor executable provenance and no permissive-profile tricks.
+
+Advance from Rune native tests -> bounded Rune bootstrap -> same inputs under GNU -> exact pinned Doom configuration/packages -> actual startup behavior. Record first real language failure. Do not use fake provides, broad swallowed errors or synthetic startup markers as compatibility evidence.
+
+## Failure evidence and independent triage
+
+Every failing phase retains commit/tree, binary/tool hashes, exact command/selector, environment contract, exit or signal, stop reason, elapsed time, log sizes/hashes and complete bounded stdout/stderr. The runner's2KB printed tails are not exhaustive: fetch full phase logs when needed.
+
+Classify separately: compiler/type, harness/setup, runtime semantic/GC, authenticated-input, admission, resource limit or infrastructure. New diagnostics borrow retained PendingExit, render condition/tag and only first datum with bounded printing; do not add general recursive object printing or Lisp callbacks. Loader result has empty source prefix, so exact test name remains essential.
+
+One author proposes a correction; independent reviewer validates cause and assertion preservation; integration owner reanchors; qualified CI reruns exact changed candidate. No repeated reruns to hide a deterministic failure. Infrastructure reruns require a named transient cause and still retain original evidence.
+
+## Performance acceptance
+
+Do not invent speedups from compilation or unqualified runs. Define workload and metric before optimizing: cold startup, representative eval/load throughput, allocation/GC pressure, peak resident memory and teardown. Pin input corpus, source commit, optimized build flags, toolchain, CPU/host class and isolation profile. Compare baseline/candidate on the same qualified host with warmup policy, multiple trials, median and spread, plus raw logs. Report cold and warm separately.
+
+Performance changes must preserve all semantic/security tests. Establish baseline variance before setting regression budget; do not promise a percentage without measurements. Investigate regressions outside agreed noise bounds, and trade memory/latency explicitly. No changing the sandbox or skipping GC/error workloads to improve benchmark numbers. Real Doom usability acceptance includes successful bounded startup and expected interaction, not elapsed time alone.
+
+## Security acceptance and maintenance
+
+No credentials in build/runtime sandbox, no network acquisition inside it, no writable verified inputs, no widened file permissions or host security changes. Exact pins are reproducibility contracts; signature validity and expiry remain independent authentication contracts. Source/data review cannot substitute for either.
+
+The snapshot observed in this research expires November 24, 2026 at 20:11:06 UTC; its historical planned refresh was 48 hours earlier. Re-read the effective signed metadata and schedule from its actual expiry; do not assume this snapshot is still active. Refresh authenticates both unchanged signers and unchanged index/package bindings; changed bindings require deliberate new payload review. Reanchor receipt/helper/extractor/inventory chain and independently audit. Expiry fails closed even while publication is delayed.
+
+## Exit criteria and reporting
+
+Release-candidate acceptance requires independently reviewed source + exact integrated tree + actual final-commit native pass count + authenticated payload/static closure + required synthetic controls + qualified real startup evidence for any startup claim. Performance acceptance is a separate measured gate. Pending runtime evidence remains explicitly pending.
+
+The integration lead summarizes only meaningful deltas: what changed, which exact gates passed, which remain blocked and the next authorized action. While blocked, avoid repetitive status polling unless a scheduled check or expected external change warrants it. Keep lanes productive on bounded reviews and prepared evidence, never manufacture progress by crossing a denied action.
+
+---
+
+## Better than Emacs without breaking Emacs: issue-driven work
+
+The following are evidence-backed regression seeds and proposed Rune improvements, **not** a claim that the old bugs remain open, that GNU has made no improvements, or that Rune has measured a speedup. Live tracker status was not established for every historical report. Preserve source version, reproduction, resolution status and date. Run each against pinned GNU and Rune before adopting an optimization. Add fixed bugs to the regression corpus rather than keeping obsolete accusations alive.
+
+| Evidence / problem | Required structural work and gate |
+| --- | --- |
+| [GNU #16875](https://lists.gnu.org/archive/html/bug-gnu-emacs/2014-07/msg00871.html) reported stalls with a huge comint line; [GNU #57669](https://lists.gnu.org/r/bug-gnu-emacs/2022-09/msg00600.html) described point jumps around long-line optimization. [NEWS.29](https://github.com/emacs-mirror/emacs/blob/master/etc/NEWS.29) records upstream long-line improvements and residual mode/fontification tradeoffs. | Measure maximum line length independently of total bytes; isolate process ingestion, syntax work, redisplay and hooks. Long-single-line, many-short-line, malformed byte and huge-output fixtures must remain responsive and preserve point, navigation, width, wrapping, truncation, overlays and syntax across thresholds. Cancel expensive work and provide an explicit, reversible large-line degraded mode, never silently alter text or navigation. |
+| [GNU display manual](https://github.com/emacs-mirror/emacs/blob/master/doc/emacs/display.texi) documents scroll/fontification responsiveness tradeoffs and potential inaccurate scrolling with variable face heights. | Budget work per frame and prioritize input, but never publish inconsistent geometry. Test precise scrolling with variable line height, images, font fallback, animations, cached/uncached layout, pending input and virtualized large buffers. Provide user-visible control over optional expensive decoration without changing required semantics. |
+| [GNU `so-long`](https://elpa.gnu.org/packages/so-long.html) and its [author's historical explanation](https://lists.gnu.org/archive/html/emacs-devel/2018-10/msg00473.html) distinguish mode-level work from redisplay. | Profile each layer; bounded incremental mode initialization, resilient buffer opening, cancellation and clear indication of deferred features. Avoid using a single giant-line workaround as evidence of fast text storage or all-mode compatibility. |
+| [GNU thread semantics](https://www.gnu.org/software/emacs/manual/html_node/elisp/Threads.html), [process/thread ownership](https://www.gnu.org/software/emacs/manual/html_node/elisp/Processes-and-Threads.html) and [NEWS.28](https://www.gnu.org/software/emacs/news/NEWS.28.html) specify cooperative execution, thread-local context and process fairness. | Implement bounded fair I/O scheduling and cancellation while preserving callback ownership, dynamic bindings, match data, current buffer, ordering and Lisp-observable thread semantics. Stress a flooding subprocess alongside typing, a quiet process and timer. Workers may prepare immutable data; they may not mutate Lisp/editor state behind the owner's back. GNU already includes fairness improvements, so measure rather than claim novelty. |
+| [GNU GC manual](https://www.gnu.org/software/emacs/manual/html_node/elisp/Garbage-Collection.html) explains threshold/percentage and memory/pause tradeoffs. | Measure GC pause p95/p99, retained roots, allocation rates and RSS on real startup, editing and package traces. Do not disguise stalls by unbounded heap growth or permanently disable GC. Test exact roots and safepoints, weak tables, ephemerons, finalizer reentry, cross-owner references and callback GC. |
+| [GNU early-init](https://www.gnu.org/software/emacs/manual/html_node/emacs/Early-Init-File.html), [package installation](https://www.gnu.org/software/emacs/manual/html_node/emacs/Package-Installation.html), and historical [#77745](https://lists.gnu.org/archive/html/bug-gnu-emacs/2025-04/msg00729.html) show startup/cache ordering and an async native-compile report. | Preserve early-init → package activation → init ordering; package quickstart/activation and any new cache must be keyed by source, versions, configuration and dependencies with atomic invalidation. Record per-stage spans and cold/warm cache, no hidden recompilation or disabled activation masquerading as a win. The historical report is not proof of current universal behavior. |
+| [GNU error debugging](https://www.gnu.org/software/emacs/manual/html_node/elisp/Error-Debugging.html) and [debugger invocation](https://www.gnu.org/software/emacs/manual/html_node/elisp/Invoking-the-Debugger.html) describe debug-init and batch behavior. | Preserve exact Lisp condition symbol/data, debugger continuation and reentry, condition-case handlers, unwind, quit and throw. Add bounded, cycle-safe display with source span, original operation, require/load and callback chain, failing argument, and expandable rooted backtrace. Distinguish upstream Lisp error, Rune unsupported feature, IO/permission, corruption, timeout, panic and cancellation; actionable next steps, privacy/redaction, and machine-readable diagnostics. Test diagnostic path itself under OOM/GC/huge/cyclic data and nested unwinds. |
+| [GNU coding systems](https://www.gnu.org/software/emacs/manual/html_node/emacs/Coding-Systems.html), [ELisp coding basics](https://www.gnu.org/software/emacs/manual/html_node/elisp/Coding-System-Basics.html), [Rust regex resource notes](https://docs.rs/regex/latest/regex/#untrusted-input) and [fancy-regex limits](https://docs.rs/fancy-regex/0.16.2/fancy_regex/struct.RegexBuilder.html). | Preserve raw bytes/unibyte semantics, encodings and line endings; no lossy replacement unless requested. For regex preserve Emacs syntax, captures, match data and byte/character offsets; bounded input/program/backtracking and explicit failure, not engine-error→no-match. `regex` earliest-mode can alter semantics and iterator complexity differs from one search. `encoding_rs` and `ropey` are components, not complete GNU coding or buffer semantics. |
+
+### Systematic external research task
+
+A fast initial primary-source pass under the ten-minute deadline did **not** read hundreds of blogs, issues or papers. The swarm must perform the requested broad investigation as a first-class, parallel task, not imply it already happened. Enumerate **at least 200 distinct relevant issue threads, maintainer discussions, user studies, technical blogs and project documents**, then deeply read and classify those relevant to Rune; the target is a research workload, not a magic proof of coverage. Include primary GNU Debbugs/mailing-list records, NEWS/manual changes and reproducible current package reports; seek contrary evidence and resolved fixes. Maintain `research/emacs-issues` with URLs, retrieval dates, affected and fixed versions, reproduction, issue status as verified, root cause vs inference, workload, user impact, proposed design, implementation owner, tests and evidence. Deduplicate by underlying issue, label inaccessible/secondary claims, and do not count search snippets as fully reviewed articles. Make an issue-to-work-package matrix covering latency, GC, command errors, key discovery, files/remote, process fairness, large buffers/lines, bidi/IME, accessibility, startup, packages, compatibility, diagnostics, input loss and crashes. Each accepted issue produces a reproducible regression and a benchmark or usability task; do not claim an issue fixed merely because an architectural idea sounds plausible. Track upstream fixes and avoid reinventing solved problems. Keep a public-facing concise changelog of verified wins versus GNU, with exact compared versions.
+
+## Rust, GC and dependency selection
+
+Rust is a means to safety and speed, not a promise of zero pauses. Keep current collector and root discipline until an evidence-backed replacement is ready. Build a decision record and exact pinned prototypes of cons/vector/ByteFn cycles, dynamic roots, global publication, weak maps/ephemerons, callbacks, finalization and FFI. Compare on realistic Rune traces and adversarial moving-GC stress. Avoid a multi-month GC rewrite based solely on a blog, benchmark microcase or API familiarity.
+
+- [MMTk `VMBinding`](https://docs.mmtk.io/api/mmtk/vm/trait.VMBinding.html), [pinning](https://docs.mmtk.io/api/mmtk/memory_manager/fn.pin_object.html) and [0.33 changelog](https://docs.rs/crate/mmtk/0.33.0/source/CHANGELOG.md): serious candidate for moving/concurrent plans, but Rune must implement and prove its VM object layout, exact scanning/roots, relocation, barriers, mutator/safepoints, weak processing and native interop. Some plans do not support pinning; choose and test an actual plan. Avoid presenting a toolkit as a drop-in `Gc<T>` or promising pause times.
+- [gc-arena](https://github.com/kyren/gc-arena) and [boa_gc](https://docs.rs/boa_gc/0.22.0/boa_gc/) are nonmoving single-owner comparison candidates, with different lifetime/root/weak semantics. Audit their limits and actual versions before deciding. [dumpster](https://docs.rs/dumpster/2.1.0/dumpster/) uses reference counting and cycle collection and may suit Rust host graphs, not automatically copied tagged Lisp values. Do not mix their derive macros or pointer rules as if interchangeable.
+- [`std::pin`](https://doc.rust-lang.org/std/pin/) is an address-stability contract, **not** tracing, rooting, write barriers or a moving collector. Model pinned objects, stable handles, raw pointers/FFI, finalizers and references over safepoints explicitly. Every unsafe block has a documented invariant and adversarial test; Miri, sanitizers and fuzzing find some bugs but do not prove soundness or provide a security sandbox.
+- Evaluate existing crates for ropes/trees, byte conversion, codecs, shaping/fonts/bidi, regex, parser generation, event loops, async/process I/O, serialization and property/fuzz testing. Examples to benchmark and qualify, not prescriptions: `ropey`, `encoding_rs`, `regex`/`fancy-regex`, `proptest`, `cargo-fuzz`, `tracing`, `criterion`, existing Lorelei font/shaping dependencies and separately qualified native accessibility libraries/adapters. Choose only after semantic differential tests, target/ABI, license/security and measured memory/build/runtime tradeoffs. Reuse tested upstream solutions where suitable; don't bolt on dependencies just to increase their count.
+- Data structures: a single authoritative text model with cheap snapshots and incremental summaries; markers/overlay intervals with correct insertion bias, text properties, undo and unibyte/multibyte distinctions. Index actual damage and dependencies instead of O(document) scan for each keystroke. Use cache-aware layout, batched allocation, compact representations, preallocation and SIMD only after measuring real edit/scroll/mixed workloads; compare branch misses, cache misses, tail latency, memory and correctness. Explicitly test pathological lines, hidden text, multiple windows, huge properties/overlays and cancellation.
+- Modern Rust techniques are evaluated experimentally: typed state machines/newtypes, enums over free strings, ownership boundaries, narrow unsafe kernels with reference implementations, zero-copy where lifetime-safe, optional SIMD, parallel immutable preparation, profile-guided optimization, LTO and incremental compilation diagnostics. Do not turn unstable features into an undocumented baseline. Pin compiler/dependency revisions and measure compile time and binary size as well as runtime.
+
+## Fast, useful diagnostics and operator experience
+
+Treat errors as a product feature. Provide readable default explanations and an expandable expert view with precise Lisp conditions, source and byte offsets, contextual filename and chain, actionable fixes, cause and failure mode; preserve `condition-case` semantics and existing debugger behavior. Offer a bounded startup timeline, slow-command/process/GC explanations, queue backlog, request-scoped interruption and exportable repro bundle with secret redaction. Errors must not crash, loop, swallow callbacks or mutate unrelated state. Establish command discovery and help, keyboard-only operation, onboarding for GNU users, consistent configuration migration and reversible safe defaults. Run usability tasks with real Emacs users, observe completion and mistakes, not just screenshots. Do not hide warnings to improve startup numbers.
+
+### Redisplay failure and cancellation regressions
+
+The [GNU debugging manual source](https://raw.githubusercontent.com/emacs-mirror/emacs/master/doc/lispref/debugging.texi) documents special handling of errors in redisplay callbacks such as mode-line evaluation, fontification and window-scroll hooks. Preserve condition data without recursively invoking redisplay, retain bounded deferred trace evidence, make any hook removal/re-enable explicit, and test repeat failures, GC and safe recovery. A [historical maintainer discussion of #45898](https://lists.gnu.org/archive/html/bug-gnu-emacs/2022-06/msg00417.html) explains why cancellation alone can immediately re-enter a wedged redisplay; use safe points and a stable degraded recovery state that preserves unsaved edits. Do not claim this historical issue remains unfixed today. As [NEWS.29](https://github.com/emacs-mirror/emacs/blob/master/etc/NEWS.29) describes, long-line paths can affect hook-visible narrowing: regression tests must check scope and restoration on errors and quit across optimization thresholds, not merely cursor speed.
+
+## Non-negotiable final validation
+
+One versioned acceptance ledger must include upstream `test/src` and `test/lisp` ERT by file and result category, differential fuzzing (including original error identity and state), `.elc` and bytecode versions, package suite and interactive workflow results, platform capability and accessibility coverage, security/sandbox controls, build reproducibility/license reports, plus separate correctness and performance dashboards. Real launch means the actual Rune binary with authentic GNU and package files, not a mock, synthetic dispatcher, generated sample, host Emacs fallback or offline fixture alone. Do not call the project 1:1, Doom-compatible, faster, lighter, finished, or the Lorelei migration complete until the corresponding final gates pass on pinned artifacts and stated platforms.
