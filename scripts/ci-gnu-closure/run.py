@@ -3,7 +3,7 @@
 import datetime,hashlib,importlib.util,json,os,pathlib,re,stat,subprocess,sys
 sys.dont_write_bytecode=True
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-gnu-closure'
-BASE_PIN='2ebb92e96281fb1958e72d66a90cc7a39c1ac13c5b93de408838d0cdde30c2a4'
+BASE_PIN='84bac22ee10b8b0cafc0263112771a030329859741d3a52a178c3fcaeaef6e7e'
 HELPERS_PIN='c4acbbeaab711199f12b6a47bda830cfcea79f943a03b65f45bc299f2be56e4f'
 OVERLAY=set(['.github/workflows/wip-gnu-closure.yml', 'docs/wip-gnu-closure-scope.md', 'scripts/ci-gnu-closure/base-inventory.json', 'scripts/ci-gnu-closure/helper-inventory.json', 'scripts/ci-gnu-closure/inspect.py', 'scripts/ci-gnu-closure/run.py'])
 OVERLAY.add('scripts/ci-exec-admission/helpers/cases.json')

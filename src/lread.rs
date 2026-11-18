@@ -844,7 +844,7 @@ mod test {
                 load-file-name lifecycle-outer-file current-load-list lifecycle-outer-list
                 lifecycle-count 0 lifecycle-body-done nil)
           (setq after-load-alist
-            (list (list 'lifecycle-early (lambda ()
+            (list (list 'lifecycle-early #'(lambda ()
               (garbage-collect)
               (setq lifecycle-scheduled-file load-file-name
                     lifecycle-early-saw-body lifecycle-body-done)))))
