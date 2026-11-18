@@ -5,7 +5,7 @@ Fixed five-group source reviewed admission; never an arbitrary command runner.
 import hashlib,importlib.util,json,os,pathlib,re,stat,subprocess,sys
 sys.dont_write_bytecode=True
 S=pathlib.Path.cwd().resolve();C=S/'scripts/ci-exec-admission';H=C/'helpers'
-BASE_PIN='2b7ba3fefaf145a5e598bd3b1897b5cc6b75f99f01f3654f19ea6f96a961508d'
+BASE_PIN='29966be4f499e133159fe6f5b5b51f260f44f61593449da5912f6b9e1c4c5da5'
 HELPERS_PIN='acb26afbc19bc56893c5a3d720d10c8c613157f67c62cbdf4cad39a527d340de'
 GROUP_NAMES=['baseline','scalar_exec','scalar_other','process_alias','metadata']
 GROUP_COUNTS=[15,8,8,9,9]
@@ -26,7 +26,7 @@ def verify(commit):
   for n,digest in items.items():
    p=root/n;need(p.is_file() and not p.is_symlink() and sha(p)==digest,'source identity')
  need({p.name for p in H.iterdir()}==set(helpers)|{'manifest.json'},'unexpected helper siblings')
- overlay={'.github/workflows/wip-exec-admission.yml','docs/wip-exec-admission-scope.md','scripts/ci-exec-admission/run.py','scripts/ci-exec-admission/base-inventory.json','scripts/ci-exec-admission/helpers/manifest.json'}|{'scripts/ci-exec-admission/helpers/'+n for n in helpers}
+ overlay={'AGENTS.md','.github/workflows/wip-exec-admission.yml','docs/wip-exec-admission-scope.md','scripts/ci-exec-admission/run.py','scripts/ci-exec-admission/base-inventory.json','scripts/ci-exec-admission/helpers/manifest.json'}|{'scripts/ci-exec-admission/helpers/'+n for n in helpers}
  actual=set(filter(None,subprocess.check_output(['/usr/bin/git','ls-files','-z'],cwd=S).decode().split('\0')))
  need(actual==set(base)|overlay,'tracked fileset')
  need(subprocess.check_output(['/usr/bin/git','rev-parse','HEAD'],cwd=S,text=True).strip()==commit,'commit mismatch')
